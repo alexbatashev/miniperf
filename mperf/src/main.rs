@@ -11,6 +11,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    List,
     Record {
         #[arg(short, long)]
         scenario: Scenario,
@@ -34,6 +35,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
 
     match args.command {
+        Commands::List => {
+            let events = pmu::list_counters();
+            for event in events {
+                println!("{} - {}", event.name(), event.description());
+            }
+        }
         Commands::Record {
             scenario,
             output_directory,
