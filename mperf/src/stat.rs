@@ -1,4 +1,4 @@
-use comfy_table::{Cell, CellAlignment, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table};
 use num_format::{Locale, ToFormattedString};
 use pmu::{Counter, Process};
 
@@ -29,29 +29,52 @@ pub fn do_stat(command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     let result = driver.counters()?;
     for (cntr, value) in result.clone() {
-        let value_str = match cntr {
+        let info = match cntr {
             Counter::Instructions | Counter::BranchInstructions => {
                 let cycles = result.get(Counter::Cycles).unwrap().value;
                 let instrs = value.value;
-                format!("{:.2} inst/cycle", instrs as f64 / cycles as f64)
+                let ipc = instrs as f64 / cycles as f64;
+                let mut cell = Cell::new(format!("{:.2} inst/cycle", ipc));
+
+                if cntr == Counter::Instructions {
+                    if ipc < 0.6 {
+                        cell = cell.fg(Color::Red);
+                    } else if ipc < 1.5 {
+                        cell = cell.fg(Color::Yellow);
+                    }
+                }
+
+                cell
             }
             Counter::BranchMisses | Counter::LLCMisses => {
                 let instrs = result.get(Counter::Instructions).unwrap().value;
                 let misses = value.value;
-                format!("{:.2} MPKI", misses as f64 / instrs as f64 * 1000_f64)
+                Cell::new(format!(
+                    "{:.2} MPKI",
+                    misses as f64 / instrs as f64 * 1000_f64
+                ))
             }
             Counter::StalledCyclesFrontend | Counter::StalledCyclesBackend => {
                 let cycles = result.get(Counter::Cycles).unwrap().value;
                 let stalled = value.value;
-                format!("{:.2}%", stalled as f64 / cycles as f64 * 100_f64)
+                let percentage = stalled as f64 / cycles as f64 * 100_f64;
+                let mut cell = Cell::new(format!("{:.2}%", percentage));
+
+                if percentage > 20_f64 {
+                    cell = cell.fg(Color::Red);
+                } else if percentage > 10_f64 {
+                    cell = cell.fg(Color::Yellow);
+                }
+
+                cell
             }
-            _ => "".to_string(),
+            _ => Cell::new(""),
         };
         table.add_row(vec![
             Cell::new(cntr.name()),
             Cell::new(value.value.to_formatted_string(&Locale::en))
                 .set_alignment(CellAlignment::Right),
-            Cell::new(value_str),
+            info,
             Cell::new(format!("{:.2}", value.scaling)).set_alignment(CellAlignment::Right),
             Cell::new(cntr.description()),
         ]);
@@ -60,9 +83,10 @@ pub fn do_stat(command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "
 
-Perf counters:
+Performance counter stats for '{}':
 
-{table}"
+{table}",
+        command.join(" ")
     );
 
     Ok(())

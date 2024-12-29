@@ -52,7 +52,6 @@ impl CountingDriver {
             attr.set_exclude_kernel(1);
             attr.set_exclude_hv(1);
             attr.set_inherit(1);
-            attr.set_pinned(0);
             attr.set_exclusive(0);
             attr.sample_type = PERF_SAMPLE_IDENTIFIER as u64;
             if process.is_some() {
@@ -252,6 +251,11 @@ fn bind_events(
     let mut handles: Vec<NativeCounterHandle> = vec![];
 
     for (cntr, attr) in std::iter::zip(counters, attrs) {
+        // cycles and instructions are typically fixed counters and thus always on
+        match cntr {
+            Counter::Cycles | Counter::Instructions => attr.set_pinned(1),
+            _ => attr.set_pinned(0),
+        };
         let new_fd = unsafe {
             sys::perf_event_open(
                 &mut *attr as *mut perf_event_attr,
