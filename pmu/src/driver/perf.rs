@@ -1,10 +1,29 @@
-use perf_event_open_sys::bindings::perf_event_attr;
+use std::sync::mpsc::{channel, Receiver, Sender};
+
+use libc::{mmap, sysconf, MAP_SHARED, PROT_READ, PROT_WRITE};
+use perf_event_open_sys::bindings::{
+    perf_event_attr, PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+};
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 
 use crate::{Counter, Error, Process};
 
 pub struct CountingDriver {
     native_handles: Vec<NativeCounterHandle>,
+}
+
+pub struct SamplingDriver {
+    native_handles: Vec<NativeCounterHandle>,
+    mmaps: Vec<*mut u8>,
+    tx: Sender<SampleFormat>,
+    rx: Receiver<SampleFormat>,
+    page_size: usize,
+    mmap_pages: usize,
+}
+
+pub struct SamplingDriverBuilder {
+    counters: Vec<Counter>,
+    sample_freq: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +49,9 @@ struct ReadFormat {
     time_running: u64,
     values: [EventValue; 0],
 }
+
+#[repr(C)]
+struct SampleFormat {}
 
 #[repr(C)]
 struct EventValue {
@@ -162,6 +184,76 @@ impl CountingDriver {
 
         Ok(CounterResult {
             values: scaled_values,
+        })
+    }
+}
+
+impl SamplingDriver {
+    pub fn builder() -> SamplingDriverBuilder {
+        SamplingDriverBuilder {
+            counters: vec![],
+            sample_freq: 1000,
+        }
+    }
+}
+
+impl SamplingDriverBuilder {
+    pub fn counters(self, counters: &[Counter]) -> Self {
+        Self {
+            counters: counters.to_vec(),
+            sample_freq: self.sample_freq,
+        }
+    }
+
+    pub fn build(self) -> Result<SamplingDriver, Error> {
+        let mut attrs = get_native_counters(&self.counters)?;
+
+        for attr in &mut attrs {
+            attr.set_exclude_kernel(1);
+            attr.set_exclude_hv(1);
+            attr.set_inherit(1);
+            attr.set_exclusive(0);
+
+            attr.sample_freq = self.sample_freq;
+            attr.set_freq(1);
+
+            attr.sample_type =
+                (PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ID) as u64;
+
+            attr.set_mmap(1);
+            // if process.is_some() {
+            //     attr.set_enable_on_exec(1);
+            // }
+        }
+
+        let native_handles = bind_events(&self.counters, &mut attrs, None)?;
+
+        let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
+        let mmap_pages = 512;
+
+        let mmaps = native_handles
+            .iter()
+            .map(|handle| unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    page_size * (mmap_pages + 1),
+                    PROT_READ | PROT_WRITE,
+                    MAP_SHARED,
+                    handle.fd,
+                    0,
+                ) as *mut u8
+            })
+            .collect();
+
+        let (tx, rx) = channel();
+
+        Ok(SamplingDriver {
+            native_handles,
+            mmaps,
+            tx,
+            rx,
+            page_size,
+            mmap_pages,
         })
     }
 }

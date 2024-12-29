@@ -5,7 +5,7 @@ mod perf;
 mod kperf;
 
 #[cfg(target_os = "linux")]
-pub use perf::{list_software_counters, CountingDriver};
+pub use perf::{list_software_counters, CountingDriver, SamplingDriver, SamplingDriverBuilder};
 
 #[cfg(target_os = "macos")]
 pub use kperf::{list_software_counters, Driver};
