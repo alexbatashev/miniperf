@@ -6,7 +6,7 @@ pub use process::Process;
 
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Counter {
     Cycles,
     Instructions,

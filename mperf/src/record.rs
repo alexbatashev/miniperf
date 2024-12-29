@@ -10,14 +10,17 @@ pub fn do_record(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Record profile with {scenario:?}");
 
-    // let _driver = pmu::Driver::new(&[
-    //     Counter::Cycles,
-    //     Counter::Instructions,
-    //     Counter::LLCReferences,
-    //     Counter::LLCMisses,
-    //     Counter::BranchMisses,
-    //     Counter::BranchInstructions,
-    // ])?;
+    let _driver = pmu::CountingDriver::new(
+        &[
+            Counter::Cycles,
+            Counter::Instructions,
+            Counter::LLCReferences,
+            Counter::LLCMisses,
+            Counter::BranchMisses,
+            Counter::BranchInstructions,
+        ],
+        None,
+    )?;
 
     Ok(())
 }

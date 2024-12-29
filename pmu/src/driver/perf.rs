@@ -1,10 +1,21 @@
-use perf_event_open_sys::bindings::{perf_event_attr, PERF_FLAG_FD_CLOEXEC};
+use perf_event_open_sys::bindings::perf_event_attr;
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 
 use crate::{Counter, Error, Process};
 
 pub struct CountingDriver {
     native_handles: Vec<NativeCounterHandle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CounterValue {
+    pub value: u64,
+    pub scaling: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CounterResult {
+    values: Vec<(Counter, CounterValue)>,
 }
 
 struct NativeCounterHandle {
@@ -101,7 +112,7 @@ impl CountingDriver {
         Ok(())
     }
 
-    pub fn get_counters(&mut self) -> Result<Vec<(Counter, u64)>, Box<dyn std::error::Error>> {
+    pub fn counters(&mut self) -> Result<CounterResult, Box<dyn std::error::Error>> {
         let read_size = std::mem::size_of::<ReadFormat>() + (std::mem::size_of::<EventValue>());
 
         let mut buffer = vec![0_u8; read_size];
@@ -131,16 +142,48 @@ impl CountingDriver {
 
             let value = &values[0];
 
+            let scaling_factor = if header.time_running > 0 {
+                (header.time_enabled as f64) / (header.time_running as f64)
+            } else {
+                1.0_f64
+            };
             let scaled_value = if header.time_running > 0 {
-                let scaling_factor = (header.time_enabled as f64) / (header.time_running as f64);
                 (value.value as f64 * scaling_factor) as u64
             } else {
                 value.value
             };
-            scaled_values.push((handle.kind.clone(), scaled_value));
+            scaled_values.push((
+                handle.kind.clone(),
+                CounterValue {
+                    value: scaled_value,
+                    scaling: scaling_factor,
+                },
+            ));
         }
 
-        Ok(scaled_values)
+        Ok(CounterResult {
+            values: scaled_values,
+        })
+    }
+}
+
+impl CounterResult {
+    pub fn get(&self, kind: Counter) -> Option<CounterValue> {
+        self.values
+            .iter()
+            .find(|(c, _)| *c == kind)
+            .map(|(_, v)| v)
+            .cloned()
+    }
+}
+
+impl IntoIterator for CounterResult {
+    type Item = (Counter, CounterValue);
+
+    type IntoIter = <Vec<(Counter, CounterValue)> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.into_iter()
     }
 }
 
