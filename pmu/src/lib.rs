@@ -1,7 +1,7 @@
 mod driver;
 mod process;
 
-pub use driver::CountingDriver;
+pub use driver::{CountingDriver, SamplingDriver};
 pub use process::Process;
 
 use thiserror::Error;
