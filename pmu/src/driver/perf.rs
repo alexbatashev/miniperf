@@ -1,8 +1,12 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-use libc::{mmap, sysconf, MAP_SHARED, PROT_READ, PROT_WRITE};
+use libc::{close, mmap, munmap, sysconf, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
 use perf_event_open_sys::bindings::{
-    perf_event_attr, PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    perf_event_attr, perf_event_header, perf_event_mmap_page, PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU,
+    PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_READ, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 
@@ -14,11 +18,10 @@ pub struct CountingDriver {
 
 pub struct SamplingDriver {
     native_handles: Vec<NativeCounterHandle>,
-    mmaps: Vec<*mut u8>,
-    tx: Sender<SampleFormat>,
-    rx: Receiver<SampleFormat>,
+    mmaps: Vec<UnsafeMmap>,
     page_size: usize,
     mmap_pages: usize,
+    running: Arc<AtomicBool>,
 }
 
 pub struct SamplingDriverBuilder {
@@ -32,15 +35,44 @@ pub struct CounterValue {
     pub scaling: f64,
 }
 
+/// A structure that represents a single sample
+#[derive(Debug)]
+pub struct Sample {
+    /// Unique ID shared by all samples of the event
+    pub event_id: u64,
+    /// Instruction pointer
+    pub ip: u64,
+    /// Process ID
+    pub pid: u32,
+    /// Thread ID
+    pub tid: u32,
+    /// Timestamp
+    pub time: u64,
+    pub time_enabled: u64,
+    pub time_running: u64,
+    pub counter: Counter,
+    pub value: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct CounterResult {
     values: Vec<(Counter, CounterValue)>,
 }
 
+#[derive(Debug, Clone)]
 struct NativeCounterHandle {
     pub kind: Counter,
+    pub id: u64,
     pub fd: i32,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct UnsafeMmap {
+    ptr: *mut u8,
+}
+
+unsafe impl Send for UnsafeMmap {}
+unsafe impl Sync for UnsafeMmap {}
 
 #[repr(C)]
 struct ReadFormat {
@@ -50,8 +82,19 @@ struct ReadFormat {
     values: [EventValue; 0],
 }
 
+/// Internal structure for reading from mmap ring buffer
 #[repr(C)]
-struct SampleFormat {}
+struct SampleFormat {
+    header: perf_event_header,
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    time: u64,
+    id: u64,
+    cpu: u32,
+    _res: u32, // Reserved unused value
+    read: ReadFormat,
+}
 
 #[repr(C)]
 struct EventValue {
@@ -154,13 +197,10 @@ impl CountingDriver {
 
             let header = unsafe { &*(buffer.as_ptr() as *const ReadFormat) };
 
-            let values = unsafe {
-                std::slice::from_raw_parts(
-                    (buffer.as_ptr() as *const ReadFormat).add(1) as *const EventValue,
-                    self.native_handles.len(),
-                )
-            };
+            let values =
+                unsafe { std::slice::from_raw_parts(header.values.as_ptr(), header.nr as usize) };
 
+            // For now it is guaranteed there's exactly 1 event
             let value = &values[0];
 
             let scaling_factor = if header.time_running > 0 {
@@ -188,12 +228,125 @@ impl CountingDriver {
     }
 }
 
+unsafe impl Send for SamplingDriver {}
+unsafe impl Sync for SamplingDriver {}
+
 impl SamplingDriver {
     pub fn builder() -> SamplingDriverBuilder {
         SamplingDriverBuilder {
             counters: vec![],
             sample_freq: 1000,
         }
+    }
+
+    pub fn start<F>(&self, mut callback: F) -> Result<(), Error>
+    where
+        F: FnMut(Sample) + Send + 'static,
+    {
+        for handle in &self.native_handles {
+            let res_enable = unsafe {
+                sys::ioctls::ENABLE(
+                    handle.fd,
+                    0, // TODO support groups
+                      // sys::bindings::PERF_IOC_FLAG_GROUP,
+                )
+            };
+
+            if res_enable < 0 {
+                return Err(Error::EnableFailed);
+            }
+        }
+
+        self.running.store(true, Ordering::SeqCst);
+
+        let running = self.running.clone();
+        let mmaps = self.mmaps.clone();
+        let page_size = self.page_size;
+        let mmap_pages = self.mmap_pages;
+        let native_handles = self.native_handles.clone();
+
+        thread::spawn(move || {
+            while running.load(Ordering::SeqCst) {
+                for &mmap in &mmaps {
+                    unsafe {
+                        let data = mmap.ptr as *mut perf_event_mmap_page;
+                        let data_head = (*data).data_head;
+                        let data_tail = (*data).data_tail;
+
+                        if data_head == data_tail {
+                            continue;
+                        }
+
+                        let base = mmap.ptr.add(page_size);
+                        let mut offset = data_tail as usize;
+
+                        while offset < data_head as usize {
+                            let header = base.add(offset % (page_size * mmap_pages))
+                                as *const perf_event_header;
+
+                            if (*header).type_ == PERF_RECORD_SAMPLE {
+                                let format = &*(base.add(offset % (page_size * mmap_pages))
+                                    as *const SampleFormat);
+
+                                let values = std::slice::from_raw_parts(
+                                    format.read.values.as_ptr(),
+                                    format.read.nr as usize,
+                                );
+
+                                let value = &values[0];
+
+                                let handle = native_handles
+                                    .iter()
+                                    .find(|handle| handle.id == value.id)
+                                    .unwrap();
+
+                                let sample = Sample {
+                                    event_id: format.id,
+                                    ip: format.ip,
+                                    pid: format.pid,
+                                    tid: format.tid,
+                                    time: format.time,
+                                    time_enabled: format.read.time_enabled,
+                                    time_running: format.read.time_running,
+                                    counter: handle.kind.clone(),
+                                    value: value.value,
+                                };
+
+                                callback(sample);
+                            }
+
+                            offset += (*header).size as usize;
+                        }
+
+                        // Update data_tail
+                        (*data).data_tail = data_head;
+                    }
+                }
+
+                thread::sleep(Duration::from_micros(100));
+            }
+        });
+
+        Ok(())
+    }
+
+    pub fn stop(&self) -> Result<(), Error> {
+        self.running.store(false, Ordering::SeqCst);
+
+        for handle in &self.native_handles {
+            let res_enable = unsafe {
+                sys::ioctls::DISABLE(
+                    handle.fd,
+                    0, // TODO support groups
+                      // sys::bindings::PERF_IOC_FLAG_GROUP,
+                )
+            };
+
+            if res_enable < 0 {
+                return Err(Error::EnableFailed);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -211,19 +364,20 @@ impl SamplingDriverBuilder {
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);
             attr.set_exclude_hv(1);
-            attr.set_inherit(1);
+            // attr.set_inherit(1);
             attr.set_exclusive(0);
 
             attr.sample_freq = self.sample_freq;
             attr.set_freq(1);
 
-            attr.sample_type =
-                (PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ID) as u64;
+            attr.sample_type = (PERF_SAMPLE_IP
+                | PERF_SAMPLE_TID
+                | PERF_SAMPLE_TIME
+                | PERF_SAMPLE_ID
+                | PERF_SAMPLE_CPU
+                | PERF_SAMPLE_READ) as u64;
 
             attr.set_mmap(1);
-            // if process.is_some() {
-            //     attr.set_enable_on_exec(1);
-            // }
         }
 
         let native_handles = bind_events(&self.counters, &mut attrs, None)?;
@@ -234,27 +388,50 @@ impl SamplingDriverBuilder {
         let mmaps = native_handles
             .iter()
             .map(|handle| unsafe {
-                mmap(
+                let ptr = mmap(
                     std::ptr::null_mut(),
                     page_size * (mmap_pages + 1),
                     PROT_READ | PROT_WRITE,
                     MAP_SHARED,
                     handle.fd,
                     0,
-                ) as *mut u8
+                ) as *mut u8;
+                if ptr as *mut libc::c_void == MAP_FAILED {
+                    let err = std::io::Error::last_os_error();
+                    panic!(
+                        "Failed to map {:?} : len = {} fd = {}",
+                        err.raw_os_error(),
+                        page_size * (mmap_pages + 1),
+                        handle.fd
+                    );
+                }
+                UnsafeMmap { ptr }
             })
             .collect();
-
-        let (tx, rx) = channel();
 
         Ok(SamplingDriver {
             native_handles,
             mmaps,
-            tx,
-            rx,
             page_size,
             mmap_pages,
+            running: Arc::new(AtomicBool::new(false)),
         })
+    }
+}
+
+impl Drop for SamplingDriver {
+    fn drop(&mut self) {
+        for &mmap in &self.mmaps {
+            unsafe {
+                munmap(
+                    mmap.ptr as *mut std::ffi::c_void,
+                    self.page_size * (self.mmap_pages + 1),
+                );
+            }
+        }
+        for handle in &self.native_handles {
+            unsafe { close(handle.fd) };
+        }
     }
 }
 
@@ -362,8 +539,16 @@ fn bind_events(
             return Err(Error::CounterCreationFail);
         }
 
+        let mut id: u64 = 0;
+
+        let result = unsafe { sys::ioctls::ID(new_fd, &mut id) };
+        if result < 0 {
+            return Err(Error::CounterCreationFail);
+        }
+
         handles.push(NativeCounterHandle {
             kind: cntr.clone(),
+            id,
             fd: new_fd,
         });
     }
