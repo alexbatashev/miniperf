@@ -4,9 +4,9 @@
 use dlopen2::wrapper::{Container, WrapperApi};
 use libc::*;
 // use std::ffi::CStr;
-use std::sync::Arc;
+use std::{ffi::CStr, sync::Arc};
 
-use crate::Counter;
+use crate::{Counter, Error, Process};
 
 const MAX_COUNTERS: usize = 6;
 
@@ -20,10 +20,27 @@ const KPC_CLASS_CONFIGURABLE_MASK: u32 = 1 << KPC_CLASS_CONFIGURABLE;
 const KPC_CLASS_POWER_MASK: u32 = 1 << KPC_CLASS_POWER;
 const KPC_CLASS_RAWPMU_MASK: u32 = 1 << KPC_CLASS_RAWPMU;
 
-pub struct Driver {
+pub enum CountingDriver {
+    InProcess(InProcessDriver),
+    Sampling,
+}
+
+pub struct InProcessDriver {
     kpc_dispatch: Arc<Container<KPCDispatch>>,
     kpep_dispatch: Arc<Container<KPEPDispatch>>,
     db: *const KPepDB,
+    cfg: *mut KPepConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct CounterValue {
+    pub value: u64,
+    pub scaling: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CounterResult {
+    values: Vec<(Counter, CounterValue)>,
 }
 
 #[repr(C)]
@@ -133,27 +150,155 @@ struct KPerfCounters {
     config: *mut KPepConfig,
 }
 
-impl Driver {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+impl CountingDriver {
+    pub fn new(
+        counters: &[Counter],
+        pid: Option<&Process>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if pid.is_some() {
+            unimplemented!()
+        }
+
         let kpc_dispatch: Container<KPCDispatch> =
             unsafe { Container::load("/System/Library/PrivateFrameworks/kperf.framework/kperf") }?;
         let kpep_dispatch: Container<KPEPDispatch> = unsafe {
             Container::load("/System/Library/PrivateFrameworks/kperfdata.framework/kperfdata")
         }?;
 
+        let kpep_dispatch = Arc::new(kpep_dispatch);
+
         let mut db: *mut KPepDB = std::ptr::null_mut();
         if unsafe { kpep_dispatch.kpep_db_create(std::ptr::null(), &mut db) } != 0 {
             panic!("Failed to load kpep database");
         }
 
-        Ok(Driver {
+        let cfg = convert_counters(counters, &kpep_dispatch, db)?;
+
+        Ok(CountingDriver::InProcess(InProcessDriver {
             kpc_dispatch: kpc_dispatch.into(),
-            kpep_dispatch: kpep_dispatch.into(),
+            kpep_dispatch,
             db,
-        })
+            cfg,
+        }))
+    }
+
+    pub fn start(&mut self) -> Result<(), Error> {
+        todo!()
+    }
+    pub fn stop(&mut self) -> Result<(), Error> {
+        todo!()
+    }
+    pub fn reset(&mut self) -> Result<(), Error> {
+        Ok(())
+        // todo!()
+    }
+    pub fn counters(&mut self) -> Result<CounterResult, Box<dyn std::error::Error>> {
+        todo!()
+    }
+}
+
+impl CounterResult {
+    pub fn get(&self, kind: Counter) -> Option<CounterValue> {
+        todo!()
+    }
+}
+
+impl IntoIterator for CounterResult {
+    type Item = (Counter, CounterValue);
+
+    type IntoIter = <Vec<(Counter, CounterValue)> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        todo!()
+        // self.values.into_iter()
     }
 }
 
 pub fn list_software_counters() -> Vec<Counter> {
     vec![]
+}
+
+macro_rules! macos_event {
+    ($m1_name:expr, $intel_name:expr, $kperf_events:ident, $cfg:ident, $dispatch:expr) => {
+        let m1_event = $kperf_events
+            .iter()
+            .find(|e| event_matches_name(*(*e), $m1_name));
+        let intel_event = $kperf_events
+            .iter()
+            .find(|e| event_matches_name(*(*e), $intel_name));
+
+        let mut event: *mut KPepEvent = m1_event.or(intel_event).unwrap().clone();
+
+        if unsafe {
+            $dispatch.kpep_config_add_event($cfg, &mut event, 0, std::ptr::null_mut()) != 0
+        } {
+            panic!("Failed to add an event");
+        }
+    };
+}
+
+fn convert_counters(
+    counters: &[Counter],
+    kpep_dispatch: &Arc<Container<KPEPDispatch>>,
+    db: *mut KPepDB,
+) -> Result<*mut KPepConfig, Error> {
+    let mut num_events: size_t = 0;
+    if unsafe { kpep_dispatch.kpep_db_events_count(db, &mut num_events) } != 0 {
+        panic!()
+        // return Err("Failed to count events".to_string());
+    }
+    let mut kperf_events: Vec<*mut KPepEvent> = Vec::with_capacity(num_events as usize);
+    kperf_events.resize(num_events, std::ptr::null_mut());
+    if unsafe {
+        kpep_dispatch.kpep_db_events(
+            db,
+            kperf_events.as_mut_ptr(),
+            num_events * std::mem::size_of::<*mut u8>(),
+        )
+    } != 0
+    {
+        panic!()
+        // return Err("Failed to query events".to_string());
+    }
+
+    let mut cfg: *mut KPepConfig = std::ptr::null_mut();
+    if unsafe { kpep_dispatch.kpep_config_create(db, &mut cfg) } != 0 {
+        panic!("Failed to create config");
+    }
+    if unsafe { kpep_dispatch.kpep_config_force_counters(cfg) != 0 } {
+        panic!("Failed to set counters");
+    }
+
+    for cntr in counters {
+        match cntr {
+            Counter::Cycles => {
+                macos_event!(
+                    "FIXED_CYCLES",
+                    "CPU_CLK_UNHALTED.REF_TSC",
+                    kperf_events,
+                    cfg,
+                    kpep_dispatch
+                );
+            }
+            Counter::Instructions => {
+                macos_event!(
+                    "FIXED_INSTRUCTIONS",
+                    "INST_RETIRED.ANY",
+                    kperf_events,
+                    cfg,
+                    kpep_dispatch
+                );
+            }
+            _ => panic!(),
+        }
+    }
+
+    Ok(cfg)
+}
+
+fn event_matches_name(e: *mut KPepEvent, name: &str) -> bool {
+    let c_str: &CStr = unsafe { CStr::from_ptr((*e).name) };
+    let str_slice: &str = c_str.to_str().unwrap();
+
+    str_slice == name
 }

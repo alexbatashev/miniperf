@@ -8,13 +8,13 @@ pub fn do_stat(command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut driver = pmu::CountingDriver::new(
         &[
             Counter::Cycles,
-            Counter::Instructions,
-            Counter::LLCReferences,
-            Counter::LLCMisses,
-            Counter::BranchMisses,
-            Counter::BranchInstructions,
-            Counter::StalledCyclesBackend,
-            Counter::StalledCyclesFrontend,
+            // Counter::Instructions,
+            // Counter::LLCReferences,
+            // Counter::LLCMisses,
+            // Counter::BranchMisses,
+            // Counter::BranchInstructions,
+            // Counter::StalledCyclesBackend,
+            // Counter::StalledCyclesFrontend,
         ],
         Some(&process),
     )?;
