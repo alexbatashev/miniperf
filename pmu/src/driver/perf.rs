@@ -10,6 +10,7 @@ use perf_event_open_sys::bindings::{
 };
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 
+use super::Sample;
 use crate::{Counter, Error, Process};
 
 pub struct CountingDriver {
@@ -33,25 +34,6 @@ pub struct SamplingDriverBuilder {
 pub struct CounterValue {
     pub value: u64,
     pub scaling: f64,
-}
-
-/// A structure that represents a single sample
-#[derive(Debug)]
-pub struct Sample {
-    /// Unique ID shared by all samples of the event
-    pub event_id: u64,
-    /// Instruction pointer
-    pub ip: u64,
-    /// Process ID
-    pub pid: u32,
-    /// Thread ID
-    pub tid: u32,
-    /// Timestamp
-    pub time: u64,
-    pub time_enabled: u64,
-    pub time_running: u64,
-    pub counter: Counter,
-    pub value: u64,
 }
 
 #[derive(Debug, Clone)]
