@@ -60,24 +60,35 @@ pub enum Record {
     Sample(Sample),
     ProcAddr(ProcAddr),
 }
+=======
+pub use kperf::{list_software_counters, CountingDriver, SamplingDriver};
+>>>>>>> 9b74494 (save progress)
 
 /// A structure that represents a single sample
 #[derive(Debug)]
 pub struct Sample {
     /// Unique ID shared by all samples of the event
+<<<<<<< HEAD
     pub event_id: u128,
+=======
+    pub event_id: u64,
+>>>>>>> 9b74494 (save progress)
     /// Instruction pointer
     pub ip: u64,
     /// Process ID
     pub pid: u32,
     /// Thread ID
     pub tid: u32,
+<<<<<<< HEAD
     /// CPU ID that the event occured on
     pub cpu: u32,
+=======
+>>>>>>> 9b74494 (save progress)
     /// Timestamp
     pub time: u64,
     pub time_enabled: u64,
     pub time_running: u64,
+<<<<<<< HEAD
     pub counter: Counter,
     pub value: u64,
     pub callstack: SmallVec<[u64; 32]>,
