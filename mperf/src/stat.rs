@@ -1,8 +1,9 @@
+use anyhow::Result;
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use num_format::{Locale, ToFormattedString};
 use pmu::{Counter, Process};
 
-pub fn do_stat(command: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn do_stat(command: Vec<String>) -> Result<()> {
     let process = Process::new(&command)?;
 
     let mut driver = pmu::CountingDriver::new(

@@ -12,10 +12,14 @@ use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 
 use crate::{Counter, Error, Process};
 
+/// Counting driver is used for simple collection of system's performance counters values. On Linux,
+/// counter multiplexing is supported.
 pub struct CountingDriver {
     native_handles: Vec<NativeCounterHandle>,
 }
 
+/// Sampling driver performs PMU event sampling. That is, every N cycles, the process is
+/// interrupted and counters values are recorded for future post processing.
 pub struct SamplingDriver {
     native_handles: Vec<NativeCounterHandle>,
     mmaps: Vec<UnsafeMmap>,
@@ -107,10 +111,7 @@ pub fn list_software_counters() -> Vec<Counter> {
 }
 
 impl CountingDriver {
-    pub fn new(
-        counters: &[Counter],
-        process: Option<&Process>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(counters: &[Counter], process: Option<&Process>) -> Result<Self, Error> {
         let mut attrs = get_native_counters(counters)?;
 
         for attr in &mut attrs {
@@ -176,7 +177,7 @@ impl CountingDriver {
         Ok(())
     }
 
-    pub fn counters(&mut self) -> Result<CounterResult, Box<dyn std::error::Error>> {
+    pub fn counters(&mut self) -> Result<CounterResult, std::io::Error> {
         let read_size = std::mem::size_of::<ReadFormat>() + (std::mem::size_of::<EventValue>());
 
         let mut buffer = vec![0_u8; read_size];
@@ -192,7 +193,7 @@ impl CountingDriver {
             };
 
             if result == -1 {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(std::io::Error::last_os_error());
             }
 
             let header = unsafe { &*(buffer.as_ptr() as *const ReadFormat) };

@@ -6,7 +6,7 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(args: &[String]) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(args: &[String]) -> Result<Self, std::io::Error> {
         let child_pid = unsafe { libc::fork() };
         if child_pid == -1 {
             panic!()
@@ -44,11 +44,11 @@ impl Process {
         }
     }
 
-    pub fn wait(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn wait(&self) -> Result<(), std::io::Error> {
         unsafe {
             let mut status: libc::c_int = 0;
             if libc::waitpid(self.pid, &mut status, 0) == -1 {
-                return Err(std::io::Error::last_os_error().into());
+                return Err(std::io::Error::last_os_error());
             }
         }
 

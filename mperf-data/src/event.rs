@@ -1,0 +1,28 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IString {
+    pub id: u64,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum EventType {
+    PMU,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[repr(C)]
+pub struct Event {
+    pub unique_id: u64,
+    pub correlation_id: u64,
+    pub parent_id: u64,
+    pub ty: EventType,
+    pub name: u64,
+    pub thread_id: u32,
+    pub process_id: u32,
+    pub time_enabled: u64,
+    pub time_running: u64,
+    pub value: u64,
+}

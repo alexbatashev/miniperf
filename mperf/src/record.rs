@@ -1,17 +1,51 @@
-use std::{thread, time::Duration};
+use anyhow::Result;
+use mperf_data::{Event, EventType, RecordInfo};
+use std::{fs::File, path::Path, sync::Arc, thread, time::Duration};
 
 use pmu::Counter;
 
-use crate::Scenario;
+use crate::{event_dispatcher::EventDispatcher, Scenario};
 
-pub fn do_record(
+pub async fn do_record(
     scenario: Scenario,
-    _output_directory: String,
-    _pid: Option<usize>,
-    _command: Vec<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Record profile with {scenario:?}");
+    output_directory: &Path,
+    pid: Option<u32>,
+    command: Vec<String>,
+) -> Result<()> {
+    println!("Record profile with {scenario:?} scenario");
 
+    let json_command = if !command.is_empty() {
+        Some(command.clone())
+    } else {
+        None
+    };
+
+    let info = RecordInfo {
+        scenario,
+        command: json_command,
+        pid,
+    };
+
+    {
+        let mut info_file = File::create(output_directory.join("info.json"))?;
+        serde_json::to_writer(&mut info_file, &info)?;
+    }
+
+    let (dispatcher, join_handle) = EventDispatcher::new(output_directory);
+
+    match scenario {
+        Scenario::Snapshot => snapshot(dispatcher.clone())?,
+        Scenario::Roofline => {
+            todo!("roofline is not implemented yet")
+        }
+    };
+
+    join_handle.join().await;
+
+    Ok(())
+}
+
+fn snapshot(dispatcher: Arc<EventDispatcher>) -> Result<()> {
     let driver = pmu::SamplingDriver::builder()
         .counters(&[
             Counter::Cycles,
@@ -23,8 +57,23 @@ pub fn do_record(
         ])
         .build()?;
 
-    driver.start(|sample| {
-        println!("got sample {:?}", sample);
+    driver.start(move |sample| {
+        let unique_id = dispatcher.unique_id();
+        let name = dispatcher.string_id(sample.counter.name());
+        let event = Event {
+            unique_id,
+            correlation_id: sample.event_id,
+            parent_id: 0,
+            name,
+            ty: EventType::PMU,
+            thread_id: sample.tid,
+            process_id: sample.pid,
+            time_enabled: sample.time_enabled,
+            time_running: sample.time_running,
+            value: sample.value,
+        };
+
+        dispatcher.publish_event(event);
     })?;
     thread::sleep(Duration::from_secs(1));
     driver.stop()?;

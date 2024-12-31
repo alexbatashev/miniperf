@@ -1,7 +1,13 @@
+mod event_dispatcher;
 mod record;
 mod stat;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use std::{path::PathBuf, str::FromStr};
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use mperf_data::Scenario;
 use record::do_record;
 use stat::do_stat;
 
@@ -24,20 +30,15 @@ enum Commands {
         #[arg(short, long)]
         output_directory: String,
         #[arg(short, long)]
-        pid: Option<usize>,
+        pid: Option<u32>,
         #[arg(last = true)]
         command: Vec<String>,
     },
     Show,
 }
 
-#[derive(Clone, Debug, Copy, ValueEnum, PartialEq, Eq)]
-enum Scenario {
-    Snapshot,
-    Roofline,
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Cli::parse();
 
     match args.command {
@@ -57,13 +58,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             command,
         } => {
             if std::fs::exists(&output_directory)? {
-                return Err(Box::new(std::io::Error::new(
+                return Err(Into::<anyhow::Error>::into(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     format!("'{output_directory}' already exists"),
-                )));
+                ))
+                .context("profiling results must be put in different directories"));
             }
             std::fs::create_dir_all(&output_directory)?;
-            return do_record(scenario, output_directory, pid, command);
+
+            let output_directory = PathBuf::from_str(&output_directory)?;
+
+            return do_record(scenario, &output_directory, pid, command).await;
         }
         Commands::Show => {
             println!("Show data")
