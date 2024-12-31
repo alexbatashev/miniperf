@@ -26,3 +26,16 @@ pub struct Event {
     pub time_running: u64,
     pub value: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcMapEntry {
+    pub filename: String,
+    pub address: usize,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcMap {
+    pub pid: u32,
+    pub entries: Vec<ProcMapEntry>,
+}

@@ -15,3 +15,4 @@ mperf-data = { path = "../mperf-data/" }
 tokio = { version = "1", features = ["full"] }
 atomic-counter = "1.0.1"
 parking_lot = "0.12.3"
+proc-maps = "0.4.0"
