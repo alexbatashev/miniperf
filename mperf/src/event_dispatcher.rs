@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, io::Write, path::Path, sync::Arc};
 
 use atomic_counter::{AtomicCounter, ConsistentCounter};
 use mperf_data::{Event, IString, ProcMap, ProcMapEntry};
@@ -61,7 +61,8 @@ impl EventDispatcher {
         let mut string_token = cancel_rx.clone();
         let string_out_dir = output_directory.to_owned();
         let string_worker = tokio::spawn(async move {
-            let mut strings = vec![];
+            let mut strings_file =
+                std::fs::File::create(string_out_dir.join("strings.jsonl")).expect("strings");
 
             loop {
                 tokio::select! {
@@ -69,14 +70,12 @@ impl EventDispatcher {
                         break;
                     }
                     Some((id, value)) = string_rx.recv() => {
-                        strings.push(IString{id, value});
+                        let string = IString{id, value};
+                        serde_json::to_writer(&mut strings_file, &string).expect("fail");
+                        writeln!(&mut strings_file).expect("fail");
                     }
                 }
             }
-
-            let mut strings_file =
-                std::fs::File::create(string_out_dir.join("strings.json")).expect("strings");
-            serde_json::to_writer(&mut strings_file, &strings).expect("fail");
         });
 
         let mut proc_map_token = cancel_rx.clone();

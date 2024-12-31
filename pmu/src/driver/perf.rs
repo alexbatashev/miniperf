@@ -31,6 +31,7 @@ pub struct SamplingDriver {
 pub struct SamplingDriverBuilder {
     counters: Vec<Counter>,
     sample_freq: u64,
+    pid: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +238,7 @@ impl SamplingDriver {
         SamplingDriverBuilder {
             counters: vec![],
             sample_freq: 1000,
+            pid: None,
         }
     }
 
@@ -356,6 +358,23 @@ impl SamplingDriverBuilder {
         Self {
             counters: counters.to_vec(),
             sample_freq: self.sample_freq,
+            pid: self.pid,
+        }
+    }
+
+    pub fn process(self, process: &Process) -> Self {
+        Self {
+            counters: self.counters,
+            sample_freq: self.sample_freq,
+            pid: Some(process.pid()),
+        }
+    }
+
+    pub fn sample_freq(self, sample_freq: u64) -> Self {
+        Self {
+            counters: self.counters,
+            sample_freq,
+            pid: self.pid,
         }
     }
 
@@ -365,7 +384,6 @@ impl SamplingDriverBuilder {
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);
             attr.set_exclude_hv(1);
-            // attr.set_inherit(1);
             attr.set_exclusive(0);
 
             attr.sample_freq = self.sample_freq;
@@ -381,7 +399,7 @@ impl SamplingDriverBuilder {
             attr.set_mmap(1);
         }
 
-        let native_handles = bind_events(&self.counters, &mut attrs, None)?;
+        let native_handles = bind_events(&self.counters, &mut attrs, self.pid)?;
 
         let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
         let mmap_pages = 512;

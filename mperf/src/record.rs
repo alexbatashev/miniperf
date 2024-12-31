@@ -1,8 +1,8 @@
 use anyhow::Result;
 use mperf_data::{Event, EventType, RecordInfo};
-use std::{fs::File, path::Path, sync::Arc, thread, time::Duration};
+use std::{fs::File, path::Path, sync::Arc};
 
-use pmu::Counter;
+use pmu::{Counter, Process};
 
 use crate::{event_dispatcher::EventDispatcher, Scenario};
 
@@ -34,7 +34,7 @@ pub async fn do_record(
     let (dispatcher, join_handle) = EventDispatcher::new(output_directory);
 
     match scenario {
-        Scenario::Snapshot => snapshot(dispatcher.clone())?,
+        Scenario::Snapshot => snapshot(dispatcher.clone(), &command)?,
         Scenario::Roofline => {
             todo!("roofline is not implemented yet")
         }
@@ -45,7 +45,9 @@ pub async fn do_record(
     Ok(())
 }
 
-fn snapshot(dispatcher: Arc<EventDispatcher>) -> Result<()> {
+fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> {
+    let process = Process::new(command)?;
+
     let driver = pmu::SamplingDriver::builder()
         .counters(&[
             Counter::Cycles,
@@ -54,7 +56,10 @@ fn snapshot(dispatcher: Arc<EventDispatcher>) -> Result<()> {
             Counter::LLCMisses,
             Counter::BranchMisses,
             Counter::BranchInstructions,
+            Counter::StalledCyclesBackend,
+            Counter::StalledCyclesFrontend,
         ])
+        .process(&process)
         .build()?;
 
     driver.start(move |sample| {
@@ -71,11 +76,13 @@ fn snapshot(dispatcher: Arc<EventDispatcher>) -> Result<()> {
             time_enabled: sample.time_enabled,
             time_running: sample.time_running,
             value: sample.value,
+            timestamp: sample.time,
         };
 
         dispatcher.publish_event(event);
     })?;
-    thread::sleep(Duration::from_secs(1));
+    process.cont();
+    process.wait()?;
     driver.stop()?;
 
     Ok(())

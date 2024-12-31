@@ -25,6 +25,7 @@ pub struct Event {
     pub time_enabled: u64,
     pub time_running: u64,
     pub value: u64,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
