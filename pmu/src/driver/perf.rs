@@ -280,14 +280,30 @@ impl SamplingDriver {
                             continue;
                         }
 
+                        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
                         let base = mmap.ptr.add(page_size);
+                        let buffer_size = page_size * mmap_pages;
                         let mut offset = data_tail as usize;
 
                         while offset < data_head as usize {
-                            let header = base.add(offset % (page_size * mmap_pages))
-                                as *const perf_event_header;
+                            let offset_in_buffer = offset % buffer_size;
 
-                            if (*header).type_ == PERF_RECORD_SAMPLE {
+                            if offset_in_buffer + std::mem::size_of::<perf_event_header>()
+                                > buffer_size
+                            {
+                                break;
+                            }
+
+                            let header = &*(base.add(offset_in_buffer) as *const perf_event_header);
+
+                            if header.size as usize > buffer_size
+                                || offset_in_buffer + header.size as usize > buffer_size
+                            {
+                                break;
+                            }
+
+                            if header.type_ == PERF_RECORD_SAMPLE {
                                 let format = &*(base.add(offset % (page_size * mmap_pages))
                                     as *const SampleFormat);
 
@@ -318,7 +334,7 @@ impl SamplingDriver {
                                 callback(sample);
                             }
 
-                            offset += (*header).size as usize;
+                            offset += header.size as usize;
                         }
 
                         // Update data_tail
