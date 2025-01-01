@@ -1,8 +1,12 @@
 mod event_dispatcher;
 mod record;
 mod stat;
+mod tui;
 
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -34,7 +38,9 @@ enum Commands {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    Show,
+    Show {
+        result_directory: String,
+    },
 }
 
 #[tokio::main]
@@ -70,8 +76,9 @@ async fn main() -> Result<()> {
 
             return do_record(scenario, &output_directory, pid, command).await;
         }
-        Commands::Show => {
-            println!("Show data")
+        Commands::Show { result_directory } => {
+            let path = Path::new(&result_directory);
+            return tui::tui_main(path).await;
         }
     }
 

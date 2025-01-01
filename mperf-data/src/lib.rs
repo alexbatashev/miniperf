@@ -17,3 +17,12 @@ pub struct RecordInfo {
     pub command: Option<Vec<String>>,
     pub pid: Option<u32>,
 }
+
+impl Scenario {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Scenario::Snapshot => "Snapshot",
+            Scenario::Roofline => "Roofline",
+        }
+    }
+}
