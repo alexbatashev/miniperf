@@ -4,7 +4,7 @@ use num_format::{Locale, ToFormattedString};
 use pmu::{Counter, Process};
 
 pub fn do_stat(command: Vec<String>) -> Result<()> {
-    let process = Process::new(&command)?;
+    let process = Process::new(&command, &[])?;
 
     let mut driver = pmu::CountingDriver::new(
         &[

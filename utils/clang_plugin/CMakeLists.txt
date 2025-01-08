@@ -7,10 +7,11 @@ SET(CMAKE_CXX_FLAGS "-fno-rtti -fno-exceptions")
 
 find_package(LLVM REQUIRED CONFIG)
 
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+
 add_definitions(${LLVM_DEFINITIONS})
 include_directories(${LLVM_INCLUDE_DIRS})
-
-message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 set(LLVM_RUNTIME_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/bin)
 set(LLVM_LIBRARY_OUTPUT_INTDIR ${CMAKE_BINARY_DIR}/lib)

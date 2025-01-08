@@ -22,6 +22,7 @@ pub struct Sender<T: Sendable> {
     phantom: PhantomData<T>,
 }
 
+#[allow(dead_code)]
 pub struct Receiver<T: Sendable> {
     shmem: platform::Shmem,
     tx_sem: platform::Semaphore,
@@ -33,7 +34,7 @@ pub struct Receiver<T: Sendable> {
 }
 
 impl<T: Sendable> Sender<T> {
-    pub fn create(name: &str, count: usize) -> Result<Self, std::io::Error> {
+    pub fn new(name: &str, count: usize) -> Result<Self, std::io::Error> {
         assert_eq!(
             platform::Semaphore::required_size() % std::mem::align_of::<usize>(),
             0
@@ -48,6 +49,46 @@ impl<T: Sendable> Sender<T> {
 
         let shmem = platform::Shmem::create(name, total_size)?;
         let tx_sem = platform::Semaphore::create(shmem.as_mut_ptr())?;
+        let ptr = unsafe { shmem.as_mut_ptr().byte_add(data_offset) };
+
+        let head = unsafe { shmem.as_mut_ptr().byte_add(sem_size) as *mut usize };
+        let tail = unsafe {
+            shmem
+                .as_mut_ptr()
+                .byte_add(sem_size + std::mem::size_of::<usize>()) as *mut usize
+        };
+
+        unsafe {
+            *head = 0;
+            *tail = 0;
+        };
+
+        Ok(Sender {
+            shmem,
+            tx_sem,
+            ptr,
+            head,
+            tail,
+            size: count,
+            phantom: PhantomData,
+        })
+    }
+
+    pub fn attach(name: &str, count: usize) -> Result<Self, std::io::Error> {
+        assert_eq!(
+            platform::Semaphore::required_size() % std::mem::align_of::<usize>(),
+            0
+        );
+        let data_size = std::mem::size_of::<T>() * count;
+        let sem_size = platform::Semaphore::required_size();
+        let alignment = std::mem::align_of::<T>() as isize;
+
+        let data_offset = (sem_size + std::mem::size_of::<usize>() * 2 - 1 + alignment as usize)
+            & (-alignment as usize);
+        let total_size = data_offset + data_size;
+
+        let shmem = platform::Shmem::open(name, total_size)?;
+        let tx_sem = platform::Semaphore::from_raw_ptr(shmem.as_mut_ptr())?;
         let ptr = unsafe { shmem.as_mut_ptr().byte_add(data_offset) };
 
         let head = unsafe { shmem.as_mut_ptr().byte_add(sem_size) as *mut usize };
@@ -114,7 +155,7 @@ impl<T: Sendable> Sender<T> {
 }
 
 impl<T: Sendable> Receiver<T> {
-    pub fn create(name: &str, count: usize) -> Result<Self, std::io::Error> {
+    pub fn attach(name: &str, count: usize) -> Result<Self, std::io::Error> {
         assert_eq!(
             platform::Semaphore::required_size() % std::mem::align_of::<usize>(),
             0
@@ -128,6 +169,40 @@ impl<T: Sendable> Receiver<T> {
 
         let shmem = platform::Shmem::open(name, total_size)?;
         let tx_sem = platform::Semaphore::from_raw_ptr(shmem.as_mut_ptr())?;
+        let ptr = unsafe { shmem.as_mut_ptr().byte_add(data_offset) };
+
+        let head = unsafe { shmem.as_mut_ptr().byte_add(sem_size) as *mut usize };
+        let tail = unsafe {
+            shmem
+                .as_mut_ptr()
+                .byte_add(sem_size + std::mem::size_of::<usize>()) as *mut usize
+        };
+
+        Ok(Receiver {
+            shmem,
+            tx_sem,
+            ptr,
+            head,
+            tail,
+            size: count,
+            phantom: PhantomData,
+        })
+    }
+
+    pub fn new(name: &str, count: usize) -> Result<Self, std::io::Error> {
+        assert_eq!(
+            platform::Semaphore::required_size() % std::mem::align_of::<usize>(),
+            0
+        );
+        let data_size = std::mem::size_of::<T>() * count;
+        let sem_size = platform::Semaphore::required_size() * 2;
+        let alignment = std::mem::align_of::<T>() as isize;
+
+        let data_offset = (sem_size - 1 + alignment as usize) & (-alignment as usize);
+        let total_size = data_offset + data_size;
+
+        let shmem = platform::Shmem::create(name, total_size)?;
+        let tx_sem = platform::Semaphore::create(shmem.as_mut_ptr())?;
         let ptr = unsafe { shmem.as_mut_ptr().byte_add(data_offset) };
 
         let head = unsafe { shmem.as_mut_ptr().byte_add(sem_size) as *mut usize };
@@ -196,6 +271,7 @@ impl<T: Sendable> Receiver<T> {
         unsafe { AtomicUsize::from_ptr(self.head) }
     }
 
+    #[allow(dead_code)]
     fn tail(&self) -> &AtomicUsize {
         unsafe { AtomicUsize::from_ptr(self.tail) }
     }
@@ -233,6 +309,7 @@ impl<T: Copy> Sendable for T {
 }
 
 unsafe impl<T: Sendable> Send for Receiver<T> {}
+unsafe impl<T: Sendable> Sync for Receiver<T> {}
 unsafe impl<T: Sendable> Send for Sender<T> {}
 
 #[cfg(test)]
@@ -241,13 +318,13 @@ mod test {
 
     #[test]
     fn channel_creation() {
-        let sender = Sender::<i32>::create("/mperf_test_shmem", 10);
+        let sender = Sender::<i32>::new("/mperf_test_shmem", 10);
 
         assert!(sender.is_ok());
 
         let sender = sender.unwrap();
 
-        let receiver = Receiver::<i32>::create(sender.name(), 10);
+        let receiver = Receiver::<i32>::attach(sender.name(), 10);
 
         assert!(receiver.is_ok());
     }

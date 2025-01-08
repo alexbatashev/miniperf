@@ -1,6 +1,11 @@
 use anyhow::Result;
 use mperf_data::{Event, EventType, RecordInfo};
-use std::{fs::File, path::Path, sync::Arc};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::sync::watch;
 
 use pmu::{Counter, Process};
 
@@ -35,9 +40,7 @@ pub async fn do_record(
 
     match scenario {
         Scenario::Snapshot => snapshot(dispatcher.clone(), &command)?,
-        Scenario::Roofline => {
-            todo!("roofline is not implemented yet")
-        }
+        Scenario::Roofline => roofline(dispatcher.clone(), &command).await?,
     };
 
     join_handle.join().await;
@@ -46,7 +49,7 @@ pub async fn do_record(
 }
 
 fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> {
-    let process = Process::new(command)?;
+    let process = Process::new(command, &[])?;
 
     let driver = pmu::SamplingDriver::builder()
         .counters(&[
@@ -79,11 +82,102 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
             timestamp: sample.time,
         };
 
-        dispatcher.publish_event(event);
+        dispatcher.publish_event_sync(event);
     })?;
     process.cont();
     process.wait()?;
     driver.stop()?;
+
+    Ok(())
+}
+
+fn get_exe_dir() -> std::io::Result<PathBuf> {
+    let mut exe_path = std::env::current_exe()?;
+    exe_path.pop();
+    Ok(exe_path)
+}
+
+async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> {
+    let pipe_name = format!(
+        "/{}{}",
+        command[0].split("/").last().unwrap(),
+        std::process::id()
+    );
+
+    let exe_path = get_exe_dir()?.to_str().unwrap().to_string();
+
+    // FIXME make this platform independent
+    let ld_path = match std::env::var("LD_LIBRARY_PATH") {
+        Ok(path) => format!("{}:{}:{}/../lib", path, exe_path, exe_path),
+        Err(_) => format!("{}:{}/../lib", exe_path, exe_path),
+    };
+
+    let process = Process::new(
+        command,
+        &[
+            ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
+            (
+                "MPERF_COLLECTOR_IDS_START".to_string(),
+                "100000000000".to_string(),
+            ),
+            ("LD_LIBRARY_PATH".to_string(), ld_path),
+        ],
+    )?;
+
+    let rx = shmem::proc_channel::Receiver::<Event>::new(&pipe_name, 8192)?;
+
+    let driver = pmu::SamplingDriver::builder()
+        .counters(&[
+            Counter::Cycles,
+            Counter::Instructions,
+            Counter::LLCReferences,
+            Counter::LLCMisses,
+        ])
+        .process(&process)
+        .build()?;
+
+    let roofline_dispatcher = dispatcher.clone();
+
+    driver.start(move |sample| {
+        let unique_id = dispatcher.unique_id();
+        let name = dispatcher.string_id(sample.counter.name());
+        let event = Event {
+            unique_id,
+            correlation_id: sample.event_id,
+            parent_id: 0,
+            name,
+            ty: EventType::PMU,
+            thread_id: sample.tid,
+            process_id: sample.pid,
+            time_enabled: sample.time_enabled,
+            time_running: sample.time_running,
+            value: sample.value,
+            timestamp: sample.time,
+        };
+
+        dispatcher.publish_event_sync(event);
+    })?;
+
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_rx.changed() => {
+                    break;
+                }
+                Ok(event) = rx.recv() => {
+                    roofline_dispatcher.publish_event(event).await;
+                }
+            }
+        }
+    });
+
+    process.cont();
+    process.wait()?;
+    driver.stop()?;
+
+    cancel_tx.send(true)?;
+    task.await?;
 
     Ok(())
 }

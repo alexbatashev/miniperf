@@ -5,7 +5,7 @@ use std::{
 
 use mperf_data::{Event, EventType, RooflineEventId};
 
-use crate::{get_next_id, send_event};
+use crate::{get_next_id, profiling_enabled, send_event};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -35,6 +35,7 @@ pub struct LoopStats {
     vector_double_ops: u64,
 }
 
+#[allow(dead_code)]
 pub struct LoopHandle {
     id: u64,
     timestamp: u64,
@@ -47,6 +48,9 @@ pub struct LoopHandle {
 pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
     info: *const LoopInfo,
 ) -> *mut LoopHandle {
+    if !profiling_enabled() {
+        return std::ptr::null_mut();
+    }
     let id = crate::get_next_id();
     let info = unsafe { info.as_ref().unwrap() };
 
@@ -77,6 +81,9 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(
     handle: *mut LoopHandle,
     stats: *const LoopStats,
 ) {
+    if !profiling_enabled() {
+        return;
+    }
     let time = SystemTime::now();
     let stats = unsafe { stats.as_ref().cloned().unwrap_or_default() };
 

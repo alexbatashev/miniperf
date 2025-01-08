@@ -1,7 +1,10 @@
 #include "llvm/Pass.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
@@ -10,9 +13,8 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Support/raw_ostream.h"
-#include <llvm/Analysis/ScalarEvolution.h>
-#include <llvm/Support/Alignment.h>
 
 using namespace llvm;
 
@@ -20,10 +22,38 @@ namespace {
 
 struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-    errs() << "Function name = " << F.getName() << "\n";
     auto &LoopInfo = FAM.getResult<LoopAnalysis>(F);
+    auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
     IRBuilder<> Builder(F.getContext());
+
+    auto LoopInfoTy = StructType::create(
+        F.getContext(),
+        {Type::getInt32Ty(F.getContext()), PointerType::get(F.getContext(), 0)},
+        "LoopInfo");
+
+    auto LoopStatsTy = StructType::create(F.getContext(),
+                                          {
+                                              // Trip count
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Bytes load
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Bytes store
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Scalar int ops
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Scalar float ops
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Scalar double ops
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Vector int ops
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Vector float ops
+                                              Type::getInt64Ty(F.getContext()),
+                                              // Vector double ops
+                                              Type::getInt64Ty(F.getContext()),
+                                          },
+                                          "LoopStats");
 
     for (auto Loop : LoopInfo) {
       if (Loop->getParentLoop())
@@ -43,29 +73,9 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
         continue;
       }
 
-      auto LoopInfoTy = StructType::create(
-          F.getContext(), {Type::getInt32Ty(F.getContext()),
-                           PointerType::get(F.getContext(), 0)});
-
-      auto LoopStatsTy = StructType::create(
-          F.getContext(), {
-                              // Trip count
-                              Type::getInt64Ty(F.getContext()),
-                              // Bytes load
-                              Type::getInt64Ty(F.getContext()),
-                              // Bytes store
-                              Type::getInt64Ty(F.getContext()),
-                              // Scalar int ops
-                              Type::getInt64Ty(F.getContext()),
-                              // Scalar float ops
-                              Type::getInt64Ty(F.getContext()),
-                              // Scalar double ops
-                              // Vector int ops
-                              // Vector float ops
-                              Type::getInt64Ty(F.getContext()),
-                              // Vector double ops
-                              Type::getInt64Ty(F.getContext()),
-                          });
+      // We can support this case but later
+      if (!DT.dominates(Loop->getLoopPreheader(), Loop->getExitBlock()))
+        continue;
 
       auto *NotifyBegin = F.getParent()->getFunction(
           "mperf_roofline_internal_notify_loop_begin");
@@ -90,10 +100,11 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
                                      F.getParent());
       }
 
-      Builder.SetInsertPoint(Loop->getLoopPreheader()->begin());
+      Builder.SetInsertPoint(Loop->getLoopPreheader()->getFirstInsertionPt());
 
       // Create necessary data structures
-      Value *StatsMem = Builder.CreateAlloca(LoopStatsTy);
+      Value *StatsMem =
+          Builder.CreateAlloca(LoopStatsTy, nullptr, "loop_stats");
       Builder.CreateMemSet(StatsMem,
                            ConstantInt::get(Type::getInt8Ty(F.getContext()), 0),
                            8 * 9, MaybeAlign());
@@ -104,10 +115,10 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
 
       Value *InfoMem = Builder.CreateAlloca(LoopInfoTy);
 
-      Value *LineNoPtr =
-          Builder.CreateConstInBoundsGEP2_64(LoopInfoTy, InfoMem, 0, 0);
+      Value *LineNoPtr = Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 0);
       Value *FilenamePtr =
-          Builder.CreateConstInBoundsGEP2_64(LoopInfoTy, InfoMem, 0, 1);
+          Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 1);
+
       Builder.CreateStore(Filename, FilenamePtr);
       Builder.CreateStore(ConstantInt::get(Type::getInt32Ty(F.getContext()),
                                            Loop->getStartLoc().getLine()),
@@ -115,7 +126,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
       Value *LoopHandle = Builder.CreateCall(NotifyBegin, {InfoMem});
 
       // Notify loop end
-      Builder.SetInsertPoint(Loop->getExitBlock()->begin());
+      Builder.SetInsertPoint(Loop->getExitBlock()->getFirstInsertionPt());
       Builder.CreateCall(NotifyEnd, {LoopHandle, StatsMem});
 
       auto UpdateStats = [&](uint64_t Counter, size_t Idx) {
@@ -123,7 +134,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           return;
 
         Value *Ptr =
-            Builder.CreateConstInBoundsGEP2_64(LoopStatsTy, StatsMem, 0, Idx);
+            Builder.CreateConstInBoundsGEP2_32(LoopStatsTy, StatsMem, 0, Idx);
         Value *Old = Builder.CreateLoad(Type::getInt64Ty(F.getContext()), Ptr);
         Value *New = Builder.CreateAdd(
             Old, ConstantInt::get(Type::getInt64Ty(F.getContext()), Counter));
@@ -145,12 +156,6 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
         for (auto &&I : *BB) {
           switch (I.getOpcode()) {
           case Instruction::Load:
-            llvm::errs() << "LOAD " << DL.getTypeAllocSize(I.getType())
-                         << " bytes of type ";
-            I.print(errs());
-            errs() << "\n";
-            BB->print(errs());
-              errs() << "\n";
             BytesLoad += DL.getTypeAllocSize(I.getType());
             break;
           case Instruction::Store:
@@ -252,12 +257,16 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
 
 } // namespace
 
-llvm::PassPluginLibraryInfo getByePluginInfo() {
+llvm::PassPluginLibraryInfo getMiniperfPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "miniperf", LLVM_VERSION_STRING,
           [](PassBuilder &PB) {
             PB.registerOptimizerLastEPCallback([](llvm::ModulePassManager &PM,
-                                                  OptimizationLevel Level) {
-              PM.printPipeline(errs(), [](StringRef Str) { return Str; });
+                                                  OptimizationLevel Level
+#if LLVM_VERSION_MAJOR >= 20
+                                                  ,
+                                                  ThinOrFullLTOPhase Phase
+#endif
+                                               ) {
               PM.addPass(createModuleToFunctionPassAdaptor(MiniperfInstr()));
             });
           }};
@@ -265,5 +274,5 @@ llvm::PassPluginLibraryInfo getByePluginInfo() {
 
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
-  return getByePluginInfo();
+  return getMiniperfPluginInfo();
 }

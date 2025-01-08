@@ -6,7 +6,7 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(args: &[String]) -> Result<Self, std::io::Error> {
+    pub fn new(args: &[String], env: &[(String, String)]) -> Result<Self, std::io::Error> {
         let child_pid = unsafe { libc::fork() };
         if child_pid == -1 {
             panic!()
@@ -22,10 +22,18 @@ impl Process {
                 c_args.iter().map(|arg| arg.as_ptr()).collect();
             c_arg_ptrs.push(std::ptr::null());
 
+            let c_env: Vec<CString> = std::env::vars()
+                .chain(env.iter().cloned())
+                .map(|(key, val)| CString::new(format!("{}={}", key, val)).unwrap())
+                .collect();
+            let mut c_env_ptrs: Vec<*const libc::c_char> =
+                c_env.iter().map(|env| env.as_ptr()).collect();
+            c_env_ptrs.push(std::ptr::null());
+
             unsafe { libc::raise(libc::SIGSTOP) };
 
             unsafe {
-                libc::execvp(prog.as_ptr(), c_arg_ptrs.as_ptr());
+                libc::execve(prog.as_ptr(), c_arg_ptrs.as_ptr(), c_env_ptrs.as_ptr());
                 // If we get here, exec failed
                 libc::_exit(1);
             }

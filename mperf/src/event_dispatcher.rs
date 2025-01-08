@@ -147,7 +147,7 @@ impl EventDispatcher {
         id
     }
 
-    pub fn publish_event(&self, evt: Event) {
+    pub fn publish_event_sync(&self, evt: Event) {
         let pid = evt.process_id;
         if let Err(err) = self.events_tx.blocking_send(evt) {
             eprintln!("lost event: {:?}", err);
@@ -169,6 +169,34 @@ impl EventDispatcher {
         }
 
         if let Err(err) = self.proc_map_tx.blocking_send(pid) {
+            eprintln!("lost process map for pid '{}': {:?}", pid, err);
+        }
+    }
+
+    pub async fn publish_event(&self, evt: Event) {
+        let pid = evt.process_id;
+        if let Err(err) = self.events_tx.send(evt).await {
+            eprintln!("lost event: {:?}", err);
+        }
+
+        if pid == 0 {
+            return;
+        }
+
+        {
+            let pids = self.proc_maps.upgradable_read();
+            if pids.contains(&pid) {
+                return;
+            }
+
+            {
+                let mut pids = RwLockUpgradableReadGuard::upgrade(pids);
+
+                pids.insert(pid);
+            }
+        }
+
+        if let Err(err) = self.proc_map_tx.send(pid).await {
             eprintln!("lost process map for pid '{}': {:?}", pid, err);
         }
     }

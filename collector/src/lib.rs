@@ -12,17 +12,18 @@ lazy_static! {
         let name = std::env::var("MPERF_COLLECTOR_SHMEM_ID")
             .expect("MPERF_COLLECTOR_SHMEM_ID must be set by the caller");
 
-        Mutex::new(Sender::create(&name, 8192).expect("failed to open shared memory"))
+        Mutex::new(Sender::attach(&name, 8192).expect("failed to open shared memory"))
     };
     static ref ID_COUNTER: ConsistentCounter = {
         let start = std::env::var("MPERF_COLLECTOR_IDS_START")
-            .expect("MPERF_COLLECTOR_SHMEM_ID must be set by the caller");
+            .expect("MPERF_COLLECTOR_IDS_START must be set by the caller");
         ConsistentCounter::new(
             start
                 .parse::<usize>()
                 .expect("MPERF_COLLECTOR_IDS_START must be an unsigned integer"),
         )
     };
+    static ref PROFILING_ENABLED: bool = { std::env::var("MPERF_COLLECTOR_ENABLED").is_ok() };
 }
 
 pub fn send_event(evt: Event) -> Result<(), Box<dyn std::error::Error>> {
@@ -34,4 +35,8 @@ pub fn send_event(evt: Event) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn get_next_id() -> u64 {
     ID_COUNTER.inc() as u64
+}
+
+pub fn profiling_enabled() -> bool {
+    *PROFILING_ENABLED
 }
