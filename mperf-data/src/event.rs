@@ -1,5 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy)]
+#[repr(u64)]
+pub enum RooflineEventId {
+    BytesLoad,
+    BytesStore,
+    ScalarIntOps,
+    ScalarFloatOps,
+    VectorIntOps,
+    VectorFloatOps,
+    VectorDoubleOps,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IString {
     pub id: u64,
@@ -10,6 +22,8 @@ pub struct IString {
 #[repr(u8)]
 pub enum EventType {
     PMU,
+    LoopStart,
+    LoopEnd,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
