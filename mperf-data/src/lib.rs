@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 mod event;
 
-pub use event::{Event, EventType, IString, ProcMap, ProcMapEntry};
+pub use event::{Event, EventType, IString, ProcMap, ProcMapEntry, RooflineEventId};
 
 #[derive(Clone, Debug, Copy, ValueEnum, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scenario {

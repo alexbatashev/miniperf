@@ -21,3 +21,4 @@ crossterm = { version = "0.28.1", features = ["event-stream"] }
 tokio-stream = "0.1.17"
 memmap2 = "0.9.5"
 serde-jsonlines = "0.6.0"
+shmem = { path = "../shmem" }

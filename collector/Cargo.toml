@@ -1,0 +1,16 @@
+[package]
+name = "collector"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mperf-data = { path = "../mperf-data/" }
+pmu = { path = "../pmu/" }
+shmem = { path = "../shmem/" }
+lazy_static = "1.5.0"
+atomic-counter = "1.0.1"
+libc = "0.2.169"
