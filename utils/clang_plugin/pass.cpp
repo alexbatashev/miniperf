@@ -1,8 +1,12 @@
 #include "llvm/Pass.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemorySSA.h"
+#include "llvm/Analysis/MemorySSAUpdater.h"
+#include "llvm/Analysis/RegionInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -15,6 +19,11 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/CodeExtractor.h"
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/Analysis/ScalarEvolutionExpressions.h>
+#include <llvm/Transforms/Utils/LoopUtils.h>
 
 using namespace llvm;
 
@@ -22,8 +31,14 @@ namespace {
 
 struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    if (F.hasMetadata("miniperf.generated"))
+      return PreservedAnalyses::all();
+
     auto &LoopInfo = FAM.getResult<LoopAnalysis>(F);
+    auto &RI = FAM.getResult<RegionInfoAnalysis>(F);
     auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+
+    CodeExtractorAnalysisCache CEAC(F);
 
     IRBuilder<> Builder(F.getContext());
 
@@ -55,52 +70,193 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
                                           },
                                           "LoopStats");
 
-    for (auto Loop : LoopInfo) {
-      if (Loop->getParentLoop())
-        continue;
+    Function *NotifyBegin =
+        F.getParent()->getFunction("mperf_roofline_internal_notify_loop_begin");
+    if (!NotifyBegin) {
+      auto FuncTy = FunctionType::get(PointerType::get(F.getContext(), 0),
+                                      {PointerType::get(F.getContext(), 0)}, 0);
+      NotifyBegin = Function::Create(
+          FuncTy, llvm::GlobalValue::ExternalLinkage,
+          "mperf_roofline_internal_notify_loop_begin", F.getParent());
+    }
 
-      if (!Loop->getLoopPreheader()) {
-        errs() << "Found a loop without a preheader at " << Loop->getLocStr()
-               << ":" << Loop->getLocRange().getStart()->getLine()
+    Function *NotifyEnd =
+        F.getParent()->getFunction("mperf_roofline_internal_notify_loop_end");
+    if (!NotifyEnd) {
+      auto FuncTy = FunctionType::get(Type::getVoidTy(F.getContext()),
+                                      {PointerType::get(F.getContext(), 0)}, 0);
+      NotifyEnd = Function::Create(FuncTy, llvm::GlobalValue::ExternalLinkage,
+                                   "mperf_roofline_internal_notify_loop_end",
+                                   F.getParent());
+    }
+
+    Function *NotifyStats =
+        F.getParent()->getFunction("mperf_roofline_internal_notify_loop_stats");
+    if (!NotifyStats) {
+      auto FuncTy = FunctionType::get(Type::getVoidTy(F.getContext()),
+                                      {PointerType::get(F.getContext(), 0),
+                                       PointerType::get(F.getContext(), 0)},
+                                      0);
+      NotifyStats = Function::Create(
+          FuncTy, llvm::GlobalValue::ExternalLinkage,
+          "mperf_roofline_internal_notify_loop_stats", F.getParent());
+    }
+
+    Function *IsInstrEnabled = F.getParent()->getFunction(
+        "mperf_roofline_internal_is_instrumented_profiling");
+    if (!IsInstrEnabled) {
+      auto FuncTy = FunctionType::get(Type::getInt32Ty(F.getContext()), {}, 0);
+      IsInstrEnabled = Function::Create(
+          FuncTy, llvm::GlobalValue::ExternalLinkage,
+          "mperf_roofline_internal_is_instrumented_profiling", F.getParent());
+    }
+
+    SmallVector<Loop *> TopLevelLoops;
+    llvm::copy_if(LoopInfo, std::back_inserter(TopLevelLoops), [](Loop *L) {
+      // Only consider outermost loops
+      if (L->getParentLoop())
+        return false;
+
+      if (!L->getLoopPreheader()) {
+        errs() << "Found a loop without a preheader at " << L->getLocStr()
                << ". Skipping.\n";
-        continue;
+        return false;
       }
 
-      if (!Loop->getExitBlock()) {
-        errs() << "Found a loop without an exit block at " << Loop->getLocStr()
-               << ":" << Loop->getLocRange().getStart()->getLine()
+      if (!L->getExitBlock()) {
+        errs() << "Found a loop without an exit block at " << L->getLocStr()
                << ". Skipping.\n";
+        return false;
+      }
+
+      return true;
+    });
+
+    for (auto L : TopLevelLoops) {
+      Region *R = RI.getRegionFor(L->getHeader());
+      SmallVector<BasicBlock *> RegionBlocks(R->block_begin(), R->block_end());
+      CodeExtractor CE(RegionBlocks, &DT);
+
+      size_t LineNo = L->getStartLoc().getLine();
+      std::string Filename = L->getLocStr().substr(0, L->getLocStr().find(":"));
+
+      Function *Extracted = CE.extractCodeRegion(CEAC);
+      if (!Extracted) {
+        errs() << "Failed to outline loop at " << L->getLocStr()
+               << ". Skipping.\n";
+      }
+
+      Extracted->setMetadata(
+          "miniperf.generated",
+          MDNode::get(F.getContext(), MDString::get(F.getContext(), "true")));
+
+      LoopInfo.erase(L);
+
+      ValueToValueMapTy VMap;
+
+      Function *Instrumented = CloneFunction(Extracted, VMap);
+      stripDebugInfo(*Instrumented);
+
+      CallInst *CallSite = cast<CallInst>(*Extracted->user_begin());
+
+      BasicBlock *CallBB = CallSite->getParent();
+
+      SmallVector<Value *> Outs;
+      for (auto &I : *CallBB) {
+        bool HasExternalUses = false;
+        for (auto *User : I.users()) {
+          if (auto *UI = dyn_cast<Instruction>(User)) {
+            if (UI->getParent() != CallBB) {
+              HasExternalUses = true;
+              break;
+            }
+          }
+        }
+
+        if (!HasExternalUses)
+          continue;
+
+        Outs.push_back(&I);
+      }
+
+      ValueToValueMapTy BlockVMap;
+      BasicBlock *InstrBB = CloneBasicBlock(CallBB, BlockVMap);
+
+      F.insert(CallBB->getSingleSuccessor()->getIterator(), InstrBB);
+
+      auto DispatchBB = BasicBlock::Create(F.getContext(), "", &F, CallBB);
+      auto LandingPadBB = BasicBlock::Create(F.getContext(), "", &F,
+                                             CallBB->getSingleSuccessor());
+
+      CallBB->replaceSuccessorsPhiUsesWith(LandingPadBB);
+      CallBB->replaceAllUsesWith(DispatchBB);
+      InstrBB->replaceSuccessorsPhiUsesWith(LandingPadBB);
+      InstrBB->replaceAllUsesWith(DispatchBB);
+
+      Builder.SetInsertPoint(DispatchBB);
+      Value *IsEnabled = Builder.CreateCall(IsInstrEnabled);
+      Value *Cmp = Builder.CreateCmp(
+          CmpInst::ICMP_NE, IsEnabled,
+          ConstantInt::get(Type::getInt32Ty(F.getContext()), 0));
+
+      Value *InfoMem = Builder.CreateAlloca(LoopInfoTy);
+
+      Value *FilenameVar = Builder.CreateGlobalString(Filename);
+
+      Value *LineNoPtr = Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 0);
+      Value *FilenamePtr =
+          Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 1);
+
+      Builder.CreateStore(FilenameVar, FilenamePtr);
+      Builder.CreateStore(
+          ConstantInt::get(Type::getInt32Ty(F.getContext()), LineNo),
+          LineNoPtr);
+      Value *LoopHandle = Builder.CreateCall(NotifyBegin, {InfoMem});
+
+      Builder.CreateCondBr(Cmp, InstrBB, CallBB);
+
+      Builder.SetInsertPoint(LandingPadBB);
+
+      for (auto V : Outs) {
+        PHINode *PHI = Builder.CreatePHI(V->getType(), 2);
+        PHI->addIncoming(V, CallBB);
+        PHI->addIncoming(BlockVMap[V], InstrBB);
+        V->replaceUsesOutsideBlock(PHI, LandingPadBB);
+      }
+
+      Builder.CreateCall(NotifyEnd, {LoopHandle});
+
+      Builder.CreateBr(CallBB->getSingleSuccessor());
+
+      cast<BranchInst>(CallBB->getTerminator())->setSuccessor(0, LandingPadBB);
+      cast<BranchInst>(InstrBB->getTerminator())->setSuccessor(0, LandingPadBB);
+
+      auto &InstrLI = FAM.getResult<LoopAnalysis>(*Instrumented);
+
+      // FIXME: for some reason this is not working properly. Need to find a way
+      // to actually extract a loop from here.
+      if (InstrLI.begin() == InstrLI.end()) {
         continue;
       }
 
-      // We can support this case but later
-      if (!DT.dominates(Loop->getLoopPreheader(), Loop->getExitBlock()))
-        continue;
+      auto OutermostLoop = *InstrLI.begin();
+      assert(OutermostLoop->isOutermost() &&
+             "Expected first loop to be outermost");
 
-      auto *NotifyBegin = F.getParent()->getFunction(
-          "mperf_roofline_internal_notify_loop_begin");
-      if (!NotifyBegin) {
-        auto FuncTy =
-            FunctionType::get(PointerType::get(F.getContext(), 0),
-                              {PointerType::get(F.getContext(), 0)}, 0);
-        NotifyBegin = Function::Create(
-            FuncTy, llvm::GlobalValue::ExternalLinkage,
-            "mperf_roofline_internal_notify_loop_begin", F.getParent());
-      }
+      BasicBlock *Preheader = [&]() {
+        if (OutermostLoop->getLoopPreheader()) {
+          return OutermostLoop->getLoopPreheader();
+        }
 
-      auto *NotifyEnd =
-          F.getParent()->getFunction("mperf_roofline_internal_notify_loop_end");
-      if (!NotifyEnd) {
-        auto FuncTy = FunctionType::get(Type::getVoidTy(F.getContext()),
-                                        {PointerType::get(F.getContext(), 0),
-                                         PointerType::get(F.getContext(), 0)},
-                                        0);
-        NotifyEnd = Function::Create(FuncTy, llvm::GlobalValue::ExternalLinkage,
-                                     "mperf_roofline_internal_notify_loop_end",
-                                     F.getParent());
-      }
+        auto &DT = FAM.getResult<DominatorTreeAnalysis>(*Instrumented);
+        auto &MSSA = FAM.getResult<MemorySSAAnalysis>(*Instrumented);
 
-      Builder.SetInsertPoint(Loop->getLoopPreheader()->getFirstInsertionPt());
+        auto MSSAU = std::make_unique<MemorySSAUpdater>(&MSSA.getMSSA());
+        return InsertPreheaderForLoop(OutermostLoop, &DT, &InstrLI, MSSAU.get(),
+                                      true);
+      }();
+
+      Builder.SetInsertPoint(Preheader->getFirstInsertionPt());
 
       // Create necessary data structures
       Value *StatsMem =
@@ -108,26 +264,6 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
       Builder.CreateMemSet(StatsMem,
                            ConstantInt::get(Type::getInt8Ty(F.getContext()), 0),
                            8 * 9, MaybeAlign());
-
-      // Notify loop begin
-      Value *Filename = Builder.CreateGlobalString(
-          Loop->getLocStr().substr(0, Loop->getLocStr().find(":")));
-
-      Value *InfoMem = Builder.CreateAlloca(LoopInfoTy);
-
-      Value *LineNoPtr = Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 0);
-      Value *FilenamePtr =
-          Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 1);
-
-      Builder.CreateStore(Filename, FilenamePtr);
-      Builder.CreateStore(ConstantInt::get(Type::getInt32Ty(F.getContext()),
-                                           Loop->getStartLoc().getLine()),
-                          LineNoPtr);
-      Value *LoopHandle = Builder.CreateCall(NotifyBegin, {InfoMem});
-
-      // Notify loop end
-      Builder.SetInsertPoint(Loop->getExitBlock()->getFirstInsertionPt());
-      Builder.CreateCall(NotifyEnd, {LoopHandle, StatsMem});
 
       auto UpdateStats = [&](uint64_t Counter, size_t Idx) {
         if (Counter == 0)
@@ -141,7 +277,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
         Builder.CreateStore(New, Ptr);
       };
 
-      auto ProcessBlock = [&](BasicBlock *BB) {
+      for (auto *BB : OutermostLoop->getBlocks()) {
         uint64_t BytesLoad = 0;
         uint64_t BytesStore = 0;
         uint64_t ScalarIntOps = 0;
@@ -247,8 +383,14 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
         UpdateStats(VectorDoubleOps, 8);
       };
 
-      for (auto *BB : Loop->getBlocks())
-        ProcessBlock(BB);
+      // There's always at least one return in the generated function
+      // TODO ensure there's exactly one return
+      BasicBlock *RetBlock = &*find_if(*Instrumented, [](BasicBlock &BB) {
+        return any_of(BB, [](Instruction &I) { return isa<ReturnInst>(I); });
+      });
+
+      Builder.SetInsertPoint(RetBlock->getTerminator());
+      Builder.CreateCall(NotifyStats, {LoopHandle, StatsMem});
     }
 
     return PreservedAnalyses::none();

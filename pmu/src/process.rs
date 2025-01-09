@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::{ffi::CString, time::Duration};
 
 #[derive(Debug)]
 pub struct Process {
@@ -37,6 +37,10 @@ impl Process {
                 // If we get here, exec failed
                 libc::_exit(1);
             }
+        } else {
+            // FIXME: there must be a smarter way (while still being cross-platform) to wait for
+            // child to become ready.
+            std::thread::sleep(Duration::from_millis(100));
         }
 
         Ok(Process { pid: child_pid })

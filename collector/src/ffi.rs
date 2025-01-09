@@ -5,7 +5,7 @@ use std::{
 
 use mperf_data::{Event, EventType, RooflineEventId};
 
-use crate::{get_next_id, profiling_enabled, send_event};
+use crate::{get_next_id, profiling_enabled, roofline_instrumentation_enabled, send_event};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -74,10 +74,68 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
     Box::leak(handle)
 }
 
+#[no_mangle]
+pub extern "C" fn mperf_roofline_internal_is_instrumented_profiling() -> i32 {
+    if profiling_enabled() && roofline_instrumentation_enabled() {
+        1
+    } else {
+        0
+    }
+}
+
 /// # Safety
 /// Shut up, clippy. There's nothing safe about what we do.
 #[no_mangle]
-pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(
+pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut LoopHandle) {
+    if !profiling_enabled() {
+        return;
+    }
+    let time = SystemTime::now();
+
+    let handle = unsafe { handle.as_ref() }.unwrap();
+
+    let start_event = Event {
+        unique_id: handle.id,
+        correlation_id: 0,
+        parent_id: 0,
+        ty: EventType::LoopStart,
+        name: 0,
+        thread_id: libc::gettid() as u32,
+        process_id: std::process::id(),
+        time_enabled: 0,
+        time_running: 0,
+        value: 0,
+        timestamp: handle.timestamp,
+    };
+
+    send_event(start_event).expect("failed to send start event");
+
+    let timestamp = time
+        .duration_since(UNIX_EPOCH)
+        .expect("failed to get time")
+        .as_millis() as u64;
+
+    let event = Event {
+        unique_id: get_next_id(),
+        correlation_id: handle.id,
+        parent_id: 0,
+        ty: EventType::LoopEnd,
+        name: 0,
+        thread_id: libc::gettid() as u32,
+        process_id: std::process::id(),
+        time_enabled: 0,
+        time_running: 0,
+        value: 0,
+        timestamp,
+    };
+
+    send_event(event).expect("failed to send loop end event");
+}
+
+/// # Safety
+/// Shut up, clippy. There's nothing safe about what we do.
+#[no_mangle]
+pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
     handle: *mut LoopHandle,
     stats: *const LoopStats,
 ) {

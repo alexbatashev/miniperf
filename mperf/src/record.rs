@@ -112,6 +112,11 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
         Err(_) => format!("{}:{}/../lib", exe_path, exe_path),
     };
 
+    println!(
+        "Run 1: collecting performance data for '{}'",
+        command.join(" ")
+    );
+
     let process = Process::new(
         command,
         &[
@@ -120,7 +125,8 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
                 "MPERF_COLLECTOR_IDS_START".to_string(),
                 "100000000000".to_string(),
             ),
-            ("LD_LIBRARY_PATH".to_string(), ld_path),
+            ("LD_LIBRARY_PATH".to_string(), ld_path.clone()),
+            ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
         ],
     )?;
 
@@ -175,6 +181,31 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
     process.cont();
     process.wait()?;
     driver.stop()?;
+
+    println!(
+        "Run 2: collecting loop statistics for '{}'",
+        command.join(" ")
+    );
+
+    let process = Process::new(
+        command,
+        &[
+            ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
+            (
+                "MPERF_COLLECTOR_IDS_START".to_string(),
+                "100000000000".to_string(),
+            ),
+            ("LD_LIBRARY_PATH".to_string(), ld_path),
+            ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
+            (
+                "MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED".to_string(),
+                "1".to_string(),
+            ),
+        ],
+    )?;
+
+    process.cont();
+    process.wait()?;
 
     cancel_tx.send(true)?;
     task.await?;

@@ -23,7 +23,9 @@ lazy_static! {
                 .expect("MPERF_COLLECTOR_IDS_START must be an unsigned integer"),
         )
     };
-    static ref PROFILING_ENABLED: bool = { std::env::var("MPERF_COLLECTOR_ENABLED").is_ok() };
+    static ref PROFILING_ENABLED: bool = std::env::var("MPERF_COLLECTOR_ENABLED").is_ok();
+    static ref ROOFLINE_INSTR_ENABLED: bool =
+        std::env::var("MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED").is_ok();
 }
 
 pub fn send_event(evt: Event) -> Result<(), Box<dyn std::error::Error>> {
@@ -39,4 +41,8 @@ pub fn get_next_id() -> u64 {
 
 pub fn profiling_enabled() -> bool {
     *PROFILING_ENABLED
+}
+
+pub fn roofline_instrumentation_enabled() -> bool {
+    *ROOFLINE_INSTR_ENABLED
 }
