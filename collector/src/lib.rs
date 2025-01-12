@@ -36,7 +36,7 @@ pub fn get_next_id() -> u128 {
         last as u128
     });
 
-    ((std::process::id() as u128) << 96) | ((unsafe { libc::gettid() as u128}) << 64) | counter
+    ((std::process::id() as u128) << 96) | ((unsafe { libc::gettid() as u128 }) << 64) | counter
 }
 
 pub fn profiling_enabled() -> bool {

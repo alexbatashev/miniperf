@@ -237,15 +237,15 @@ impl SummaryTab {
                 (evt.value as f64 * (evt.time_enabled as f64 / evt.time_running as f64)) as u64;
 
             match evt.ty {
-                EventType::PmuCycles => { stat.cycles += value },
-                EventType::PmuInstructions => { stat.instructions += value},
-                EventType::PmuLlcReferences => { stat.cache_references += value},
-                EventType::PmuLlcMisses => { stat.cache_misses += value},
-                EventType::PmuBranchMisses => { stat.branch_misses += value},
-                EventType::PmuBranchInstructions => { stat.branch_instructions += value},
-                EventType::PmuStalledCyclesBackend => { stat.stalled_cycles_backend += value},
-                EventType::PmuStalledCyclesFrontend => { stat.stalled_cycles_frontend += value},
-                _ => {},
+                EventType::PmuCycles => stat.cycles += value,
+                EventType::PmuInstructions => stat.instructions += value,
+                EventType::PmuLlcReferences => stat.cache_references += value,
+                EventType::PmuLlcMisses => stat.cache_misses += value,
+                EventType::PmuBranchMisses => stat.branch_misses += value,
+                EventType::PmuBranchInstructions => stat.branch_instructions += value,
+                EventType::PmuStalledCyclesBackend => stat.stalled_cycles_backend += value,
+                EventType::PmuStalledCyclesFrontend => stat.stalled_cycles_frontend += value,
+                _ => {}
             };
         }
 
