@@ -1,4 +1,9 @@
+use std::io::{BufRead, Read, Write};
+
+use capnp::message::ReaderOptions;
 use serde::{Deserialize, Serialize};
+
+use crate::event_capnp;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IString {
@@ -63,4 +68,29 @@ pub struct ProcMapEntry {
 pub struct ProcMap {
     pub pid: u32,
     pub entries: Vec<ProcMapEntry>,
+}
+
+impl Event {
+    pub fn write_binary(&self, writer: &mut dyn Write) -> Result<(), Box<dyn std::error::Error>> {
+        use capnp::serialize_packed;
+        let mut message = capnp::message::Builder::new_default();
+        let mut event = message.init_root::<event_capnp::event::Builder>();
+        event.set_event(self);
+
+        serialize_packed::write_message(writer, &message).map_err(|e| e.into())
+    }
+
+    pub fn read_binary(reader: &mut dyn BufRead) -> Result<Self, Box<dyn std::error::Error>> {
+        use capnp::serialize_packed;
+
+        let mut buf = [0_u8; 2 * std::mem::size_of::<Self>()];
+
+        let message =
+            serialize_packed::read_message_no_alloc(reader, &mut buf, ReaderOptions::default())?;
+
+
+        let root = message.get_root::<event_capnp::event::Reader>()?;
+
+        Ok(root.into())
+    }
 }

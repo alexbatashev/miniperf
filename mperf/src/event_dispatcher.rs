@@ -34,7 +34,7 @@ pub struct DispatcherJoinHandle {
 
 impl EventDispatcher {
     pub fn new(output_directory: &Path) -> (Arc<Self>, DispatcherJoinHandle) {
-        let (events_tx, mut event_rx) = mpsc::channel(8192);
+        let (events_tx, mut event_rx) = mpsc::channel::<Event>(8192);
         let (string_tx, mut string_rx) = mpsc::channel(8192);
         let (proc_map_tx, mut proc_map_rx) = mpsc::channel::<u32>(8192);
 
@@ -43,19 +43,18 @@ impl EventDispatcher {
         let mut events_token = cancel_rx.clone();
         let events_out_dir = output_directory.to_owned();
         let events_worker = tokio::spawn(async move {
-            let mut events_file = File::create(events_out_dir.join("events.bin"))
-                .await
-                .expect("event file stream creation");
+            let mut events_file = std::io::BufWriter::new(std::fs::File::create(events_out_dir.join("events.bin"))
+                .expect("event file stream creation"));
             loop {
                 tokio::select! {
                     _ = events_token.changed() => {
                         break;
                     }
                     Some(event) = event_rx.recv() => {
-                        let data = unsafe {
-                            std::slice::from_raw_parts(&event as *const Event as *const u8, std::mem::size_of::<Event>())
-                        };
-                        events_file.write_all(data).await.expect("write failed");
+                        let result = event.write_binary(&mut events_file);
+                        if result.is_err() {
+                            eprintln!("Failed to write data for event id {}", event.unique_id);
+                        }
                     }
                 }
             }

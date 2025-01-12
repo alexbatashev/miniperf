@@ -214,19 +214,21 @@ impl SummaryTab {
         map.advise(Advice::Sequential)
             .expect("Failed to advice sequential reads");
 
-        let events = unsafe {
-            std::slice::from_raw_parts(
-                map.as_ptr() as *const Event,
-                map.len() / std::mem::size_of::<Event>(),
-            )
+        let data_stream = unsafe {
+            std::slice::from_raw_parts(map.as_ptr(), map.len())
         };
+
+        let mut cursor = std::io::Cursor::new(data_stream);
 
         let mut stat = Stat::default();
 
-        for (i, evt) in events.iter().enumerate() {
-            if i % 1000 == 0 {
+        while (cursor.position() as usize) < map.len() {
+            // FIXME: should we just skip?
+            let evt = Event::read_binary(&mut cursor).expect("Failed to decode event");
+
+            {
                 let mut cntr = self.counter.write();
-                *cntr = (100 * i / events.len()) as u16;
+                *cntr = (100 * cursor.position() / data_stream.len() as u64) as u16;
             }
 
             if evt.time_running == 0 {
@@ -248,6 +250,18 @@ impl SummaryTab {
                 _ => {}
             };
         }
+
+        // let events = unsafe {
+        //     std::slice::from_raw_parts(
+        //         map.as_ptr() as *const Event,
+        //         map.len() / std::mem::size_of::<Event>(),
+        //     )
+        // };
+
+
+        // for (i, evt) in events.iter().enumerate() {
+        //
+        // }
 
         {
             let mut cntr = self.counter.write();
