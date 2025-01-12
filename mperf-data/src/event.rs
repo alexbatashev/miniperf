@@ -21,9 +21,32 @@ pub struct IString {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EventType {
-    PMU,
-    LoopStart,
-    LoopEnd,
+    PmuCycles,
+    PmuInstructions,
+    PmuLlcReferences,
+    PmuLlcMisses,
+    PmuBranchInstructions,
+    PmuBranchMisses,
+    PmuStalledCyclesFrontend,
+    PmuStalledCyclesBackend,
+    PmuCustom,
+    OsCpuClock,
+    OsCpuMigrations,
+    OsPageFaults,
+    OsContextSwitches,
+    OsTotalTime,
+    OsUserTime,
+    OsSystemTime,
+    RooflineBytesLoad,
+    RooflineBytesStore,
+    RooflineScalarIntOps,
+    RooflineScalarFloatOps,
+    RooflineScalarDoubleOps,
+    RooflineVectorIntOps,
+    RooflineVectorFloatOps,
+    RooflineVectorDoubleOps,
+    RooflineLoopStart,
+    RooflineLoopEnd,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

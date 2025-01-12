@@ -2,6 +2,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 mod event;
+pub(crate) mod event_capnp;
 
 pub use event::{Event, EventType, IString, ProcMap, ProcMapEntry, RooflineEventId};
 
