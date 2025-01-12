@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mperf_data::{Event, EventType, RecordInfo};
+use mperf_data::{Event, RecordInfo};
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 use pmu::{Counter, Process};
 
-use crate::{event_dispatcher::EventDispatcher, Scenario};
+use crate::{event_dispatcher::EventDispatcher, utils::counter_to_event_ty, Scenario};
 
 pub async fn do_record(
     scenario: Scenario,
@@ -67,13 +67,11 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
 
     driver.start(move |sample| {
         let unique_id = dispatcher.unique_id();
-        let name = dispatcher.string_id(sample.counter.name());
         let event = Event {
             unique_id,
-            correlation_id: sample.event_id,
+            correlation_id: sample.event_id as u128,
             parent_id: 0,
-            name,
-            ty: EventType::PMU,
+            ty: counter_to_event_ty(&sample.counter),
             thread_id: sample.tid,
             process_id: sample.pid,
             time_enabled: sample.time_enabled,
@@ -121,10 +119,6 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
         command,
         &[
             ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
-            (
-                "MPERF_COLLECTOR_IDS_START".to_string(),
-                "100000000000".to_string(),
-            ),
             ("LD_LIBRARY_PATH".to_string(), ld_path.clone()),
             ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
         ],
@@ -146,13 +140,11 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     driver.start(move |sample| {
         let unique_id = dispatcher.unique_id();
-        let name = dispatcher.string_id(sample.counter.name());
         let event = Event {
             unique_id,
-            correlation_id: sample.event_id,
+            correlation_id: sample.event_id as u128,
             parent_id: 0,
-            name,
-            ty: EventType::PMU,
+            ty: counter_to_event_ty(&sample.counter),
             thread_id: sample.tid,
             process_id: sample.pid,
             time_enabled: sample.time_enabled,
@@ -191,10 +183,6 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
         command,
         &[
             ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
-            (
-                "MPERF_COLLECTOR_IDS_START".to_string(),
-                "100000000000".to_string(),
-            ),
             ("LD_LIBRARY_PATH".to_string(), ld_path),
             ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
             (

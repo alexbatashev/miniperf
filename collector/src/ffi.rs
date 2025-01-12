@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mperf_data::{Event, EventType, RooflineEventId};
+use mperf_data::{Event, EventType};
 
 use crate::{get_next_id, profiling_enabled, roofline_instrumentation_enabled, send_event};
 
@@ -98,8 +98,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         unique_id: handle.id,
         correlation_id: 0,
         parent_id: 0,
-        ty: EventType::LoopStart,
-        name: 0,
+        ty: EventType::RooflineLoopStart,
         thread_id: libc::gettid() as u32,
         process_id: std::process::id(),
         time_enabled: 0,
@@ -119,8 +118,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         unique_id: get_next_id(),
         correlation_id: handle.id,
         parent_id: 0,
-        ty: EventType::LoopEnd,
-        name: 0,
+        ty: EventType::RooflineLoopEnd,
         thread_id: libc::gettid() as u32,
         process_id: std::process::id(),
         time_enabled: 0,
@@ -147,34 +145,17 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
 
     let handle = unsafe { handle.as_ref() }.unwrap();
 
-    let start_event = Event {
-        unique_id: handle.id,
-        correlation_id: 0,
-        parent_id: 0,
-        ty: EventType::LoopStart,
-        name: 0,
-        thread_id: libc::gettid() as u32,
-        process_id: std::process::id(),
-        time_enabled: 0,
-        time_running: 0,
-        value: 0,
-        timestamp: handle.timestamp,
-    };
-
-    send_event(start_event).expect("failed to send start event");
-
     let timestamp = time
         .duration_since(UNIX_EPOCH)
         .expect("failed to get time")
         .as_millis() as u64;
 
-    let send_end_event = |ty: RooflineEventId, value: u64| {
+    let send_end_event = |ty: EventType, value: u64| {
         let event = Event {
             unique_id: get_next_id(),
             correlation_id: handle.id,
             parent_id: 0,
-            ty: EventType::LoopEnd,
-            name: ty as u64,
+            ty,
             thread_id: libc::gettid() as u32,
             process_id: std::process::id(),
             time_enabled: 0,
@@ -186,11 +167,11 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
         send_event(event).expect("failed to send loop end event");
     };
 
-    send_end_event(RooflineEventId::BytesLoad, stats.bytes_load);
-    send_end_event(RooflineEventId::BytesStore, stats.bytes_store);
-    send_end_event(RooflineEventId::ScalarIntOps, stats.scalar_int_ops);
-    send_end_event(RooflineEventId::ScalarFloatOps, stats.scalar_float_ops);
-    send_end_event(RooflineEventId::VectorIntOps, stats.vector_int_ops);
-    send_end_event(RooflineEventId::VectorFloatOps, stats.vector_float_ops);
-    send_end_event(RooflineEventId::VectorDoubleOps, stats.vector_double_ops);
+    send_end_event(EventType::RooflineBytesLoad, stats.bytes_load);
+    send_end_event(EventType::RooflineBytesStore, stats.bytes_store);
+    send_end_event(EventType::RooflineScalarIntOps, stats.scalar_int_ops);
+    send_end_event(EventType::RooflineScalarFloatOps, stats.scalar_float_ops);
+    send_end_event(EventType::RooflineVectorIntOps, stats.vector_int_ops);
+    send_end_event(EventType::RooflineVectorFloatOps, stats.vector_float_ops);
+    send_end_event(EventType::RooflineVectorDoubleOps, stats.vector_double_ops);
 }

@@ -1,21 +1,21 @@
 include!(concat!(env!("OUT_DIR"), "/schema/event_capnp.rs"));
 
-impl<'a> event::Builder<'a> {
+impl event::Builder<'_> {
     pub fn set_event(&mut self, event: &crate::Event) {
         {
             let mut unique_id = self.reborrow().init_unique_id();
-            unique_id.set_p1(0);
-            unique_id.set_p2(event.unique_id);
+            unique_id.set_p1((event.unique_id >> 64) as u64);
+            unique_id.set_p2(event.unique_id as u64);
         }
         {
             let mut parent_id = self.reborrow().init_parent_id();
-            parent_id.set_p1(0);
-            parent_id.set_p2(event.parent_id);
+            parent_id.set_p1((event.parent_id >> 64) as u64);
+            parent_id.set_p2(event.parent_id as u64);
         }
         {
             let mut correlation_id = self.reborrow().init_correlation_id();
-            correlation_id.set_p1(0);
-            correlation_id.set_p2(event.correlation_id);
+            correlation_id.set_p1((event.correlation_id >> 64) as u64);
+            correlation_id.set_p2(event.correlation_id as u64);
         }
 
         self.reborrow().set_ty(event.ty.into());

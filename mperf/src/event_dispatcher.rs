@@ -1,10 +1,13 @@
+#![allow(dead_code)]
+
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::{collections::HashMap, io::Write, path::Path, sync::Arc};
 
-use atomic_counter::{AtomicCounter, ConsistentCounter};
 use mperf_data::{Event, IString, ProcMap, ProcMapEntry};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use proc_maps::{get_process_maps, Pid};
+use thread_local::ThreadLocal;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio::{
@@ -16,7 +19,7 @@ use tokio::{
 pub struct EventDispatcher {
     strings: RwLock<HashMap<String, u64>>,
     proc_maps: RwLock<HashSet<u32>>,
-    last_unique_id: ConsistentCounter,
+    last_unique_id: ThreadLocal<RefCell<u64>>,
     events_tx: Sender<Event>,
     string_tx: Sender<(u64, String)>,
     proc_map_tx: Sender<u32>,
@@ -107,7 +110,7 @@ impl EventDispatcher {
             Arc::new(EventDispatcher {
                 strings: RwLock::new(HashMap::new()),
                 proc_maps: RwLock::new(HashSet::new()),
-                last_unique_id: ConsistentCounter::new(0),
+                last_unique_id: ThreadLocal::new(),
                 events_tx,
                 string_tx,
                 proc_map_tx,
@@ -121,8 +124,11 @@ impl EventDispatcher {
         )
     }
 
-    pub fn unique_id(&self) -> u64 {
-        self.last_unique_id.inc() as u64
+    pub fn unique_id(&self) -> u128 {
+        let mut counter = self.last_unique_id.get().unwrap().borrow_mut();
+        let id = ((std::process::id() as u128) << 96) | ((unsafe { libc::gettid() } as u128) << 64) | (*counter as u128);
+        *counter += 1;
+        id
     }
 
     pub fn string_id(&self, string: &str) -> u64 {
