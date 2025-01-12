@@ -249,17 +249,6 @@ impl SummaryTab {
             };
         }
 
-        // let events = unsafe {
-        //     std::slice::from_raw_parts(
-        //         map.as_ptr() as *const Event,
-        //         map.len() / std::mem::size_of::<Event>(),
-        //     )
-        // };
-
-        // for (i, evt) in events.iter().enumerate() {
-        //
-        // }
-
         {
             let mut cntr = self.counter.write();
             *cntr = 50;
