@@ -43,8 +43,10 @@ impl EventDispatcher {
         let mut events_token = cancel_rx.clone();
         let events_out_dir = output_directory.to_owned();
         let events_worker = tokio::spawn(async move {
-            let mut events_file = std::io::BufWriter::new(std::fs::File::create(events_out_dir.join("events.bin"))
-                .expect("event file stream creation"));
+            let mut events_file = std::io::BufWriter::new(
+                std::fs::File::create(events_out_dir.join("events.bin"))
+                    .expect("event file stream creation"),
+            );
             loop {
                 tokio::select! {
                     _ = events_token.changed() => {

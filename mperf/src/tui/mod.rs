@@ -214,9 +214,7 @@ impl SummaryTab {
         map.advise(Advice::Sequential)
             .expect("Failed to advice sequential reads");
 
-        let data_stream = unsafe {
-            std::slice::from_raw_parts(map.as_ptr(), map.len())
-        };
+        let data_stream = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
 
         let mut cursor = std::io::Cursor::new(data_stream);
 
@@ -257,7 +255,6 @@ impl SummaryTab {
         //         map.len() / std::mem::size_of::<Event>(),
         //     )
         // };
-
 
         // for (i, evt) in events.iter().enumerate() {
         //

@@ -45,7 +45,7 @@ impl From<event::Reader<'_>> for Event {
             correlation_id,
             parent_id,
             ty: val.get_ty().expect("ty").into(),
-            thread_id: val.get_thread_id(), 
+            thread_id: val.get_thread_id(),
             process_id: val.get_process_id(),
             time_enabled: val.get_time_enabled(),
             time_running: val.get_time_running(),

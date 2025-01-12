@@ -88,7 +88,6 @@ impl Event {
         let message =
             serialize_packed::read_message_no_alloc(reader, &mut buf, ReaderOptions::default())?;
 
-
         let root = message.get_root::<event_capnp::event::Reader>()?;
 
         Ok(root.into())
