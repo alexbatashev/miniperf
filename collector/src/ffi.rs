@@ -37,7 +37,7 @@ pub struct LoopStats {
 
 #[allow(dead_code)]
 pub struct LoopHandle {
-    id: u64,
+    id: u128,
     timestamp: u64,
     info: SafeLoopInfo,
 }

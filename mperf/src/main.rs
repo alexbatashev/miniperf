@@ -2,6 +2,7 @@ mod event_dispatcher;
 mod record;
 mod stat;
 mod tui;
+mod utils;
 
 use std::{
     path::{Path, PathBuf},
