@@ -125,7 +125,7 @@ impl EventDispatcher {
     }
 
     pub fn unique_id(&self) -> u128 {
-        let mut counter = self.last_unique_id.get().unwrap().borrow_mut();
+        let mut counter = self.last_unique_id.get_or(|| RefCell::new(0)).borrow_mut();
         let id = ((std::process::id() as u128) << 96) | ((unsafe { libc::gettid() } as u128) << 64) | (*counter as u128);
         *counter += 1;
         id

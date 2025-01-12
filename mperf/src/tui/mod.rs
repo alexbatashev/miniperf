@@ -7,7 +7,7 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use memmap2::{Advice, Mmap};
-use mperf_data::{Event, EventType, IString, RecordInfo, Scenario};
+use mperf_data::{Event, EventType, RecordInfo, Scenario};
 use num_format::{Locale, ToFormattedString};
 use parking_lot::RwLock;
 use ratatui::{
