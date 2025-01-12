@@ -1,6 +1,5 @@
-use atomic_counter::{AtomicCounter, ConsistentCounter};
 use lazy_static::lazy_static;
-use std::sync::Mutex;
+use std::{cell::RefCell, sync::Mutex};
 
 use mperf_data::Event;
 use shmem::proc_channel::Sender;
@@ -14,18 +13,13 @@ lazy_static! {
 
         Mutex::new(Sender::attach(&name, 8192).expect("failed to open shared memory"))
     };
-    static ref ID_COUNTER: ConsistentCounter = {
-        let start = std::env::var("MPERF_COLLECTOR_IDS_START")
-            .expect("MPERF_COLLECTOR_IDS_START must be set by the caller");
-        ConsistentCounter::new(
-            start
-                .parse::<usize>()
-                .expect("MPERF_COLLECTOR_IDS_START must be an unsigned integer"),
-        )
-    };
     static ref PROFILING_ENABLED: bool = std::env::var("MPERF_COLLECTOR_ENABLED").is_ok();
     static ref ROOFLINE_INSTR_ENABLED: bool =
         std::env::var("MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED").is_ok();
+}
+
+thread_local! {
+    static LAST_ID: RefCell<u64> = const { RefCell::new(0) };
 }
 
 pub fn send_event(evt: Event) -> Result<(), Box<dyn std::error::Error>> {
@@ -35,8 +29,14 @@ pub fn send_event(evt: Event) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn get_next_id() -> u64 {
-    ID_COUNTER.inc() as u64
+pub fn get_next_id() -> u128 {
+    let counter = LAST_ID.with_borrow_mut(|cnt| {
+        let last = *cnt;
+        *cnt += 1;
+        last as u128
+    });
+
+    ((std::process::id() as u128) << 96) | ((unsafe { libc::gettid() as u128 }) << 64) | counter
 }
 
 pub fn profiling_enabled() -> bool {

@@ -7,7 +7,7 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use memmap2::{Advice, Mmap};
-use mperf_data::{Event, IString, RecordInfo, Scenario};
+use mperf_data::{Event, EventType, RecordInfo, Scenario};
 use num_format::{Locale, ToFormattedString};
 use parking_lot::RwLock;
 use ratatui::{
@@ -17,7 +17,6 @@ use ratatui::{
     widgets::{Block, Gauge, Row, Table, Tabs, Widget},
     DefaultTerminal, Frame,
 };
-use serde_jsonlines::json_lines;
 use tokio::fs::{self, File};
 use tokio_stream::StreamExt;
 
@@ -215,65 +214,19 @@ impl SummaryTab {
         map.advise(Advice::Sequential)
             .expect("Failed to advice sequential reads");
 
-        let strings: Vec<IString> = json_lines(self.res_dir.join("strings.jsonl"))
-            .expect("failed to read or parse strings.jsonl")
-            .collect::<Result<_, _>>()
-            .expect("failed to parse strings");
+        let data_stream = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
 
-        let cycles = strings
-            .iter()
-            .find(|istr| istr.value == "cycles")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-        let instruction = strings
-            .iter()
-            .find(|istr| istr.value == "instructions")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-        let llc_references = strings
-            .iter()
-            .find(|istr| istr.value == "llc_references")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-        let llc_misses = strings
-            .iter()
-            .find(|istr| istr.value == "llc_misses")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-        let branches = strings
-            .iter()
-            .find(|istr| istr.value == "branches")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-        let branch_misses = strings
-            .iter()
-            .find(|istr| istr.value == "branch_misses")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-        let stalled_cycles_frontend = strings
-            .iter()
-            .find(|istr| istr.value == "stalled_cycles_frontend")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-        let stalled_cycles_backend = strings
-            .iter()
-            .find(|istr| istr.value == "stalled_cycles_backend")
-            .map(|istr| istr.id)
-            .unwrap_or(u64::MAX);
-
-        let events = unsafe {
-            std::slice::from_raw_parts(
-                map.as_ptr() as *const Event,
-                map.len() / std::mem::size_of::<Event>(),
-            )
-        };
+        let mut cursor = std::io::Cursor::new(data_stream);
 
         let mut stat = Stat::default();
 
-        for (i, evt) in events.iter().enumerate() {
-            if i % 1000 == 0 {
+        while (cursor.position() as usize) < map.len() {
+            // FIXME: should we just skip?
+            let evt = Event::read_binary(&mut cursor).expect("Failed to decode event");
+
+            {
                 let mut cntr = self.counter.write();
-                *cntr = (100 * i / events.len()) as u16;
+                *cntr = (100 * cursor.position() / data_stream.len() as u64) as u16;
             }
 
             if evt.time_running == 0 {
@@ -283,23 +236,17 @@ impl SummaryTab {
             let value =
                 (evt.value as f64 * (evt.time_enabled as f64 / evt.time_running as f64)) as u64;
 
-            if evt.name == cycles {
-                stat.cycles += value;
-            } else if evt.name == instruction {
-                stat.instructions += value;
-            } else if evt.name == llc_references {
-                stat.cache_references += value;
-            } else if evt.name == llc_misses {
-                stat.cache_misses += value;
-            } else if evt.name == branches {
-                stat.branch_instructions += value;
-            } else if evt.name == branch_misses {
-                stat.branch_misses += value;
-            } else if evt.name == stalled_cycles_frontend {
-                stat.stalled_cycles_frontend += value;
-            } else if evt.name == stalled_cycles_backend {
-                stat.stalled_cycles_backend += value;
-            }
+            match evt.ty {
+                EventType::PmuCycles => stat.cycles += value,
+                EventType::PmuInstructions => stat.instructions += value,
+                EventType::PmuLlcReferences => stat.cache_references += value,
+                EventType::PmuLlcMisses => stat.cache_misses += value,
+                EventType::PmuBranchMisses => stat.branch_misses += value,
+                EventType::PmuBranchInstructions => stat.branch_instructions += value,
+                EventType::PmuStalledCyclesBackend => stat.stalled_cycles_backend += value,
+                EventType::PmuStalledCyclesFrontend => stat.stalled_cycles_frontend += value,
+                _ => {}
+            };
         }
 
         {
