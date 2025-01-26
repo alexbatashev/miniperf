@@ -3,8 +3,11 @@ use serde::{Deserialize, Serialize};
 
 mod event;
 pub(crate) mod event_capnp;
+mod ipc;
+mod ipc_message_capnp;
 
 pub use event::{Event, EventType, IString, ProcMap, ProcMapEntry};
+pub use ipc::{IPCClient, IPCMessage, IPCServer, IPCString};
 
 #[derive(Clone, Debug, Copy, ValueEnum, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scenario {

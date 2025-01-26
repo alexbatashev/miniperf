@@ -1,8 +1,0 @@
-[package]
-name = "shmem"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-libc = "0.2.169"
-ouroboros = "0.18.4"

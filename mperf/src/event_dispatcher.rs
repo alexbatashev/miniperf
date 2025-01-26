@@ -8,10 +8,8 @@ use mperf_data::{Event, IString, ProcMap, ProcMapEntry};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use proc_maps::{get_process_maps, Pid};
 use thread_local::ThreadLocal;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio::{
-    fs::File,
     sync::mpsc::{self, Sender},
     task::JoinHandle,
 };
