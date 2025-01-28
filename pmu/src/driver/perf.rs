@@ -8,10 +8,12 @@ use std::time::Duration;
 use events::process_counter;
 use libc::{close, mmap, munmap, sysconf, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
 use perf_event_open_sys::bindings::{
-    perf_event_attr, perf_event_header, perf_event_mmap_page, PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU,
-    PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_READ, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    perf_event_attr, perf_event_header, perf_event_mmap_page, PERF_RECORD_SAMPLE,
+    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_READ,
+    PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
+use smallvec::{SmallVec, ToSmallVec};
 
 use crate::{Counter, Error, Process};
 
@@ -63,6 +65,7 @@ pub struct Sample {
     pub time_running: u64,
     pub counter: Counter,
     pub value: u64,
+    pub callstack: SmallVec<[u64; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,13 +310,29 @@ impl SamplingDriver {
                             }
 
                             if header.type_ == PERF_RECORD_SAMPLE {
-                                let format = &*(base.add(offset % (page_size * mmap_pages))
-                                    as *const SampleFormat);
+                                let mut current_ptr =
+                                    base.add(offset % (page_size * mmap_pages)) as *const u8;
 
-                                let values = std::slice::from_raw_parts(
-                                    format.read.values.as_ptr(),
-                                    format.read.nr as usize,
-                                );
+                                // Read the fixed-size portion of the sample
+                                let (next_ptr, format) = SampleFormat::read_from_ptr(current_ptr);
+                                current_ptr = next_ptr;
+
+                                // Read the variable-length values array
+                                let (next_ptr, values) =
+                                    SampleFormat::read_values(current_ptr, format.read.nr);
+                                current_ptr = next_ptr;
+
+                                // Read the callchain
+                                let (_next_ptr, callstack) =
+                                    SampleFormat::read_callchain(current_ptr);
+
+                                // let format = &*(base.add(offset % (page_size * mmap_pages))
+                                //     as *const SampleFormat);
+                                //
+                                // let values = std::slice::from_raw_parts(
+                                //     format.read.values.as_ptr(),
+                                //     format.read.nr as usize,
+                                // );
 
                                 let value = &values[0];
 
@@ -332,6 +351,7 @@ impl SamplingDriver {
                                     time_running: format.read.time_running,
                                     counter: handle.kind.clone(),
                                     value: value.value,
+                                    callstack,
                                 };
 
                                 callback(sample);
@@ -425,7 +445,8 @@ impl SamplingDriverBuilder {
                 | PERF_SAMPLE_TIME
                 | PERF_SAMPLE_ID
                 | PERF_SAMPLE_CPU
-                | PERF_SAMPLE_READ) as u64;
+                | PERF_SAMPLE_READ
+                | PERF_SAMPLE_CALLCHAIN) as u64;
 
             attr.set_mmap(1);
         }
@@ -633,4 +654,30 @@ fn bind_counters(
     }
 
     Ok(handles)
+}
+
+impl SampleFormat {
+    unsafe fn read_from_ptr(ptr: *const u8) -> (*const u8, Self) {
+        let sample: Self = std::ptr::read(ptr as *const _);
+        let next_ptr = ptr.add(std::mem::size_of::<Self>());
+        (next_ptr, sample)
+    }
+
+    unsafe fn read_values(ptr: *const u8, nr: u64) -> (*const u8, &'static [EventValue]) {
+        let values = std::slice::from_raw_parts(ptr as *const EventValue, nr as usize);
+        let next_ptr = ptr.add(std::mem::size_of::<EventValue>() * nr as usize);
+        (next_ptr, values)
+    }
+
+    unsafe fn read_callchain(ptr: *const u8) -> (*const u8, SmallVec<[u64; 32]>) {
+        let nr_callchain = std::ptr::read(ptr as *const u64);
+        let callchain_ptr = ptr.add(std::mem::size_of::<u64>());
+
+        let callchain =
+            std::slice::from_raw_parts(callchain_ptr as *const u64, nr_callchain as usize)
+                .to_smallvec();
+
+        let next_ptr = callchain_ptr.add(std::mem::size_of::<u64>() * nr_callchain as usize);
+        (next_ptr, callchain)
+    }
 }

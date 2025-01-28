@@ -1,3 +1,4 @@
+use smallvec::smallvec;
 use std::{
     ffi::CStr,
     time::{SystemTime, UNIX_EPOCH},
@@ -105,6 +106,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         time_running: 0,
         value: 0,
         timestamp: handle.timestamp,
+        callstack: smallvec![],
     };
 
     send_event(start_event).expect("failed to send start event");
@@ -125,6 +127,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         time_running: 0,
         value: 0,
         timestamp,
+        callstack: smallvec![],
     };
 
     send_event(event).expect("failed to send loop end event");
@@ -162,6 +165,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
             time_running: 0,
             value,
             timestamp,
+            callstack: smallvec![],
         };
 
         send_event(event).expect("failed to send loop end event");

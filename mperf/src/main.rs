@@ -1,4 +1,5 @@
 mod event_dispatcher;
+mod processing;
 mod record;
 mod stat;
 mod tui;

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mperf_data::{Event, IPCMessage, RecordInfo};
+use mperf_data::{CallFrame, Event, IPCMessage, RecordInfo};
 use std::{
     fs::File,
     path::{Path, PathBuf},
@@ -70,6 +70,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
 
     driver.start(move |sample| {
         let unique_id = dispatcher.unique_id();
+        let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
         let event = Event {
             unique_id,
             correlation_id: sample.event_id as u128,
@@ -81,6 +82,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
             time_running: sample.time_running,
             value: sample.value,
             timestamp: sample.time,
+            callstack,
         };
 
         dispatcher.publish_event_sync(event);
@@ -143,6 +145,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     driver.start(move |sample| {
         let unique_id = dispatcher.unique_id();
+        let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
         let event = Event {
             unique_id,
             correlation_id: sample.event_id as u128,
@@ -154,6 +157,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
             time_running: sample.time_running,
             value: sample.value,
             timestamp: sample.time,
+            callstack,
         };
 
         dispatcher.publish_event_sync(event);

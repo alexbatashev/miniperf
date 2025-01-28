@@ -40,6 +40,13 @@ struct Location {
   line @2 : UInt32;
 }
 
+struct CallFrame {
+  union {
+    location @0 :Location;
+    ip @1 :UInt64;
+  }
+}
+
 struct Metadata {
   key @0 : EventId;
   union {
@@ -59,6 +66,6 @@ struct Event {
   timeRunning @7 : UInt64;
   timestamp @8 : UInt64;
   value @9 : UInt64;
-  callstack @10 : List(Location);
+  callstack @10 : List(CallFrame);
   metadata @11 : List(Metadata);
 }
