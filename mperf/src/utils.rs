@@ -22,7 +22,11 @@ pub fn counter_to_event_ty(counter: &Counter) -> EventType {
         Counter::CpuMigrations => EventType::OsCpuMigrations,
         Counter::ContextSwitches => EventType::OsContextSwitches,
         Counter::Custom(_) => EventType::PmuCustom,
-        Counter::Internal{name: _, desc: _, code: _} => EventType::PmuCustom,
+        Counter::Internal {
+            name: _,
+            desc: _,
+            code: _,
+        } => EventType::PmuCustom,
     }
 }
 

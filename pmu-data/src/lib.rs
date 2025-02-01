@@ -19,6 +19,8 @@ pub const INTEL_ROCKETLAKE: &str = "rocketlake";
 pub const INTEL_ALDERLAKE: &str = "alderlake";
 pub const INTEL_RAPTORLAKE: &str = "raptorlake";
 
+pub const SIFIVE_U7: &str = "sifive_u7";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlatformDesc {
     pub family_id: String,

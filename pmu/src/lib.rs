@@ -2,7 +2,7 @@ mod cpu_family;
 mod driver;
 mod process;
 
-pub use driver::{CountingDriver, SamplingDriver, list_supported_counters};
+pub use driver::{list_supported_counters, CountingDriver, SamplingDriver};
 pub use process::Process;
 
 use thiserror::Error;
@@ -22,7 +22,11 @@ pub enum Counter {
     ContextSwitches,
     CpuMigrations,
     Custom(String),
-    Internal{name: String, desc: String, code: u64},
+    Internal {
+        name: String,
+        desc: String,
+        code: u64,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -49,7 +53,11 @@ impl Counter {
             Counter::ContextSwitches => "context_switches",
             Counter::CpuMigrations => "cpu_migrations",
             Counter::Custom(name) => name,
-            Counter::Internal{name, desc: _, code: _} => name,
+            Counter::Internal {
+                name,
+                desc: _,
+                code: _,
+            } => name,
         }
     }
 
@@ -70,7 +78,11 @@ impl Counter {
             Counter::ContextSwitches => "Number of context switches",
             Counter::CpuMigrations => "Number of the times the process has migrated to a new CPU",
             Counter::Custom(_) => "",
-            Counter::Internal{name: _, desc, code: _} => desc,
+            Counter::Internal {
+                name: _,
+                desc,
+                code: _,
+            } => desc,
         }
     }
 }
