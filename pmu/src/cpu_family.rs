@@ -89,7 +89,7 @@ pub fn get_host_cpu_family() -> &'static str {
 }
 
 #[cfg(target_arch = "riscv64")]
-fn get_cpu_family() -> ProcessorFamily {
+fn get_host_cpu_family() -> ProcessorFamily {
     use proc_getter::cpuinfo::cpuinfo;
 
     let info = cpuinfo().expect("/proc/cpuinfo is inaccessible");
