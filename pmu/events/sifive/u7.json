@@ -3,6 +3,20 @@
   "name": "SiFive U7 series",
   "vendor": "SiFive",
   "arch": "riscv64",
+  "aliases": [
+    {
+      "target": "branches",
+      "origin": "CONDITIONAL_BRANCH_RETIRED"
+    },
+    {
+      "target": "branch_misses",
+      "origin": "BRANCH_DIRECTION_MISPRED"
+    },
+    {
+      "target": "cache_misses",
+      "origin": "DCACHE_MISS_MMIO_ACCESSES"
+    }
+  ],
   "events": [
     {
       "name": "EXCEPTION_TAKEN",
@@ -93,6 +107,91 @@
       "name": "OTHER_FP_RETIRED",
       "desc": "Other floating-point instruction retired",
       "code": "0x2000000"
+    },
+    {
+      "name": "ICACHE_RETIRED",
+      "desc": "Instruction cache miss",
+      "code": "0x0000102"
+    },
+    {
+      "name": "DCACHE_MISS_MMIO_ACCESSES",
+      "desc": "Data cache miss or memory-mapped I/O access",
+      "code": "0x0000202"
+    },
+    {
+      "name": "DCACHE_WRITEBACK",
+      "desc": "Data cache write-back",
+      "code": "0x0000402"
+    },
+    {
+      "name": "INST_TLB_MISS",
+      "desc": "Instruction TLB miss",
+      "code": "0x0000802"
+    },
+    {
+      "name": "DATA_TLB_MISS",
+      "desc": "Data TLB miss",
+      "code": "0x0001002"
+    },
+    {
+      "name": "UTLB_MISS",
+      "desc": "UTLB miss",
+      "code": "0x0002002"
+    },
+    {
+      "name": "ADDRESSGEN_INTERLOCK",
+      "desc": "Address-generation interlock",
+      "code": "0x0000101"
+    },
+    {
+      "name": "LONGLAT_INTERLOCK",
+      "desc": "Long-latency interlock",
+      "code": "0x0000201"
+    },
+    {
+      "name": "CSR_READ_INTERLOCK",
+      "desc": "CSR read interlock",
+      "code": "0x0000401"
+    },
+    {
+      "name": "ICACHE_ITIM_BUSY",
+      "desc": "Instruction cache/ITIM busy",
+      "code": "0x0000801"
+    },
+    {
+      "name": "DCACHE_DTIM_BUSY",
+      "desc": "Data cache/DTIM busy",
+      "code": "0x0001001"
+    },
+    {
+      "name": "BRANCH_DIRECTION_MISPREDICTION",
+      "desc": "Branch direction misprediction",
+      "code": "0x0002001"
+    },
+    {
+      "name": "BRANCH_TARGET_MISPREDICTION",
+      "desc": "Branch/jump target misprediction",
+      "code": "0x0004001"
+    },
+    {
+      "name": "PIPE_FLUSH_CSR_WRITE",
+      "desc": "Pipeline flush from CSR write",
+      "code": "0x0008001"
+    },
+    {
+      "name": "PIPE_FLUSH_OTHER_EVENT",
+      "desc": "Pipeline flush from other event",
+      "code": "0x0010001"
+    },
+    {
+      "name": "INTEGER_MULTIPLICATION_INTERLOCK",
+      "desc": "Integer multiplication interlock",
+      "code": "0x0020001"
+    },
+    {
+      "name": "FP_INTERLOCK",
+      "desc": "Floating-point interlock",
+      "code": "0x0040001"
     }
   ]
 }
