@@ -7,6 +7,8 @@ edition = "2021"
 cfg-if = "1.0.0"
 libc = "0.2.144"
 thiserror = "2.0.9"
+pmu-data = { path = "../pmu-data/" }
+lazy_static = "1.5.0"
 
 [target.'cfg(unix)'.dependencies]
 proc_getter = "0.0.3"
@@ -14,3 +16,12 @@ dlopen2 = "0.7.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 perf-event-open-sys2 = "5.0.6"
+
+[build-dependencies]
+serde = "1.0.217"
+serde_json = "1.0.138"
+pmu-data = { path = "../pmu-data/" }
+glob = "0.3.2"
+quote = "1.0.38"
+prettyplease = "0.2.29"
+syn = "2.0.96"

@@ -1,0 +1,13 @@
+{
+  "family_id": "zen1",
+  "name": "AMD Zen or Zen+ architecture",
+  "vendor": "AMD",
+  "arch": "x86_64",
+  "events": [
+    {
+      "name": "ex_ret_instr",
+      "desc": "Retired Instructions",
+      "code": "0xc0"
+    }
+  ]
+}
