@@ -16,6 +16,10 @@ pub fn do_stat(command: Vec<String>) -> Result<()> {
             Counter::BranchInstructions,
             Counter::StalledCyclesBackend,
             Counter::StalledCyclesFrontend,
+            Counter::CpuClock,
+            Counter::CpuMigrations,
+            Counter::PageFaults,
+            Counter::ContextSwitches,
         ],
         Some(&process),
     )?;

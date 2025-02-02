@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
             return do_stat(command);
         }
         Commands::List => {
-            let events = pmu::list_counters();
+            let events = pmu::list_supported_counters();
             for event in events {
                 println!("{} - {}", event.name(), event.description());
             }

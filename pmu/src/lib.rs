@@ -1,7 +1,8 @@
+mod cpu_family;
 mod driver;
 mod process;
 
-pub use driver::{CountingDriver, SamplingDriver};
+pub use driver::{list_supported_counters, CountingDriver, SamplingDriver};
 pub use process::Process;
 
 use thiserror::Error;
@@ -16,7 +17,16 @@ pub enum Counter {
     BranchMisses,
     StalledCyclesFrontend,
     StalledCyclesBackend,
+    CpuClock,
+    PageFaults,
+    ContextSwitches,
+    CpuMigrations,
     Custom(String),
+    Internal {
+        name: String,
+        desc: String,
+        code: u64,
+    },
 }
 
 #[derive(Error, Debug)]
@@ -25,21 +35,6 @@ pub enum Error {
     CounterCreationFail,
     #[error("Failed to enable counters")]
     EnableFailed,
-}
-
-pub fn list_counters() -> Vec<Counter> {
-    let mut counters = vec![
-        Counter::Cycles,
-        Counter::Instructions,
-        Counter::LLCReferences,
-        Counter::LLCMisses,
-        Counter::BranchInstructions,
-        Counter::BranchMisses,
-    ];
-
-    counters.extend(driver::list_software_counters());
-
-    counters
 }
 
 impl Counter {
@@ -53,7 +48,16 @@ impl Counter {
             Counter::BranchMisses => "branch_misses",
             Counter::StalledCyclesFrontend => "stalled_cycles_frontend",
             Counter::StalledCyclesBackend => "stalled_cycles_backend",
-            _ => todo!(),
+            Counter::CpuClock => "cpu_clock",
+            Counter::PageFaults => "page_faults",
+            Counter::ContextSwitches => "context_switches",
+            Counter::CpuMigrations => "cpu_migrations",
+            Counter::Custom(name) => name,
+            Counter::Internal {
+                name,
+                desc: _,
+                code: _,
+            } => name,
         }
     }
 
@@ -69,7 +73,16 @@ impl Counter {
                 "Number of cycles stalled due to frontend bottlenecks"
             }
             Counter::StalledCyclesBackend => "Number of cycles stalled due to backend bottlenecks",
-            _ => todo!(),
+            Counter::CpuClock => "A high-resolution per-CPU timer",
+            Counter::PageFaults => "Number of page faults",
+            Counter::ContextSwitches => "Number of context switches",
+            Counter::CpuMigrations => "Number of the times the process has migrated to a new CPU",
+            Counter::Custom(_) => "",
+            Counter::Internal {
+                name: _,
+                desc,
+                code: _,
+            } => desc,
         }
     }
 }

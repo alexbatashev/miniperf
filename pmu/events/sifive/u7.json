@@ -1,0 +1,197 @@
+{
+  "family_id": "sifive_u7",
+  "name": "SiFive U7 series",
+  "vendor": "SiFive",
+  "arch": "riscv64",
+  "aliases": [
+    {
+      "target": "branches",
+      "origin": "CONDITIONAL_BRANCH_RETIRED"
+    },
+    {
+      "target": "branch_misses",
+      "origin": "BRANCH_DIRECTION_MISPRED"
+    },
+    {
+      "target": "cache_misses",
+      "origin": "DCACHE_MISS_MMIO_ACCESSES"
+    }
+  ],
+  "events": [
+    {
+      "name": "EXCEPTION_TAKEN",
+      "desc": "Exception taken",
+      "code": "0x0000100"
+    },
+    {
+      "name": "INTEGER_LOAD_RETIRED",
+      "desc": "Integer load instruction retired",
+      "code": "0x0000200"
+    },
+    {
+      "name": "INTEGER_STORE_RETIRED",
+      "desc": "Integer store instruction retired",
+      "code": "0x0000400"
+    },
+    {
+      "name": "ATOMIC_MEMORY_RETIRED",
+      "desc": "Atomic memory operation retired",
+      "code": "0x0000800"
+    },
+    {
+      "name": "SYSTEM_INSTRUCTION_RETIRED",
+      "desc": "System instruction retired",
+      "code": "0x0001000"
+    },
+    {
+      "name": "INTEGER_ARITHMETIC_RETIRED",
+      "desc": "Integer arithmetic instruction retired",
+      "code": "0x0002000"
+    },
+    {
+      "name": "CONDITIONAL_BRANCH_RETIRED",
+      "desc": "Conditional branch retired",
+      "code": "0x0004000"
+    },
+    {
+      "name": "JAL_INSTRUCTION_RETIRED",
+      "desc": "JAL instruction retired",
+      "code": "0x0008000"
+    },
+    {
+      "name": "JALR_INSTRUCTION_RETIRED",
+      "desc": "JALR instruction retired",
+      "code": "0x0010000"
+    },
+    {
+      "name": "INTEGER_MULTIPLICATION_RETIRED",
+      "desc": "Integer multiplication instruction retired",
+      "code": "0x0020000"
+    },
+    {
+      "name": "INTEGER_DIVISION_RETIRED",
+      "desc": "Integer division instruction retired",
+      "code": "0x0040000"
+    },
+    {
+      "name": "FP_LOAD_RETIRED",
+      "desc": "Floating-point load instruction retired",
+      "code": "0x0080000"
+    },
+    {
+      "name": "FP_STORE_RETIRED",
+      "desc": "Floating-point store instruction retired",
+      "code": "0x0100000"
+    },
+    {
+      "name": "FP_ADDITION_RETIRED",
+      "desc": "Floating-point addition retired",
+      "code": "0x0200000"
+    },
+    {
+      "name": "FP_MULTIPLICATION_RETIRED",
+      "desc": "Floating-point multiplication retired",
+      "code": "0x0400000"
+    },
+    {
+      "name": "FP_FUSEDMADD_RETIRED",
+      "desc": "Floating-point fused multiply-add retired",
+      "code": "0x0800000"
+    },
+    {
+      "name": "FP_DIV_SQRT_RETIRED",
+      "desc": "Floating-point division or square-root retired",
+      "code": "0x1000000"
+    },
+    {
+      "name": "OTHER_FP_RETIRED",
+      "desc": "Other floating-point instruction retired",
+      "code": "0x2000000"
+    },
+    {
+      "name": "ICACHE_RETIRED",
+      "desc": "Instruction cache miss",
+      "code": "0x0000102"
+    },
+    {
+      "name": "DCACHE_MISS_MMIO_ACCESSES",
+      "desc": "Data cache miss or memory-mapped I/O access",
+      "code": "0x0000202"
+    },
+    {
+      "name": "DCACHE_WRITEBACK",
+      "desc": "Data cache write-back",
+      "code": "0x0000402"
+    },
+    {
+      "name": "INST_TLB_MISS",
+      "desc": "Instruction TLB miss",
+      "code": "0x0000802"
+    },
+    {
+      "name": "DATA_TLB_MISS",
+      "desc": "Data TLB miss",
+      "code": "0x0001002"
+    },
+    {
+      "name": "UTLB_MISS",
+      "desc": "UTLB miss",
+      "code": "0x0002002"
+    },
+    {
+      "name": "ADDRESSGEN_INTERLOCK",
+      "desc": "Address-generation interlock",
+      "code": "0x0000101"
+    },
+    {
+      "name": "LONGLAT_INTERLOCK",
+      "desc": "Long-latency interlock",
+      "code": "0x0000201"
+    },
+    {
+      "name": "CSR_READ_INTERLOCK",
+      "desc": "CSR read interlock",
+      "code": "0x0000401"
+    },
+    {
+      "name": "ICACHE_ITIM_BUSY",
+      "desc": "Instruction cache/ITIM busy",
+      "code": "0x0000801"
+    },
+    {
+      "name": "DCACHE_DTIM_BUSY",
+      "desc": "Data cache/DTIM busy",
+      "code": "0x0001001"
+    },
+    {
+      "name": "BRANCH_DIRECTION_MISPREDICTION",
+      "desc": "Branch direction misprediction",
+      "code": "0x0002001"
+    },
+    {
+      "name": "BRANCH_TARGET_MISPREDICTION",
+      "desc": "Branch/jump target misprediction",
+      "code": "0x0004001"
+    },
+    {
+      "name": "PIPE_FLUSH_CSR_WRITE",
+      "desc": "Pipeline flush from CSR write",
+      "code": "0x0008001"
+    },
+    {
+      "name": "PIPE_FLUSH_OTHER_EVENT",
+      "desc": "Pipeline flush from other event",
+      "code": "0x0010001"
+    },
+    {
+      "name": "INTEGER_MULTIPLICATION_INTERLOCK",
+      "desc": "Integer multiplication interlock",
+      "code": "0x0020001"
+    },
+    {
+      "name": "FP_INTERLOCK",
+      "desc": "Floating-point interlock",
+      "code": "0x0040001"
+    }
+  ]
+}

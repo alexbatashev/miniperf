@@ -1,8 +1,11 @@
+mod events;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use events::process_counter;
 use libc::{close, mmap, munmap, sysconf, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
 use perf_event_open_sys::bindings::{
     perf_event_attr, perf_event_header, perf_event_mmap_page, PERF_RECORD_SAMPLE, PERF_SAMPLE_CPU,
@@ -11,6 +14,8 @@ use perf_event_open_sys::bindings::{
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 
 use crate::{Counter, Error, Process};
+
+pub use events::list_supported_counters;
 
 /// Counting driver is used for simple collection of system's performance counters values. On Linux,
 /// counter multiplexing is supported.
@@ -32,6 +37,7 @@ pub struct SamplingDriverBuilder {
     counters: Vec<Counter>,
     sample_freq: u64,
     pid: Option<i32>,
+    prefer_raw_events: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,13 +113,9 @@ struct EventValue {
     id: u64,
 }
 
-pub fn list_software_counters() -> Vec<Counter> {
-    vec![]
-}
-
 impl CountingDriver {
     pub fn new(counters: &[Counter], process: Option<&Process>) -> Result<Self, Error> {
-        let mut attrs = get_native_counters(counters)?;
+        let mut attrs = get_native_counters(counters, false)?;
 
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);
@@ -128,7 +130,7 @@ impl CountingDriver {
 
         let pid = process.map(|p| p.pid());
 
-        let native_handles = bind_events(counters, &mut attrs, pid)?;
+        let native_handles = bind_counters(counters, &mut attrs, pid)?;
 
         Ok(CountingDriver { native_handles })
     }
@@ -239,6 +241,7 @@ impl SamplingDriver {
             counters: vec![],
             sample_freq: 1000,
             pid: None,
+            prefer_raw_events: false,
         }
     }
 
@@ -375,6 +378,7 @@ impl SamplingDriverBuilder {
             counters: counters.to_vec(),
             sample_freq: self.sample_freq,
             pid: self.pid,
+            prefer_raw_events: self.prefer_raw_events,
         }
     }
 
@@ -383,6 +387,7 @@ impl SamplingDriverBuilder {
             counters: self.counters,
             sample_freq: self.sample_freq,
             pid: Some(process.pid()),
+            prefer_raw_events: self.prefer_raw_events,
         }
     }
 
@@ -391,11 +396,21 @@ impl SamplingDriverBuilder {
             counters: self.counters,
             sample_freq,
             pid: self.pid,
+            prefer_raw_events: self.prefer_raw_events,
+        }
+    }
+
+    pub fn prefer_raw_events(self) -> Self {
+        Self {
+            counters: self.counters,
+            sample_freq: self.sample_freq,
+            pid: self.pid,
+            prefer_raw_events: true,
         }
     }
 
     pub fn build(self) -> Result<SamplingDriver, Error> {
-        let mut attrs = get_native_counters(&self.counters)?;
+        let mut attrs = get_native_counters(&self.counters, self.prefer_raw_events)?;
 
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);
@@ -415,7 +430,7 @@ impl SamplingDriverBuilder {
             attr.set_mmap(1);
         }
 
-        let native_handles = bind_events(&self.counters, &mut attrs, self.pid)?;
+        let native_handles = bind_counters(&self.counters, &mut attrs, self.pid)?;
 
         let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
         let mmap_pages = 512;
@@ -490,7 +505,10 @@ impl IntoIterator for CounterResult {
     }
 }
 
-fn get_native_counters(counters: &[Counter]) -> Result<Vec<perf_event_attr>, Error> {
+fn get_native_counters(
+    counters: &[Counter],
+    prefer_raw_counters: bool,
+) -> Result<Vec<perf_event_attr>, Error> {
     let attrs = counters
         .iter()
         .map(|cntr| {
@@ -503,6 +521,8 @@ fn get_native_counters(counters: &[Counter]) -> Result<Vec<perf_event_attr>, Err
                 | sys::bindings::PERF_FORMAT_ID as u64
                 | sys::bindings::PERF_FORMAT_TOTAL_TIME_ENABLED as u64
                 | sys::bindings::PERF_FORMAT_TOTAL_TIME_RUNNING as u64;
+
+            let cntr = process_counter(cntr, prefer_raw_counters);
 
             match cntr {
                 Counter::Cycles => {
@@ -537,6 +557,30 @@ fn get_native_counters(counters: &[Counter]) -> Result<Vec<perf_event_attr>, Err
                     attrs.type_ = sys::bindings::PERF_TYPE_HARDWARE;
                     attrs.config = sys::bindings::PERF_COUNT_HW_STALLED_CYCLES_BACKEND as u64;
                 }
+                Counter::CpuClock => {
+                    attrs.type_ = sys::bindings::PERF_TYPE_SOFTWARE;
+                    attrs.config = sys::bindings::PERF_COUNT_SW_CPU_CLOCK as u64;
+                }
+                Counter::ContextSwitches => {
+                    attrs.type_ = sys::bindings::PERF_TYPE_SOFTWARE;
+                    attrs.config = sys::bindings::PERF_COUNT_SW_CONTEXT_SWITCHES as u64;
+                }
+                Counter::CpuMigrations => {
+                    attrs.type_ = sys::bindings::PERF_TYPE_SOFTWARE;
+                    attrs.config = sys::bindings::PERF_COUNT_SW_CPU_MIGRATIONS as u64;
+                }
+                Counter::PageFaults => {
+                    attrs.type_ = sys::bindings::PERF_TYPE_SOFTWARE;
+                    attrs.config = sys::bindings::PERF_COUNT_SW_PAGE_FAULTS as u64;
+                }
+                Counter::Internal {
+                    name: _,
+                    desc: _,
+                    code,
+                } => {
+                    attrs.type_ = sys::bindings::PERF_TYPE_RAW;
+                    attrs.config = code;
+                }
                 _ => todo!(),
             }
 
@@ -547,7 +591,7 @@ fn get_native_counters(counters: &[Counter]) -> Result<Vec<perf_event_attr>, Err
     Ok(attrs)
 }
 
-fn bind_events(
+fn bind_counters(
     counters: &[Counter],
     attrs: &mut [perf_event_attr],
     pid: Option<i32>,

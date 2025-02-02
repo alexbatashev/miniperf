@@ -11,7 +11,7 @@ use crate::{get_next_id, profiling_enabled, roofline_instrumentation_enabled, se
 #[repr(C)]
 pub struct LoopInfo {
     line: u32,
-    filename: *const i8,
+    filename: *const libc::c_char,
 }
 
 #[derive(Debug, Clone)]
