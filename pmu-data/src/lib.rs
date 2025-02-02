@@ -41,8 +41,8 @@ pub struct EventDesc {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Alias {
-    target: String,
-    origin: String,
+    pub target: String,
+    pub origin: String,
 }
 
 fn serialize_hex<S>(v: &u64, serializer: S) -> Result<S::Ok, S::Error>

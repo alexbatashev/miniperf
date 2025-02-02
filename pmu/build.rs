@@ -39,6 +39,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         }
 
+        let mut aliases = vec![];
+
+        for alias in &data.aliases.unwrap_or_default() {
+            let target = alias.target.clone();
+            let origin = alias.origin.clone();
+            aliases.push(quote! {
+                aliases.insert(#target.to_string(), #origin.to_string());
+            });
+        }
+
         let name = &data.name;
         let vendor = &data.vendor;
         let family_id = &data.family_id;
@@ -47,7 +57,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut events = HashMap::new();
             #(#events)*
 
+            #[allow(unused_mut)]
             let mut aliases = HashMap::new();
+
+            #(#aliases)*
 
             let family = CPUFamily {
                 name: #name.to_string(),
