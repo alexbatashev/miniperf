@@ -404,6 +404,15 @@ impl SamplingDriverBuilder {
         }
     }
 
+    pub fn prefer_raw_events(self) -> Self {
+        Self {
+            counters: self.counters,
+            sample_freq: self.sample_freq,
+            pid: self.pid,
+            prefer_raw_events: true,
+        }
+    }
+
     pub fn build(self) -> Result<SamplingDriver, Error> {
         let mut attrs = get_native_counters(&self.counters, self.prefer_raw_events)?;
 
