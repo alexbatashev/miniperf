@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use lazy_static::lazy_static;
 use pmu_data::EventDesc;
 
+#[allow(dead_code)]
 pub struct CPUFamily {
     pub name: String,
     pub vendor: String,
@@ -62,11 +63,9 @@ pub fn get_host_cpu_family() -> &'static str {
         } else if (extended_model == 0x3 && model == 0xd) || (extended_model == 0x4 && model == 0x7)
         {
             return pmu_data::INTEL_BROADWELL;
-        } else if (extended_model == 0x5 && model == 0xe) || (extended_model == 0x4 && model == 0xe)
-        {
+        } else if model == 0xe && (extended_model == 0x5 || extended_model == 0x4) {
             return pmu_data::INTEL_SKYLAKE;
-        } else if (extended_model == 0x8 && model == 0xe) || (extended_model == 0x9 && model == 0xe)
-        {
+        } else if model == 0xe && (extended_model == 0x8 || extended_model == 0x9) {
             return pmu_data::INTEL_KABYLAKE;
         } else if extended_model == 0xa && model == 0x5 {
             return pmu_data::INTEL_COMETLAKE;

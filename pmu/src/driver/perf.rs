@@ -113,10 +113,6 @@ struct EventValue {
     id: u64,
 }
 
-pub fn list_software_counters() -> Vec<Counter> {
-    vec![]
-}
-
 impl CountingDriver {
     pub fn new(counters: &[Counter], process: Option<&Process>) -> Result<Self, Error> {
         let mut attrs = get_native_counters(counters, false)?;
