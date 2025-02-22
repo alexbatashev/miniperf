@@ -105,8 +105,10 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
     let socket_path = create_ipc_server(move |message| match message {
         IPCMessage::String(string) => {
             roofline_dispatcher.string_id(&string.value);
+            println!("GOT A STRING!!!!!!!!!!");
         }
         IPCMessage::Event(event) => {
+            println!("GOT IPC EVENT!!!!!!!!!!!!!!!!!!!!!!!!!!");
             roofline_dispatcher.publish_event_sync(event);
         }
     });

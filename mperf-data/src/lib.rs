@@ -6,7 +6,7 @@ pub(crate) mod event_capnp;
 mod ipc;
 mod ipc_message_capnp;
 
-pub use event::{CallFrame, Event, EventType, IString, ProcMap, ProcMapEntry};
+pub use event::{CallFrame, Event, EventType, IString, Location, ProcMap, ProcMapEntry};
 pub use ipc::{IPCClient, IPCMessage, IPCServer, IPCString};
 
 #[derive(Clone, Debug, Copy, ValueEnum, PartialEq, Eq, Serialize, Deserialize)]

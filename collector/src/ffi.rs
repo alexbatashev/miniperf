@@ -4,9 +4,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use mperf_data::{Event, EventType};
+use mperf_data::{CallFrame, Event, EventType, Location};
 
-use crate::{get_next_id, profiling_enabled, roofline_instrumentation_enabled, send_event};
+use crate::{
+    get_next_id, get_string_id, profiling_enabled, roofline_instrumentation_enabled, send_event,
+};
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
@@ -95,6 +97,15 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
 
     let handle = unsafe { handle.as_ref() }.unwrap();
 
+    // FIXME we should use the full stack frame instead
+    let filename = get_string_id(&handle.info.filename);
+
+    let start_frame = CallFrame::Location(Location {
+        function_name: 0,
+        file_name: filename as u128,
+        line: handle.info.line,
+    });
+
     let start_event = Event {
         unique_id: handle.id,
         correlation_id: 0,
@@ -106,7 +117,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         time_running: 0,
         value: 0,
         timestamp: handle.timestamp,
-        callstack: smallvec![],
+        callstack: smallvec![start_frame],
     };
 
     send_event(start_event).expect("failed to send start event");

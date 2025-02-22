@@ -13,7 +13,3 @@ struct IpcMessage {
     string @1 :IpcString;
   }
 }
-
-interface IpcService {
-  post @0 (message: IpcMessage) -> ();
-}

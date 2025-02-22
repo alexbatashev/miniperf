@@ -68,6 +68,8 @@ pub fn get_string_id(string: &str) -> u64 {
         value: string.to_string(),
     }));
 
+    println!("SENT A STRING!!!!!!!!!");
+
     hash
 }
 
@@ -138,6 +140,7 @@ impl UnixSender {
                         Some(message) = rx.recv() => {
                             let mut request = ipc.post_request();
                             request.get().init_message().set_message(&message);
+                            let _ = request.send();
                         }
                     }
                 }
