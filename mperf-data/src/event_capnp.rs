@@ -1,4 +1,9 @@
-use crate::Event;
+use crate::{
+    event::{CallFrame, Location},
+    Event,
+};
+
+use smallvec::smallvec;
 
 include!(concat!(env!("OUT_DIR"), "/schema/event_capnp.rs"));
 
@@ -27,6 +32,31 @@ impl event::Builder<'_> {
         self.reborrow().set_time_running(event.time_running);
         self.reborrow().set_timestamp(event.timestamp);
         self.reborrow().set_value(event.value);
+
+        if !event.callstack.is_empty() {
+            let mut root = self.reborrow().init_callstack(event.callstack.len() as u32);
+            for (id, frame) in event.callstack.iter().enumerate() {
+                let mut capnp_frame = root.reborrow().get(id as u32);
+                match frame {
+                    CallFrame::IP(ip) => {
+                        capnp_frame.set_ip(*ip);
+                    }
+                    CallFrame::Location(loc) => {
+                        let mut capnp_loc = capnp_frame.reborrow().init_location();
+
+                        let mut filename_id = capnp_loc.reborrow().init_filename();
+                        filename_id.set_p1((loc.file_name >> 64) as u64);
+                        filename_id.set_p2(loc.file_name as u64);
+
+                        let mut func_name_id = capnp_loc.reborrow().init_function_name();
+                        func_name_id.set_p1((loc.function_name >> 64) as u64);
+                        func_name_id.set_p2(loc.function_name as u64);
+
+                        capnp_loc.set_line(loc.line);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -40,6 +70,31 @@ impl From<event::Reader<'_>> for Event {
             << 64)
             | ((val.get_correlation_id().expect("correlation_id").get_p2()) as u128);
 
+        let mut callstack = smallvec![];
+
+        let callstack_list = val.get_callstack().expect("callstack");
+
+        for frame in callstack_list {
+            match frame.which() {
+                Ok(call_frame::Location(Ok(loc))) => {
+                    let location = Location {
+                        file_name: ((loc.get_filename().expect("filename").get_p1() as u128) << 64)
+                            | (loc.get_filename().expect("filename").get_p2() as u128),
+                        function_name: ((loc.get_function_name().expect("function_name").get_p1()
+                            as u128)
+                            << 64)
+                            | (loc.get_function_name().expect("function_name").get_p2() as u128),
+                        line: loc.get_line(),
+                    };
+                    callstack.push(CallFrame::Location(location));
+                }
+                Ok(call_frame::Ip(ip)) => {
+                    callstack.push(CallFrame::IP(ip));
+                }
+                _ => unimplemented!(),
+            }
+        }
+
         Event {
             unique_id,
             correlation_id,
@@ -51,6 +106,7 @@ impl From<event::Reader<'_>> for Event {
             time_running: val.get_time_running(),
             value: val.get_value(),
             timestamp: val.get_timestamp(),
+            callstack,
         }
     }
 }

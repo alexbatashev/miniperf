@@ -154,6 +154,31 @@ impl EventDispatcher {
         id
     }
 
+    pub async fn string_id_async(&self, string: &str) -> u64 {
+        let id;
+
+        {
+            let strings = self.strings.upgradable_read();
+
+            if strings.contains_key(string) {
+                return *strings.get(string).unwrap();
+            }
+
+            {
+                let mut strings = RwLockUpgradableReadGuard::upgrade(strings);
+
+                id = strings.len() as u64;
+                strings.insert(string.to_string(), id);
+            }
+        }
+
+        if let Err(err) = self.string_tx.send((id, string.to_string())).await {
+            eprintln!("Lost string {} -> {}: {}", id, string, err);
+        }
+
+        id
+    }
+
     pub fn publish_event_sync(&self, evt: Event) {
         let pid = evt.process_id;
         if let Err(err) = self.events_tx.blocking_send(evt) {

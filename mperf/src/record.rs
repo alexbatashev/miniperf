@@ -1,18 +1,17 @@
 use anyhow::Result;
-use mperf_data::{Event, IPCMessage, RecordInfo};
+use mperf_data::{CallFrame, Event, IPCMessage, RecordInfo};
 use std::{
     fs::File,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::watch;
 
 use pmu::{Counter, Process};
 
-use crate::{
-    event_dispatcher::EventDispatcher,
-    utils::{counter_to_event_ty, create_ipc_server},
-    Scenario,
-};
+const SIZE_16MB: usize = 16 * 1024 * 1024;
+
+use crate::{event_dispatcher::EventDispatcher, utils::counter_to_event_ty, Scenario};
 
 pub async fn do_record(
     scenario: Scenario,
@@ -70,6 +69,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
 
     driver.start(move |sample| {
         let unique_id = dispatcher.unique_id();
+        let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
         let event = Event {
             unique_id,
             correlation_id: sample.event_id as u128,
@@ -81,6 +81,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
             time_running: sample.time_running,
             value: sample.value,
             timestamp: sample.time,
+            callstack,
         };
 
         dispatcher.publish_event_sync(event);
@@ -99,15 +100,13 @@ fn get_exe_dir() -> std::io::Result<PathBuf> {
 }
 
 async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> {
+    let pipe_name = format!(
+        "/{}{}",
+        command[0].split("/").last().unwrap(),
+        std::process::id()
+    );
+
     let roofline_dispatcher = dispatcher.clone();
-    let socket_path = create_ipc_server(move |message| match message {
-        IPCMessage::String(string) => {
-            roofline_dispatcher.string_id(&string.value);
-        }
-        IPCMessage::Event(event) => {
-            roofline_dispatcher.publish_event_sync(event);
-        }
-    });
 
     let exe_path = get_exe_dir()?.to_str().unwrap().to_string();
 
@@ -125,11 +124,13 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
     let process = Process::new(
         command,
         &[
-            ("MPERF_COLLECTOR_ADDR".to_string(), socket_path.clone()),
+            ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
             ("LD_LIBRARY_PATH".to_string(), ld_path.clone()),
             ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
         ],
     )?;
+
+    let rx = shmem::proc_channel::Receiver::<IPCMessage>::new(&pipe_name, SIZE_16MB)?;
 
     let driver = pmu::SamplingDriver::builder()
         .counters(&[
@@ -143,6 +144,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     driver.start(move |sample| {
         let unique_id = dispatcher.unique_id();
+        let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
         let event = Event {
             unique_id,
             correlation_id: sample.event_id as u128,
@@ -154,10 +156,45 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
             time_running: sample.time_running,
             value: sample.value,
             timestamp: sample.time,
+            callstack,
         };
 
         dispatcher.publish_event_sync(event);
     })?;
+
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_rx.changed() => {
+                    break;
+                }
+                Ok(message) = rx.recv() => {
+                    match message {
+                        IPCMessage::String(string) => {
+                            roofline_dispatcher.string_id_async(&string.value).await;
+                        }
+                        IPCMessage::Event(event) => {
+                            roofline_dispatcher.publish_event(event).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        while !rx.empty() {
+            if let Ok(message) = rx.recv_sync() {
+                match message {
+                    IPCMessage::String(string) => {
+                        roofline_dispatcher.string_id_async(&string.value).await;
+                    }
+                    IPCMessage::Event(event) => {
+                        roofline_dispatcher.publish_event(event).await;
+                    }
+                }
+            }
+        }
+    });
 
     process.cont();
     process.wait()?;
@@ -171,7 +208,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
     let process = Process::new(
         command,
         &[
-            ("MPERF_COLLECTOR_ADDR".to_string(), socket_path.clone()),
+            ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
             ("LD_LIBRARY_PATH".to_string(), ld_path),
             ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
             (
@@ -183,6 +220,10 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     process.cont();
     process.wait()?;
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
+    cancel_tx.send(true)?;
+    task.await?;
 
     Ok(())
 }

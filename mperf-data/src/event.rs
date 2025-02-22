@@ -2,6 +2,7 @@ use std::io::{BufRead, Write};
 
 use capnp::message::ReaderOptions;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::event_capnp;
 
@@ -42,8 +43,20 @@ pub enum EventType {
     RooflineLoopEnd,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Location {
+    pub function_name: u128,
+    pub file_name: u128,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum CallFrame {
+    Location(Location),
+    IP(u64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub unique_id: u128,
     pub correlation_id: u128,
@@ -55,6 +68,7 @@ pub struct Event {
     pub time_running: u64,
     pub value: u64,
     pub timestamp: u64,
+    pub callstack: SmallVec<[CallFrame; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
