@@ -33,10 +33,20 @@ impl Widget for HotspotsTab {
             .collect::<Row>()
             .height(1);
 
-        let rows = self.hotspots.read().iter().map(|h| {
-            let cols = [Cell::new(h.name.clone()), Cell::new("0"), Cell::new("0"), Cell::new("0")];
-            cols.into_iter().collect::<Row>() 
-        }).collect::<Vec<_>>();
+        let rows = self
+            .hotspots
+            .read()
+            .iter()
+            .map(|h| {
+                let cols = [
+                    Cell::new(h.name.clone()),
+                    Cell::new("0"),
+                    Cell::new("0"),
+                    Cell::new("0"),
+                ];
+                cols.into_iter().collect::<Row>()
+            })
+            .collect::<Vec<_>>();
 
         let t = Table::new(rows, [Constraint::Min(10)]).header(header);
 
@@ -93,7 +103,9 @@ impl HotspotsTab {
 
         let mut hotspots = self.hotspots.write();
         // hotspots.clear();
-        hotspots.push(Hotspot { name: "TEST".to_string() });
+        hotspots.push(Hotspot {
+            name: "TEST".to_string(),
+        });
         *self.is_running.write() = false;
     }
 }
