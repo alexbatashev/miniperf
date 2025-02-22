@@ -13,9 +13,6 @@ pmu = { path = "../pmu/" }
 lazy_static = "1.5.0"
 atomic-counter = "1.0.1"
 libc = "0.2.169"
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7.13", features = ["compat"] }
-capnp-rpc = "0.20.3"
-futures = "0.3.31"
 parking_lot = "0.12.3"
 smallvec = "1.13.2"
+shmem = { path = "../shmem/" }

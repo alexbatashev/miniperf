@@ -151,6 +151,17 @@ impl Semaphore {
 
         Ok(())
     }
+
+    pub fn counter(&self) -> Result<i32, std::io::Error> {
+        let mut res = 0;
+        unsafe {
+            if libc::sem_getvalue(self.sem, &mut res as *mut i32) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        Ok(res)
+    }
 }
 
 impl Drop for Semaphore {
@@ -165,3 +176,46 @@ impl Drop for Semaphore {
 
 unsafe impl Send for Shmem {}
 unsafe impl Send for Semaphore {}
+
+#[cfg(test)]
+mod tests {
+    use super::{Semaphore, Shmem};
+
+    #[test]
+    fn shmem_updates() {
+        let name = format!("/shmem_updates_{}", std::process::id());
+        let shmem1 = Shmem::create(&name, 32).expect("failed to create shmem");
+        let shmem2 = Shmem::open(&name, 32).expect("failed to open shmem");
+
+        unsafe {
+            *(shmem1.as_mut_ptr() as *mut i32) = 42;
+        };
+
+        let result = unsafe { *(shmem2.as_ptr() as *const i32) };
+
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn shared_semaphores() {
+        let name = format!("/shared_semaphores_{}", std::process::id());
+        let shmem1 = Shmem::create(&name, 32).expect("failed to create shmem");
+        let shmem2 = Shmem::open(&name, 32).expect("failed to open shmem");
+
+        let semaphore1 =
+            Semaphore::create(shmem1.as_mut_ptr()).expect("failed to create a semaphore");
+
+        semaphore1.post().expect("failed to post a semaphore");
+
+        assert_eq!(semaphore1.counter().unwrap(), 1);
+
+        let semaphore2 =
+            Semaphore::from_raw_ptr(shmem2.as_mut_ptr()).expect("failed to open a semaphore");
+
+        assert_eq!(semaphore2.counter().unwrap(), 1);
+
+        assert!(semaphore2.wait().is_ok());
+        assert_eq!(semaphore2.counter().unwrap(), 0);
+        assert_eq!(semaphore1.counter().unwrap(), 0);
+    }
+}

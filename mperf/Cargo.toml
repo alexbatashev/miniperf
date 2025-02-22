@@ -20,13 +20,12 @@ ratatui = "0.29.0"
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.13"
-futures = "0.3.31"
 memmap2 = "0.9.5"
 serde-jsonlines = "0.7.0"
 thread_local = "1.1.8"
 libc = "0.2.169"
-capnp-rpc = "0.20.3"
 smallvec = "1.13.2"
+shmem = { path = "../shmem/" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 addr2line = "0.24.2"
