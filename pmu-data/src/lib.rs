@@ -21,6 +21,8 @@ pub const INTEL_RAPTORLAKE: &str = "raptorlake";
 
 pub const SIFIVE_U7: &str = "sifive_u7";
 
+pub const SPACEMIT_X60: &str = "spacemit_x60";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlatformDesc {
     pub family_id: String,

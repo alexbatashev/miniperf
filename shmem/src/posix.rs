@@ -92,7 +92,7 @@ impl Drop for Shmem {
         }
         if self.is_owning {
             unsafe {
-                let name = self.name.as_str().as_ptr() as *const i8;
+                let name = self.name.as_str().as_ptr() as *const libc::c_char;
                 shm_unlink(name);
             }
         }

@@ -96,11 +96,11 @@ pub fn get_host_cpu_family() -> &'static str {
 
     match marchid {
         Some(marchid) => {
-            if marchid == "0x8000000000000007" {
-                // TODO(Alex): technically speaking this also includes E7 and S7
-                pmu_data::SIFIVE_U7
-            } else {
-                "unknown"
+            match marchid.as_str() {
+                // FIXME: technically speaking this also includes E7 and S7
+                "0x8000000000000007" => pmu_data::SIFIVE_U7,
+                "0x8000000058000001" => pmu_data::SPACEMIT_X60,
+                _ => "unknown",
             }
         }
         None => "unknown",
