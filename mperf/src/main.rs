@@ -1,4 +1,5 @@
 mod event_dispatcher;
+mod events_export;
 mod processing;
 mod record;
 mod stat;
@@ -13,6 +14,7 @@ use std::{
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use events_export::do_events_export;
 use mperf_data::Scenario;
 use record::do_record;
 use stat::do_stat;
@@ -41,6 +43,9 @@ enum Commands {
         command: Vec<String>,
     },
     Show {
+        result_directory: String,
+    },
+    EventsExport {
         result_directory: String,
     },
 }
@@ -81,6 +86,10 @@ async fn main() -> Result<()> {
         Commands::Show { result_directory } => {
             let path = Path::new(&result_directory);
             return tui::tui_main(path).await;
+        }
+        Commands::EventsExport { result_directory } => {
+            let path = Path::new(&result_directory);
+            do_events_export(path);
         }
     }
 

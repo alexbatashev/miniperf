@@ -13,7 +13,7 @@ use num_format::{Locale, ToFormattedString};
 use parking_lot::RwLock;
 use ratatui::{
     layout::{Constraint, Layout},
-    style::{Style, Stylize},
+    style::{palette, Style, Stylize},
     text::Line,
     widgets::{Block, Gauge, Row, Table, Tabs, Widget},
     DefaultTerminal, Frame,
@@ -102,9 +102,17 @@ impl Widget for &TabsWidget {
         if read_tabs.len() == 0 {
             return;
         }
+
+        let highlight_style = (
+            ratatui::style::Color::default(),
+            palette::tailwind::EMERALD.c700,
+        );
+
         let tabs = Tabs::new(read_tabs.iter().map(|t| t.name()))
             .style(Style::default().white())
-            .highlight_style(Style::default().yellow())
+            .highlight_style(highlight_style)
+            .divider(ratatui::symbols::DOT)
+            .padding(" ", " ")
             .select(self.cur_tab);
 
         tabs.render(area, buf);
@@ -186,10 +194,7 @@ impl TabsWidget {
         match info.scenario {
             Scenario::Snapshot => {
                 write_tabs.push(Tab::Summary(SummaryTab::new(res_dir.clone(), info.clone())));
-                write_tabs.push(Tab::Hotspots(HotspotsTab::new(
-                    res_dir.clone(),
-                    info.clone(),
-                )));
+                write_tabs.push(Tab::Hotspots(HotspotsTab::new(res_dir.clone())));
             }
             _ => unimplemented!(),
         }

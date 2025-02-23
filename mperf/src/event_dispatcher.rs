@@ -8,7 +8,6 @@ use mperf_data::{Event, IString, ProcMap, ProcMapEntry};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use proc_maps::{get_process_maps, Pid};
 use thread_local::ThreadLocal;
-use tokio::sync::watch;
 use tokio::{
     sync::mpsc::{self, Sender},
     task::JoinHandle,
@@ -24,7 +23,6 @@ pub struct EventDispatcher {
 }
 
 pub struct DispatcherJoinHandle {
-    token: watch::Sender<bool>,
     events_worker: JoinHandle<()>,
     string_worker: JoinHandle<()>,
     proc_map_worker: JoinHandle<()>,
@@ -36,73 +34,63 @@ impl EventDispatcher {
         let (string_tx, mut string_rx) = mpsc::channel(8192);
         let (proc_map_tx, mut proc_map_rx) = mpsc::channel::<u32>(8192);
 
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-
-        let mut events_token = cancel_rx.clone();
         let events_out_dir = output_directory.to_owned();
         let events_worker = tokio::spawn(async move {
             let mut events_file = std::io::BufWriter::new(
                 std::fs::File::create(events_out_dir.join("events.bin"))
                     .expect("event file stream creation"),
             );
-            loop {
-                tokio::select! {
-                    _ = events_token.changed() => {
-                        break;
-                    }
-                    Some(event) = event_rx.recv() => {
-                        let result = event.write_binary(&mut events_file);
-                        if result.is_err() {
-                            eprintln!("Failed to write data for event id {}", event.unique_id);
-                        }
-                    }
+            while let Some(event) = event_rx.recv().await {
+                let result = event.write_binary(&mut events_file);
+                if result.is_err() {
+                    eprintln!("Failed to write data for event id {}", event.unique_id);
                 }
             }
         });
 
-        let mut string_token = cancel_rx.clone();
         let string_out_dir = output_directory.to_owned();
         let string_worker = tokio::spawn(async move {
             let mut strings_file =
                 std::fs::File::create(string_out_dir.join("strings.jsonl")).expect("strings");
 
-            loop {
-                tokio::select! {
-                    _ = string_token.changed() => {
-                        break;
-                    }
-                    Some((id, value)) = string_rx.recv() => {
-                        let string = IString{id, value};
-                        serde_json::to_writer(&mut strings_file, &string).expect("fail");
-                        writeln!(&mut strings_file).expect("fail");
-                    }
-                }
+            while let Some((id, value)) = string_rx.recv().await {
+                let string = IString { id, value };
+                let stringified = serde_json::to_string(&string).expect("fail");
+                writeln!(&mut strings_file, "{}", stringified).expect("fail");
             }
         });
 
-        let mut proc_map_token = cancel_rx.clone();
         let proc_map_out_dir = output_directory.to_owned();
         let proc_map_worker = tokio::spawn(async move {
-            let mut map_file =
-                std::fs::File::create(proc_map_out_dir.join("proc_map.jsonl")).expect("proc map");
-            loop {
-                tokio::select! {
-                    _ = proc_map_token.changed() => {
-                        break;
-                    }
-                    Some(pid) = proc_map_rx.recv() => {
-                        let maps = get_process_maps(pid as Pid).expect("get proc maps");
-                        let proc_map_entries = maps.iter().map(|m| ProcMapEntry {
-                            filename: m.filename().map(|p| p.to_str().unwrap_or("unknown").to_owned()).unwrap_or("unknown".to_string()),
+            let mut proc_map_entries = HashMap::<u32, Vec<ProcMapEntry>>::new();
+            while let Some(pid) = proc_map_rx.recv().await {
+                if let Ok(maps) = get_process_maps(pid as Pid) {
+                    let pm = maps
+                        .iter()
+                        .map(|m| ProcMapEntry {
+                            filename: m
+                                .filename()
+                                .map(|p| p.to_str().unwrap_or("unknown").to_owned())
+                                .unwrap_or("unknown".to_string()),
                             address: m.start(),
                             size: m.size(),
-                        }).collect();
-
-                        let proc_map = ProcMap {pid, entries: proc_map_entries};
-                        serde_json::to_writer(&mut map_file, &proc_map).expect("fail");
+                        })
+                        .collect::<Vec<ProcMapEntry>>();
+                    if !proc_map_entries.contains_key(&pid)
+                        || proc_map_entries.get(&pid).unwrap().len() < pm.len()
+                    {
+                        proc_map_entries.insert(pid, pm);
                     }
                 }
             }
+
+            let proc_map = proc_map_entries
+                .into_iter()
+                .map(ProcMap::new)
+                .collect::<Vec<_>>();
+            let mut map_file =
+                std::fs::File::create(proc_map_out_dir.join("proc_map.json")).expect("proc map");
+            serde_json::to_writer(&mut map_file, &proc_map).expect("failed to write proc maps");
         });
 
         (
@@ -115,7 +103,6 @@ impl EventDispatcher {
                 proc_map_tx,
             }),
             DispatcherJoinHandle {
-                token: cancel_tx,
                 events_worker,
                 string_worker,
                 proc_map_worker,
@@ -189,16 +176,16 @@ impl EventDispatcher {
             return;
         }
 
-        let pids = self.proc_maps.upgradable_read();
-        if pids.contains(&pid) {
-            return;
-        }
-
-        {
-            let mut pids = RwLockUpgradableReadGuard::upgrade(pids);
-
-            pids.insert(pid);
-        }
+        // let pids = self.proc_maps.upgradable_read();
+        // if pids.contains(&pid) {
+        //     return;
+        // }
+        //
+        // {
+        //     let mut pids = RwLockUpgradableReadGuard::upgrade(pids);
+        //
+        //     pids.insert(pid);
+        // }
 
         if let Err(err) = self.proc_map_tx.blocking_send(pid) {
             eprintln!("lost process map for pid '{}': {:?}", pid, err);
@@ -215,18 +202,18 @@ impl EventDispatcher {
             return;
         }
 
-        {
-            let pids = self.proc_maps.upgradable_read();
-            if pids.contains(&pid) {
-                return;
-            }
-
-            {
-                let mut pids = RwLockUpgradableReadGuard::upgrade(pids);
-
-                pids.insert(pid);
-            }
-        }
+        // {
+        //     let pids = self.proc_maps.upgradable_read();
+        //     if pids.contains(&pid) {
+        //         return;
+        //     }
+        //
+        //     {
+        //         let mut pids = RwLockUpgradableReadGuard::upgrade(pids);
+        //
+        //         pids.insert(pid);
+        //     }
+        // }
 
         if let Err(err) = self.proc_map_tx.send(pid).await {
             eprintln!("lost process map for pid '{}': {:?}", pid, err);
@@ -236,7 +223,6 @@ impl EventDispatcher {
 
 impl DispatcherJoinHandle {
     pub async fn join(self) {
-        let _ = self.token.send(true);
         let _ = tokio::join!(self.events_worker, self.string_worker, self.proc_map_worker);
     }
 }

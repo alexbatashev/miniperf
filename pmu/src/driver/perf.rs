@@ -326,14 +326,6 @@ impl SamplingDriver {
                                 let (_next_ptr, callstack) =
                                     SampleFormat::read_callchain(current_ptr);
 
-                                // let format = &*(base.add(offset % (page_size * mmap_pages))
-                                //     as *const SampleFormat);
-                                //
-                                // let values = std::slice::from_raw_parts(
-                                //     format.read.values.as_ptr(),
-                                //     format.read.nr as usize,
-                                // );
-
                                 let value = &values[0];
 
                                 let handle = native_handles
@@ -351,7 +343,7 @@ impl SamplingDriver {
                                     time_running: format.read.time_running,
                                     counter: handle.kind.clone(),
                                     value: value.value,
-                                    callstack,
+                                    callstack: callstack[1..].to_smallvec(),
                                 };
 
                                 callback(sample);
