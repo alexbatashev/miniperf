@@ -66,7 +66,6 @@ struct Event {
   timeRunning @7 : UInt64;
   timestamp @8 : UInt64;
   value @9 : UInt64;
-  ip @10 : UInt64;
-  callstack @11 : List(CallFrame);
-  metadata @12 : List(Metadata);
+  callstack @10 : List(CallFrame);
+  metadata @11 : List(Metadata);
 }

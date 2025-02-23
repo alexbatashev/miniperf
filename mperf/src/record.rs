@@ -87,7 +87,6 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
             time_running: sample.time_running,
             value: sample.value,
             timestamp: sample.time,
-            ip: sample.ip,
             callstack,
         };
 
@@ -163,7 +162,6 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
             time_running: sample.time_running,
             value: sample.value,
             timestamp: sample.time,
-            ip: sample.ip,
             callstack,
         };
 

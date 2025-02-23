@@ -68,7 +68,6 @@ pub struct Event {
     pub time_running: u64,
     pub value: u64,
     pub timestamp: u64,
-    pub ip: u64,
     pub callstack: SmallVec<[CallFrame; 32]>,
 }
 

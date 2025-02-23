@@ -32,7 +32,6 @@ impl event::Builder<'_> {
         self.reborrow().set_time_running(event.time_running);
         self.reborrow().set_timestamp(event.timestamp);
         self.reborrow().set_value(event.value);
-        self.reborrow().set_ip(event.ip);
 
         if !event.callstack.is_empty() {
             let mut root = self.reborrow().init_callstack(event.callstack.len() as u32);
@@ -107,7 +106,6 @@ impl From<event::Reader<'_>> for Event {
             time_running: val.get_time_running(),
             value: val.get_value(),
             timestamp: val.get_timestamp(),
-            ip: val.get_ip(),
             callstack,
         }
     }

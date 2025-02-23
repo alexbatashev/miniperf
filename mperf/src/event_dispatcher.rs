@@ -176,17 +176,7 @@ impl EventDispatcher {
             return;
         }
 
-        // let pids = self.proc_maps.upgradable_read();
-        // if pids.contains(&pid) {
-        //     return;
-        // }
-        //
-        // {
-        //     let mut pids = RwLockUpgradableReadGuard::upgrade(pids);
-        //
-        //     pids.insert(pid);
-        // }
-
+        // FIXME figure out a way to limit traffic here
         if let Err(err) = self.proc_map_tx.blocking_send(pid) {
             eprintln!("lost process map for pid '{}': {:?}", pid, err);
         }
@@ -202,19 +192,7 @@ impl EventDispatcher {
             return;
         }
 
-        // {
-        //     let pids = self.proc_maps.upgradable_read();
-        //     if pids.contains(&pid) {
-        //         return;
-        //     }
-        //
-        //     {
-        //         let mut pids = RwLockUpgradableReadGuard::upgrade(pids);
-        //
-        //         pids.insert(pid);
-        //     }
-        // }
-
+        // FIXME figure out a way to limit traffic here
         if let Err(err) = self.proc_map_tx.send(pid).await {
             eprintln!("lost process map for pid '{}': {:?}", pid, err);
         }
