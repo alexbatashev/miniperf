@@ -1,0 +1,842 @@
+{
+  "family_id": "spacemit_x60",
+  "name": "SpacemiT K1/M1",
+  "vendor": "SpacemiT",
+  "arch": "riscv64",
+  "aliases": [
+    {
+      "target": "cycles",
+      "origin": "u_mode_cycle"
+    },
+    {
+      "target": "cache_references",
+      "origin": "l2_access"
+    },
+    {
+      "target": "cache_misses",
+      "origin": "l2_miss"
+    }
+  ],
+  "events": [
+    {
+      "name": "alu_inst",
+      "desc": "ALU (integer) instructions",
+      "code": "0x24"
+    },
+    {
+      "name": "mult_inst",
+      "desc": "Multiplication instructions",
+      "code": "0x25"
+    },
+    {
+      "name": "div_inst",
+      "desc": "Division instructions",
+      "code": "0x26"
+    },
+    {
+      "name": "vector_div_inst",
+      "desc": "Vector division instructions",
+      "code": "0x27"
+    },
+    {
+      "name": "fp_div_inst",
+      "desc": "Floating-point division instructions",
+      "code": "0x28"
+    },
+    {
+      "name": "csr_inst",
+      "desc": "CSR instructions",
+      "code": "0x29"
+    },
+    {
+      "name": "ecall_inst",
+      "desc": "ECALL instructions",
+      "code": "0x2a"
+    },
+    {
+      "name": "fp_inst",
+      "desc": "Floating-point instructions",
+      "code": "0x2b"
+    },
+    {
+      "name": "store_inst",
+      "desc": "Store instructions",
+      "code": "0x2c"
+    },
+    {
+      "name": "load_inst",
+      "desc": "Load instructions",
+      "code": "0x2d"
+    },
+    {
+      "name": "unaligned_load_inst",
+      "desc": "Unaligned load instructions",
+      "code": "0x2e"
+    },
+    {
+      "name": "unaligned_store_inst",
+      "desc": "Unaligned store instructions",
+      "code": "0x2f"
+    },
+    {
+      "name": "atomic_inst",
+      "desc": "Atomic instructions",
+      "code": "0x30"
+    },
+    {
+      "name": "lr_inst",
+      "desc": "LR instructions",
+      "code": "0x31"
+    },
+    {
+      "name": "sc_inst",
+      "desc": "SC instructions",
+      "code": "0x32"
+    },
+    {
+      "name": "amo_inst",
+      "desc": "AMO instructions",
+      "code": "0x33"
+    },
+    {
+      "name": "fence_inst",
+      "desc": "FENCE instructions",
+      "code": "0x34"
+    },
+    {
+      "name": "failed_sc_inst",
+      "desc": "Failed SC instructions",
+      "code": "0x35"
+    },
+    {
+      "name": "bus_fence_inst",
+      "desc": "Bus FENCE instructions",
+      "code": "0x36"
+    },
+    {
+      "name": "fp_load_inst",
+      "desc": "Floating-point load instructions",
+      "code": "0x37"
+    },
+    {
+      "name": "fp_store_inst",
+      "desc": "Floating-point store instructions",
+      "code": "0x38"
+    },
+    {
+      "name": "vector_load_inst",
+      "desc": "Vector load instructions",
+      "code": "0x39"
+    },
+    {
+      "name": "vector_store_inst",
+      "desc": "Vector store instructions",
+      "code": "0x3a"
+    },
+    {
+      "name": "vector_inst",
+      "desc": "Vector instructions",
+      "code": "0x3b"
+    },
+    {
+      "name": "stalled_cycle_frontend",
+      "desc": "Stalled cycles frontend",
+      "code": "0x3"
+    },
+    {
+      "name": "stalled_cycle_backend",
+      "desc": "Stalled cycles backend",
+      "code": "0x4"
+    },
+    {
+      "name": "m_mode_cycle",
+      "desc": "M-mode cycles",
+      "code": "0x20"
+    },
+    {
+      "name": "s_mode_cycle",
+      "desc": "S-mode cycles",
+      "code": "0x21"
+    },
+    {
+      "name": "u_mode_cycle",
+      "desc": "U-mode cycles",
+      "code": "0x22"
+    },
+    {
+      "name": "pipeline_flush",
+      "desc": "Pipeline flushes",
+      "code": "0x3f"
+    },
+    {
+      "name": "interrupt",
+      "desc": "Interrupts",
+      "code": "0x40"
+    },
+    {
+      "name": "exception",
+      "desc": "Exceptions",
+      "code": "0x41"
+    },
+    {
+      "name": "ifu_btb_miss",
+      "desc": "IFU (Instruction Fetch Unit) BTB misses",
+      "code": "0x43"
+    },
+    {
+      "name": "ifu_btb_access",
+      "desc": "IFU (Instruction Fetch Unit) BTB accesses",
+      "code": "0x44"
+    },
+    {
+      "name": "ecc_interrupt",
+      "desc": "ECC interrupts",
+      "code": "0x4b"
+    },
+    {
+      "name": "async_abort",
+      "desc": "Asynchronous aborts",
+      "code": "0x4c"
+    },
+    {
+      "name": "issued_inst",
+      "desc": "Issued instructions",
+      "code": "0x4d"
+    },
+    {
+      "name": "if_stall",
+      "desc": "IF stalls",
+      "code": "0x4e"
+    },
+    {
+      "name": "if_mmu_stall",
+      "desc": "IF-MMU stalls",
+      "code": "0x4f"
+    },
+    {
+      "name": "if_refill_stall",
+      "desc": "IF-refill stalls",
+      "code": "0x50"
+    },
+    {
+      "name": "ip_stall",
+      "desc": "IP stalls",
+      "code": "0x51"
+    },
+    {
+      "name": "ib_stall",
+      "desc": "IB stalls",
+      "code": "0x52"
+    },
+    {
+      "name": "ib_vsetvl_stall",
+      "desc": "IB vsetvl stalls",
+      "code": "0x53"
+    },
+    {
+      "name": "ib_fifo_stall",
+      "desc": "IB FIFO stalls",
+      "code": "0x54"
+    },
+    {
+      "name": "ib_mispred_stall",
+      "desc": "IB misprediction stalls",
+      "code": "0x55"
+    },
+    {
+      "name": "ib_ind_btd_stall",
+      "desc": "IB IND BTB stalls",
+      "code": "0x56"
+    },
+    {
+      "name": "iq_full",
+      "desc": "IQ fulls",
+      "code": "0x57"
+    },
+    {
+      "name": "id_stall",
+      "desc": "ID stalls",
+      "code": "0x58"
+    },
+    {
+      "name": "id_inst_pipedown",
+      "desc": "ID instruction pipedowns",
+      "code": "0x59"
+    },
+    {
+      "name": "id_one_inst_pipedown",
+      "desc": "ID one instruction pipedowns",
+      "code": "0x5a"
+    },
+    {
+      "name": "id_flush_stall",
+      "desc": "ID flush stalls",
+      "code": "0x5b"
+    },
+    {
+      "name": "id_vsetvl_fof_stall",
+      "desc": " ",
+      "code": "0x5c"
+    },
+    {
+      "name": "id_iid_not_vld_stall",
+      "desc": " ",
+      "code": "0x5d"
+    },
+    {
+      "name": "id_csr_bef_fence_stall",
+      "desc": " ",
+      "code": "0x5e"
+    },
+    {
+      "name": "id_mispred_stall",
+      "desc": "ID misprediction stalls",
+      "code": "0x5f"
+    },
+    {
+      "name": "rf_stall",
+      "desc": "RF stalls",
+      "code": "0x60"
+    },
+    {
+      "name": "rf_inst_pipedown",
+      "desc": "RF instruction pipedowns",
+      "code": "0x61"
+    },
+    {
+      "name": "rf_one_inst_pipedown",
+      "desc": "RF one instruction pipedowns",
+      "code": "0x62"
+    },
+    {
+      "name": "rf_waw_stall",
+      "desc": "RF WAW stalls",
+      "code": "0x63"
+    },
+    {
+      "name": "rf_raw_stall",
+      "desc": "RF RAW stalls",
+      "code": "0x64"
+    },
+    {
+      "name": "rf_csr_aft_fence_stall",
+      "desc": " ",
+      "code": "0x65"
+    },
+    {
+      "name": "rf_structure_stall",
+      "desc": " ",
+      "code": "0x66"
+    },
+    {
+      "name": "eu_stall",
+      "desc": "EU (Execution Unit) stalls",
+      "code": "0x67"
+    },
+    {
+      "name": "eu_iu_full",
+      "desc": "EU IU (Integer Unit) fulls",
+      "code": "0x68"
+    },
+    {
+      "name": "eu_iu_control_full",
+      "desc": "EU IU (Integer Unit) control fulls",
+      "code": "0x69"
+    },
+    {
+      "name": "eu_bju_full",
+      "desc": "EU BJU (Branch and Jump Unit) fulls",
+      "code": "0x6a"
+    },
+    {
+      "name": "eu_lsu_load_full",
+      "desc": "EU LSU (Load and Store Unit) load fulls",
+      "code": "0x6b"
+    },
+    {
+      "name": "eu_lsu_store_full",
+      "desc": "EU LSU (Load and Store Unit) store fulls",
+      "code": "0x6c"
+    },
+    {
+      "name": "eu_cp0_full",
+      "desc": "EU CP0 (Coprocessor 0) fulls",
+      "code": "0x6d"
+    },
+    {
+      "name": "eu_vfpu_full",
+      "desc": "EU VFPU (Vector and Floating-point Processing Unit)",
+      "code": "0x6e"
+    },
+    {
+      "name": "iu_dp_stall_pipe0",
+      "desc": " ",
+      "code": "0x6f"
+    },
+    {
+      "name": "iu_mult_stall_pipe0",
+      "desc": " ",
+      "code": "0x70"
+    },
+    {
+      "name": "iu_div_ex1_stall_pipe0",
+      "desc": " ",
+      "code": "0x71"
+    },
+    {
+      "name": "iu_dp_pipe_stall_pipe1",
+      "desc": " ",
+      "code": "0x72"
+    },
+    {
+      "name": "iu_mult_stall_pipe1",
+      "desc": " ",
+      "code": "0x73"
+    },
+    {
+      "name": "iu_div_ex1_stall_pipe1",
+      "desc": " ",
+      "code": "0x74"
+    },
+    {
+      "name": "iu_dp_uncommit_pipe0",
+      "desc": " ",
+      "code": "0x75"
+    },
+    {
+      "name": "iu_dp_wb_conflict_pipe0",
+      "desc": " ",
+      "code": "0x76"
+    },
+    {
+      "name": "iu_dp_waw_stall_pipe0",
+      "desc": " ",
+      "code": "0x77"
+    },
+    {
+      "name": "iu_dp_uncommit_pipe1",
+      "desc": " ",
+      "code": "0x78"
+    },
+    {
+      "name": "iu_dp_wb_conflict_pipe1",
+      "desc": " ",
+      "code": "0x79"
+    },
+    {
+      "name": "iu_dp_waw_stall_pipe1",
+      "desc": " ",
+      "code": "0x7a"
+    },
+    {
+      "name": "iu_mult_wb_stall",
+      "desc": " ",
+      "code": "0x7b"
+    },
+    {
+      "name": "iu_mult_uncommit",
+      "desc": " ",
+      "code": "0x7c"
+    },
+    {
+      "name": "iu_div_wb_stall",
+      "desc": " ",
+      "code": "0x7d"
+    },
+    {
+      "name": "iu_div_uncommit",
+      "desc": " ",
+      "code": "0x7e"
+    },
+    {
+      "name": "mult_inner_forward",
+      "desc": " ",
+      "code": "0x7f"
+    },
+    {
+      "name": "div_buffer_hit",
+      "desc": " ",
+      "code": "0x80"
+    },
+    {
+      "name": "vpu_stall_pipe0",
+      "desc": "VPU (Vector Processing Unit) pipe0 stalls",
+      "code": "0x81"
+    },
+    {
+      "name": "vpu_stall_pipe1",
+      "desc": "VPU (Vector Processing Unit) pipe1 stalls",
+      "code": "0x82"
+    },
+    {
+      "name": "vpu_hazard_stall_pipe0",
+      "desc": " ",
+      "code": "0x83"
+    },
+    {
+      "name": "vpu_uncommit_stall_pipe0",
+      "desc": " ",
+      "code": "0x84"
+    },
+    {
+      "name": "vpu_vlsu_stall_pipe0",
+      "desc": " ",
+      "code": "0x85"
+    },
+    {
+      "name": "vpu_hazard_stall_pipe1",
+      "desc": " ",
+      "code": "0x86"
+    },
+    {
+      "name": "vpu_uncommit_stall_pipe1",
+      "desc": " ",
+      "code": "0x87"
+    },
+    {
+      "name": "vpu_vlsu_stall_pipe1",
+      "desc": " ",
+      "code": "0x88"
+    },
+    {
+      "name": "vpu_div_busy",
+      "desc": " ",
+      "code": "0x89"
+    },
+    {
+      "name": "bju_cp0_stall",
+      "desc": " ",
+      "code": "0x8a"
+    },
+    {
+      "name": "bju_ibuf_stall",
+      "desc": " ",
+      "code": "0x8b"
+    },
+    {
+      "name": "bju_wb_stall",
+      "desc": " ",
+      "code": "0x8c"
+    },
+    {
+      "name": "bju_pipedown",
+      "desc": " ",
+      "code": "0x8d"
+    },
+    {
+      "name": "vidu_vec0_stall",
+      "desc": " ",
+      "code": "0x8e"
+    },
+    {
+      "name": "vidu_vec1_stall",
+      "desc": " ",
+      "code": "0x8f"
+    },
+    {
+      "name": "vidu_vec0_depend_stall",
+      "desc": " ",
+      "code": "0x90"
+    },
+    {
+      "name": "vidu_vec0_struct_hazard_stall",
+      "desc": " ",
+      "code": "0x91"
+    },
+    {
+      "name": "vidu_vec1_depend_stall",
+      "desc": " ",
+      "code": "0x92"
+    },
+    {
+      "name": "vidu_vec1_struct_hazard_stall",
+      "desc": " ",
+      "code": "0x93"
+    },
+    {
+      "name": "vidu_total_cycle",
+      "desc": " ",
+      "code": "0x94"
+    },
+    {
+      "name": "vidu_vec0_cycle",
+      "desc": " ",
+      "code": "0x95"
+    },
+    {
+      "name": "vidu_vec1_cycle",
+      "desc": " ",
+      "code": "0x96"
+    },
+    {
+      "name": "vector_micro_op",
+      "desc": " ",
+      "code": "0x97"
+    },
+    {
+      "name": "rtu_flush_cycle",
+      "desc": " ",
+      "code": "0x98"
+    },
+    {
+      "name": "rtu_only_iu_not_no_op",
+      "desc": " ",
+      "code": "0x99"
+    },
+    {
+      "name": "rtu_only_bju_not_no_op",
+      "desc": " ",
+      "code": "0x9a"
+    },
+    {
+      "name": "rtu_only_cp0_not_no_op",
+      "desc": " ",
+      "code": "0x9b"
+    },
+    {
+      "name": "rtu_only_lsu_not_no_op",
+      "desc": " ",
+      "code": "0x9c"
+    },
+    {
+      "name": "rtu_only_vfpu_not_no_op",
+      "desc": " ",
+      "code": "0x9d"
+    },
+    {
+      "name": "rtu_iu_not_no_op",
+      "desc": " ",
+      "code": "0x9e"
+    },
+    {
+      "name": "rtu_bju_not_no_op",
+      "desc": " ",
+      "code": "0x9f"
+    },
+    {
+      "name": "rtu_cp0_not_no_op",
+      "desc": " ",
+      "code": "0xa0"
+    },
+    {
+      "name": "rtu_lsu_not_no_op",
+      "desc": " ",
+      "code": "0xa1"
+    },
+    {
+      "name": "rtu_vfpu_not_no_op",
+      "desc": " ",
+      "code": "0xa2"
+    },
+    {
+      "name": "lsu_fence_stall",
+      "desc": " ",
+      "code": "0xa4"
+    },
+    {
+      "name": "lsu_load_waw_stall",
+      "desc": " ",
+      "code": "0xa5"
+    },
+    {
+      "name": "lsu_load_commit_stall",
+      "desc": " ",
+      "code": "0xa6"
+    },
+    {
+      "name": "lsu_load_raw_stall",
+      "desc": " ",
+      "code": "0xa7"
+    },
+    {
+      "name": "lsu_store_commit_stall",
+      "desc": " ",
+      "code": "0xa8"
+    },
+    {
+      "name": "vidu_rf_no_pipedown",
+      "desc": " ",
+      "code": "0xa9"
+    },
+    {
+      "name": "l1d_load_miss",
+      "desc": "L1 D-cache load misses",
+      "code": "0x5"
+    },
+    {
+      "name": "l1d_load_access",
+      "desc": "L1 D-cache load accesses",
+      "code": "0x6"
+    },
+    {
+      "name": "l1d_store_miss",
+      "desc": "L1 D-cache store misses",
+      "code": "0x9"
+    },
+    {
+      "name": "l1d_store_access",
+      "desc": "L1 D-cache store accesses",
+      "code": "0xa"
+    },
+    {
+      "name": "l1i_load_miss",
+      "desc": "L1 I-cache load misses",
+      "code": "0xb"
+    },
+    {
+      "name": "l1i_load_access",
+      "desc": "L1 I-cache load accesses",
+      "code": "0xc"
+    },
+    {
+      "name": "l1i_prefetch_miss",
+      "desc": "L1 I-cache prefetch misses",
+      "code": "0xd"
+    },
+    {
+      "name": "l1i_prefetch",
+      "desc": "L1 I-cache prefetches",
+      "code": "0xe"
+    },
+    {
+      "name": "dtlb_load_miss",
+      "desc": "DTLB load misses",
+      "code": "0x15"
+    },
+    {
+      "name": "dtlb_store_miss",
+      "desc": "DTLB store misses",
+      "code": "0x19"
+    },
+    {
+      "name": "itlb_load_miss",
+      "desc": "ITLB load misses",
+      "code": "0x1b"
+    },
+    {
+      "name": "jtlb_miss",
+      "desc": "JTLB misses",
+      "code": "0xa3"
+    },
+    {
+      "name": "l1d_access",
+      "desc": "L1 D-cache accesses",
+      "code": "0xaa"
+    },
+    {
+      "name": "l1d_miss",
+      "desc": "L1 D-cache misses",
+      "code": "0xab"
+    },
+    {
+      "name": "l1d_excl_evict",
+      "desc": "L1 D-cache exclusive evictions to L2",
+      "code": "0xac"
+    },
+    {
+      "name": "l1d_amr_active",
+      "desc": "L1 D-cache AMR actives",
+      "code": "0xad"
+    },
+    {
+      "name": "l1d_prefetch_refill",
+      "desc": "L1 D-cache prefetch refills",
+      "code": "0xae"
+    },
+    {
+      "name": "l1d_prefetch_hit",
+      "desc": "L1 D-cache prefetch hits",
+      "code": "0xaf"
+    },
+    {
+      "name": "l2_access",
+      "desc": "L2 cache accesses",
+      "code": "0xb8"
+    },
+    {
+      "name": "l2_miss",
+      "desc": "L2 cache misses",
+      "code": "0xb9"
+    },
+    {
+      "name": "l2_load_access",
+      "desc": "L2 cache load accesses",
+      "code": "0xba"
+    },
+    {
+      "name": "l2_load_stall",
+      "desc": "L2 cache load stalls",
+      "code": "0xbb"
+    },
+    {
+      "name": "l2_store_access",
+      "desc": "L2 cache store accesses",
+      "code": "0xbc"
+    },
+    {
+      "name": "l2_store_stall",
+      "desc": "L2 cache store stalls",
+      "code": "0xbd"
+    },
+    {
+      "name": "cond_br_inst",
+      "desc": "Conditional branch instructions",
+      "code": "0x1"
+    },
+    {
+      "name": "cond_br_mispred",
+      "desc": "Conditional branch mispredictions",
+      "code": "0x2"
+    },
+    {
+      "name": "br_inst",
+      "desc": "Branch instructions",
+      "code": "0x3c"
+    },
+    {
+      "name": "uncond_br_inst",
+      "desc": "Unconditional branch instructions",
+      "code": "0x3d"
+    },
+    {
+      "name": "indirect_br_inst",
+      "desc": "Indirect branch instructions",
+      "code": "0x3e"
+    },
+    {
+      "name": "indirect_br_mispred",
+      "desc": "Indirect branch mispredictions",
+      "code": "0x42"
+    },
+    {
+      "name": "br_mispred",
+      "desc": "Branch mispredictions",
+      "code": "0x45"
+    },
+    {
+      "name": "uncond_br_mispred",
+      "desc": "Unconditional branch mispredictions",
+      "code": "0x46"
+    },
+    {
+      "name": "taken_br_mispred",
+      "desc": "Taken branch mispredictions",
+      "code": "0x47"
+    },
+    {
+      "name": "taken_cond_br_inst",
+      "desc": "Taken conditional branch instructions",
+      "code": "0x48"
+    },
+    {
+      "name": "taken_cond_br_mispred",
+      "desc": "Taken conditional branch mispredictions",
+      "code": "0x49"
+    },
+    {
+      "name": "long_jump",
+      "desc": "Long jumps",
+      "code": "0x4a"
+    }
+  ]
+}
