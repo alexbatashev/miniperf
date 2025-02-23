@@ -12,7 +12,7 @@ pub struct IString {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum EventType {
     PmuCycles,
@@ -105,5 +105,38 @@ impl Event {
         let root = message.get_root::<event_capnp::event::Reader>()?;
 
         Ok(root.into())
+    }
+}
+
+impl EventType {
+    pub fn is_pmu(&self) -> bool {
+        *self == EventType::PmuCycles
+            || *self == EventType::PmuInstructions
+            || *self == EventType::PmuBranchInstructions
+            || *self == EventType::PmuBranchMisses
+            || *self == EventType::PmuLlcReferences
+            || *self == EventType::PmuLlcMisses
+            || *self == EventType::PmuStalledCyclesBackend
+            || *self == EventType::PmuStalledCyclesFrontend
+            || *self == EventType::PmuCustom
+    }
+
+    pub fn is_os(&self) -> bool {
+        *self == EventType::OsContextSwitches
+            || *self == EventType::OsCpuMigrations
+            || *self == EventType::OsSystemTime
+            || *self == EventType::OsPageFaults
+            || *self == EventType::OsTotalTime
+            || *self == EventType::OsUserTime
+            || *self == EventType::OsCpuClock
+    }
+}
+
+impl ProcMap {
+    pub fn new(map: (u32, Vec<ProcMapEntry>)) -> Self {
+        Self {
+            pid: map.0,
+            entries: map.1,
+        }
     }
 }

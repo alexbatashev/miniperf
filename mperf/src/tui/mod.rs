@@ -6,19 +6,22 @@ use std::{
 
 use anyhow::Result;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
+use hotspots::HotspotsTab;
 use memmap2::{Advice, Mmap};
 use mperf_data::{Event, EventType, RecordInfo, Scenario};
 use num_format::{Locale, ToFormattedString};
 use parking_lot::RwLock;
 use ratatui::{
     layout::{Constraint, Layout},
-    style::{Style, Stylize},
+    style::{palette, Style, Stylize},
     text::Line,
     widgets::{Block, Gauge, Row, Table, Tabs, Widget},
     DefaultTerminal, Frame,
 };
 use tokio::fs::{self, File};
 use tokio_stream::StreamExt;
+
+mod hotspots;
 
 pub async fn tui_main(res_dir: &Path) -> Result<()> {
     let terminal = ratatui::init();
@@ -73,6 +76,8 @@ impl App {
             if key.kind == KeyEventKind::Press {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+                    KeyCode::Tab => self.tabs.next_tab(),
+                    KeyCode::BackTab => self.tabs.previous_tab(),
                     // KeyCode::Char('j') | KeyCode::Down => self.pull_requests.scroll_down(),
                     // KeyCode::Char('k') | KeyCode::Up => self.pull_requests.scroll_up(),
                     _ => {}
@@ -97,9 +102,17 @@ impl Widget for &TabsWidget {
         if read_tabs.len() == 0 {
             return;
         }
+
+        let highlight_style = (
+            ratatui::style::Color::default(),
+            palette::tailwind::EMERALD.c700,
+        );
+
         let tabs = Tabs::new(read_tabs.iter().map(|t| t.name()))
             .style(Style::default().white())
-            .highlight_style(Style::default().yellow())
+            .highlight_style(highlight_style)
+            .divider(ratatui::symbols::DOT)
+            .padding(" ", " ")
             .select(self.cur_tab);
 
         tabs.render(area, buf);
@@ -114,6 +127,7 @@ impl Widget for &TabsWidget {
 #[derive(Clone)]
 enum Tab {
     Summary(SummaryTab),
+    Hotspots(HotspotsTab),
 }
 
 #[derive(Clone)]
@@ -140,12 +154,14 @@ impl Tab {
     fn name(&self) -> &'static str {
         match self {
             Tab::Summary(_) => "Summary",
+            Tab::Hotspots(_) => "Hotspots",
         }
     }
 
     fn run(&self) {
         match self {
             Tab::Summary(summary) => summary.run(),
+            Tab::Hotspots(hotspots) => hotspots.run(),
         }
     }
 }
@@ -178,8 +194,24 @@ impl TabsWidget {
         match info.scenario {
             Scenario::Snapshot => {
                 write_tabs.push(Tab::Summary(SummaryTab::new(res_dir.clone(), info.clone())));
+                write_tabs.push(Tab::Hotspots(HotspotsTab::new(res_dir.clone())));
             }
             _ => unimplemented!(),
+        }
+    }
+
+    fn next_tab(&mut self) {
+        self.cur_tab += 1;
+        if self.cur_tab >= self.tabs.read().len() {
+            self.cur_tab = 0;
+        }
+    }
+
+    fn previous_tab(&mut self) {
+        if self.cur_tab == 0 {
+            self.cur_tab = self.tabs.read().len() - 1;
+        } else {
+            self.cur_tab -= 1;
         }
     }
 }
@@ -271,6 +303,7 @@ impl Widget for &Tab {
     {
         match self {
             Tab::Summary(tab) => tab.clone().render(area, buf),
+            Tab::Hotspots(tab) => tab.clone().render(area, buf),
         }
     }
 }

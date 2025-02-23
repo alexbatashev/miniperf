@@ -45,6 +45,8 @@ pub async fn do_record(
         Scenario::Roofline => roofline(dispatcher.clone(), &command).await?,
     };
 
+    drop(dispatcher);
+
     join_handle.join().await;
 
     Ok(())
@@ -63,6 +65,10 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
             Counter::BranchInstructions,
             Counter::StalledCyclesBackend,
             Counter::StalledCyclesFrontend,
+            Counter::CpuClock,
+            Counter::CpuMigrations,
+            Counter::PageFaults,
+            Counter::ContextSwitches,
         ])
         .process(&process)
         .build()?;
