@@ -244,7 +244,7 @@ impl SamplingDriver {
             counters: vec![],
             sample_freq: 1000,
             pid: None,
-            prefer_raw_events: false,
+            prefer_raw_events: true,
         }
     }
 
