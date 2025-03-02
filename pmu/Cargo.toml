@@ -10,6 +10,7 @@ thiserror = "2.0.9"
 pmu-data = { path = "../pmu-data/" }
 lazy_static = "1.5.0"
 smallvec = "1.13.2"
+itertools = "0.14.0"
 
 [target.'cfg(unix)'.dependencies]
 proc_getter = "0.0.3"

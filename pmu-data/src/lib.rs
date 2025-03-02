@@ -27,6 +27,7 @@ pub struct PlatformDesc {
     pub name: String,
     pub vendor: String,
     pub arch: String,
+    pub max_counters: Option<usize>,
     pub events: Vec<EventDesc>,
     pub aliases: Option<Vec<Alias>>,
 }
