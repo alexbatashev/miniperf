@@ -1,3 +1,4 @@
+mod binding;
 mod events;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +79,7 @@ struct NativeCounterHandle {
     pub kind: Counter,
     pub id: u64,
     pub fd: i32,
+    pub leader: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -133,20 +135,14 @@ impl CountingDriver {
 
         let pid = process.map(|p| p.pid());
 
-        let native_handles = bind_counters(counters, &mut attrs, pid)?;
+        let native_handles = binding::direct(counters, &mut attrs, pid)?;
 
         Ok(CountingDriver { native_handles })
     }
 
     pub fn start(&mut self) -> Result<(), Error> {
         for handle in &self.native_handles {
-            let res_enable = unsafe {
-                sys::ioctls::ENABLE(
-                    handle.fd,
-                    0, // TODO support groups
-                      // sys::bindings::PERF_IOC_FLAG_GROUP,
-                )
-            };
+            let res_enable = unsafe { sys::ioctls::ENABLE(handle.fd, 0) };
 
             if res_enable < 0 {
                 return Err(Error::EnableFailed);
@@ -242,7 +238,7 @@ impl SamplingDriver {
     pub fn builder() -> SamplingDriverBuilder {
         SamplingDriverBuilder {
             counters: vec![],
-            sample_freq: 1000,
+            sample_freq: 4000,
             pid: None,
             prefer_raw_events: true,
         }
@@ -253,13 +249,12 @@ impl SamplingDriver {
         F: FnMut(Sample) + Send + 'static,
     {
         for handle in &self.native_handles {
-            let res_enable = unsafe {
-                sys::ioctls::ENABLE(
-                    handle.fd,
-                    0, // TODO support groups
-                      // sys::bindings::PERF_IOC_FLAG_GROUP,
-                )
-            };
+            if !handle.leader {
+                continue;
+            }
+
+            let res_enable =
+                unsafe { sys::ioctls::ENABLE(handle.fd, sys::bindings::PERF_IOC_FLAG_GROUP) };
 
             if res_enable < 0 {
                 return Err(Error::EnableFailed);
@@ -326,27 +321,31 @@ impl SamplingDriver {
                                 let (_next_ptr, callstack) =
                                     SampleFormat::read_callchain(current_ptr);
 
-                                let value = &values[0];
+                                for value in values {
+                                    let handle = native_handles
+                                        .iter()
+                                        .find(|handle| handle.id == value.id)
+                                        .unwrap();
 
-                                let handle = native_handles
-                                    .iter()
-                                    .find(|handle| handle.id == value.id)
-                                    .unwrap();
+                                    let sample = Sample {
+                                        event_id: format.id,
+                                        ip: format.ip,
+                                        pid: format.pid,
+                                        tid: format.tid,
+                                        time: format.time,
+                                        time_enabled: format.read.time_enabled,
+                                        time_running: format.read.time_running,
+                                        counter: handle.kind.clone(),
+                                        value: value.value,
+                                        callstack: callstack[1..].to_smallvec(),
+                                    };
 
-                                let sample = Sample {
-                                    event_id: format.id,
-                                    ip: format.ip,
-                                    pid: format.pid,
-                                    tid: format.tid,
-                                    time: format.time,
-                                    time_enabled: format.read.time_enabled,
-                                    time_running: format.read.time_running,
-                                    counter: handle.kind.clone(),
-                                    value: value.value,
-                                    callstack: callstack[1..].to_smallvec(),
-                                };
+                                    callback(sample);
+                                }
+                            }
 
-                                callback(sample);
+                            if !running.load(Ordering::SeqCst) {
+                                break;
                             }
 
                             offset += header.size as usize;
@@ -368,13 +367,12 @@ impl SamplingDriver {
         self.running.store(false, Ordering::SeqCst);
 
         for handle in &self.native_handles {
-            let res_enable = unsafe {
-                sys::ioctls::DISABLE(
-                    handle.fd,
-                    0, // TODO support groups
-                      // sys::bindings::PERF_IOC_FLAG_GROUP,
-                )
-            };
+            if !handle.leader {
+                continue;
+            }
+
+            let res_enable =
+                unsafe { sys::ioctls::DISABLE(handle.fd, sys::bindings::PERF_IOC_FLAG_GROUP) };
 
             if res_enable < 0 {
                 return Err(Error::EnableFailed);
@@ -443,7 +441,7 @@ impl SamplingDriverBuilder {
             attr.set_mmap(1);
         }
 
-        let native_handles = bind_counters(&self.counters, &mut attrs, self.pid)?;
+        let native_handles = binding::grouped(&self.counters, &mut attrs, self.pid)?;
 
         let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
         let mmap_pages = 512;
@@ -602,50 +600,6 @@ fn get_native_counters(
         .collect::<Vec<_>>();
 
     Ok(attrs)
-}
-
-fn bind_counters(
-    counters: &[Counter],
-    attrs: &mut [perf_event_attr],
-    pid: Option<i32>,
-) -> Result<Vec<NativeCounterHandle>, Error> {
-    let mut handles: Vec<NativeCounterHandle> = vec![];
-
-    for (cntr, attr) in std::iter::zip(counters, attrs) {
-        // cycles and instructions are typically fixed counters and thus always on
-        match cntr {
-            Counter::Cycles | Counter::Instructions => attr.set_pinned(1),
-            _ => attr.set_pinned(0),
-        };
-        let new_fd = unsafe {
-            sys::perf_event_open(
-                &mut *attr as *mut perf_event_attr,
-                pid.unwrap_or(0),
-                -1,
-                -1,
-                0,
-            )
-        };
-
-        if new_fd < 0 {
-            return Err(Error::CounterCreationFail);
-        }
-
-        let mut id: u64 = 0;
-
-        let result = unsafe { sys::ioctls::ID(new_fd, &mut id) };
-        if result < 0 {
-            return Err(Error::CounterCreationFail);
-        }
-
-        handles.push(NativeCounterHandle {
-            kind: cntr.clone(),
-            id,
-            fd: new_fd,
-        });
-    }
-
-    Ok(handles)
 }
 
 impl SampleFormat {

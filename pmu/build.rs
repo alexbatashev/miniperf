@@ -52,6 +52,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let name = &data.name;
         let vendor = &data.vendor;
         let family_id = &data.family_id;
+        let max_counters = data
+            .max_counters
+            .map(|num| quote! {Some(#num)})
+            .unwrap_or(quote! { None });
 
         families.push(quote! {
             let mut events = HashMap::new();
@@ -66,6 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 name: #name.to_string(),
                 vendor: #vendor.to_string(),
                 id: #family_id.to_string(),
+                max_counters: #max_counters,
                 events,
                 aliases,
             };
