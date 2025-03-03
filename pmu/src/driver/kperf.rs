@@ -22,6 +22,9 @@ const KPC_CLASS_CONFIGURABLE_MASK: u32 = 1 << KPC_CLASS_CONFIGURABLE;
 const KPC_CLASS_POWER_MASK: u32 = 1 << KPC_CLASS_POWER;
 const KPC_CLASS_RAWPMU_MASK: u32 = 1 << KPC_CLASS_RAWPMU;
 
+const KPERF_ACTION_MAX: u32 = 32;
+const KPERF_TIMER_MAX: u32 = 8;
+
 pub enum CountingDriver {
     InProcess(InProcessDriver),
     Sampling,
@@ -130,6 +133,14 @@ struct KPCDispatch {
     kpc_set_config: unsafe extern "C" fn(classes: u32, config: *mut u64) -> c_int,
     kpc_get_thread_counters: unsafe extern "C" fn(tid: u32, buf_count: u32, buf: *mut u64) -> c_int,
     kpc_force_all_ctrs_set: unsafe extern "C" fn(val: c_int) -> c_int,
+    kpc_get_counter_count: unsafe extern "C" fn(val: u32) -> u32,
+    kperf_action_count_set: unsafe extern "C" fn(val: u32) -> c_int,
+    kperf_timer_count_set: unsafe extern "C" fn(val: u32) -> c_int,
+    kperf_action_samplers_set: unsafe extern "C" fn(action_id: u32, sample: u32) -> c_int,
+    kperf_timer_period_set: unsafe extern "C" fn(action_id: u32, tick: u64) -> c_int,
+    kperf_timer_action_set: unsafe extern "C" fn(action_id: u32, timer_id: u32) -> c_int,
+    kperf_timer_pet_set: unsafe extern "C" fn(timer_id: u32) -> c_int,
+    kperf_sample_set: unsafe extern "C" fn(enabled: u32) -> c_int,
 }
 
 #[derive(WrapperApi)]
@@ -414,6 +425,29 @@ impl SamplingDriver {
             if ret != 0 {
                 return Err(Error::EnableFailed);
             }
+        }
+
+        let counter_count = unsafe { self.kpc_dispatch.kpc_get_counter_count(classes) };
+        if counter_count == 0 {
+            panic!()
+        }
+
+        if unsafe { self.kpc_dispatch.kpc_set_counting(classes) != 0 } {
+            return Err(Error::EnableFailed);
+        }
+        if unsafe { self.kpc_dispatch.kpc_set_thread_counting(classes) != 0 } {
+            return Err(Error::EnableFailed);
+        }
+
+        let action_id = 1_u32;
+        let timer_id = 1_u32;
+
+        if unsafe { self.kpc_dispatch.kperf_action_count_set(KPERF_ACTION_MAX) != 0 } {
+            return Err(Error::EnableFailed);
+        }
+
+        if unsafe { self.kpc_dispatch.kperf_timer_count_set(KPERF_TIMER_MAX) != 0 } {
+            return Err(Error::EnableFailed);
         }
 
         Ok(())
