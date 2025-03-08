@@ -40,7 +40,7 @@ struct App {
 }
 
 impl App {
-    const FRAMES_PER_SECOND: f32 = 120.0;
+    const FRAMES_PER_SECOND: f32 = 30.0;
 
     pub fn new(res_dir: &Path) -> Self {
         App {
