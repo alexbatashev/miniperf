@@ -227,11 +227,7 @@ impl LoopsTab {
                         );
                     }
                 }
-                EventType::RooflineLoopEnd => {
-                    let stats = loop_data
-                        .get_mut(&evt.correlation_id)
-                        .expect("Loop start event not found!!!");
-                }
+                EventType::RooflineLoopEnd => {}
                 EventType::RooflineBytesLoad => {
                     let stats = loop_data
                         .get_mut(&evt.parent_id)
