@@ -1,11 +1,11 @@
 use anyhow::Result;
 use mperf_data::{CallFrame, Event, IPCMessage, RecordInfo};
 use std::{
+    collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::watch;
 
 use pmu::{Counter, Process};
 
@@ -106,14 +106,6 @@ fn get_exe_dir() -> std::io::Result<PathBuf> {
 }
 
 async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> {
-    let pipe_name = format!(
-        "/{}{}",
-        command[0].split("/").last().unwrap(),
-        std::process::id()
-    );
-
-    let roofline_dispatcher = dispatcher.clone();
-
     let exe_path = get_exe_dir()?.to_str().unwrap().to_string();
 
     // FIXME make this platform independent
@@ -127,6 +119,9 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
         command.join(" ")
     );
 
+    let (pipe_name, task) =
+        create_shmem_pipe(command[0].split("/").last().unwrap(), dispatcher.clone())?;
+
     let process = Process::new(
         command,
         &[
@@ -135,8 +130,6 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
             ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
         ],
     )?;
-
-    let rx = shmem::proc_channel::Receiver::<IPCMessage>::new(&pipe_name, SIZE_16MB)?;
 
     let driver = pmu::SamplingDriver::builder()
         .counters(&[
@@ -147,6 +140,8 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
         ])
         .process(&process)
         .build()?;
+
+    let roofline_dispatcher = dispatcher.clone();
 
     driver.start(move |sample| {
         let unique_id = dispatcher.unique_id();
@@ -168,48 +163,18 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
         dispatcher.publish_event_sync(event);
     })?;
 
-    let (cancel_tx, mut cancel_rx) = watch::channel(false);
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel_rx.changed() => {
-                    break;
-                }
-                Ok(message) = rx.recv() => {
-                    match message {
-                        IPCMessage::String(string) => {
-                            roofline_dispatcher.string_id_async(&string.value).await;
-                        }
-                        IPCMessage::Event(event) => {
-                            roofline_dispatcher.publish_event(event).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        while !rx.empty() {
-            if let Ok(message) = rx.recv_sync() {
-                match message {
-                    IPCMessage::String(string) => {
-                        roofline_dispatcher.string_id_async(&string.value).await;
-                    }
-                    IPCMessage::Event(event) => {
-                        roofline_dispatcher.publish_event(event).await;
-                    }
-                }
-            }
-        }
-    });
-
     process.cont();
     process.wait()?;
     driver.stop()?;
+    task.await?;
 
     println!(
         "Run 2: collecting loop statistics for '{}'",
         command.join(" ")
     );
+
+    let (pipe_name, task) =
+        create_shmem_pipe(command[0].split("/").last().unwrap(), roofline_dispatcher)?;
 
     let process = Process::new(
         command,
@@ -227,9 +192,57 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
     process.cont();
     process.wait()?;
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
-    cancel_tx.send(true)?;
     task.await?;
 
     Ok(())
+}
+
+fn create_shmem_pipe(
+    prefix: &str,
+    roofline_dispatcher: Arc<EventDispatcher>,
+) -> Result<(String, tokio::task::JoinHandle<()>), std::io::Error> {
+    let pipe_name = format!(
+        "/{}{}{}",
+        prefix,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    );
+
+    let rx = shmem::proc_channel::Receiver::<IPCMessage>::new(&pipe_name, SIZE_16MB)?;
+
+    let task = tokio::spawn(async move {
+        let mut strings = HashMap::<u64, u64>::new();
+
+        while let Some(message) = rx.recv().await {
+            match message {
+                IPCMessage::String(string) => {
+                    let id = roofline_dispatcher.string_id_async(&string.value).await;
+                    strings.insert(string.key, id);
+                }
+                IPCMessage::Event(mut event) => {
+                    for stack in event.callstack.iter_mut() {
+                        if let CallFrame::Location(loc) = stack {
+                            loc.function_name = strings
+                                .get(&(loc.function_name as u64))
+                                .cloned()
+                                .unwrap_or_default()
+                                as u128;
+                            loc.file_name = strings
+                                .get(&(loc.file_name as u64))
+                                .cloned()
+                                .unwrap_or_default()
+                                as u128;
+                        }
+                    }
+
+                    roofline_dispatcher.publish_event(event).await;
+                }
+            }
+        }
+    });
+
+    Ok((pipe_name, task))
 }

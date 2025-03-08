@@ -130,6 +130,18 @@ impl EventType {
             || *self == EventType::OsUserTime
             || *self == EventType::OsCpuClock
     }
+
+    pub fn is_roofline(&self) -> bool {
+        *self == EventType::RooflineLoopStart
+            || *self == EventType::RooflineBytesLoad
+            || *self == EventType::RooflineBytesStore
+            || *self == EventType::RooflineScalarIntOps
+            || *self == EventType::RooflineScalarFloatOps
+            || *self == EventType::RooflineScalarDoubleOps
+            || *self == EventType::RooflineVectorIntOps
+            || *self == EventType::RooflineVectorFloatOps
+            || *self == EventType::RooflineVectorDoubleOps
+    }
 }
 
 impl ProcMap {

@@ -19,7 +19,13 @@ lazy_static! {
         let name = std::env::var("MPERF_COLLECTOR_SHMEM_ID")
             .expect("MPERF_COLLECTOR_SHMEM_ID must be set by the caller");
 
-        Mutex::new(Sender::attach(&name, SIZE_16MB).expect("failed to open shared memory"))
+        let mutex =
+            Mutex::new(Sender::attach(&name, SIZE_16MB).expect("failed to open shared memory"));
+
+        unsafe {
+            libc::atexit(close_pipe);
+        }
+        mutex
     };
     static ref STRINGS: RwLock<HashMap<String, u64>> = RwLock::new(HashMap::new());
     static ref PROFILING_ENABLED: bool = std::env::var("MPERF_COLLECTOR_ENABLED").is_ok();
@@ -94,4 +100,9 @@ pub fn profiling_enabled() -> bool {
 
 pub fn roofline_instrumentation_enabled() -> bool {
     *ROOFLINE_INSTR_ENABLED
+}
+
+extern "C" fn close_pipe() {
+    let sender = SENDER.lock().unwrap();
+    let _ = sender.close();
 }
