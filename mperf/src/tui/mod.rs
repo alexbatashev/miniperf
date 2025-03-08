@@ -7,6 +7,7 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use hotspots::HotspotsTab;
+use loops::LoopsTab;
 use memmap2::{Advice, Mmap};
 use mperf_data::{Event, EventType, RecordInfo, Scenario};
 use num_format::{Locale, ToFormattedString};
@@ -22,6 +23,7 @@ use tokio::fs::{self, File};
 use tokio_stream::StreamExt;
 
 mod hotspots;
+mod loops;
 
 pub async fn tui_main(res_dir: &Path) -> Result<()> {
     let terminal = ratatui::init();
@@ -78,8 +80,6 @@ impl App {
                     KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
                     KeyCode::Tab => self.tabs.next_tab(),
                     KeyCode::BackTab => self.tabs.previous_tab(),
-                    // KeyCode::Char('j') | KeyCode::Down => self.pull_requests.scroll_down(),
-                    // KeyCode::Char('k') | KeyCode::Up => self.pull_requests.scroll_up(),
                     _ => {}
                 }
             }
@@ -112,7 +112,6 @@ impl Widget for &TabsWidget {
             .style(Style::default().white())
             .highlight_style(highlight_style)
             .divider(ratatui::symbols::DOT)
-            .padding(" ", " ")
             .select(self.cur_tab);
 
         tabs.render(area, buf);
@@ -128,6 +127,7 @@ impl Widget for &TabsWidget {
 enum Tab {
     Summary(SummaryTab),
     Hotspots(HotspotsTab),
+    Loops(LoopsTab),
 }
 
 #[derive(Clone)]
@@ -153,8 +153,9 @@ struct Stat {
 impl Tab {
     fn name(&self) -> &'static str {
         match self {
-            Tab::Summary(_) => "Summary",
-            Tab::Hotspots(_) => "Hotspots",
+            Tab::Summary(_) => " Summary ",
+            Tab::Hotspots(_) => " Hotspots ",
+            Tab::Loops(_) => " Loops ",
         }
     }
 
@@ -162,6 +163,7 @@ impl Tab {
         match self {
             Tab::Summary(summary) => summary.run(),
             Tab::Hotspots(hotspots) => hotspots.run(),
+            Tab::Loops(loops) => loops.run(),
         }
     }
 }
@@ -196,7 +198,10 @@ impl TabsWidget {
                 write_tabs.push(Tab::Summary(SummaryTab::new(res_dir.clone(), info.clone())));
                 write_tabs.push(Tab::Hotspots(HotspotsTab::new(res_dir.clone())));
             }
-            _ => unimplemented!(),
+            Scenario::Roofline => {
+                write_tabs.push(Tab::Summary(SummaryTab::new(res_dir.clone(), info.clone())));
+                write_tabs.push(Tab::Loops(LoopsTab::new(res_dir.clone())));
+            }
         }
     }
 
@@ -304,6 +309,7 @@ impl Widget for &Tab {
         match self {
             Tab::Summary(tab) => tab.clone().render(area, buf),
             Tab::Hotspots(tab) => tab.clone().render(area, buf),
+            Tab::Loops(tab) => tab.clone().render(area, buf),
         }
     }
 }

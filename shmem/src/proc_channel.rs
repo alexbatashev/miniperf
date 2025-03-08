@@ -26,6 +26,7 @@ pub struct Receiver<T: Sendable> {
 struct Inner {
     shmem: platform::Shmem,
     sem: platform::Semaphore,
+    finish_sem: platform::Semaphore,
     ptr: *mut (),
     head: *mut usize,
     tail: *mut usize,
@@ -38,7 +39,7 @@ impl Inner {
             platform::Semaphore::required_size() % std::mem::align_of::<usize>(),
             0
         );
-        let sem_size = platform::Semaphore::required_size();
+        let sem_size = 2 * platform::Semaphore::required_size();
         let alignment = std::mem::align_of::<usize>() as isize;
 
         (sem_size + std::mem::size_of::<usize>() * 2 - 1 + alignment as usize)
@@ -51,13 +52,27 @@ impl Inner {
     }
 
     fn new(shmem: platform::Shmem, data_size: usize, init: bool) -> Result<Self, std::io::Error> {
-        let sem = if init {
-            platform::Semaphore::create(shmem.as_mut_ptr())?
+        let (sem, finish_sem) = if init {
+            (
+                platform::Semaphore::create(shmem.as_mut_ptr())?,
+                platform::Semaphore::create(unsafe {
+                    shmem
+                        .as_mut_ptr()
+                        .byte_add(platform::Semaphore::required_size())
+                })?,
+            )
         } else {
-            platform::Semaphore::from_raw_ptr(shmem.as_mut_ptr())?
+            (
+                platform::Semaphore::from_raw_ptr(shmem.as_mut_ptr())?,
+                platform::Semaphore::from_raw_ptr(unsafe {
+                    shmem
+                        .as_mut_ptr()
+                        .byte_add(platform::Semaphore::required_size())
+                })?,
+            )
         };
 
-        let sem_size = platform::Semaphore::required_size();
+        let sem_size = 2 * platform::Semaphore::required_size();
         let data_offset = Self::data_offset();
 
         let ptr = unsafe { shmem.as_mut_ptr().byte_add(data_offset) };
@@ -77,6 +92,7 @@ impl Inner {
         Ok(Inner {
             shmem,
             sem,
+            finish_sem,
             ptr,
             head,
             tail,
@@ -164,11 +180,21 @@ impl<T: Sendable> Sender<T> {
         Ok(())
     }
 
+    pub fn close(&self) -> Result<(), std::io::Error> {
+        self.inner.finish_sem.post()
+    }
+
     fn head(&self) -> &AtomicUsize {
         unsafe { AtomicUsize::from_ptr(self.inner.head) }
     }
     fn tail(&self) -> &AtomicUsize {
         unsafe { AtomicUsize::from_ptr(self.inner.tail) }
+    }
+}
+
+impl<T: Sendable> Drop for Sender<T> {
+    fn drop(&mut self) {
+        let _ = self.inner.finish_sem.post();
     }
 }
 
@@ -197,14 +223,20 @@ impl<T: Sendable> Receiver<T> {
         })
     }
 
-    pub fn recv_sync(&self) -> Result<T, std::io::Error> {
-        self.inner.sem.wait()?;
+    pub fn recv_sync(&self) -> Option<T> {
+        if self.inner.sem.counter().ok()? == 0 && self.inner.finish_sem.counter().ok()? > 0 {
+            return None;
+        }
+
+        self.inner.sem.wait().ok()?;
 
         let size_offset = self
             .head()
             .fetch_add(std::mem::size_of::<usize>(), Ordering::SeqCst);
 
         let size = unsafe { *(self.inner.ptr.byte_add(size_offset) as *const usize) };
+
+        assert_ne!(size, 0);
 
         let offset = self.head().fetch_add(size, Ordering::SeqCst);
 
@@ -214,11 +246,11 @@ impl<T: Sendable> Receiver<T> {
             std::slice::from_raw_parts(self.inner.ptr.byte_add(offset) as *const u8, size)
         };
 
-        Ok(T::from_raw_bytes(slice))
+        Some(T::from_raw_bytes(slice))
     }
 
-    pub async fn recv(&self) -> Result<T, std::io::Error> {
-        blocker(|| {
+    pub async fn recv(&self) -> Option<T> {
+        let _ = blocker(|| {
             let res = self.inner.sem.try_wait();
             if res.is_ok() {
                 return Ok(true);
@@ -227,19 +259,29 @@ impl<T: Sendable> Receiver<T> {
             let err = res.err().unwrap();
             if let Some(code) = err.raw_os_error() {
                 if code == EAGAIN {
+                    if self.inner.finish_sem.counter()? > 0 {
+                        return Ok(true);
+                    }
+
                     return Ok(false);
                 }
             }
 
             Err(err)
         })
-        .await?;
+        .await;
+
+        if self.empty() && self.inner.finish_sem.counter().ok()? > 0 {
+            return None;
+        }
 
         let size_offset = self
             .head()
             .fetch_add(std::mem::size_of::<usize>(), Ordering::SeqCst);
 
         let size = unsafe { *(self.inner.ptr.byte_add(size_offset) as *const usize) };
+
+        assert_ne!(size, 0);
 
         let offset = self.head().fetch_add(size, Ordering::SeqCst);
 
@@ -249,7 +291,7 @@ impl<T: Sendable> Receiver<T> {
             std::slice::from_raw_parts(self.inner.ptr.byte_add(offset) as *const u8, size)
         };
 
-        Ok(T::from_raw_bytes(slice))
+        Some(T::from_raw_bytes(slice))
     }
 
     pub fn empty(&self) -> bool {

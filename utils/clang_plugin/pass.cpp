@@ -1,9 +1,11 @@
 #include "llvm/Pass.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DebugInfo.h"
@@ -14,20 +16,52 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassInstrumentation.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
-#include <llvm/ADT/STLExtras.h>
-#include <llvm/Analysis/ScalarEvolutionExpressions.h>
-#include <llvm/Transforms/Utils/LoopUtils.h>
+#include "llvm/Transforms/Utils/LoopUtils.h"
 
 using namespace llvm;
 
 namespace {
+
+static void markFunctionNoOptimize(Function *F) {
+  F->addFnAttr(Attribute::OptimizeNone);
+  F->addFnAttr(Attribute::NoInline);
+}
+
+static Function *cloneInstrumentedFunction(Function *Extracted) {
+  FunctionType *OrigTy = Extracted->getFunctionType();
+
+  llvm::SmallVector<Type *> Args{OrigTy->param_begin(), OrigTy->param_end()};
+  Args.push_back(PointerType::get(Extracted->getContext(), 0));
+
+  auto NewTy = FunctionType::get(OrigTy->getReturnType(), Args, false);
+
+  auto *F = Function::Create(NewTy, Extracted->getLinkage(),
+                             Extracted->getName() + ".instrumented",
+                             Extracted->getParent());
+  ValueToValueMapTy VMap;
+
+  for (const auto &Arg : enumerate(Extracted->args())) {
+    VMap[&Arg.value()] = F->getArg(Arg.index());
+  }
+
+  SmallVector<ReturnInst *, 4> Returns;
+  CloneFunctionInto(F, Extracted, VMap,
+                    CloneFunctionChangeType::LocalChangesOnly, Returns);
+
+  stripDebugInfo(*F);
+  markFunctionNoOptimize(F);
+
+  return F;
+}
 
 struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
@@ -150,12 +184,11 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           "miniperf.generated",
           MDNode::get(F.getContext(), MDString::get(F.getContext(), "true")));
 
-      LoopInfo.erase(L);
+      // LoopInfo.erase(L);
 
       ValueToValueMapTy VMap;
 
-      Function *Instrumented = CloneFunction(Extracted, VMap);
-      stripDebugInfo(*Instrumented);
+      Function *Instrumented = cloneInstrumentedFunction(Extracted);
 
       CallInst *CallSite = cast<CallInst>(*Extracted->user_begin());
 
@@ -231,7 +264,21 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
       cast<BranchInst>(CallBB->getTerminator())->setSuccessor(0, LandingPadBB);
       cast<BranchInst>(InstrBB->getTerminator())->setSuccessor(0, LandingPadBB);
 
-      auto &InstrLI = FAM.getResult<LoopAnalysis>(*Instrumented);
+      for (auto &&I : *InstrBB) {
+        if (auto *Call = dyn_cast<CallInst>(&I)) {
+          if (Call->getCalledFunction() == Extracted) {
+            SmallVector<Value *> Operands{Call->arg_begin(), Call->arg_end()};
+            Operands.push_back(LoopHandle);
+            Builder.SetInsertPoint(Call);
+            Builder.CreateCall(Instrumented, Operands);
+            Call->eraseFromParent();
+            break;
+          }
+        }
+      }
+
+      DominatorTree InstrDT(*Instrumented);
+      class LoopInfo InstrLI(InstrDT);
 
       // FIXME: for some reason this is not working properly. Need to find a way
       // to actually extract a loop from here.
@@ -243,27 +290,15 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
       assert(OutermostLoop->isOutermost() &&
              "Expected first loop to be outermost");
 
-      BasicBlock *Preheader = [&]() {
-        if (OutermostLoop->getLoopPreheader()) {
-          return OutermostLoop->getLoopPreheader();
-        }
-
-        auto &DT = FAM.getResult<DominatorTreeAnalysis>(*Instrumented);
-        auto &MSSA = FAM.getResult<MemorySSAAnalysis>(*Instrumented);
-
-        auto MSSAU = std::make_unique<MemorySSAUpdater>(&MSSA.getMSSA());
-        return InsertPreheaderForLoop(OutermostLoop, &DT, &InstrLI, MSSAU.get(),
-                                      true);
-      }();
-
-      Builder.SetInsertPoint(Preheader->getFirstInsertionPt());
+      Builder.SetInsertPoint(
+          Instrumented->getEntryBlock().getFirstInsertionPt());
 
       // Create necessary data structures
       Value *StatsMem =
           Builder.CreateAlloca(LoopStatsTy, nullptr, "loop_stats");
       Builder.CreateMemSet(StatsMem,
                            ConstantInt::get(Type::getInt8Ty(F.getContext()), 0),
-                           8 * 9, MaybeAlign());
+                           8 * 9, Align(8));
 
       auto UpdateStats = [&](uint64_t Counter, size_t Idx) {
         if (Counter == 0)
@@ -389,8 +424,13 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
         return any_of(BB, [](Instruction &I) { return isa<ReturnInst>(I); });
       });
 
+      Value *LocalHandle = Instrumented->getArg(Instrumented->arg_size() - 1);
       Builder.SetInsertPoint(RetBlock->getTerminator());
-      Builder.CreateCall(NotifyStats, {LoopHandle, StatsMem});
+      Builder.CreateCall(NotifyStats, {LocalHandle, StatsMem});
+
+      if (verifyFunction(*Instrumented, &llvm::errs())) {
+        abort();
+      }
     }
 
     return PreservedAnalyses::none();

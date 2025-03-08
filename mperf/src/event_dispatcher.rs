@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::{collections::HashMap, io::Write, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use mperf_data::{Event, IString, ProcMap, ProcMapEntry};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
@@ -50,14 +50,15 @@ impl EventDispatcher {
 
         let string_out_dir = output_directory.to_owned();
         let string_worker = tokio::spawn(async move {
-            let mut strings_file =
-                std::fs::File::create(string_out_dir.join("strings.jsonl")).expect("strings");
-
+            let mut strings = vec![];
             while let Some((id, value)) = string_rx.recv().await {
                 let string = IString { id, value };
-                let stringified = serde_json::to_string(&string).expect("fail");
-                writeln!(&mut strings_file, "{}", stringified).expect("fail");
+                strings.push(string);
             }
+
+            let mut strings_file =
+                std::fs::File::create(string_out_dir.join("strings.json")).expect("strings");
+            serde_json::to_writer(&mut strings_file, &strings).expect("failed to write strings");
         });
 
         let proc_map_out_dir = output_directory.to_owned();

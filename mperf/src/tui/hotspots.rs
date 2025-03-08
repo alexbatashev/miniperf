@@ -64,6 +64,7 @@ impl HotspotsTab {
             is_running: Arc::new(RwLock::new(false)),
         }
     }
+
     pub fn run(&self) {
         {
             let hotspots = self.hotspots.read();

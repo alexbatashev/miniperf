@@ -74,29 +74,6 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
         .expect("failed to get timestamp")
         .as_millis() as u64;
 
-    Box::leak(handle)
-}
-
-#[no_mangle]
-pub extern "C" fn mperf_roofline_internal_is_instrumented_profiling() -> i32 {
-    if profiling_enabled() && roofline_instrumentation_enabled() {
-        1
-    } else {
-        0
-    }
-}
-
-/// # Safety
-/// Shut up, clippy. There's nothing safe about what we do.
-#[no_mangle]
-pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut LoopHandle) {
-    if !profiling_enabled() {
-        return;
-    }
-    let time = SystemTime::now();
-
-    let handle = unsafe { handle.as_ref() }.unwrap();
-
     // FIXME we should use the full stack frame instead
     let filename = get_string_id(&handle.info.filename);
 
@@ -121,6 +98,29 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
     };
 
     send_event(start_event).expect("failed to send start event");
+
+    Box::leak(handle)
+}
+
+#[no_mangle]
+pub extern "C" fn mperf_roofline_internal_is_instrumented_profiling() -> i32 {
+    if profiling_enabled() && roofline_instrumentation_enabled() {
+        1
+    } else {
+        0
+    }
+}
+
+/// # Safety
+/// Shut up, clippy. There's nothing safe about what we do.
+#[no_mangle]
+pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut LoopHandle) {
+    if !profiling_enabled() {
+        return;
+    }
+    let time = SystemTime::now();
+
+    let handle = unsafe { handle.as_ref() }.unwrap();
 
     let timestamp = time
         .duration_since(UNIX_EPOCH)
@@ -164,11 +164,11 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
         .expect("failed to get time")
         .as_millis() as u64;
 
-    let send_end_event = |ty: EventType, value: u64| {
+    let send_counter_event = |ty: EventType, value: u64| {
         let event = Event {
             unique_id: get_next_id(),
-            correlation_id: handle.id,
-            parent_id: 0,
+            correlation_id: 0,
+            parent_id: handle.id,
             ty,
             thread_id: libc::gettid() as u32,
             process_id: std::process::id(),
@@ -182,11 +182,11 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
         send_event(event).expect("failed to send loop end event");
     };
 
-    send_end_event(EventType::RooflineBytesLoad, stats.bytes_load);
-    send_end_event(EventType::RooflineBytesStore, stats.bytes_store);
-    send_end_event(EventType::RooflineScalarIntOps, stats.scalar_int_ops);
-    send_end_event(EventType::RooflineScalarFloatOps, stats.scalar_float_ops);
-    send_end_event(EventType::RooflineVectorIntOps, stats.vector_int_ops);
-    send_end_event(EventType::RooflineVectorFloatOps, stats.vector_float_ops);
-    send_end_event(EventType::RooflineVectorDoubleOps, stats.vector_double_ops);
+    send_counter_event(EventType::RooflineBytesLoad, stats.bytes_load);
+    send_counter_event(EventType::RooflineBytesStore, stats.bytes_store);
+    send_counter_event(EventType::RooflineScalarIntOps, stats.scalar_int_ops);
+    send_counter_event(EventType::RooflineScalarFloatOps, stats.scalar_float_ops);
+    send_counter_event(EventType::RooflineVectorIntOps, stats.vector_int_ops);
+    send_counter_event(EventType::RooflineVectorFloatOps, stats.vector_float_ops);
+    send_counter_event(EventType::RooflineVectorDoubleOps, stats.vector_double_ops);
 }
