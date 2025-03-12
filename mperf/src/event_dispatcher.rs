@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc, iter::Extend};
 
 use mperf_data::{Event, IString, ProcMap, ProcMapEntry};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
@@ -63,25 +63,31 @@ impl EventDispatcher {
 
         let proc_map_out_dir = output_directory.to_owned();
         let proc_map_worker = tokio::spawn(async move {
-            let mut proc_map_entries = HashMap::<u32, Vec<ProcMapEntry>>::new();
+            // let mut proc_map_entries = Hash::<u32, Vec<ProcMapEntry>>::new();
+            let mut proc_map_entries = HashMap::<u32, HashSet::<ProcMapEntry>>::new();
             while let Some(pid) = proc_map_rx.recv().await {
                 if let Ok(maps) = get_process_maps(pid as Pid) {
                     let pm = maps
                         .iter()
-                        .map(|m| ProcMapEntry {
-                            filename: m
-                                .filename()
-                                .map(|p| p.to_str().unwrap_or("unknown").to_owned())
-                                .unwrap_or("unknown".to_string()),
-                            address: m.start(),
-                            size: m.size(),
-                        })
-                        .collect::<Vec<ProcMapEntry>>();
-                    if !proc_map_entries.contains_key(&pid)
-                        || proc_map_entries.get(&pid).unwrap().len() < pm.len()
-                    {
-                        proc_map_entries.insert(pid, pm);
-                    }
+                        .filter_map(|m| {
+                            if m.filename().is_none() || m.filename().unwrap().ends_with("mperf") {
+                                return None;
+                            }
+                            Some(ProcMapEntry {
+                                filename: m
+                                    .filename()
+                                    .map(|p| p.to_str().unwrap_or("unknown").to_owned())
+                                    .unwrap_or("unknown".to_string()),
+                                address: m.start(),
+                                size: m.size(),
+                            })
+                        });
+
+                    proc_map_entries.entry(pid).or_default();
+
+                    let set = proc_map_entries.get_mut(&pid).unwrap();
+
+                    set.extend(pm.into_iter());
                 }
             }
 

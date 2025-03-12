@@ -1,4 +1,4 @@
-use std::io::{BufRead, Write};
+use std::{collections::HashSet, io::{BufRead, Write}};
 
 use capnp::message::ReaderOptions;
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ pub struct Event {
     pub callstack: SmallVec<[CallFrame; 32]>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct ProcMapEntry {
     pub filename: String,
     pub address: usize,
@@ -145,10 +145,10 @@ impl EventType {
 }
 
 impl ProcMap {
-    pub fn new(map: (u32, Vec<ProcMapEntry>)) -> Self {
+    pub fn new(map: (u32, HashSet<ProcMapEntry>)) -> Self {
         Self {
             pid: map.0,
-            entries: map.1,
+            entries: map.1.into_iter().collect(),
         }
     }
 }
