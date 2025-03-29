@@ -1,3 +1,4 @@
+mod counter_selection;
 mod event_dispatcher;
 mod events_export;
 mod processing;
