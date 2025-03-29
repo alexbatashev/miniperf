@@ -16,10 +16,31 @@ pub enum Scenario {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    pub pid: i32,
+    pub counters: Vec<EventType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RooflineInfo {
+    pub perf_pid: i32,
+    pub counters: Vec<EventType>,
+    pub inst_pid: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ScenarioInfo {
+    Snapshot(SnapshotInfo),
+    Roofline(RooflineInfo),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordInfo {
     pub scenario: Scenario,
     pub command: Option<Vec<String>>,
-    pub pid: Option<u32>,
+    pub cpu_model: String,
+    pub cpu_vendor: String,
+    pub scenario_info: ScenarioInfo,
 }
 
 impl Scenario {

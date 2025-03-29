@@ -1,5 +1,5 @@
 use anyhow::Result;
-use mperf_data::{CallFrame, Event, IPCMessage, RecordInfo};
+use mperf_data::{CallFrame, Event, IPCMessage, RecordInfo, RooflineInfo, ScenarioInfo};
 use std::{
     collections::HashMap,
     fs::File,
@@ -7,40 +7,26 @@ use std::{
     sync::Arc,
 };
 
-use pmu::{Counter, Process};
+use pmu::Process;
 
 const SIZE_16MB: usize = 16 * 1024 * 1024;
 
-use crate::{event_dispatcher::EventDispatcher, utils::counter_to_event_ty, Scenario};
+use crate::{
+    counter_selection::get_pmu_counters, event_dispatcher::EventDispatcher,
+    utils::counter_to_event_ty, Scenario,
+};
 
 pub async fn do_record(
     scenario: Scenario,
     output_directory: &Path,
-    pid: Option<u32>,
+    _pid: Option<u32>,
     command: Vec<String>,
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
 
-    let json_command = if !command.is_empty() {
-        Some(command.clone())
-    } else {
-        None
-    };
-
-    let info = RecordInfo {
-        scenario,
-        command: json_command,
-        pid,
-    };
-
-    {
-        let mut info_file = File::create(output_directory.join("info.json"))?;
-        serde_json::to_writer(&mut info_file, &info)?;
-    }
-
     let (dispatcher, join_handle) = EventDispatcher::new(output_directory);
 
-    match scenario {
+    let info = match scenario {
         Scenario::Snapshot => snapshot(dispatcher.clone(), &command)?,
         Scenario::Roofline => roofline(dispatcher.clone(), &command).await?,
     };
@@ -49,27 +35,35 @@ pub async fn do_record(
 
     join_handle.join().await;
 
+    let json_command = if !command.is_empty() {
+        Some(command.clone())
+    } else {
+        None
+    };
+
+    let ri = RecordInfo {
+        scenario,
+        command: json_command,
+        cpu_model: "Unknown".to_string(),
+        cpu_vendor: "Unknown".to_string(),
+        scenario_info: info,
+    };
+
+    {
+        let mut info_file = File::create(output_directory.join("info.json"))?;
+        serde_json::to_writer(&mut info_file, &ri)?;
+    }
+
     Ok(())
 }
 
-fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> {
+fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
     let process = Process::new(command, &[])?;
 
+    let counters = get_pmu_counters(Scenario::Snapshot);
+
     let driver = pmu::SamplingDriver::builder()
-        .counters(&[
-            Counter::Cycles,
-            Counter::Instructions,
-            Counter::LLCReferences,
-            Counter::LLCMisses,
-            Counter::BranchMisses,
-            Counter::BranchInstructions,
-            Counter::StalledCyclesBackend,
-            Counter::StalledCyclesFrontend,
-            Counter::CpuClock,
-            Counter::CpuMigrations,
-            Counter::PageFaults,
-            Counter::ContextSwitches,
-        ])
+        .counters(&counters)
         .process(&process)
         .build()?;
 
@@ -96,7 +90,10 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> 
     process.wait()?;
     driver.stop()?;
 
-    Ok(())
+    Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
+        pid: process.pid(),
+        counters: counters.iter().map(counter_to_event_ty).collect(),
+    }))
 }
 
 fn get_exe_dir() -> std::io::Result<PathBuf> {
@@ -105,7 +102,7 @@ fn get_exe_dir() -> std::io::Result<PathBuf> {
     Ok(exe_path)
 }
 
-async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<()> {
+async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
     let exe_path = get_exe_dir()?.to_str().unwrap().to_string();
 
     // FIXME make this platform independent
@@ -131,13 +128,10 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
         ],
     )?;
 
+    let counters = get_pmu_counters(Scenario::Roofline);
+
     let driver = pmu::SamplingDriver::builder()
-        .counters(&[
-            Counter::Cycles,
-            Counter::Instructions,
-            Counter::LLCReferences,
-            Counter::LLCMisses,
-        ])
+        .counters(&counters)
         .process(&process)
         .build()?;
 
@@ -168,6 +162,8 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
     driver.stop()?;
     task.await?;
 
+    let perf_pid = process.pid();
+
     println!(
         "Run 2: collecting loop statistics for '{}'",
         command.join(" ")
@@ -194,7 +190,13 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     task.await?;
 
-    Ok(())
+    let inst_pid = process.pid();
+
+    Ok(ScenarioInfo::Roofline(RooflineInfo {
+        perf_pid,
+        counters: counters.iter().map(counter_to_event_ty).collect(),
+        inst_pid,
+    }))
 }
 
 fn create_shmem_pipe(
