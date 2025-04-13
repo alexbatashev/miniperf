@@ -63,7 +63,6 @@ impl EventDispatcher {
 
         let proc_map_out_dir = output_directory.to_owned();
         let proc_map_worker = tokio::spawn(async move {
-            // let mut proc_map_entries = Hash::<u32, Vec<ProcMapEntry>>::new();
             let mut proc_map_entries = HashMap::<u32, HashSet<ProcMapEntry>>::new();
             while let Some(pid) = proc_map_rx.recv().await {
                 if let Ok(maps) = get_process_maps(pid as Pid) {

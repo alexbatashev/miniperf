@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mperf_data::{Event, EventType, ProcMap};
+use mperf_data::{EventType, ProcMap};
 use pmu::Counter;
 
 pub fn counter_to_event_ty(counter: &Counter) -> EventType {
@@ -84,24 +84,33 @@ pub fn find_sym_name(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<String> {
         })
 }
 
-pub fn get_event_readable_name(evt: &Event) -> String {
-    match evt.ty {
-        EventType::PmuCycles => "Cycles",
-        EventType::PmuInstructions => "Instructions",
-        EventType::PmuBranchInstructions => "Branches",
-        EventType::PmuBranchMisses => "Branch misses",
-        EventType::PmuLlcReferences => "LLC References",
-        EventType::PmuLlcMisses => "LLC Misses",
-        EventType::PmuStalledCyclesFrontend => "Stalled cycles frontend",
-        EventType::PmuStalledCyclesBackend => "Stalled cycles backend",
-        EventType::OsCpuClock => "CPU clock",
-        EventType::OsUserTime => "User time",
-        EventType::OsTotalTime => "Total time",
-        EventType::OsPageFaults => "Page faults",
-        EventType::OsSystemTime => "System time",
-        EventType::OsCpuMigrations => "CPU migrations",
-        EventType::OsContextSwitches => "Context switches",
-        _ => unimplemented!(),
-    }
-    .to_string()
+pub fn find_location(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<(String, u32)> {
+    pmes.iter()
+        .find_map(|entry| {
+            if ip < entry.address || ip > entry.address + entry.size {
+                return None;
+            }
+
+            entry
+                .loader
+                .as_ref()
+                .and_then(|loader| loader.find_location((ip - entry.address) as u64).ok())
+                .flatten()
+                .map(|loc| {
+                    (
+                        loc.file.unwrap_or_default().to_string(),
+                        loc.line.unwrap_or_default(),
+                    )
+                })
+        })
+        .or_else(|| {
+            pmes[0].loader.as_ref().and_then(|loader| {
+                loader.find_location(ip as u64).ok().flatten().map(|loc| {
+                    (
+                        loc.file.unwrap_or_default().to_string(),
+                        loc.line.unwrap_or_default(),
+                    )
+                })
+            })
+        })
 }
