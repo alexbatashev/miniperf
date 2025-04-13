@@ -13,7 +13,7 @@ const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 use crate::{
     counter_selection::get_pmu_counters, event_dispatcher::EventDispatcher,
-    utils::counter_to_event_ty, Scenario,
+    postprocess::perform_postprocessing, utils::counter_to_event_ty, Scenario,
 };
 
 pub async fn do_record(
@@ -53,6 +53,8 @@ pub async fn do_record(
         let mut info_file = File::create(output_directory.join("info.json"))?;
         serde_json::to_writer(&mut info_file, &ri)?;
     }
+
+    perform_postprocessing(output_directory).await?;
 
     Ok(())
 }
