@@ -59,6 +59,7 @@ async fn process_strings(connection: &sqlite::Connection, res_dir: &Path) -> Res
 
     Ok(())
 }
+
 async fn process_pmu_counters(
     connection: &sqlite::Connection,
     info: &ScenarioInfo,

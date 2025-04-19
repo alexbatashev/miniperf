@@ -343,7 +343,8 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           case Instruction::Mul:
           case Instruction::CompareUsingScalarTypes:
             if (I.getType()->isVectorTy()) {
-              VectorIntOps += 1;
+              auto VecTy = cast<VectorType>(I.getType());
+              VectorIntOps += VecTy->getElementCount().getFixedValue();
             } else {
               ScalarIntOps += 1;
             }
@@ -355,12 +356,14 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           case Instruction::FRem:
           case Instruction::FCmp:
             if (I.getType()->isVectorTy()) {
-              auto ElementTy = cast<VectorType>(I.getType())->getElementType();
+              auto VecTy = cast<VectorType>(I.getType());
+              auto ElementTy = VecTy->getElementType();
+              size_t Multiplier = VecTy->getElementCount().getFixedValue();
               if (ElementTy->isFloatTy()) {
-                VectorFloatOps += 1;
+                VectorFloatOps += Multiplier;
               } else {
                 // FIXME this could actually be half or bfloat
-                VectorDoubleOps += 1;
+                VectorDoubleOps += Multiplier;
               }
             } else if (I.getType()->isFloatTy()) {
               ScalarFloatOps += 1;
@@ -375,13 +378,14 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
             switch (Call.getIntrinsicID()) {
             case Intrinsic::fma:
               if (I.getType()->isVectorTy()) {
-                auto ElementTy =
-                    cast<VectorType>(I.getType())->getElementType();
+                auto VecTy = cast<VectorType>(I.getType());
+                auto ElementTy = VecTy->getElementType();
+                size_t Multiplier = VecTy->getElementCount().getFixedValue();
                 if (ElementTy->isFloatTy()) {
-                  VectorFloatOps += 2;
+                  VectorFloatOps += 2 * Multiplier;
                 } else {
                   // FIXME this could actually be half or bfloat
-                  VectorDoubleOps += 2;
+                  VectorDoubleOps += 2 * Multiplier;
                 }
               } else if (I.getType()->isFloatTy()) {
                 ScalarFloatOps += 2;
@@ -394,13 +398,14 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
             case Intrinsic::maxnum:
             case Intrinsic::maximum:
               if (I.getType()->isVectorTy()) {
-                auto ElementTy =
-                    cast<VectorType>(I.getType())->getElementType();
+                auto VecTy = cast<VectorType>(I.getType());
+                auto ElementTy = VecTy->getElementType();
+                size_t Multiplier = VecTy->getElementCount().getFixedValue();
                 if (ElementTy->isFloatTy()) {
-                  VectorFloatOps += 1;
+                  VectorFloatOps += Multiplier;
                 } else {
                   // FIXME this could actually be half or bfloat
-                  VectorDoubleOps += 1;
+                  VectorDoubleOps += Multiplier;
                 }
               } else if (I.getType()->isFloatTy()) {
                 ScalarFloatOps += 1;
