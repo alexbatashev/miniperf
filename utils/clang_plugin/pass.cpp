@@ -76,10 +76,11 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
 
     IRBuilder<> Builder(F.getContext());
 
-    auto LoopInfoTy = StructType::create(
-        F.getContext(),
-        {Type::getInt32Ty(F.getContext()), PointerType::get(F.getContext(), 0)},
-        "LoopInfo");
+    auto LoopInfoTy = StructType::create(F.getContext(),
+                                         {Type::getInt32Ty(F.getContext()),
+                                          PointerType::get(F.getContext(), 0),
+                                          PointerType::get(F.getContext(), 0)},
+                                         "LoopInfo");
 
     auto LoopStatsTy = StructType::create(F.getContext(),
                                           {
@@ -235,12 +236,16 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
       Value *InfoMem = Builder.CreateAlloca(LoopInfoTy);
 
       Value *FilenameVar = Builder.CreateGlobalString(Filename);
+      Value *FuncNameVar = Builder.CreateGlobalString(F.getName());
 
       Value *LineNoPtr = Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 0);
       Value *FilenamePtr =
           Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 1);
+      Value *FuncNamePtr =
+          Builder.CreateConstGEP2_32(LoopInfoTy, InfoMem, 0, 2);
 
       Builder.CreateStore(FilenameVar, FilenamePtr);
+      Builder.CreateStore(FuncNameVar, FuncNamePtr);
       Builder.CreateStore(
           ConstantInt::get(Type::getInt32Ty(F.getContext()), LineNo),
           LineNoPtr);

@@ -13,6 +13,7 @@ use crate::{
 pub struct LoopInfo {
     line: u32,
     filename: *const libc::c_char,
+    func_name: *const libc::c_char,
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +21,7 @@ pub struct LoopInfo {
 pub struct SafeLoopInfo {
     line: u32,
     filename: String,
+    func_name: String,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -58,6 +60,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
     let info = SafeLoopInfo {
         line: info.line,
         filename: CStr::from_ptr(info.filename).to_str().unwrap().to_string(),
+        func_name: CStr::from_ptr(info.func_name).to_str().unwrap().to_string(),
     };
 
     let mut handle = Box::new(LoopHandle {
@@ -70,9 +73,10 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
 
     // FIXME we should use the full stack frame instead
     let filename = get_string_id(&handle.info.filename);
+    let func_name = get_string_id(&handle.info.func_name);
 
     let start_frame = CallFrame::Location(Location {
-        function_name: 0,
+        function_name: func_name as u128,
         file_name: filename as u128,
         line: handle.info.line,
     });
