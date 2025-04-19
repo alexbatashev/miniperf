@@ -48,10 +48,14 @@ impl Widget for LoopsTab {
         let header = [
             Cell::from("Function"),
             Cell::from("Location"),
-            Cell::from("Avg. SFLOPs"),
-            Cell::from("SFP AI"),
-            Cell::from("Avg. SDFLOPs"),
-            Cell::from("SDP AI"),
+            Cell::from("Scalar SP GFLOP/s"),
+            Cell::from("Scalar SP AI"),
+            Cell::from("Scalar DP GFLOP/s"),
+            Cell::from("Scalar DP AI"),
+            Cell::from("Vector SP GFLOP/s"),
+            Cell::from("Vector SP AI"),
+            Cell::from("Vector DP GFLOP/s"),
+            Cell::from("Vector DP AI"),
         ]
         .into_iter()
         .collect::<Row>()
@@ -66,17 +70,26 @@ impl Widget for LoopsTab {
                 Cell::from(format!("{:.2}", loop_.sfp_ai)),
                 Cell::from(format!("{:.2}", loop_.sdp_ops)),
                 Cell::from(format!("{:.2}", loop_.sdp_ai)),
+                Cell::from(format!("{:.2}", loop_.vfp_ops)),
+                Cell::from(format!("{:.2}", loop_.vfp_ai)),
+                Cell::from(format!("{:.2}", loop_.vdp_ops)),
+                Cell::from(format!("{:.2}", loop_.vdp_ai)),
             ]
             .into_iter()
             .collect::<Row>()
         });
 
         let widths = [
-            Constraint::Max(40),
-            Constraint::Min(50),
             Constraint::Max(30),
-            Constraint::Max(30),
-            Constraint::Max(30),
+            Constraint::Min(40),
+            Constraint::Max(20),
+            Constraint::Max(20),
+            Constraint::Max(20),
+            Constraint::Max(20),
+            Constraint::Max(20),
+            Constraint::Max(20),
+            Constraint::Max(20),
+            Constraint::Max(20),
         ];
 
         let t = Table::new(rows, widths)
@@ -121,23 +134,23 @@ impl LoopsTab {
                     file_name: row.read::<&str, _>("file_name").to_string(),
                     line: row.read::<i64, _>("line") as u32,
 
-                    sint_ops: row.read::<f64, _>("scalar_int_ops"),
-                    sint_ai: row.read::<f64, _>("scalar_int_ai"),
+                    sint_ops: row.try_read::<f64, _>("scalar_int_ops").unwrap_or_default() / 1_000_000_000.0,
+                    sint_ai: row.try_read::<f64, _>("scalar_int_ai").unwrap_or_default(),
 
-                    sfp_ops: row.read::<f64, _>("scalar_float_ops"),
-                    sfp_ai: row.read::<f64, _>("scalar_float_ai"),
+                    sfp_ops: row.try_read::<f64, _>("scalar_float_ops").unwrap_or_default() / 1_000_000_000.0,
+                    sfp_ai: row.try_read::<f64, _>("scalar_float_ai").unwrap_or_default(),
 
-                    sdp_ops: row.read::<f64, _>("scalar_double_ops"),
-                    sdp_ai: row.read::<f64, _>("scalar_double_ai"),
+                    sdp_ops: row.try_read::<f64, _>("scalar_double_ops").unwrap_or_default() / 1_000_000_000.0,
+                    sdp_ai: row.try_read::<f64, _>("scalar_double_ai").unwrap_or_default(),
 
-                    vint_ops: row.read::<f64, _>("vector_int_ops"),
-                    vint_ai: row.read::<f64, _>("vector_int_ai"),
+                    vint_ops: row.try_read::<f64, _>("vector_int_ops").unwrap_or_default() / 1_000_000_000.0,
+                    vint_ai: row.try_read::<f64, _>("vector_int_ai").unwrap_or_default(),
 
-                    vfp_ops: row.read::<f64, _>("vector_float_ops"),
-                    vfp_ai: row.read::<f64, _>("vector_float_ai"),
+                    vfp_ops: row.try_read::<f64, _>("vector_float_ops").unwrap_or_default() / 1_000_000_000.0,
+                    vfp_ai: row.try_read::<f64, _>("vector_float_ai").unwrap_or_default(),
 
-                    vdp_ops: row.read::<f64, _>("vector_double_ops"),
-                    vdp_ai: row.read::<f64, _>("vector_double_ai"),
+                    vdp_ops: row.try_read::<f64, _>("vector_double_ops").unwrap_or_default() / 1_000_000_000.0,
+                    vdp_ai: row.try_read::<f64, _>("vector_double_ai").unwrap_or_default(),
                 }
             })
             .collect();
