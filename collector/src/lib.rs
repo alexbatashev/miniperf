@@ -11,7 +11,6 @@ use std::{
 use mperf_data::{Event, IPCMessage, IPCString};
 
 pub mod ffi;
-
 const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 lazy_static! {
@@ -105,4 +104,13 @@ pub fn roofline_instrumentation_enabled() -> bool {
 extern "C" fn close_pipe() {
     let sender = SENDER.lock().unwrap();
     let _ = sender.close();
+}
+
+pub(crate) fn get_timestamp() -> u64 {
+    let mut ts: libc::timespec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
+    (ts.tv_sec * 1_000_000_000 + ts.tv_nsec) as u64
 }

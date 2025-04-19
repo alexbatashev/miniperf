@@ -505,33 +505,31 @@ runs AS (
   GROUP BY process_id, file_name, function_name, line
 )
 SELECT
-  runs.process_id,
   s_file.string AS file_name,
   s_func.string AS function_name,
   runs.line,
 
-  CAST(ops.scalar_int_ops AS REAL) / NULLIF(runs.total_duration, 0) AS scalar_int_ops,
+  CAST(ops.scalar_int_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS scalar_int_ops,
   CAST(ops.scalar_int_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS scalar_int_ai,
 
-  CAST(ops.scalar_float_ops AS REAL) / NULLIF(runs.total_duration, 0) AS scalar_float_ops,
+  CAST(ops.scalar_float_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS scalar_float_ops,
   CAST(ops.scalar_float_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS scalar_float_ai,
 
-  CAST(ops.scalar_double_ops AS REAL) / NULLIF(runs.total_duration, 0) AS scalar_double_ops,
+  CAST(ops.scalar_double_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS scalar_double_ops,
   CAST(ops.scalar_double_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS scalar_double_ai,
 
-  CAST(ops.vector_int_ops AS REAL) / NULLIF(runs.total_duration, 0) AS vector_int_ops,
+  CAST(ops.vector_int_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_int_ops,
   CAST(ops.vector_int_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_int_ai,
 
-  CAST(ops.vector_float_ops AS REAL) / NULLIF(runs.total_duration, 0) AS vector_float_ops,
+  CAST(ops.vector_float_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_float_ops,
   CAST(ops.vector_float_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_float_ai,
 
-  CAST(ops.vector_double_ops AS REAL) / NULLIF(runs.total_duration, 0) AS vector_double_ops,
+  CAST(ops.vector_double_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_double_ops,
   CAST(ops.vector_double_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_double_ai
 
 FROM runs
 LEFT JOIN ops
-  ON runs.process_id = ops.process_id
-  AND runs.file_name = ops.file_name
+  ON runs.file_name = ops.file_name
   AND runs.function_name = ops.function_name
   AND runs.line = ops.line
 LEFT JOIN strings s_file ON runs.file_name = s_file.id
