@@ -1,13 +1,11 @@
 use smallvec::smallvec;
-use std::{
-    ffi::CStr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::ffi::CStr;
 
 use mperf_data::{CallFrame, Event, EventType, Location};
 
 use crate::{
-    get_next_id, get_string_id, profiling_enabled, roofline_instrumentation_enabled, send_event,
+    get_next_id, get_string_id, get_timestamp, profiling_enabled, roofline_instrumentation_enabled,
+    send_event,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -68,11 +66,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
         info,
     });
 
-    let time = SystemTime::now();
-    handle.timestamp = time
-        .duration_since(UNIX_EPOCH)
-        .expect("failed to get timestamp")
-        .as_millis() as u64;
+    handle.timestamp = get_timestamp();
 
     // FIXME we should use the full stack frame instead
     let filename = get_string_id(&handle.info.filename);
@@ -118,14 +112,10 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
     if !profiling_enabled() {
         return;
     }
-    let time = SystemTime::now();
 
     let handle = unsafe { handle.as_ref() }.unwrap();
 
-    let timestamp = time
-        .duration_since(UNIX_EPOCH)
-        .expect("failed to get time")
-        .as_millis() as u64;
+    let timestamp = get_timestamp();
 
     let event = Event {
         unique_id: get_next_id(),
@@ -154,15 +144,11 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
     if !profiling_enabled() {
         return;
     }
-    let time = SystemTime::now();
     let stats = unsafe { stats.as_ref().cloned().unwrap_or_default() };
 
     let handle = unsafe { handle.as_ref() }.unwrap();
 
-    let timestamp = time
-        .duration_since(UNIX_EPOCH)
-        .expect("failed to get time")
-        .as_millis() as u64;
+    let timestamp = get_timestamp();
 
     let send_counter_event = |ty: EventType, value: u64| {
         let event = Event {
