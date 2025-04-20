@@ -4,15 +4,22 @@ use std::{
 };
 
 use anyhow::Result;
+use kdam::BarExt;
 use memmap2::{Advice, Mmap};
 use mperf_data::{
     CallFrame, Event, EventType, IString, ProcMapEntry, RecordInfo, Scenario, ScenarioInfo,
 };
-use tokio::fs::{self, File};
+use smallvec::SmallVec;
+use tokio::{
+    fs::{self, File},
+    io::AsyncWriteExt,
+};
 
 use crate::utils;
 
-pub async fn perform_postprocessing(res_dir: &Path) -> Result<()> {
+pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()> {
+    let mut pb = pb;
+
     let data = fs::read_to_string(res_dir.join("info.json"))
         .await
         .expect("failed to read info.json");
@@ -30,12 +37,12 @@ pub async fn perform_postprocessing(res_dir: &Path) -> Result<()> {
 
     match info.scenario {
         Scenario::Snapshot => {
-            process_pmu_counters(&connection, &info.scenario_info, res_dir).await?;
+            process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
         }
         Scenario::Roofline => {
-            process_pmu_counters(&connection, &info.scenario_info, res_dir).await?;
-            process_roofline_events(&connection, &info.scenario_info, res_dir).await?;
+            process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
+            process_roofline_events(&connection, &info.scenario_info, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
             create_roofline_view(&connection).await?;
         }
@@ -64,6 +71,7 @@ async fn process_pmu_counters(
     connection: &sqlite::Connection,
     info: &ScenarioInfo,
     res_dir: &Path,
+    pb: &mut kdam::Bar,
 ) -> Result<()> {
     let events = match info {
         ScenarioInfo::Snapshot(s) => &s.counters,
@@ -101,6 +109,9 @@ async fn process_pmu_counters(
     map.advise(Advice::Sequential)
         .expect("Failed to advice sequential reads");
 
+    pb.reset(Some(map.len()));
+    pb.write("Coolecting hotspots")?;
+
     let proc_map_file = std::fs::File::open(res_dir.join("proc_map.json"))?;
     let proc_map: Vec<ProcMapEntry> = serde_json::from_reader(proc_map_file)?;
 
@@ -118,19 +129,43 @@ async fn process_pmu_counters(
 
     let mut known_ips = HashSet::<u64>::new();
 
+    let mut flamegraph_cycles = HashMap::<String, u64>::new();
+    let mut flamegraph_instructions = HashMap::<String, u64>::new();
+
     while (cursor.position() as usize) < map.len() {
         let evt = Event::read_binary(&mut cursor).expect("Failed to decode event");
+
+        pb.update_to(cursor.position() as usize)?;
 
         if !evt.ty.is_pmu() && !evt.ty.is_os() {
             continue;
         }
 
         let pm = resolved_pm.get(&evt.process_id);
-        assert!(pm.is_some());
+
         if pm.is_none() {
             continue;
         }
         let pm = pm.unwrap();
+
+        let func_names = evt
+            .callstack
+            .iter()
+            .rev()
+            .map(|frame| match frame {
+                CallFrame::Location(_) => unreachable!(),
+                CallFrame::IP(ip) => {
+                    utils::find_sym_name(pm, *ip as usize).unwrap_or("[unknown]".to_string())
+                }
+            })
+            .collect::<SmallVec<[_; 32]>>()
+            .join(";");
+
+        if evt.ty == EventType::PmuCycles {
+            *flamegraph_cycles.entry(func_names).or_default() += evt.value;
+        } else if evt.ty == EventType::PmuInstructions {
+            *flamegraph_instructions.entry(func_names).or_default() += evt.value;
+        }
 
         if evt.correlation_id
             != lead_event
@@ -224,6 +259,44 @@ async fn process_pmu_counters(
         counters.insert(format!("{}", evt.ty), evt.value);
     }
 
+    let flamegraph_cycles = flamegraph_cycles
+        .into_iter()
+        .map(|(key, value)| format!("{} {}", key, value))
+        .collect::<Vec<_>>();
+    let flamegraph_instructions = flamegraph_instructions
+        .into_iter()
+        .map(|(key, value)| format!("{} {}", key, value))
+        .collect::<Vec<_>>();
+
+    let mut options = inferno::flamegraph::Options::default();
+    options.reverse_stack_order = false;
+    let fg_file = std::fs::File::create(res_dir.join("flamegraph_cycles.svg"))?;
+    inferno::flamegraph::from_lines(
+        &mut options,
+        flamegraph_cycles.iter().map(|s| s.as_str()),
+        &fg_file,
+    )?;
+    let fg_file = std::fs::File::create(res_dir.join("flamegraph_instructions.svg"))?;
+    inferno::flamegraph::from_lines(
+        &mut options,
+        flamegraph_instructions.iter().map(|s| s.as_str()),
+        &fg_file,
+    )?;
+
+    let mut fg_file = File::create(res_dir.join("flamegraph_cycles.folded")).await?;
+
+    for fc in flamegraph_cycles {
+        fg_file.write_all(fc.as_bytes()).await?;
+        fg_file.write_all("\n".as_bytes()).await?;
+    }
+
+    let mut fg_file = File::create(res_dir.join("flamegraph_instructions.folded")).await?;
+
+    for fi in flamegraph_instructions {
+        fg_file.write_all(fi.as_bytes()).await?;
+        fg_file.write_all("\n".as_bytes()).await?;
+    }
+
     Ok(())
 }
 
@@ -252,6 +325,7 @@ async fn process_roofline_events(
     connection: &sqlite::Connection,
     info: &ScenarioInfo,
     res_dir: &Path,
+    pb: &mut kdam::Bar,
 ) -> Result<()> {
     let (baseline_pid, instr_pid) = match info {
         ScenarioInfo::Roofline(roofline) => (roofline.perf_pid, roofline.inst_pid),
@@ -301,6 +375,9 @@ async fn process_roofline_events(
     map.advise(Advice::Sequential)
         .expect("Failed to advice sequential reads");
 
+    pb.reset(Some(map.len()));
+    pb.write("Coolecting roofline data")?;
+
     let data_stream = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
 
     let mut cursor = std::io::Cursor::new(data_stream);
@@ -328,6 +405,8 @@ async fn process_roofline_events(
 
     while (cursor.position() as usize) < map.len() {
         let evt = Event::read_binary(&mut cursor).expect("Failed to decode event");
+
+        pb.update_to(cursor.position() as usize)?;
 
         if !evt.ty.is_roofline() {
             continue;

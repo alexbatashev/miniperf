@@ -6,21 +6,23 @@ use std::{
 
 use anyhow::Result;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
+use flamegraph::FlamegraphTab;
 use hotspots::HotspotsTab;
 use loops::LoopsTab;
 use mperf_data::{RecordInfo, Scenario};
 use parking_lot::{Mutex, RwLock};
 use ratatui::{
-    layout::{Constraint, Layout},
+    layout::{Constraint, Flex, Layout},
     style::{palette, Style, Stylize},
     text::Line,
-    widgets::{Tabs, Widget},
+    widgets::{Block, Cell, Clear, Row, Table, Tabs, Widget},
     DefaultTerminal, Frame,
 };
 use summary::SummaryTab;
 use tokio::fs::{self};
 use tokio_stream::StreamExt;
 
+mod flamegraph;
 mod hotspots;
 mod loops;
 mod summary;
@@ -35,6 +37,7 @@ pub async fn tui_main(res_dir: &Path) -> Result<()> {
 #[derive(Default)]
 struct App {
     should_quit: bool,
+    show_help: bool,
     tabs: TabsWidget,
     res_dir: PathBuf,
 }
@@ -71,16 +74,70 @@ impl App {
         let title = Line::from("mperf results").centered().bold();
         frame.render_widget(title, title_area);
         frame.render_widget(&self.tabs, body_area);
+
+        if self.show_help {
+            let block = Block::bordered().title("Help");
+
+            let vertical = Layout::vertical([Constraint::Length(20)]).flex(Flex::Center);
+            let horizontal = Layout::horizontal([Constraint::Length(50)]).flex(Flex::Center);
+
+            let [area] = vertical.areas(frame.area());
+            let [area] = horizontal.areas(area);
+
+            frame.render_widget(Clear, area);
+            frame.render_widget(block, area);
+
+            let header = [Cell::from("Key"), Cell::from("Action")]
+                .into_iter()
+                .collect::<Row>()
+                .style(Style::new().bold());
+
+            let rows = [
+                [Cell::from("?"), Cell::from("Show/hide this window")]
+                    .into_iter()
+                    .collect::<Row>(),
+                [Cell::from("q"), Cell::from("Quit miniperf")]
+                    .into_iter()
+                    .collect::<Row>(),
+                [Cell::from("<tab>"), Cell::from("Switch tabs")]
+                    .into_iter()
+                    .collect::<Row>(),
+            ];
+
+            let vertical = Layout::vertical_margin(Layout::vertical([Constraint::Fill(1)]), 2);
+            let horizontal =
+                Layout::horizontal_margin(Layout::horizontal([Constraint::Fill(1)]), 2);
+
+            let [table_area] = vertical.areas(area);
+            let [table_area] = horizontal.areas(table_area);
+
+            let widths = [Constraint::Length(8), Constraint::Fill(1)];
+            let t = Table::new(rows, widths).header(header);
+            frame.render_widget(t, table_area);
+        }
     }
 
     fn handle_event(&mut self, event: &crossterm::event::Event) {
         if let crossterm::event::Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
-                    KeyCode::Tab => self.tabs.next_tab(),
-                    KeyCode::BackTab => self.tabs.previous_tab(),
-                    _ => {}
+                    KeyCode::Char('q') => self.should_quit = true,
+                    KeyCode::Tab => {
+                        if !self.show_help {
+                            self.tabs.next_tab()
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        if !self.show_help {
+                            self.tabs.previous_tab()
+                        }
+                    }
+                    KeyCode::Char('?') => self.show_help = !self.show_help,
+                    _ => {
+                        if !self.show_help {
+                            self.tabs.handle_event(key.code);
+                        }
+                    }
                 }
             }
         }
@@ -128,6 +185,7 @@ enum Tab {
     Summary(SummaryTab),
     Hotspots(HotspotsTab),
     Loops(LoopsTab),
+    Flamegraph(FlamegraphTab),
 }
 
 impl Tab {
@@ -136,6 +194,7 @@ impl Tab {
             Tab::Summary(_) => " Summary ",
             Tab::Hotspots(_) => " Hotspots ",
             Tab::Loops(_) => " Loops ",
+            Tab::Flamegraph(_) => " Flamegraph ",
         }
     }
 
@@ -144,6 +203,7 @@ impl Tab {
             Tab::Summary(summary) => summary.run(),
             Tab::Hotspots(hotspots) => hotspots.run(),
             Tab::Loops(loops) => loops.run(),
+            Tab::Flamegraph(fg) => fg.run(),
         }
     }
 }
@@ -184,6 +244,7 @@ impl TabsWidget {
                     connection.clone(),
                 )));
                 write_tabs.push(Tab::Hotspots(HotspotsTab::new(connection.clone())));
+                write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())));
             }
             Scenario::Roofline => {
                 write_tabs.push(Tab::Summary(SummaryTab::new(
@@ -191,6 +252,7 @@ impl TabsWidget {
                     connection.clone(),
                 )));
                 write_tabs.push(Tab::Loops(LoopsTab::new(connection.clone())));
+                write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())));
             }
         }
     }
@@ -209,6 +271,13 @@ impl TabsWidget {
             self.cur_tab -= 1;
         }
     }
+
+    fn handle_event(&mut self, code: KeyCode) {
+        match &mut self.tabs.write()[self.cur_tab] {
+            Tab::Flamegraph(tab) => tab.handle_event(code),
+            _ => {}
+        }
+    }
 }
 
 impl Widget for &Tab {
@@ -220,6 +289,7 @@ impl Widget for &Tab {
             Tab::Summary(tab) => tab.clone().render(area, buf),
             Tab::Hotspots(tab) => tab.clone().render(area, buf),
             Tab::Loops(tab) => tab.clone().render(area, buf),
+            Tab::Flamegraph(tab) => tab.clone().render(area, buf),
         }
     }
 }
