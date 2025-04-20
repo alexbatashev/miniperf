@@ -9,6 +9,7 @@ pub struct CPUFamily {
     pub vendor: String,
     pub id: String,
     pub max_counters: Option<usize>,
+    pub leader_event: Option<String>,
     pub events: HashMap<String, EventDesc>,
     pub aliases: HashMap<String, String>,
 }

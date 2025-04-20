@@ -60,7 +60,23 @@ pub fn grouped(
     let cpu_family = cpu_family::get_host_cpu_family();
     let info = cpu_family::find_cpu_family(cpu_family);
 
-    let max_counters_in_group = info.and_then(|info| info.max_counters).unwrap_or(3);
+    let leader = info.and_then(|info| info.leader_event.clone());
+
+    let leader_cntr = counters.iter().find(|cntr| {
+        leader.is_some()
+            && match cntr {
+                Counter::Custom(name) => name == leader.as_ref().unwrap(),
+                _ => false,
+            }
+    });
+
+    let max_counters_in_group = info.and_then(|info| info.max_counters).unwrap_or_else(|| {
+        if leader.is_some() {
+            2
+        } else {
+            3
+        }
+    });
 
     let mut cycles_attrs = zip(counters, attrs.iter())
         .find(|(cntr, _)| **cntr == Counter::Cycles)
@@ -73,26 +89,65 @@ pub fn grouped(
         .cloned()
         .expect("Instructions are required for correct sampling");
 
+    let leader_attrs = zip(counters, attrs.iter())
+        .find(|(cntr, _)| leader.is_some() && cntr == leader_cntr.as_ref().unwrap())
+        .map(|(_, attrs)| attrs)
+        .cloned();
+
+    // Filter out Cycles, Instructions and group leader (if any)
     let chunks = zip(counters, attrs.iter_mut())
-        .filter(|(cntr, _)| **cntr != Counter::Cycles && **cntr != Counter::Instructions)
+        .filter(|(cntr, _)| {
+            **cntr != Counter::Cycles
+                && **cntr != Counter::Instructions
+                && if leader.is_some() {
+                    cntr == leader_cntr.as_ref().unwrap()
+                } else {
+                    true
+                }
+        })
         .chunks(max_counters_in_group);
 
     let mut handles: Vec<NativeCounterHandle> = vec![];
 
     for chunk in chunks.into_iter() {
-        let cycles_fd =
-            unsafe { sys::perf_event_open(&mut cycles_attrs, pid.unwrap_or(0), -1, -1, 0) };
+        let cycles_leader_fd = if leader.is_some() {
+            let leader_fd = unsafe {
+                sys::perf_event_open(&mut leader_attrs.unwrap(), pid.unwrap_or(0), -1, -1, 0)
+            };
+            handles.push(get_native_handle(
+                leader_fd,
+                leader_cntr.unwrap().clone(),
+                true,
+            )?);
+            leader_fd
+        } else {
+            -1
+        };
 
-        handles.push(get_native_handle(cycles_fd, Counter::Cycles, true)?);
+        let cycles_fd = unsafe {
+            sys::perf_event_open(&mut cycles_attrs, pid.unwrap_or(0), -1, cycles_leader_fd, 0)
+        };
+
+        let leader_fd = if leader.is_some() {
+            cycles_leader_fd
+        } else {
+            cycles_fd
+        };
+
+        handles.push(get_native_handle(
+            cycles_fd,
+            Counter::Cycles,
+            !leader.is_some(),
+        )?);
 
         let instr_fd =
-            unsafe { sys::perf_event_open(&mut instr_attrs, pid.unwrap_or(0), -1, cycles_fd, 0) };
+            unsafe { sys::perf_event_open(&mut instr_attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
 
         handles.push(get_native_handle(instr_fd, Counter::Instructions, false)?);
 
         for (cntr, attrs) in chunk {
             let new_fd =
-                unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, cycles_fd, 0) };
+                unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
             handles.push(get_native_handle(new_fd, cntr.clone(), false)?);
         }
     }
