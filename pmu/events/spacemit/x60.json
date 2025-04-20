@@ -3,11 +3,8 @@
   "name": "SpacemiT K1/M1",
   "vendor": "SpacemiT",
   "arch": "riscv64",
+  "leader_event": "u_mode_cycle",
   "aliases": [
-    {
-      "target": "cycles",
-      "origin": "u_mode_cycle"
-    },
     {
       "target": "cache_references",
       "origin": "l2_access"

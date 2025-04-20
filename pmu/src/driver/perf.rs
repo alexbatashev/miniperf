@@ -3,6 +3,7 @@ mod events;
 mod mmap;
 
 use hashbrown::HashMap;
+use itertools::chain;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -18,7 +19,7 @@ use perf_event_open_sys::bindings::{
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 use smallvec::SmallVec;
 
-use crate::{Counter, Error, Process};
+use crate::{cpu_family, Counter, Error, Process};
 
 pub use events::list_supported_counters;
 
@@ -370,8 +371,19 @@ impl SamplingDriver {
 
 impl SamplingDriverBuilder {
     pub fn counters(self, counters: &[Counter]) -> Self {
+        let cpu_family = cpu_family::get_host_cpu_family();
+        let info = cpu_family::find_cpu_family(cpu_family);
+
+        let leader = info.and_then(|info| info.leader_event.clone());
+
+        let counters = if leader.is_some() {
+            chain([Counter::Custom(leader.unwrap())], counters.iter().cloned()).collect()
+        } else {
+            counters.to_vec()
+        };
+
         Self {
-            counters: counters.to_vec(),
+            counters,
             sample_freq: self.sample_freq,
             pid: self.pid,
             prefer_raw_events: self.prefer_raw_events,
