@@ -57,12 +57,12 @@ impl SummaryTab {
                 "SELECT
             SUM(pmu_cycles) as pmu_cycles,
             SUM(pmu_instructions) as pmu_instructions,
-            SUM(pmu_llc_references) as pmu_llc_references,
-            SUM(pmu_llc_misses) as pmu_llc_misses,
-            SUM(pmu_branch_instructions) as pmu_branch_instructions,
-            SUM(pmu_branch_misses) as pmu_branch_misses,
-            SUM(pmu_stalled_cycles_frontend) as pmu_stalled_cycles_frontend,
-            SUM(pmu_stalled_cycles_backend) as pmu_stalled_cycles_backend
+            CAST(SUM(pmu_llc_references * 1.0 / confidence) AS INTEGER) AS pmu_llc_references,
+            CAST(SUM(pmu_llc_misses * 1.0 / confidence) AS INTEGER) AS pmu_llc_misses,
+            CAST(SUM(pmu_branch_instructions * 1.0 / confidence) AS INTEGER) AS pmu_branch_instructions,
+            CAST(SUM(pmu_branch_misses * 1.0 / confidence) AS INTEGER) AS pmu_branch_misses,
+            CAST(SUM(pmu_stalled_cycles_frontend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_frontend,
+            CAST(SUM(pmu_stalled_cycles_backend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_backend
 
             FROM pmu_counters;
         ",
@@ -71,8 +71,6 @@ impl SummaryTab {
             .into_iter();
 
         let row = row.next().unwrap().unwrap();
-
-        println!("{:?}", &row);
 
         let mut stat = self.stat.write();
         *stat = Stat {

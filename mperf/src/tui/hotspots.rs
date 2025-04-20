@@ -23,7 +23,9 @@ struct HSRow {
     instructions: u64,
     ipc: f64,
     branch_miss_rate: Option<f64>,
+    branch_mpki: Option<f64>,
     cache_miss_rate: Option<f64>,
+    cache_mpki: Option<f64>,
 }
 
 macro_rules! oflt {
@@ -46,7 +48,9 @@ impl Widget for HotspotsTab {
             Cell::from("Cycles"),
             Cell::from("Instructions"),
             Cell::from("IPC"),
+            Cell::from("Branch MPKI"),
             Cell::from("Branch mispred, %"),
+            Cell::from("Cache MPKI"),
             Cell::from("Cache miss, %"),
         ]
         .into_iter()
@@ -98,7 +102,9 @@ impl HotspotsTab {
                     instructions: row.read::<i64, _>("instructions") as u64,
                     ipc: row.read::<f64, _>("ipc") as f64,
                     branch_miss_rate: row.try_read::<f64, _>("branch_miss_rate").ok(),
+                    branch_mpki: row.try_read::<f64, _>("branch_mpki").ok(),
                     cache_miss_rate: row.try_read::<f64, _>("cache_miss_rate").ok(),
+                    cache_mpki: row.try_read::<f64, _>("cache_mpki").ok(),
                 }
             })
             .collect();
@@ -118,7 +124,9 @@ fn get_rows(hotspots: &[HSRow]) -> (Vec<Row<'_>>, Vec<Constraint>) {
                 Cell::new(Text::from(h.cycles.to_formatted_string(&Locale::en))),
                 Cell::new(Text::from(h.instructions.to_formatted_string(&Locale::en))),
                 Cell::new(Text::from(format!("{:.2}", h.ipc))),
+                Cell::new(oflt!(h.branch_mpki)),
                 Cell::new(oflt!(h.branch_miss_rate)),
+                Cell::new(oflt!(h.cache_mpki)),
                 Cell::new(oflt!(h.cache_miss_rate)),
             ]
             .into_iter()
@@ -128,8 +136,10 @@ fn get_rows(hotspots: &[HSRow]) -> (Vec<Row<'_>>, Vec<Constraint>) {
 
     let widths = [
         Constraint::Max(30),
+        Constraint::Max(10), // Total %
         Constraint::Max(20),
         Constraint::Max(20),
+        Constraint::Max(10), // IPC
         Constraint::Max(20),
         Constraint::Max(20),
         Constraint::Max(20),

@@ -6,7 +6,7 @@ use std::{
 use anyhow::Result;
 use memmap2::{Advice, Mmap};
 use mperf_data::{
-    CallFrame, Event, EventType, IString, ProcMap, RecordInfo, Scenario, ScenarioInfo,
+    CallFrame, Event, EventType, IString, ProcMapEntry, RecordInfo, Scenario, ScenarioInfo,
 };
 use tokio::fs::{self, File};
 
@@ -102,7 +102,7 @@ async fn process_pmu_counters(
         .expect("Failed to advice sequential reads");
 
     let proc_map_file = std::fs::File::open(res_dir.join("proc_map.json"))?;
-    let proc_map: Vec<ProcMap> = serde_json::from_reader(proc_map_file)?;
+    let proc_map: Vec<ProcMapEntry> = serde_json::from_reader(proc_map_file)?;
 
     let resolved_pm = utils::resolve_proc_maps(&proc_map);
 
@@ -126,6 +126,7 @@ async fn process_pmu_counters(
         }
 
         let pm = resolved_pm.get(&evt.process_id);
+        assert!(pm.is_some());
         if pm.is_none() {
             continue;
         }
