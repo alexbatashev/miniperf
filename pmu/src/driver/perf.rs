@@ -1,6 +1,8 @@
 mod binding;
 mod events;
+mod mmap;
 
+use hashbrown::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -8,13 +10,13 @@ use std::time::Duration;
 
 use events::process_counter;
 use libc::{close, mmap, munmap, sysconf, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
+use mmap::{EventValue, ReadFormat, Records};
 use perf_event_open_sys::bindings::{
-    perf_event_attr, perf_event_header, perf_event_mmap_page, PERF_RECORD_SAMPLE,
-    PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_READ,
-    PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    perf_event_attr, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IP,
+    PERF_SAMPLE_READ, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
-use smallvec::{SmallVec, ToSmallVec};
+use smallvec::SmallVec;
 
 use crate::{Counter, Error, Process};
 
@@ -34,6 +36,7 @@ pub struct SamplingDriver {
     page_size: usize,
     mmap_pages: usize,
     running: Arc<AtomicBool>,
+    thread_handle: Option<thread::JoinHandle<()>>,
 }
 
 pub struct SamplingDriverBuilder {
@@ -53,7 +56,7 @@ pub struct CounterValue {
 #[derive(Debug)]
 pub struct Sample {
     /// Unique ID shared by all samples of the event
-    pub event_id: u64,
+    pub event_id: u128,
     /// Instruction pointer
     pub ip: u64,
     /// Process ID
@@ -67,6 +70,21 @@ pub struct Sample {
     pub counter: Counter,
     pub value: u64,
     pub callstack: SmallVec<[u64; 32]>,
+}
+
+#[derive(Debug)]
+pub struct ProcAddr {
+    pub pid: u32,
+    pub addr: u64,
+    pub len: u64,
+    pub pgoff: u64,
+    pub filename: String,
+}
+
+#[derive(Debug)]
+pub enum Record {
+    Sample(Sample),
+    ProcAddr(ProcAddr),
 }
 
 #[derive(Debug, Clone)]
@@ -89,34 +107,6 @@ struct UnsafeMmap {
 
 unsafe impl Send for UnsafeMmap {}
 unsafe impl Sync for UnsafeMmap {}
-
-#[repr(C)]
-struct ReadFormat {
-    nr: u64,
-    time_enabled: u64,
-    time_running: u64,
-    values: [EventValue; 0],
-}
-
-/// Internal structure for reading from mmap ring buffer
-#[repr(C)]
-struct SampleFormat {
-    header: perf_event_header,
-    ip: u64,
-    pid: u32,
-    tid: u32,
-    time: u64,
-    id: u64,
-    cpu: u32,
-    _res: u32, // Reserved unused value
-    read: ReadFormat,
-}
-
-#[repr(C)]
-struct EventValue {
-    value: u64,
-    id: u64,
-}
 
 impl CountingDriver {
     pub fn new(counters: &[Counter], process: Option<&Process>) -> Result<Self, Error> {
@@ -200,8 +190,12 @@ impl CountingDriver {
 
             let header = unsafe { &*(buffer.as_ptr() as *const ReadFormat) };
 
-            let values =
-                unsafe { std::slice::from_raw_parts(header.values.as_ptr(), header.nr as usize) };
+            let values = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.as_ptr().add(std::mem::size_of::<ReadFormat>()) as *const EventValue,
+                    header.nr as usize,
+                )
+            };
 
             // For now it is guaranteed there's exactly 1 event
             let value = &values[0];
@@ -238,121 +232,106 @@ impl SamplingDriver {
     pub fn builder() -> SamplingDriverBuilder {
         SamplingDriverBuilder {
             counters: vec![],
-            sample_freq: 4000,
+            sample_freq: 1000,
             pid: None,
             prefer_raw_events: true,
         }
     }
 
-    pub fn start<F>(&self, mut callback: F) -> Result<(), Error>
+    pub fn start<F>(&mut self, mut callback: F) -> Result<(), Error>
     where
-        F: FnMut(Sample) + Send + 'static,
+        F: FnMut(Record) + Send + 'static,
     {
-        for handle in &self.native_handles {
-            if !handle.leader {
-                continue;
-            }
-
-            let res_enable =
-                unsafe { sys::ioctls::ENABLE(handle.fd, sys::bindings::PERF_IOC_FLAG_GROUP) };
-
-            if res_enable < 0 {
-                return Err(Error::EnableFailed);
-            }
-        }
-
         self.running.store(true, Ordering::SeqCst);
 
         let running = self.running.clone();
         let mmaps = self.mmaps.clone();
-        let page_size = self.page_size;
-        let mmap_pages = self.mmap_pages;
         let native_handles = self.native_handles.clone();
 
-        thread::spawn(move || {
+        #[derive(Clone, Default)]
+        struct LastSample {
+            time_enabled: u64,
+            time_running: u64,
+            value: u64,
+        }
+
+        let handle = thread::spawn(move || {
+            let mut last_samples_map = HashMap::<(usize, u32, u32, u32, u64), LastSample>::new();
+
             while running.load(Ordering::SeqCst) {
-                for &mmap in &mmaps {
-                    unsafe {
-                        let data = mmap.ptr as *mut perf_event_mmap_page;
-                        let data_head = (*data).data_head;
-                        let data_tail = (*data).data_tail;
+                for (idx, &mmap) in mmaps.iter().enumerate() {
+                    let records = Records::from_ptr(mmap.ptr);
 
-                        if data_head == data_tail {
-                            continue;
+                    for record in records.into_iter() {
+                        if !running.load(Ordering::SeqCst) {
+                            break;
                         }
-
-                        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-
-                        let base = mmap.ptr.add(page_size);
-                        let buffer_size = page_size * mmap_pages;
-                        let mut offset = data_tail as usize;
-
-                        while offset < data_head as usize {
-                            let offset_in_buffer = offset % buffer_size;
-
-                            if offset_in_buffer + std::mem::size_of::<perf_event_header>()
-                                > buffer_size
-                            {
-                                break;
-                            }
-
-                            let header = &*(base.add(offset_in_buffer) as *const perf_event_header);
-
-                            if header.size as usize > buffer_size
-                                || offset_in_buffer + header.size as usize > buffer_size
-                            {
-                                break;
-                            }
-
-                            if header.type_ == PERF_RECORD_SAMPLE {
-                                let mut current_ptr =
-                                    base.add(offset % (page_size * mmap_pages)) as *const u8;
-
-                                // Read the fixed-size portion of the sample
-                                let (next_ptr, format) = SampleFormat::read_from_ptr(current_ptr);
-                                current_ptr = next_ptr;
-
-                                // Read the variable-length values array
-                                let (next_ptr, values) =
-                                    SampleFormat::read_values(current_ptr, format.read.nr);
-                                current_ptr = next_ptr;
-
-                                // Read the callchain
-                                let (_next_ptr, callstack) =
-                                    SampleFormat::read_callchain(current_ptr);
+                        match record {
+                            mmap::MmapRecord::Sample {
+                                ip,
+                                pid,
+                                tid,
+                                cpu,
+                                time,
+                                time_enabled,
+                                time_running,
+                                values,
+                                callstack,
+                            } => {
+                                let uid = uuid::Uuid::now_v7();
 
                                 for value in values {
                                     let handle = native_handles
                                         .iter()
                                         .find(|handle| handle.id == value.id)
                                         .unwrap();
+                                    let last_sample = last_samples_map
+                                        .get(&(idx, cpu, pid, tid, value.id))
+                                        .cloned()
+                                        .unwrap_or_default();
 
-                                    let sample = Sample {
-                                        event_id: format.id,
-                                        ip: format.ip,
-                                        pid: format.pid,
-                                        tid: format.tid,
-                                        time: format.time,
-                                        time_enabled: format.read.time_enabled,
-                                        time_running: format.read.time_running,
+                                    let sample = Record::Sample(Sample {
+                                        event_id: uid.as_u128(),
+                                        ip,
+                                        pid,
+                                        tid,
+                                        time,
+                                        time_enabled: time_enabled - last_sample.time_enabled,
+                                        time_running: time_running - last_sample.time_running,
                                         counter: handle.kind.clone(),
-                                        value: value.value,
-                                        callstack: callstack[1..].to_smallvec(),
-                                    };
+                                        value: value.value - last_sample.value,
+                                        callstack: callstack.clone(),
+                                    });
+
+                                    last_samples_map.insert(
+                                        (idx, cpu, pid, tid, value.id),
+                                        LastSample {
+                                            time_enabled,
+                                            time_running,
+                                            value: value.value,
+                                        },
+                                    );
 
                                     callback(sample);
                                 }
                             }
-
-                            if !running.load(Ordering::SeqCst) {
-                                break;
+                            mmap::MmapRecord::Address {
+                                pid,
+                                start,
+                                len,
+                                offset,
+                                filename,
+                            } => {
+                                callback(Record::ProcAddr(ProcAddr {
+                                    pid,
+                                    addr: start,
+                                    len,
+                                    pgoff: offset,
+                                    filename,
+                                }));
                             }
-
-                            offset += header.size as usize;
+                            mmap::MmapRecord::Unknown => {}
                         }
-
-                        // Update data_tail
-                        (*data).data_tail = data_head;
                     }
                 }
 
@@ -360,12 +339,12 @@ impl SamplingDriver {
             }
         });
 
+        self.thread_handle = Some(handle);
+
         Ok(())
     }
 
-    pub fn stop(&self) -> Result<(), Error> {
-        self.running.store(false, Ordering::SeqCst);
-
+    pub fn stop(&mut self) -> Result<(), Error> {
         for handle in &self.native_handles {
             if !handle.leader {
                 continue;
@@ -378,6 +357,13 @@ impl SamplingDriver {
                 return Err(Error::EnableFailed);
             }
         }
+
+        self.running.store(false, Ordering::SeqCst);
+
+        if let Some(handle) = self.thread_handle.take() {
+            handle.join().map_err(|_| Error::EnableFailed)?;
+        }
+
         Ok(())
     }
 }
@@ -424,8 +410,10 @@ impl SamplingDriverBuilder {
 
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);
-            attr.set_exclude_hv(1);
+            attr.set_exclude_user(0);
             attr.set_exclusive(0);
+            attr.set_inherit(0);
+            attr.set_enable_on_exec(1);
 
             attr.sample_freq = self.sample_freq;
             attr.set_freq(1);
@@ -448,6 +436,7 @@ impl SamplingDriverBuilder {
 
         let mmaps = native_handles
             .iter()
+            .filter(|native_handle| native_handle.leader)
             .map(|handle| unsafe {
                 let ptr = mmap(
                     std::ptr::null_mut(),
@@ -476,6 +465,7 @@ impl SamplingDriverBuilder {
             page_size,
             mmap_pages,
             running: Arc::new(AtomicBool::new(false)),
+            thread_handle: None,
         })
     }
 }
@@ -600,30 +590,4 @@ fn get_native_counters(
         .collect::<Vec<_>>();
 
     Ok(attrs)
-}
-
-impl SampleFormat {
-    unsafe fn read_from_ptr(ptr: *const u8) -> (*const u8, Self) {
-        let sample: Self = std::ptr::read(ptr as *const _);
-        let next_ptr = ptr.add(std::mem::size_of::<Self>());
-        (next_ptr, sample)
-    }
-
-    unsafe fn read_values(ptr: *const u8, nr: u64) -> (*const u8, &'static [EventValue]) {
-        let values = std::slice::from_raw_parts(ptr as *const EventValue, nr as usize);
-        let next_ptr = ptr.add(std::mem::size_of::<EventValue>() * nr as usize);
-        (next_ptr, values)
-    }
-
-    unsafe fn read_callchain(ptr: *const u8) -> (*const u8, SmallVec<[u64; 32]>) {
-        let nr_callchain = std::ptr::read(ptr as *const u64);
-        let callchain_ptr = ptr.add(std::mem::size_of::<u64>());
-
-        let callchain =
-            std::slice::from_raw_parts(callchain_ptr as *const u64, nr_callchain as usize)
-                .to_smallvec();
-
-        let next_ptr = callchain_ptr.add(std::mem::size_of::<u64>() * nr_callchain as usize);
-        (next_ptr, callchain)
-    }
 }

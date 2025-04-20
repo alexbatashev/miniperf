@@ -376,6 +376,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
             if (!isa<IntrinsicInst>(Call))
               break;
             switch (Call.getIntrinsicID()) {
+            case Intrinsic::fmuladd:
             case Intrinsic::fma:
               if (I.getType()->isVectorTy()) {
                 auto VecTy = cast<VectorType>(I.getType());

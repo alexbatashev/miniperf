@@ -1,5 +1,7 @@
 use anyhow::Result;
-use mperf_data::{CallFrame, Event, IPCMessage, RecordInfo, RooflineInfo, ScenarioInfo};
+use mperf_data::{
+    CallFrame, Event, IPCMessage, ProcMapEntry, RecordInfo, RooflineInfo, ScenarioInfo,
+};
 use std::{
     collections::HashMap,
     fs::File,
@@ -7,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use pmu::Process;
+use pmu::{Process, Record};
 
 const SIZE_16MB: usize = 16 * 1024 * 1024;
 
@@ -54,6 +56,7 @@ pub async fn do_record(
         serde_json::to_writer(&mut info_file, &ri)?;
     }
 
+    println!("Postprocessing...");
     perform_postprocessing(output_directory).await?;
 
     Ok(())
@@ -64,29 +67,44 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
 
     let counters = get_pmu_counters(Scenario::Snapshot);
 
-    let driver = pmu::SamplingDriver::builder()
+    let mut driver = pmu::SamplingDriver::builder()
         .counters(&counters)
         .process(&process)
         .build()?;
 
-    driver.start(move |sample| {
-        let unique_id = dispatcher.unique_id();
-        let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
-        let event = Event {
-            unique_id,
-            correlation_id: sample.event_id as u128,
-            parent_id: 0,
-            ty: counter_to_event_ty(&sample.counter),
-            thread_id: sample.tid,
-            process_id: sample.pid,
-            time_enabled: sample.time_enabled,
-            time_running: sample.time_running,
-            value: sample.value,
-            timestamp: sample.time,
-            callstack,
-        };
+    driver.start(move |record| {
+        match record {
+            Record::Sample(sample) => {
+                let unique_id = uuid::Uuid::now_v7().as_u128();
+                let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
+                let event = Event {
+                    unique_id,
+                    correlation_id: sample.event_id,
+                    parent_id: 0,
+                    ty: counter_to_event_ty(&sample.counter),
+                    thread_id: sample.tid,
+                    process_id: sample.pid,
+                    time_enabled: sample.time_enabled,
+                    time_running: sample.time_running,
+                    value: sample.value,
+                    timestamp: sample.time,
+                    callstack,
+                };
 
-        dispatcher.publish_event_sync(event);
+                dispatcher.publish_event_sync(event);
+            }
+            Record::ProcAddr(addr) => {
+                let entry = ProcMapEntry {
+                    filename: addr.filename,
+                    address: addr.addr as usize,
+                    size: addr.len as usize,
+                    offset: addr.pgoff as usize,
+                    pid: addr.pid,
+                };
+
+                dispatcher.publish_proc_map_sync(entry);
+            }
+        };
     })?;
     process.cont();
     process.wait()?;
@@ -132,31 +150,46 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     let counters = get_pmu_counters(Scenario::Roofline);
 
-    let driver = pmu::SamplingDriver::builder()
+    let mut driver = pmu::SamplingDriver::builder()
         .counters(&counters)
         .process(&process)
         .build()?;
 
     let roofline_dispatcher = dispatcher.clone();
 
-    driver.start(move |sample| {
-        let unique_id = dispatcher.unique_id();
-        let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
-        let event = Event {
-            unique_id,
-            correlation_id: sample.event_id as u128,
-            parent_id: 0,
-            ty: counter_to_event_ty(&sample.counter),
-            thread_id: sample.tid,
-            process_id: sample.pid,
-            time_enabled: sample.time_enabled,
-            time_running: sample.time_running,
-            value: sample.value,
-            timestamp: sample.time,
-            callstack,
-        };
+    driver.start(move |record| {
+        match record {
+            Record::Sample(sample) => {
+                let unique_id = uuid::Uuid::now_v7().as_u128();
+                let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
+                let event = Event {
+                    unique_id,
+                    correlation_id: sample.event_id,
+                    parent_id: 0,
+                    ty: counter_to_event_ty(&sample.counter),
+                    thread_id: sample.tid,
+                    process_id: sample.pid,
+                    time_enabled: sample.time_enabled,
+                    time_running: sample.time_running,
+                    value: sample.value,
+                    timestamp: sample.time,
+                    callstack,
+                };
 
-        dispatcher.publish_event_sync(event);
+                dispatcher.publish_event_sync(event);
+            }
+            Record::ProcAddr(addr) => {
+                let entry = ProcMapEntry {
+                    filename: addr.filename,
+                    address: addr.addr as usize,
+                    size: addr.len as usize,
+                    offset: addr.pgoff as usize,
+                    pid: addr.pid,
+                };
+
+                dispatcher.publish_proc_map_sync(entry);
+            }
+        };
     })?;
 
     process.cont();

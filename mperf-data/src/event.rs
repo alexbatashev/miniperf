@@ -1,8 +1,5 @@
 use core::fmt;
-use std::{
-    collections::HashSet,
-    io::{BufRead, Write},
-};
+use std::io::{BufRead, Write};
 
 use capnp::message::ReaderOptions;
 use serde::{Deserialize, Serialize};
@@ -80,12 +77,8 @@ pub struct ProcMapEntry {
     pub filename: String,
     pub address: usize,
     pub size: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcMap {
+    pub offset: usize,
     pub pid: u32,
-    pub entries: Vec<ProcMapEntry>,
 }
 
 impl Event {
@@ -146,15 +139,6 @@ impl EventType {
             || *self == EventType::RooflineVectorIntOps
             || *self == EventType::RooflineVectorFloatOps
             || *self == EventType::RooflineVectorDoubleOps
-    }
-}
-
-impl ProcMap {
-    pub fn new(map: (u32, HashSet<ProcMapEntry>)) -> Self {
-        Self {
-            pid: map.0,
-            entries: map.1.into_iter().collect(),
-        }
     }
 }
 

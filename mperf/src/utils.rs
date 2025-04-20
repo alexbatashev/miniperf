@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mperf_data::{EventType, ProcMap};
+use mperf_data::{EventType, ProcMapEntry};
 use pmu::Counter;
 
 pub fn counter_to_event_ty(counter: &Counter) -> EventType {
@@ -32,85 +32,68 @@ pub struct ResolvedPME<'a> {
     name: &'a str,
     address: usize,
     size: usize,
+    offset: usize,
 }
 
-pub fn resolve_proc_maps(proc_maps: &[ProcMap]) -> HashMap<u32, Vec<ResolvedPME<'_>>> {
+pub fn resolve_proc_maps(proc_maps: &[ProcMapEntry]) -> HashMap<u32, Vec<ResolvedPME<'_>>> {
     let mut procs = HashMap::<u32, Vec<ResolvedPME>>::new();
 
     for pm in proc_maps {
-        let entries = pm
-            .entries
-            .iter()
-            .map(|e| {
-                let loader = if std::fs::exists(&e.filename).unwrap() {
-                    addr2line::Loader::new(&e.filename).ok()
-                } else {
-                    None
-                };
+        let vec = procs.entry(pm.pid).or_default();
 
-                ResolvedPME {
-                    loader,
-                    name: &e.filename,
-                    address: e.address,
-                    size: e.size,
-                }
-            })
-            .collect::<Vec<_>>();
+        let loader = if std::fs::exists(&pm.filename).unwrap() {
+            addr2line::Loader::new(&pm.filename).ok()
+        } else {
+            None
+        };
 
-        procs.insert(pm.pid, entries);
+        vec.push(ResolvedPME {
+            loader,
+            name: &pm.filename,
+            address: pm.address,
+            size: pm.size,
+            offset: pm.offset,
+        });
     }
 
     procs
 }
 
 pub fn find_sym_name(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<String> {
-    pmes.iter()
-        .find_map(|entry| {
-            if ip < entry.address || ip > entry.address + entry.size {
-                return None;
-            }
+    pmes.iter().find_map(|entry| {
+        if ip < entry.address || ip > entry.address + entry.size {
+            return None;
+        }
 
-            entry
-                .loader
-                .as_ref()
-                .and_then(|loader| loader.find_symbol((ip - entry.address) as u64))
-                .map(String::from)
-        })
-        .or_else(|| {
-            pmes[0]
-                .loader
-                .as_ref()
-                .and_then(|loader| loader.find_symbol(ip as u64).map(String::from))
-        })
+        // FIXME support PIE code
+        let file_addr = ip;
+
+        entry
+            .loader
+            .as_ref()
+            .and_then(|loader| loader.find_symbol(file_addr as u64))
+            .map(String::from)
+    })
 }
 
 pub fn find_location(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<(String, u32)> {
-    pmes.iter()
-        .find_map(|entry| {
-            if ip < entry.address || ip > entry.address + entry.size {
-                return None;
-            }
+    pmes.iter().find_map(|entry| {
+        if ip < entry.address || ip > entry.address + entry.size {
+            return None;
+        }
 
-            entry
-                .loader
-                .as_ref()
-                .and_then(|loader| loader.find_location((ip - entry.address) as u64).ok())
-                .flatten()
-                .map(|loc| {
-                    (
-                        loc.file.unwrap_or_default().to_string(),
-                        loc.line.unwrap_or_default(),
-                    )
-                })
-        })
-        .or_else(|| {
-            pmes[0].loader.as_ref().and_then(|loader| {
-                loader.find_location(ip as u64).ok().flatten().map(|loc| {
-                    (
-                        loc.file.unwrap_or_default().to_string(),
-                        loc.line.unwrap_or_default(),
-                    )
-                })
+        let file_addr = ip - entry.address + entry.offset;
+
+        entry
+            .loader
+            .as_ref()
+            .and_then(|loader| loader.find_location(file_addr as u64).ok())
+            .flatten()
+            .map(|loc| {
+                (
+                    loc.file.unwrap_or_default().to_string(),
+                    loc.line.unwrap_or_default(),
+                )
             })
-        })
+    })
 }

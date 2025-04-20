@@ -2,11 +2,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::{collections::HashMap, iter::Extend, path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
-use mperf_data::{Event, IString, ProcMap, ProcMapEntry};
+use mperf_data::{Event, IString, ProcMapEntry};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use proc_maps::{get_process_maps, Pid};
 use thread_local::ThreadLocal;
 use tokio::{
     sync::mpsc::{self, Sender},
@@ -19,7 +18,7 @@ pub struct EventDispatcher {
     last_unique_id: ThreadLocal<RefCell<u64>>,
     events_tx: Sender<Event>,
     string_tx: Sender<(u64, String)>,
-    proc_map_tx: Sender<u32>,
+    proc_map_tx: Sender<ProcMapEntry>,
 }
 
 pub struct DispatcherJoinHandle {
@@ -32,7 +31,7 @@ impl EventDispatcher {
     pub fn new(output_directory: &Path) -> (Arc<Self>, DispatcherJoinHandle) {
         let (events_tx, mut event_rx) = mpsc::channel::<Event>(8192);
         let (string_tx, mut string_rx) = mpsc::channel(8192);
-        let (proc_map_tx, mut proc_map_rx) = mpsc::channel::<u32>(8192);
+        let (proc_map_tx, mut proc_map_rx) = mpsc::channel::<ProcMapEntry>(8192);
 
         let events_out_dir = output_directory.to_owned();
         let events_worker = tokio::spawn(async move {
@@ -63,35 +62,12 @@ impl EventDispatcher {
 
         let proc_map_out_dir = output_directory.to_owned();
         let proc_map_worker = tokio::spawn(async move {
-            let mut proc_map_entries = HashMap::<u32, HashSet<ProcMapEntry>>::new();
-            while let Some(pid) = proc_map_rx.recv().await {
-                if let Ok(maps) = get_process_maps(pid as Pid) {
-                    let pm = maps.iter().filter_map(|m| {
-                        if m.filename().is_none() || m.filename().unwrap().ends_with("mperf") {
-                            return None;
-                        }
-                        Some(ProcMapEntry {
-                            filename: m
-                                .filename()
-                                .map(|p| p.to_str().unwrap_or("unknown").to_owned())
-                                .unwrap_or("unknown".to_string()),
-                            address: m.start(),
-                            size: m.size(),
-                        })
-                    });
-
-                    proc_map_entries.entry(pid).or_default();
-
-                    let set = proc_map_entries.get_mut(&pid).unwrap();
-
-                    set.extend(pm.into_iter());
-                }
+            let mut proc_map_entries = HashSet::<ProcMapEntry>::new();
+            while let Some(entry) = proc_map_rx.recv().await {
+                proc_map_entries.insert(entry);
             }
 
-            let proc_map = proc_map_entries
-                .into_iter()
-                .map(ProcMap::new)
-                .collect::<Vec<_>>();
+            let proc_map = proc_map_entries.into_iter().collect::<Vec<_>>();
             let mut map_file =
                 std::fs::File::create(proc_map_out_dir.join("proc_map.json")).expect("proc map");
             serde_json::to_writer(&mut map_file, &proc_map).expect("failed to write proc maps");
@@ -179,10 +155,11 @@ impl EventDispatcher {
         if pid == 0 {
             return;
         }
+    }
 
-        // FIXME figure out a way to limit traffic here
-        if let Err(err) = self.proc_map_tx.blocking_send(pid) {
-            eprintln!("lost process map for pid '{}': {:?}", pid, err);
+    pub fn publish_proc_map_sync(&self, map: ProcMapEntry) {
+        if let Err(err) = self.proc_map_tx.blocking_send(map) {
+            eprintln!("lost proc map entry: {:?}", err);
         }
     }
 
@@ -194,11 +171,6 @@ impl EventDispatcher {
 
         if pid == 0 {
             return;
-        }
-
-        // FIXME figure out a way to limit traffic here
-        if let Err(err) = self.proc_map_tx.send(pid).await {
-            eprintln!("lost process map for pid '{}': {:?}", pid, err);
         }
     }
 }
