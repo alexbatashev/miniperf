@@ -3,7 +3,8 @@ use std::sync::Arc;
 use num_format::{Locale, ToFormattedString};
 use parking_lot::{Mutex, RwLock};
 use ratatui::{
-    layout::Constraint,
+    layout::{Constraint, Layout},
+    style::{Style, Stylize},
     text::Text,
     widgets::{Block, Cell, Row, Table, Widget},
 };
@@ -54,15 +55,20 @@ impl Widget for HotspotsTab {
             Cell::from("Cache miss, %"),
         ]
         .into_iter()
-        .collect::<Row>();
+        .collect::<Row>()
+        .style(Style::new().bold());
 
         let (rows, widths) = get_rows(&hotspots);
 
-        let t = Table::new(rows, widths)
-            .header(header)
-            .block(Block::bordered());
+        let vertical = Layout::vertical([Constraint::Fill(1)]).vertical_margin(1);
+        let horizontal = Layout::horizontal([Constraint::Fill(1)]).horizontal_margin(1);
 
-        t.render(area, buf);
+        let [table_area] = vertical.areas(area);
+        let [table_area] = horizontal.areas(table_area);
+
+        let t = Table::new(rows, widths).header(header).block(Block::new());
+
+        t.render(table_area, buf);
     }
 }
 

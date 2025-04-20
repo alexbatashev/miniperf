@@ -57,7 +57,13 @@ pub async fn do_record(
     }
 
     println!("Postprocessing...");
-    perform_postprocessing(output_directory).await?;
+    kdam::term::init(false);
+    kdam::term::hide_cursor()?;
+
+    let pb = kdam::tqdm!(total = 100);
+    perform_postprocessing(output_directory, pb).await?;
+
+    kdam::term::show_cursor()?;
 
     Ok(())
 }
