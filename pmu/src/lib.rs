@@ -2,7 +2,10 @@ mod cpu_family;
 mod driver;
 mod process;
 
-pub use driver::{list_supported_counters, CountingDriver, Record, SamplingDriver};
+pub use driver::{
+    list_supported_counters, CountingDriverBuilder, DriverKind, Record, SamplingDriver,
+    SamplingDriverBuilder,
+};
 pub use process::Process;
 
 use thiserror::Error;

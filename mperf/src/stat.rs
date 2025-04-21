@@ -6,8 +6,8 @@ use pmu::{Counter, Process};
 pub fn do_stat(command: Vec<String>) -> Result<()> {
     let process = Process::new(&command, &[])?;
 
-    let mut driver = pmu::CountingDriver::new(
-        &[
+    let mut driver = pmu::CountingDriverBuilder::new()
+        .counters(&[
             Counter::Cycles,
             Counter::Instructions,
             Counter::LLCReferences,
@@ -20,9 +20,9 @@ pub fn do_stat(command: Vec<String>) -> Result<()> {
             Counter::CpuMigrations,
             Counter::PageFaults,
             Counter::ContextSwitches,
-        ],
-        Some(&process),
-    )?;
+        ])
+        .process(Some(&process))
+        .build()?;
 
     driver.reset()?;
     process.cont();

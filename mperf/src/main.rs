@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
             return do_stat(command);
         }
         Commands::List => {
-            let events = pmu::list_supported_counters();
+            let events = pmu::list_supported_counters(pmu::DriverKind::Default);
             for event in events {
                 println!("{} - {}", event.name(), event.description());
             }
