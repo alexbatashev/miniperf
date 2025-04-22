@@ -73,12 +73,12 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
 
     let counters = get_pmu_counters(Scenario::Snapshot);
 
-    let mut driver = pmu::SamplingDriver::builder()
+    let mut driver = pmu::SamplingDriverBuilder::new()
         .counters(&counters)
         .process(&process)
         .build()?;
 
-    driver.start(move |record| {
+    driver.start(Arc::new(move |record| {
         match record {
             Record::Sample(sample) => {
                 let unique_id = uuid::Uuid::now_v7().as_u128();
@@ -111,7 +111,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
                 dispatcher.publish_proc_map_sync(entry);
             }
         };
-    })?;
+    }))?;
     process.cont();
     process.wait()?;
     driver.stop()?;
@@ -156,14 +156,14 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     let counters = get_pmu_counters(Scenario::Roofline);
 
-    let mut driver = pmu::SamplingDriver::builder()
+    let mut driver = pmu::SamplingDriverBuilder::new()
         .counters(&counters)
         .process(&process)
         .build()?;
 
     let roofline_dispatcher = dispatcher.clone();
 
-    driver.start(move |record| {
+    driver.start(Arc::new(move |record| {
         match record {
             Record::Sample(sample) => {
                 let unique_id = uuid::Uuid::now_v7().as_u128();
@@ -196,7 +196,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
                 dispatcher.publish_proc_map_sync(entry);
             }
         };
-    })?;
+    }))?;
 
     process.cont();
     process.wait()?;

@@ -3,7 +3,6 @@ mod events;
 mod mmap;
 
 use hashbrown::HashMap;
-use itertools::chain;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -19,78 +18,28 @@ use perf_event_open_sys::bindings::{
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 use smallvec::SmallVec;
 
-use crate::{cpu_family, Counter, Error, Process};
+use crate::driver::{ProcAddr, Sample};
+use crate::{Counter, Error, Record};
 
 pub use events::list_supported_counters;
 
+use super::{CounterResult, CounterValue, CountingDriver, SamplingCallback, SamplingDriver};
+
 /// Counting driver is used for simple collection of system's performance counters values. On Linux,
 /// counter multiplexing is supported.
-pub struct CountingDriver {
+pub struct PerfCountingDriver {
     native_handles: Vec<NativeCounterHandle>,
 }
 
 /// Sampling driver performs PMU event sampling. That is, every N cycles, the process is
 /// interrupted and counters values are recorded for future post processing.
-pub struct SamplingDriver {
+pub struct PerfSamplingDriver {
     native_handles: Vec<NativeCounterHandle>,
     mmaps: Vec<UnsafeMmap>,
     page_size: usize,
     mmap_pages: usize,
     running: Arc<AtomicBool>,
     thread_handle: Option<thread::JoinHandle<()>>,
-}
-
-pub struct SamplingDriverBuilder {
-    counters: Vec<Counter>,
-    sample_freq: u64,
-    pid: Option<i32>,
-    prefer_raw_events: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct CounterValue {
-    pub value: u64,
-    pub scaling: f64,
-}
-
-/// A structure that represents a single sample
-#[derive(Debug)]
-pub struct Sample {
-    /// Unique ID shared by all samples of the event
-    pub event_id: u128,
-    /// Instruction pointer
-    pub ip: u64,
-    /// Process ID
-    pub pid: u32,
-    /// Thread ID
-    pub tid: u32,
-    /// Timestamp
-    pub time: u64,
-    pub time_enabled: u64,
-    pub time_running: u64,
-    pub counter: Counter,
-    pub value: u64,
-    pub callstack: SmallVec<[u64; 32]>,
-}
-
-#[derive(Debug)]
-pub struct ProcAddr {
-    pub pid: u32,
-    pub addr: u64,
-    pub len: u64,
-    pub pgoff: u64,
-    pub filename: String,
-}
-
-#[derive(Debug)]
-pub enum Record {
-    Sample(Sample),
-    ProcAddr(ProcAddr),
-}
-
-#[derive(Debug, Clone)]
-pub struct CounterResult {
-    values: Vec<(Counter, CounterValue)>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,9 +58,9 @@ struct UnsafeMmap {
 unsafe impl Send for UnsafeMmap {}
 unsafe impl Sync for UnsafeMmap {}
 
-impl CountingDriver {
-    pub fn new(counters: &[Counter], process: Option<&Process>) -> Result<Self, Error> {
-        let mut attrs = get_native_counters(counters, false)?;
+impl PerfCountingDriver {
+    pub fn new(counters: Vec<Counter>, pid: Option<i32>) -> Result<Self, Error> {
+        let mut attrs = get_native_counters(&counters, false)?;
 
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);
@@ -119,19 +68,19 @@ impl CountingDriver {
             attr.set_inherit(1);
             attr.set_exclusive(0);
             attr.sample_type = PERF_SAMPLE_IDENTIFIER as u64;
-            if process.is_some() {
+            if pid.is_some() {
                 attr.set_enable_on_exec(1);
             }
         }
 
-        let pid = process.map(|p| p.pid());
+        let native_handles = binding::direct(&counters, &mut attrs, pid)?;
 
-        let native_handles = binding::direct(counters, &mut attrs, pid)?;
-
-        Ok(CountingDriver { native_handles })
+        Ok(PerfCountingDriver { native_handles })
     }
+}
 
-    pub fn start(&mut self) -> Result<(), Error> {
+impl CountingDriver for PerfCountingDriver {
+    fn start(&mut self) -> Result<(), Error> {
         for handle in &self.native_handles {
             let res_enable = unsafe { sys::ioctls::ENABLE(handle.fd, 0) };
 
@@ -143,7 +92,7 @@ impl CountingDriver {
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<(), Error> {
+    fn stop(&mut self) -> Result<(), Error> {
         for handle in &self.native_handles {
             let res_enable = unsafe { sys::ioctls::DISABLE(handle.fd, 0) };
 
@@ -155,7 +104,7 @@ impl CountingDriver {
         Ok(())
     }
 
-    pub fn reset(&mut self) -> Result<(), Error> {
+    fn reset(&mut self) -> Result<(), Error> {
         let res_enable = unsafe {
             sys::ioctls::RESET(
                 self.native_handles.first().unwrap().fd,
@@ -170,11 +119,11 @@ impl CountingDriver {
         Ok(())
     }
 
-    pub fn counters(&mut self) -> Result<CounterResult, std::io::Error> {
+    fn counters(&mut self) -> Result<CounterResult, std::io::Error> {
         let read_size = std::mem::size_of::<ReadFormat>() + (std::mem::size_of::<EventValue>());
 
         let mut buffer = vec![0_u8; read_size];
-        let mut scaled_values = Vec::with_capacity(self.native_handles.len());
+        let mut scaled_values = SmallVec::<[(Counter, CounterValue); 16]>::with_capacity(self.native_handles.len());
 
         for handle in self.native_handles.iter() {
             let result = unsafe {
@@ -226,22 +175,11 @@ impl CountingDriver {
     }
 }
 
-unsafe impl Send for SamplingDriver {}
-unsafe impl Sync for SamplingDriver {}
+unsafe impl Send for PerfSamplingDriver {}
+unsafe impl Sync for PerfSamplingDriver {}
 
-impl SamplingDriver {
-    pub fn builder() -> SamplingDriverBuilder {
-        SamplingDriverBuilder {
-            counters: vec![],
-            sample_freq: 1000,
-            pid: None,
-            prefer_raw_events: true,
-        }
-    }
-
-    pub fn start<F>(&mut self, mut callback: F) -> Result<(), Error>
-    where
-        F: FnMut(Record) + Send + 'static,
+impl SamplingDriver for PerfSamplingDriver {
+    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error>
     {
         self.running.store(true, Ordering::SeqCst);
 
@@ -296,6 +234,7 @@ impl SamplingDriver {
                                         ip,
                                         pid,
                                         tid,
+                                        cpu,
                                         time,
                                         time_enabled: time_enabled - last_sample.time_enabled,
                                         time_running: time_running - last_sample.time_running,
@@ -313,7 +252,7 @@ impl SamplingDriver {
                                         },
                                     );
 
-                                    callback(sample);
+                                    callback.call(sample);
                                 }
                             }
                             mmap::MmapRecord::Address {
@@ -323,7 +262,7 @@ impl SamplingDriver {
                                 offset,
                                 filename,
                             } => {
-                                callback(Record::ProcAddr(ProcAddr {
+                                callback.call(Record::ProcAddr(ProcAddr {
                                     pid,
                                     addr: start,
                                     len,
@@ -345,7 +284,7 @@ impl SamplingDriver {
         Ok(())
     }
 
-    pub fn stop(&mut self) -> Result<(), Error> {
+    fn stop(&mut self) -> Result<(), Error> {
         for handle in &self.native_handles {
             if !handle.leader {
                 continue;
@@ -369,56 +308,9 @@ impl SamplingDriver {
     }
 }
 
-impl SamplingDriverBuilder {
-    pub fn counters(self, counters: &[Counter]) -> Self {
-        let cpu_family = cpu_family::get_host_cpu_family();
-        let info = cpu_family::find_cpu_family(cpu_family);
-
-        let leader = info.and_then(|info| info.leader_event.clone());
-
-        let counters = if leader.is_some() {
-            chain([Counter::Custom(leader.unwrap())], counters.iter().cloned()).collect()
-        } else {
-            counters.to_vec()
-        };
-
-        Self {
-            counters,
-            sample_freq: self.sample_freq,
-            pid: self.pid,
-            prefer_raw_events: self.prefer_raw_events,
-        }
-    }
-
-    pub fn process(self, process: &Process) -> Self {
-        Self {
-            counters: self.counters,
-            sample_freq: self.sample_freq,
-            pid: Some(process.pid()),
-            prefer_raw_events: self.prefer_raw_events,
-        }
-    }
-
-    pub fn sample_freq(self, sample_freq: u64) -> Self {
-        Self {
-            counters: self.counters,
-            sample_freq,
-            pid: self.pid,
-            prefer_raw_events: self.prefer_raw_events,
-        }
-    }
-
-    pub fn prefer_raw_events(self) -> Self {
-        Self {
-            counters: self.counters,
-            sample_freq: self.sample_freq,
-            pid: self.pid,
-            prefer_raw_events: true,
-        }
-    }
-
-    pub fn build(self) -> Result<SamplingDriver, Error> {
-        let mut attrs = get_native_counters(&self.counters, self.prefer_raw_events)?;
+impl PerfSamplingDriver {
+    pub fn new(counters: &[Counter], sample_freq: u64, pid: Option<i32>, prefer_raw_events: bool) -> Result<PerfSamplingDriver, Error> {
+        let mut attrs = get_native_counters(counters, prefer_raw_events)?;
 
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);
@@ -427,7 +319,7 @@ impl SamplingDriverBuilder {
             attr.set_inherit(0);
             attr.set_enable_on_exec(1);
 
-            attr.sample_freq = self.sample_freq;
+            attr.sample_freq = sample_freq;
             attr.set_freq(1);
 
             attr.sample_type = (PERF_SAMPLE_IP
@@ -441,7 +333,7 @@ impl SamplingDriverBuilder {
             attr.set_mmap(1);
         }
 
-        let native_handles = binding::grouped(&self.counters, &mut attrs, self.pid)?;
+        let native_handles = binding::grouped(counters, &mut attrs, pid)?;
 
         let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
         let mmap_pages = 512;
@@ -471,7 +363,7 @@ impl SamplingDriverBuilder {
             })
             .collect();
 
-        Ok(SamplingDriver {
+        Ok(PerfSamplingDriver {
             native_handles,
             mmaps,
             page_size,
@@ -482,7 +374,7 @@ impl SamplingDriverBuilder {
     }
 }
 
-impl Drop for SamplingDriver {
+impl Drop for PerfSamplingDriver {
     fn drop(&mut self) {
         for &mmap in &self.mmaps {
             unsafe {
@@ -495,26 +387,6 @@ impl Drop for SamplingDriver {
         for handle in &self.native_handles {
             unsafe { close(handle.fd) };
         }
-    }
-}
-
-impl CounterResult {
-    pub fn get(&self, kind: Counter) -> Option<CounterValue> {
-        self.values
-            .iter()
-            .find(|(c, _)| *c == kind)
-            .map(|(_, v)| v)
-            .cloned()
-    }
-}
-
-impl IntoIterator for CounterResult {
-    type Item = (Counter, CounterValue);
-
-    type IntoIter = <Vec<(Counter, CounterValue)> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.values.into_iter()
     }
 }
 

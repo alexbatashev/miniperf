@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = [ "collector", "mperf", "mperf-data", "pmu", "pmu-data"]
+
+[profile.dev.package]
+insta.opt-level = 3
+similar.opt-level = 3
