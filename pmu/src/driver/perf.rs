@@ -123,7 +123,8 @@ impl CountingDriver for PerfCountingDriver {
         let read_size = std::mem::size_of::<ReadFormat>() + (std::mem::size_of::<EventValue>());
 
         let mut buffer = vec![0_u8; read_size];
-        let mut scaled_values = SmallVec::<[(Counter, CounterValue); 16]>::with_capacity(self.native_handles.len());
+        let mut scaled_values =
+            SmallVec::<[(Counter, CounterValue); 16]>::with_capacity(self.native_handles.len());
 
         for handle in self.native_handles.iter() {
             let result = unsafe {
@@ -179,8 +180,7 @@ unsafe impl Send for PerfSamplingDriver {}
 unsafe impl Sync for PerfSamplingDriver {}
 
 impl SamplingDriver for PerfSamplingDriver {
-    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error>
-    {
+    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
         self.running.store(true, Ordering::SeqCst);
 
         let running = self.running.clone();
@@ -309,7 +309,12 @@ impl SamplingDriver for PerfSamplingDriver {
 }
 
 impl PerfSamplingDriver {
-    pub fn new(counters: &[Counter], sample_freq: u64, pid: Option<i32>, prefer_raw_events: bool) -> Result<PerfSamplingDriver, Error> {
+    pub fn new(
+        counters: &[Counter],
+        sample_freq: u64,
+        pid: Option<i32>,
+        prefer_raw_events: bool,
+    ) -> Result<PerfSamplingDriver, Error> {
         let mut attrs = get_native_counters(counters, prefer_raw_events)?;
 
         for attr in &mut attrs {

@@ -177,6 +177,9 @@ async fn process_pmu_counters(
                 let mut keys = vec![];
                 let mut values = vec![];
                 for (k, v) in counters.iter() {
+                    if k == "pmu_unknown" {
+                        continue;
+                    }
                     keys.push(k.clone());
                     values.push(v.to_string());
                 }
