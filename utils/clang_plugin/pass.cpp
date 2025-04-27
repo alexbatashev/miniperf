@@ -344,7 +344,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           case Instruction::CompareUsingScalarTypes:
             if (I.getType()->isVectorTy()) {
               auto VecTy = cast<VectorType>(I.getType());
-              VectorIntOps += VecTy->getElementCount().getFixedValue();
+              VectorIntOps += VecTy->getElementCount().getKnownMinValue();
             } else {
               ScalarIntOps += 1;
             }
@@ -358,7 +358,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
             if (I.getType()->isVectorTy()) {
               auto VecTy = cast<VectorType>(I.getType());
               auto ElementTy = VecTy->getElementType();
-              size_t Multiplier = VecTy->getElementCount().getFixedValue();
+              size_t Multiplier = VecTy->getElementCount().getKnownMinValue();
               if (ElementTy->isFloatTy()) {
                 VectorFloatOps += Multiplier;
               } else {
@@ -381,7 +381,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
               if (I.getType()->isVectorTy()) {
                 auto VecTy = cast<VectorType>(I.getType());
                 auto ElementTy = VecTy->getElementType();
-                size_t Multiplier = VecTy->getElementCount().getFixedValue();
+                size_t Multiplier = VecTy->getElementCount().getKnownMinValue();
                 if (ElementTy->isFloatTy()) {
                   VectorFloatOps += 2 * Multiplier;
                 } else {
@@ -401,7 +401,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
               if (I.getType()->isVectorTy()) {
                 auto VecTy = cast<VectorType>(I.getType());
                 auto ElementTy = VecTy->getElementType();
-                size_t Multiplier = VecTy->getElementCount().getFixedValue();
+                size_t Multiplier = VecTy->getElementCount().getKnownMinValue();
                 if (ElementTy->isFloatTy()) {
                   VectorFloatOps += Multiplier;
                 } else {
