@@ -68,7 +68,11 @@ pub fn find_sym_name(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<String> {
         entry
             .loader
             .as_ref()
-            .and_then(|loader| loader.find_symbol((ip - entry.address) as u64).or(loader.find_symbol(ip as u64)))
+            .and_then(|loader| {
+                loader
+                    .find_symbol((ip - entry.address) as u64)
+                    .or(loader.find_symbol(ip as u64))
+            })
             .map(String::from)
     })
 }
@@ -84,7 +88,12 @@ pub fn find_location(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<(String, u32
         entry
             .loader
             .as_ref()
-            .and_then(|loader| loader.find_location(file_addr as u64).or(loader.find_location(ip as u64)).ok())
+            .and_then(|loader| {
+                loader
+                    .find_location(file_addr as u64)
+                    .or(loader.find_location(ip as u64))
+                    .ok()
+            })
             .flatten()
             .map(|loc| {
                 (
