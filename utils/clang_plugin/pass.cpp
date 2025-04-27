@@ -332,10 +332,20 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
         for (auto &&I : *BB) {
           switch (I.getOpcode()) {
           case Instruction::Load:
-            BytesLoad += DL.getTypeAllocSize(I.getType());
+            if (I.getType()->isVectorTy()) {
+              auto VecTy = cast<VectorType>(I.getType());
+              BytesLoad += DL.getTypeAllocSize(VecTy->getElementType()) * VecTy->getElementCount().getKnownMinValue();
+            } else {
+              BytesLoad += DL.getTypeAllocSize(I.getType());
+            }
             break;
           case Instruction::Store:
-            BytesStore += DL.getTypeAllocSize(I.getOperand(0)->getType());
+            if (I.getType()->isVectorTy()) {
+              auto VecTy = cast<VectorType>(I.getType());
+              BytesStore += DL.getTypeAllocSize(VecTy->getElementType()) * VecTy->getElementCount().getKnownMinValue();
+            } else {
+              BytesStore += DL.getTypeAllocSize(I.getType());
+            }
             break;
           case Instruction::Add:
           case Instruction::Sub:
