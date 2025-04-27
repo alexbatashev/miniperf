@@ -65,13 +65,10 @@ pub fn find_sym_name(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<String> {
             return None;
         }
 
-        // FIXME support PIE code
-        let file_addr = ip;
-
         entry
             .loader
             .as_ref()
-            .and_then(|loader| loader.find_symbol(file_addr as u64))
+            .and_then(|loader| loader.find_symbol(ip as u64).or(loader.find_symbol((ip - entry.address) as u64)))
             .map(String::from)
     })
 }

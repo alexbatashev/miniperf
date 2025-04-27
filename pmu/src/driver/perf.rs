@@ -60,7 +60,7 @@ unsafe impl Sync for UnsafeMmap {}
 
 impl PerfCountingDriver {
     pub fn new(counters: Vec<Counter>, pid: Option<i32>) -> Result<Self, Error> {
-        let mut attrs = get_native_counters(&counters, false)?;
+        let mut attrs = get_native_counters(&counters, true)?;
 
         for attr in &mut attrs {
             attr.set_exclude_kernel(1);

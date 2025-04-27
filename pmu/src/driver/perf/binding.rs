@@ -100,7 +100,7 @@ pub fn grouped(
             **cntr != Counter::Cycles
                 && **cntr != Counter::Instructions
                 && if leader.is_some() {
-                    cntr == leader_cntr.as_ref().unwrap()
+                    cntr != leader_cntr.as_ref().unwrap()
                 } else {
                     true
                 }
