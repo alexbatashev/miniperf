@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
 
 use libc::{
     c_char, close, ftruncate, mmap, munmap, sem_init, shm_open, shm_unlink, MAP_FAILED, MAP_SHARED,
@@ -60,8 +60,8 @@ impl Shmem {
         size: usize,
         flags: i32,
     ) -> Result<(i32, *mut c_void), std::io::Error> {
-        let name = name.as_ptr() as *const c_char;
-        let fd = shm_open(name, flags, S_IRUSR | S_IWUSR);
+        let name = CString::new(name)?;
+        let fd = shm_open(name.as_ptr(), flags, S_IRUSR | S_IWUSR);
 
         if fd == -1 {
             eprintln!("fd == -1\n");
