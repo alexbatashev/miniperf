@@ -26,6 +26,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/CodeExtractor.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
+#include <llvm/IR/DataLayout.h>
 
 using namespace llvm;
 
@@ -34,6 +35,16 @@ namespace {
 static void markFunctionNoOptimize(Function *F) {
   F->addFnAttr(Attribute::OptimizeNone);
   F->addFnAttr(Attribute::NoInline);
+}
+
+unsigned getVectorBytes(Type *Ty, DataLayout &DL) {
+  auto VecTy = cast<VectorType>(Ty);
+  if (VecTy->isScalableTy()) {
+    auto ElementTy = VecTy->getElementType();
+    return 8 * DL.getTypeAllocSize(ElementTy);
+  } else {
+    return VecTy->getElementCount().getFixedValue();
+  }
 }
 
 static Function *cloneInstrumentedFunction(Function *Extracted) {
@@ -333,22 +344,14 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           switch (I.getOpcode()) {
           case Instruction::Load:
             if (I.getType()->isVectorTy()) {
-              auto VecTy = cast<VectorType>(I.getType());
-              if (!VecTy->getElementType()->isSized()) {
-                VecTy->dump();
-              }
-              BytesLoad += VecTy->getElementType()->getScalarSizeInBits() * VecTy->getElementCount().getKnownMinValue();
+              BytesLoad += getVectorBytes(I.getType(), DL);
             } else {
               BytesLoad += DL.getTypeAllocSize(I.getType());
             }
             break;
           case Instruction::Store:
-            if (I.getType()->isVectorTy()) {
-              auto VecTy = cast<VectorType>(I.getOperand(0)->getType());
-              if (!VecTy->getElementType()->isSized()) {
-                VecTy->dump();
-              }
-              BytesStore += VecTy->getElementType()->getScalarSizeInBits() * VecTy->getElementCount().getKnownMinValue();
+            if (I.getOperand(0)->getType()->isVectorTy()) {
+              BytesStore += getVectorBytes(I.getOperand(0)->getType(), DL);
             } else {
               BytesStore += DL.getTypeAllocSize(I.getOperand(0)->getType());
             }
@@ -359,8 +362,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           case Instruction::Mul:
           case Instruction::CompareUsingScalarTypes:
             if (I.getType()->isVectorTy()) {
-              auto VecTy = cast<VectorType>(I.getType());
-              VectorIntOps += VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
+              VectorIntOps += getVectorBytes(I.getType(), DL);
             } else {
               ScalarIntOps += 1;
             }
@@ -374,7 +376,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
             if (I.getType()->isVectorTy()) {
               auto VecTy = cast<VectorType>(I.getType());
               auto ElementTy = VecTy->getElementType();
-              size_t Multiplier = VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
+              unsigned Multiplier = getVectorBytes(I.getType(), DL);
               if (ElementTy->isFloatTy()) {
                 VectorFloatOps += Multiplier;
               } else {
@@ -397,7 +399,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
               if (I.getType()->isVectorTy()) {
                 auto VecTy = cast<VectorType>(I.getType());
                 auto ElementTy = VecTy->getElementType();
-                size_t Multiplier = VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
+                unsigned Multiplier = getVectorBytes(I.getType(), DL);
                 if (ElementTy->isFloatTy()) {
                   VectorFloatOps += 2 * Multiplier;
                 } else {
@@ -417,7 +419,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
               if (I.getType()->isVectorTy()) {
                 auto VecTy = cast<VectorType>(I.getType());
                 auto ElementTy = VecTy->getElementType();
-                size_t Multiplier = VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
+                unsigned Multiplier = getVectorBytes(I.getType(), DL);
                 if (ElementTy->isFloatTy()) {
                   VectorFloatOps += Multiplier;
                 } else {
