@@ -334,17 +334,23 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           case Instruction::Load:
             if (I.getType()->isVectorTy()) {
               auto VecTy = cast<VectorType>(I.getType());
-              BytesLoad += DL.getTypeAllocSize(VecTy->getElementType()) * VecTy->getElementCount().getKnownMinValue();
+              if (!VecTy->getElementType()->isSized()) {
+                VecTy->dump();
+              }
+              BytesLoad += VecTy->getElementType()->getScalarSizeInBits() * VecTy->getElementCount().getKnownMinValue();
             } else {
               BytesLoad += DL.getTypeAllocSize(I.getType());
             }
             break;
           case Instruction::Store:
             if (I.getType()->isVectorTy()) {
-              auto VecTy = cast<VectorType>(I.getType());
-              BytesStore += DL.getTypeAllocSize(VecTy->getElementType()) * VecTy->getElementCount().getKnownMinValue();
+              auto VecTy = cast<VectorType>(I.getOperand(0)->getType());
+              if (!VecTy->getElementType()->isSized()) {
+                VecTy->dump();
+              }
+              BytesStore += VecTy->getElementType()->getScalarSizeInBits() * VecTy->getElementCount().getKnownMinValue();
             } else {
-              BytesStore += DL.getTypeAllocSize(I.getType());
+              BytesStore += DL.getTypeAllocSize(I.getOperand(0)->getType());
             }
             break;
           case Instruction::Add:
@@ -354,7 +360,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
           case Instruction::CompareUsingScalarTypes:
             if (I.getType()->isVectorTy()) {
               auto VecTy = cast<VectorType>(I.getType());
-              VectorIntOps += VecTy->getElementCount().getKnownMinValue();
+              VectorIntOps += VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
             } else {
               ScalarIntOps += 1;
             }
@@ -368,7 +374,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
             if (I.getType()->isVectorTy()) {
               auto VecTy = cast<VectorType>(I.getType());
               auto ElementTy = VecTy->getElementType();
-              size_t Multiplier = VecTy->getElementCount().getKnownMinValue();
+              size_t Multiplier = VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
               if (ElementTy->isFloatTy()) {
                 VectorFloatOps += Multiplier;
               } else {
@@ -391,7 +397,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
               if (I.getType()->isVectorTy()) {
                 auto VecTy = cast<VectorType>(I.getType());
                 auto ElementTy = VecTy->getElementType();
-                size_t Multiplier = VecTy->getElementCount().getKnownMinValue();
+                size_t Multiplier = VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
                 if (ElementTy->isFloatTy()) {
                   VectorFloatOps += 2 * Multiplier;
                 } else {
@@ -411,7 +417,7 @@ struct MiniperfInstr : PassInfoMixin<MiniperfInstr> {
               if (I.getType()->isVectorTy()) {
                 auto VecTy = cast<VectorType>(I.getType());
                 auto ElementTy = VecTy->getElementType();
-                size_t Multiplier = VecTy->getElementCount().getKnownMinValue();
+                size_t Multiplier = VecTy->getElementCount().getKnownMinValue() * DL.getTypeAllocSize(VecTy->getElementType());
                 if (ElementTy->isFloatTy()) {
                   VectorFloatOps += Multiplier;
                 } else {
