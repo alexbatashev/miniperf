@@ -88,4 +88,14 @@ impl Counter {
             } => desc,
         }
     }
+
+    pub fn is_software(&self) -> bool {
+        match self {
+            Counter::CpuClock
+            | Counter::PageFaults
+            | Counter::ContextSwitches
+            | Counter::CpuMigrations => true,
+            _ => false,
+        }
+    }
 }

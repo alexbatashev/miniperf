@@ -94,11 +94,16 @@ pub fn grouped(
         .map(|(_, attrs)| attrs)
         .cloned();
 
+    let mut sw_counters = zip(counters, attrs.iter().cloned())
+        .filter(|(cntr, _)| cntr.is_software())
+        .collect::<Vec<_>>();
+
     // Filter out Cycles, Instructions and group leader (if any)
     let chunks = zip(counters, attrs.iter_mut())
         .filter(|(cntr, _)| {
             **cntr != Counter::Cycles
                 && **cntr != Counter::Instructions
+                && !cntr.is_software()
                 && if leader.is_some() {
                     cntr != leader_cntr.as_ref().unwrap()
                 } else {
@@ -146,6 +151,12 @@ pub fn grouped(
         handles.push(get_native_handle(instr_fd, Counter::Instructions, false)?);
 
         for (cntr, attrs) in chunk {
+            let new_fd =
+                unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
+            handles.push(get_native_handle(new_fd, cntr.clone(), false)?);
+        }
+
+        for (cntr, attrs) in &mut sw_counters {
             let new_fd =
                 unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
             handles.push(get_native_handle(new_fd, cntr.clone(), false)?);
