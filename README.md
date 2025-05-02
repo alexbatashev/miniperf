@@ -26,31 +26,12 @@ miniperf is implemented in Rust and requires Cap'n Proto as a dependency.
 
 1. Rust Toolchain
    1. Install Rust by following instructions on [rustup.rs](https://rustup.rs)
-
-2. Cap'n Proto Compiler
-   1. Install from your package manager:
-
-```sh
-# Ubuntu/Debian
-sudo apt install capnproto
-
-# Fedora/RHEL
-sudo dnf install capnproto
-
-# macOS
-brew install capnp
-
-# Arch Linux
-sudo pacman -S capnproto
-```
-
-See [Cap'n Proto installation guide](https://capnproto.org/install.html) for
-more information.
+2. Clang 19 or 20 for Roofline analysis
 
 #### Building
 
 ```sh
-git clone https://github.com/yourusername/miniperf.git
+git clone https://github.com/alexbatashev/miniperf.git
 cd miniperf
 cargo build --release
 ```

@@ -2,9 +2,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 mod event;
-pub(crate) mod event_capnp;
 mod ipc;
-mod ipc_message_capnp;
 
 pub use event::{CallFrame, Event, EventType, IString, Location, ProcMapEntry};
 pub use ipc::{IPCMessage, IPCString};

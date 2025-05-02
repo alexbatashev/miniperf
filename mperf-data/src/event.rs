@@ -1,19 +1,19 @@
 use core::fmt;
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
 
-use capnp::message::ReaderOptions;
+use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-use crate::event_capnp;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
 pub struct IString {
     pub id: u64,
     pub value: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Encode, Decode, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 #[repr(u8)]
 pub enum EventType {
     PmuCycles,
@@ -44,20 +44,20 @@ pub enum EventType {
     RooflineLoopEnd,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Encode, Decode, Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Location {
     pub function_name: u128,
     pub file_name: u128,
     pub line: u32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Encode, Decode, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum CallFrame {
     Location(Location),
     IP(u64),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub unique_id: u128,
     pub correlation_id: u128,
@@ -72,7 +72,7 @@ pub struct Event {
     pub callstack: SmallVec<[CallFrame; 32]>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct ProcMapEntry {
     pub filename: String,
     pub address: usize,
@@ -82,26 +82,22 @@ pub struct ProcMapEntry {
 }
 
 impl Event {
-    pub fn write_binary(&self, writer: &mut dyn Write) -> Result<(), Box<dyn std::error::Error>> {
-        use capnp::serialize_packed;
-        let mut message = capnp::message::Builder::new_default();
-        let mut event = message.init_root::<event_capnp::event::Builder>();
-        event.set_event(self);
-
-        serialize_packed::write_message(writer, &message).map_err(|e| e.into())
+    pub fn write_binary<W>(&self, writer: &mut W) -> Result<(), Box<dyn std::error::Error>>
+    where
+        W: Write,
+    {
+        bincode::encode_into_std_write(self, writer, bincode::config::standard())?;
+        Ok(())
     }
 
-    pub fn read_binary(reader: &mut dyn BufRead) -> Result<Self, Box<dyn std::error::Error>> {
-        use capnp::serialize_packed;
-
-        let mut buf = [0_u8; 2 * std::mem::size_of::<Self>()];
-
-        let message =
-            serialize_packed::read_message_no_alloc(reader, &mut buf, ReaderOptions::default())?;
-
-        let root = message.get_root::<event_capnp::event::Reader>()?;
-
-        Ok(root.into())
+    pub fn read_binary<R>(reader: &mut R) -> Result<Self, Box<dyn std::error::Error>>
+    where
+        R: Read,
+    {
+        Ok(bincode::decode_from_std_read(
+            reader,
+            bincode::config::standard(),
+        )?)
     }
 }
 
