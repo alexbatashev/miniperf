@@ -1,7 +1,7 @@
 use std::ffi::{c_void, CString};
 
 use libc::{
-    c_char, close, ftruncate, mmap, munmap, sem_init, shm_open, shm_unlink, MAP_FAILED, MAP_SHARED,
+    close, ftruncate, mmap, munmap, sem_init, shm_open, shm_unlink, MAP_FAILED, MAP_SHARED,
     O_CREAT, O_RDWR, PROT_WRITE, S_IRUSR, S_IWUSR,
 };
 
