@@ -31,6 +31,13 @@ struct HSRow {
 
 macro_rules! oflt {
     ($e:expr) => {
+        $e.map(|v| Text::from(format!("{:.2}", v)))
+            .unwrap_or(Text::from("N/A"))
+    };
+}
+
+macro_rules! ofltp {
+    ($e:expr) => {
         $e.map(|v| Text::from(format!("{:.2}%", v * 100.0)))
             .unwrap_or(Text::from("N/A"))
     };
@@ -126,14 +133,14 @@ fn get_rows(hotspots: &[HSRow]) -> (Vec<Row<'_>>, Vec<Constraint>) {
         .map(|h| {
             [
                 Cell::new(h.func_name.clone()),
-                Cell::new(Text::from(format!("{:.2}%", h.total * 100.0))),
+                Cell::new(ofltp!(Some(h.total))),
                 Cell::new(Text::from(h.cycles.to_formatted_string(&Locale::en))),
                 Cell::new(Text::from(h.instructions.to_formatted_string(&Locale::en))),
-                Cell::new(Text::from(format!("{:.2}", h.ipc))),
+                Cell::new(oflt!(Some(h.ipc))),
                 Cell::new(oflt!(h.branch_mpki)),
-                Cell::new(oflt!(h.branch_miss_rate)),
+                Cell::new(ofltp!(h.branch_miss_rate)),
                 Cell::new(oflt!(h.cache_mpki)),
-                Cell::new(oflt!(h.cache_miss_rate)),
+                Cell::new(ofltp!(h.cache_miss_rate)),
             ]
             .into_iter()
             .collect::<Row>()

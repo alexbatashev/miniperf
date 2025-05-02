@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or(quote! { None });
         let leader_event = data
             .leader_event
-            .map(|l| quote! {Some(#l)})
+            .map(|l| quote! {Some(#l.to_string())})
             .unwrap_or(quote! { None });
 
         families.push(quote! {
