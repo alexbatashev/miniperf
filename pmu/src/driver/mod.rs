@@ -7,9 +7,6 @@ mod kperf;
 #[cfg(target_os = "linux")]
 use perf::{PerfCountingDriver, PerfSamplingDriver};
 
-#[cfg(target_os = "macos")]
-pub use kperf::{list_software_counters, Driver};
-
 use itertools::chain;
 use smallvec::SmallVec;
 use std::sync::Arc;

@@ -33,5 +33,5 @@ flamelens = "0.3.1"
 inferno = "0.12.2"
 regex = "1.11.1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 addr2line = "0.24.2"
