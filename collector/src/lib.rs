@@ -90,7 +90,7 @@ pub fn get_next_id() -> u128 {
         last as u128
     });
 
-    ((std::process::id() as u128) << 96) | ((unsafe { libc::gettid() as u128 }) << 64) | counter
+    ((std::process::id() as u128) << 96) | ((unsafe { utils::gettid() as u128 }) << 64) | counter
 }
 
 pub fn profiling_enabled() -> bool {
@@ -113,4 +113,26 @@ pub(crate) fn get_timestamp() -> u64 {
     };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut ts) };
     (ts.tv_sec * 1_000_000_000 + ts.tv_nsec) as u64
+}
+
+#[cfg(target_os = "macos")]
+pub mod utils {
+    #[link(name = "pthread")]
+    extern "C" {
+        fn pthread_threadid_np(thread: libc::pthread_t, thread_id: *mut u64) -> libc::c_int;
+    }
+    pub fn gettid() -> u64 {
+        let mut result = 0;
+        unsafe {
+            let _ = pthread_threadid_np(0, &mut result);
+        }
+        result
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod utils {
+    pub fn gettid() -> u64 {
+        libc::gettid()
+    }
 }

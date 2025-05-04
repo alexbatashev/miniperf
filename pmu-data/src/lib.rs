@@ -23,6 +23,11 @@ pub const SIFIVE_U7: &str = "sifive_u7";
 
 pub const SPACEMIT_X60: &str = "spacemit_x60";
 
+pub const APPLE_M1: &str = "apple_m1";
+pub const APPLE_M2: &str = "apple_m2";
+pub const APPLE_M3: &str = "apple_m3";
+pub const APPLE_M4: &str = "apple_m4";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlatformDesc {
     pub family_id: String,

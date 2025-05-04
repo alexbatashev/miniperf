@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 libc = "0.2.169"
 ouroboros = "0.18.4"
+futures = "0.3.31"
