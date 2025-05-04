@@ -49,6 +49,47 @@ fn main() -> Result<(), Box<dyn Error>> {
             });
         }
 
+        let mut scenarios = vec![];
+
+        for scenario in &data.scenarios.unwrap_or_default() {
+            let name = scenario.name.clone();
+            let events = scenario.events.iter().map(|evt| quote! { #evt.to_string() });
+            let constants = scenario.constants.iter().map(|cst| {
+                let name = cst.name.clone();
+                let value = cst.value;
+
+                quote! {
+                    pmu_data::Constant {
+                        name: #name.to_string(),
+                        value: #value
+                    }
+                }
+            });
+
+            let metrics = scenario.metrics.iter().map(|metric| {
+                let name = metric.name.clone();
+                let desc = metric.desc.clone();
+                let formula = metric.formula.clone();
+
+                quote! {
+                    pmu_data::Metric {
+                        name: #name.to_string(),
+                        desc: #desc.to_string(),
+                        formula: #formula.to_string(),
+                    }
+                }
+            });
+
+            scenarios.push(quote!{
+                scenarios.insert(#name.to_string(), pmu_data::Scenario {
+                    name: #name.to_string(),
+                    events: vec![#(#events),*],
+                    constants: vec![#(#constants),*],
+                    metrics: vec![#(#metrics),*],
+                });
+            });
+        }
+
         let name = &data.name;
         let vendor = &data.vendor;
         let family_id = &data.family_id;
@@ -70,6 +111,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             #(#aliases)*
 
+            #[allow(unused_mut)]
+            let mut scenarios = HashMap::new();
+
+            #(#scenarios)*
+
             let family = CPUFamily {
                 name: #name.to_string(),
                 vendor: #vendor.to_string(),
@@ -78,6 +124,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 max_counters: #max_counters,
                 events,
                 aliases,
+                scenarios,
             };
 
             families.insert(#family_id.to_string(), family);

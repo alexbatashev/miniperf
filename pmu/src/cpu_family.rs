@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
-use pmu_data::EventDesc;
+use pmu_data::{EventDesc, Scenario};
 
 #[allow(dead_code)]
 pub struct CPUFamily {
@@ -12,6 +12,7 @@ pub struct CPUFamily {
     pub leader_event: Option<String>,
     pub events: HashMap<String, EventDesc>,
     pub aliases: HashMap<String, String>,
+    pub scenarios: HashMap<String, Scenario>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/events.rs"));
