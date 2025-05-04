@@ -13,11 +13,11 @@ use tokio::{
 };
 
 pub struct EventDispatcher {
-    strings: RwLock<HashMap<String, u64>>,
+    strings: RwLock<HashMap<String, u128>>,
     proc_maps: RwLock<HashSet<u32>>,
     last_unique_id: ThreadLocal<RefCell<u64>>,
     events_tx: Sender<Event>,
-    string_tx: Sender<(u64, String)>,
+    string_tx: Sender<(u128, String)>,
     proc_map_tx: Sender<ProcMapEntry>,
 }
 
@@ -30,7 +30,7 @@ pub struct DispatcherJoinHandle {
 impl EventDispatcher {
     pub fn new(output_directory: &Path) -> (Arc<Self>, DispatcherJoinHandle) {
         let (events_tx, mut event_rx) = mpsc::channel::<Event>(8192);
-        let (string_tx, mut string_rx) = mpsc::channel(8192);
+        let (string_tx, mut string_rx) = mpsc::channel::<(u128, String)>(8192);
         let (proc_map_tx, mut proc_map_rx) = mpsc::channel::<ProcMapEntry>(8192);
 
         let events_out_dir = output_directory.to_owned();
@@ -99,18 +99,17 @@ impl EventDispatcher {
         id
     }
 
-    pub fn string_id(&self, string: &str) -> u64 {
+    pub fn string_id(&self, string: &str) -> u128 {
         let strings = self.strings.upgradable_read();
 
         if strings.contains_key(string) {
             return *strings.get(string).unwrap();
         }
 
-        let id;
+        let id = uuid::Uuid::now_v7().as_u128();
         {
             let mut strings = RwLockUpgradableReadGuard::upgrade(strings);
 
-            id = strings.len() as u64;
             strings.insert(string.to_string(), id);
         }
 
@@ -121,7 +120,7 @@ impl EventDispatcher {
         id
     }
 
-    pub async fn string_id_async(&self, string: &str) -> u64 {
+    pub async fn string_id_async(&self, string: &str) -> u128 {
         let id;
 
         {
@@ -131,10 +130,10 @@ impl EventDispatcher {
                 return *strings.get(string).unwrap();
             }
 
+            id = uuid::Uuid::now_v7().as_u128();
             {
                 let mut strings = RwLockUpgradableReadGuard::upgrade(strings);
 
-                id = strings.len() as u64;
                 strings.insert(string.to_string(), id);
             }
         }

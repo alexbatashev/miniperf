@@ -254,6 +254,9 @@ impl TabsWidget {
                 write_tabs.push(Tab::Loops(LoopsTab::new(connection.clone())));
                 write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())));
             }
+            Scenario::TMA => {
+                todo!()
+            }
         }
     }
 

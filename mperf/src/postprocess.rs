@@ -55,6 +55,10 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
             create_hotspots_view(&connection).await?;
             create_roofline_view(&connection).await?;
         }
+        Scenario::TMA => {
+            process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
+            create_tma_view(&connection, &info.scenario_info).await?;
+        }
     }
 
     Ok(())
@@ -76,6 +80,13 @@ async fn process_strings(connection: &sqlite::Connection, res_dir: &Path) -> Res
     Ok(())
 }
 
+fn get_event_column_name(evt: &(EventType, String)) -> String {
+    match evt.0 {
+        EventType::PmuCustom => format!("pmu_{}", evt.1.replace(".", "_")),
+        _ => evt.0.to_string(),
+    }
+}
+
 async fn process_pmu_counters(
     connection: &sqlite::Connection,
     info: &ScenarioInfo,
@@ -85,11 +96,12 @@ async fn process_pmu_counters(
     let events = match info {
         ScenarioInfo::Snapshot(s) => &s.counters,
         ScenarioInfo::Roofline(r) => &r.counters,
+        ScenarioInfo::TMA(t) => &t.counters,
     };
 
     let str_events = events
         .iter()
-        .map(|evt| format!("{} INTEGER DEFAULT 0", evt))
+        .map(|evt| format!("{} INTEGER DEFAULT 0", get_event_column_name(evt)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -120,6 +132,28 @@ async fn process_pmu_counters(
 
     pb.reset(Some(map.len()));
     pb.write("Coolecting hotspots")?;
+
+    let strings_file =
+        std::fs::File::open(res_dir.join("strings.json")).expect("failed to open strings.json");
+    let strings: Vec<IString> =
+        serde_json::from_reader(strings_file).expect("failed to parse strings.json");
+
+    let find_string = |str_id| {
+        if str_id == 0 {
+            return String::new();
+        }
+
+        strings
+            .iter()
+            .find_map(|istr| {
+                if istr.id == str_id {
+                    Some(istr.value.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    };
 
     let proc_map_file = std::fs::File::open(res_dir.join("proc_map.json"))?;
     let proc_map: Vec<ProcMapEntry> = serde_json::from_reader(proc_map_file)?;
@@ -187,9 +221,6 @@ async fn process_pmu_counters(
                 let mut keys = vec![];
                 let mut values = vec![];
                 for (k, v) in counters.iter() {
-                    if k == "pmu_unknown" {
-                        continue;
-                    }
                     keys.push(k.clone());
                     values.push(v.to_string());
                 }
@@ -271,7 +302,10 @@ async fn process_pmu_counters(
             }
         }
 
-        counters.insert(format!("{}", evt.ty), evt.value);
+        counters.insert(
+            get_event_column_name(&(evt.ty, find_string(evt.name))),
+            evt.value,
+        );
     }
 
     let flamegraph_cycles = flamegraph_cycles
@@ -919,4 +953,118 @@ LEFT JOIN strings s_file ON runs.file_name = s_file.id
 LEFT JOIN strings s_func ON runs.function_name = s_func.id;
     ").expect("failed to create a view");
     Ok(())
+}
+
+async fn create_tma_view(connection: &sqlite::Connection, info: &ScenarioInfo) -> Result<()> {
+    let info = match info {
+        ScenarioInfo::TMA(tma) => tma,
+        _ => unreachable!(),
+    };
+
+    let mut cols = vec![];
+    for metric in &info.metrics {
+        let expr = pmu_data::arith_parser::parse_expr(&metric.formula);
+        let sql = build_sql_expr(&info.metrics, &info.counters, &info.constants, &expr);
+        cols.push(format!("{} AS {}", sql, metric.name.replace(".", "_")));
+    }
+
+    connection
+        .execute(format!(
+            "
+    CREATE VIEW tma
+    AS
+    SELECT
+        proc_map.func_name as func_name,
+        COUNT(pmu_counters.pmu_cycles) AS num_samples,
+        (SUM(pmu_counters.pmu_cycles) * 1.0 / (SELECT SUM(pmu_cycles) FROM pmu_counters)) AS total,
+        SUM(pmu_counters.pmu_cycles) AS cycles,
+        SUM(pmu_counters.pmu_instructions) AS instructions,
+        (SUM(pmu_counters.pmu_instructions) * 1.0 / SUM(pmu_counters.pmu_cycles)) AS ipc,
+        {}
+    FROM pmu_counters
+    INNER JOIN proc_map ON pmu_counters.ip = proc_map.ip
+    GROUP BY proc_map.func_name;
+    ",
+            cols.join(",\n")
+        ))
+        .expect("failed to create a view");
+
+    Ok(())
+}
+
+fn build_sql_expr(
+    metrics: &[pmu_data::Metric],
+    events: &[(EventType, String)],
+    constants: &[pmu_data::Constant],
+    expr: &pmu_data::arith_parser::Expr,
+) -> String {
+    match expr {
+        pmu_data::arith_parser::Expr::Variable(var) => events
+            .iter()
+            .find_map(|(ty, name)| {
+                if name == var {
+                    if ty == &EventType::PmuCycles || ty == &EventType::PmuInstructions {
+                        // Cycles and instructions are fixed counters and do not require scaling
+                        Some(format!(
+                            "SUM(pmu_counters.{})",
+                            get_event_column_name(&(*ty, name.clone()))
+                        ))
+                    } else {
+                        Some(format!(
+                            "SUM(pmu_counters.{} / pmu_counters.confidence)",
+                            get_event_column_name(&(*ty, name.clone()))
+                        ))
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                let new_expr = metrics
+                    .iter()
+                    .find_map(|m| {
+                        if m.name.as_str() == var {
+                            let expr = pmu_data::arith_parser::parse_expr(&m.formula);
+                            Some(build_sql_expr(metrics, events, constants, &expr))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+
+                format!("({})", new_expr)
+            }),
+        pmu_data::arith_parser::Expr::Constant(cst_name) => {
+            let value = constants
+                .iter()
+                .find_map(|cst| {
+                    if cst.name.as_str() == cst_name {
+                        Some(cst.value)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default();
+            format!("{}", value)
+        }
+        pmu_data::arith_parser::Expr::Binary { op, lhs, rhs } => {
+            let op_str = match op {
+                pmu_data::arith_parser::BinOp::Add => "+",
+                pmu_data::arith_parser::BinOp::Sub => "-",
+                pmu_data::arith_parser::BinOp::Mul => "*",
+                pmu_data::arith_parser::BinOp::Div => "/",
+            };
+
+            let lhs_str = build_sql_expr(metrics, events, constants, lhs);
+            let rhs_str = build_sql_expr(metrics, events, constants, rhs);
+
+            match op {
+                pmu_data::arith_parser::BinOp::Div => {
+                    format!("CAST(({}) AS REAL) / CAST(({}) AS REAL)", lhs_str, rhs_str)
+                }
+                _ => format!("({}) {} ({})", lhs_str, op_str, rhs_str),
+            }
+        }
+        pmu_data::arith_parser::Expr::Num(num) => num.to_string(),
+    }
 }

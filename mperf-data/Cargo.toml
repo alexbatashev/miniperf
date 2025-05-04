@@ -13,3 +13,4 @@ clap = { version = "4.5.23", features = ["derive"] }
 smallvec = {version = "1.15.0", features = ["serde", "impl_bincode"] }
 shmem = { path = "../shmem/" }
 bincode = "2.0.1"
+pmu-data = { path = "../pmu-data" }

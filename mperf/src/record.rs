@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Error, Result};
 use mperf_data::{
     CallFrame, Event, IPCMessage, ProcMapEntry, RecordInfo, RooflineInfo, ScenarioInfo,
 };
@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use pmu::{Process, Record};
+use pmu::{Counter, Process, Record};
 
 const SIZE_16MB: usize = 16 * 1024 * 1024;
 
@@ -31,6 +31,7 @@ pub async fn do_record(
     let info = match scenario {
         Scenario::Snapshot => snapshot(dispatcher.clone(), &command)?,
         Scenario::Roofline => roofline(dispatcher.clone(), &command).await?,
+        Scenario::TMA => topdown(dispatcher.clone(), &command)?,
     };
 
     drop(dispatcher);
@@ -43,11 +44,18 @@ pub async fn do_record(
         None
     };
 
+    let family_name = pmu::cpu_family::get_host_cpu_family();
+    let family = pmu::cpu_family::find_cpu_family(family_name);
+
     let ri = RecordInfo {
         scenario,
         command: json_command,
-        cpu_model: "Unknown".to_string(),
-        cpu_vendor: "Unknown".to_string(),
+        cpu_model: family
+            .map(|f| f.name.clone())
+            .unwrap_or("Unknown".to_string()),
+        cpu_vendor: family
+            .map(|f| f.vendor.clone())
+            .unwrap_or("Unknown".to_string()),
         scenario_info: info,
     };
 
@@ -83,6 +91,13 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
             Record::Sample(sample) => {
                 let unique_id = uuid::Uuid::now_v7().as_u128();
                 let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
+
+                let name = if let Counter::Custom(name) = &sample.counter {
+                    dispatcher.string_id(name)
+                } else {
+                    0
+                };
+
                 let event = Event {
                     unique_id,
                     correlation_id: sample.event_id,
@@ -94,6 +109,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
                     time_running: sample.time_running,
                     value: sample.value,
                     timestamp: sample.time,
+                    name,
                     callstack,
                 };
 
@@ -118,7 +134,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
 
     Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
         pid: process.pid(),
-        counters: counters.iter().map(counter_to_event_ty).collect(),
+        counters: counters.iter().map(|counter| (counter_to_event_ty(counter), counter.name().to_string())).collect(),
     }))
 }
 
@@ -168,6 +184,13 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
             Record::Sample(sample) => {
                 let unique_id = uuid::Uuid::now_v7().as_u128();
                 let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
+
+                let name = if let Counter::Custom(name) = &sample.counter {
+                    dispatcher.string_id(name)
+                } else {
+                    0
+                };
+
                 let event = Event {
                     unique_id,
                     correlation_id: sample.event_id,
@@ -178,6 +201,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
                     time_enabled: sample.time_enabled,
                     time_running: sample.time_running,
                     value: sample.value,
+                    name,
                     timestamp: sample.time,
                     callstack,
                 };
@@ -235,7 +259,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     Ok(ScenarioInfo::Roofline(RooflineInfo {
         perf_pid,
-        counters: counters.iter().map(counter_to_event_ty).collect(),
+        counters: counters.iter().map(|counter| (counter_to_event_ty(counter), counter.name().to_string())).collect(),
         inst_pid,
     }))
 }
@@ -257,7 +281,7 @@ fn create_shmem_pipe(
     let rx = shmem::proc_channel::Receiver::<IPCMessage>::new(&pipe_name, SIZE_16MB)?;
 
     let task = tokio::spawn(async move {
-        let mut strings = HashMap::<u64, u64>::new();
+        let mut strings = HashMap::<u128, u128>::new();
 
         while let Some(message) = rx.recv().await {
             match message {
@@ -269,12 +293,12 @@ fn create_shmem_pipe(
                     for stack in event.callstack.iter_mut() {
                         if let CallFrame::Location(loc) = stack {
                             loc.function_name = strings
-                                .get(&(loc.function_name as u64))
+                                .get(&loc.function_name)
                                 .cloned()
                                 .unwrap_or_default()
                                 as u128;
                             loc.file_name = strings
-                                .get(&(loc.file_name as u64))
+                                .get(&loc.file_name)
                                 .cloned()
                                 .unwrap_or_default()
                                 as u128;
@@ -288,4 +312,88 @@ fn create_shmem_pipe(
     });
 
     Ok((pipe_name, task))
+}
+
+fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
+    let family_name = pmu::cpu_family::get_host_cpu_family();
+    let family = pmu::cpu_family::find_cpu_family(family_name);
+    if family.is_none() {
+        return Err(Error::msg(format!(
+            "Unsupported CPU family '{}'",
+            family_name
+        )));
+    }
+
+    let family = family.unwrap();
+
+    if !family.scenarios.contains_key("tma") {
+        return Err(Error::msg(format!(
+            "TMA is not supported for CPU family '{}'",
+            family_name
+        )));
+    }
+
+    let scenario = family.scenarios.get("tma").unwrap();
+
+    let process = Process::new(command, &[])?;
+
+    let counters = get_pmu_counters(Scenario::TMA);
+
+    let mut driver = pmu::SamplingDriverBuilder::new()
+        .counters(&counters)
+        .process(&process)
+        .build()?;
+
+    driver.start(Arc::new(move |record| {
+        match record {
+            Record::Sample(sample) => {
+                let unique_id = uuid::Uuid::now_v7().as_u128();
+                let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
+
+                let name = if let Counter::Custom(name) = &sample.counter {
+                    dispatcher.string_id(name)
+                } else {
+                    0
+                };
+
+                let event = Event {
+                    unique_id,
+                    correlation_id: sample.event_id,
+                    parent_id: 0,
+                    ty: counter_to_event_ty(&sample.counter),
+                    thread_id: sample.tid,
+                    process_id: sample.pid,
+                    time_enabled: sample.time_enabled,
+                    time_running: sample.time_running,
+                    value: sample.value,
+                    name,
+                    timestamp: sample.time,
+                    callstack,
+                };
+
+                dispatcher.publish_event_sync(event);
+            }
+            Record::ProcAddr(addr) => {
+                let entry = ProcMapEntry {
+                    filename: addr.filename,
+                    address: addr.addr as usize,
+                    size: addr.len as usize,
+                    offset: addr.pgoff as usize,
+                    pid: addr.pid,
+                };
+
+                dispatcher.publish_proc_map_sync(entry);
+            }
+        };
+    }))?;
+    process.cont();
+    process.wait()?;
+    driver.stop()?;
+
+    Ok(ScenarioInfo::TMA(mperf_data::TMAInfo {
+        pid: process.pid(),
+        counters: counters.iter().map(|counter| (counter_to_event_ty(counter), counter.name().to_string())).collect(),
+        metrics: scenario.metrics.clone(),
+        constants: scenario.constants.clone(),
+    }))
 }
