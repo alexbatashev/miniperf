@@ -1,3 +1,5 @@
+pub mod arith_parser;
+
 use serde::{de, Deserialize, Serialize};
 
 // Well-known CPU families
@@ -31,6 +33,7 @@ pub struct PlatformDesc {
     pub arch: String,
     pub max_counters: Option<usize>,
     pub leader_event: Option<String>,
+    pub scenarios: Option<Vec<Scenario>>,
     pub events: Vec<EventDesc>,
     pub aliases: Option<Vec<Alias>>,
 }
@@ -47,6 +50,27 @@ pub struct EventDesc {
 pub struct Alias {
     pub target: String,
     pub origin: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Scenario {
+    pub name: String,
+    pub events: Vec<String>,
+    pub constants: Vec<Constant>,
+    pub metrics: Vec<Metric>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Metric {
+    pub name: String,
+    pub desc: String,
+    pub formula: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Constant {
+    pub name: String,
+    pub value: u32,
 }
 
 fn serialize_hex<S>(v: &u64, serializer: S) -> Result<S::Ok, S::Error>

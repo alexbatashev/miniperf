@@ -4,7 +4,7 @@ use crate::Event;
 
 #[derive(Encode, Decode, Clone, Debug)]
 pub struct IPCString {
-    pub key: u64,
+    pub key: u128,
     pub value: String,
 }
 

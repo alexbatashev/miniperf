@@ -1,4 +1,4 @@
-mod cpu_family;
+pub mod cpu_family;
 mod driver;
 mod process;
 

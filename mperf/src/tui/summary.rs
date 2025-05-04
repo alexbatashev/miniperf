@@ -26,8 +26,6 @@ struct Stat {
     branch_misses: u64,
     cache_references: u64,
     cache_misses: u64,
-    stalled_cycles_frontend: u64,
-    stalled_cycles_backend: u64,
 }
 
 impl SummaryTab {
@@ -60,9 +58,7 @@ impl SummaryTab {
             CAST(SUM(pmu_llc_references * 1.0 / confidence) AS INTEGER) AS pmu_llc_references,
             CAST(SUM(pmu_llc_misses * 1.0 / confidence) AS INTEGER) AS pmu_llc_misses,
             CAST(SUM(pmu_branch_instructions * 1.0 / confidence) AS INTEGER) AS pmu_branch_instructions,
-            CAST(SUM(pmu_branch_misses * 1.0 / confidence) AS INTEGER) AS pmu_branch_misses,
-            CAST(SUM(pmu_stalled_cycles_frontend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_frontend,
-            CAST(SUM(pmu_stalled_cycles_backend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_backend
+            CAST(SUM(pmu_branch_misses * 1.0 / confidence) AS INTEGER) AS pmu_branch_misses
 
             FROM pmu_counters;
         ",
@@ -80,8 +76,6 @@ impl SummaryTab {
             branch_misses: row.read::<i64, _>("pmu_branch_misses") as u64,
             cache_references: row.read::<i64, _>("pmu_llc_references") as u64,
             cache_misses: row.read::<i64, _>("pmu_llc_misses") as u64,
-            stalled_cycles_frontend: row.read::<i64, _>("pmu_stalled_cycles_frontend") as u64,
-            stalled_cycles_backend: row.read::<i64, _>("pmu_stalled_cycles_backend") as u64,
         };
     }
 }
@@ -183,23 +177,6 @@ impl Widget for SummaryTab {
                         ),
                         "".to_string(),
                     ]),
-                    Row::new([
-                        "Stalled cycles backend".to_string(),
-                        stat.stalled_cycles_backend.to_formatted_string(&Locale::en),
-                        format!(
-                            "{:.2}%",
-                            stat.stalled_cycles_backend as f64 / stat.cycles as f64 * 100.0
-                        ),
-                    ]),
-                    Row::new([
-                        "Stalled cycles frontend".to_string(),
-                        stat.stalled_cycles_frontend
-                            .to_formatted_string(&Locale::en),
-                        format!(
-                            "{:.2}%",
-                            stat.stalled_cycles_frontend as f64 / stat.cycles as f64 * 100.0
-                        ),
-                    ]),
                 ];
                 let widths = [
                     Constraint::Percentage(60),
@@ -219,9 +196,12 @@ impl Widget for SummaryTab {
             .command
             .unwrap_or(vec!["".to_string()])
             .join(" ");
+
         let rows = [
             Row::new(["Scenario", self.record_info.scenario.name()]),
             Row::new(["Command", command.as_str()]),
+            Row::new(["CPU family", self.record_info.cpu_model.as_str()]),
+            Row::new(["CPU vendor", self.record_info.cpu_vendor.as_str()]),
         ];
         let widths = [Constraint::Percentage(20), Constraint::Percentage(80)];
 
