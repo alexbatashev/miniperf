@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
-use pmu_data::{EventDesc, Metric};
+use pmu_data::{EventDesc, Metric, TmaScenario};
 
 #[allow(dead_code)]
 pub struct CPUFamily {
@@ -13,6 +13,7 @@ pub struct CPUFamily {
     pub events: HashMap<String, EventDesc>,
     pub aliases: HashMap<String, String>,
     pub metrics: Vec<Metric>,
+    pub scenarios: HashMap<String, TmaScenario>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/events.rs"));
@@ -26,6 +27,12 @@ pub fn host_metrics() -> Vec<Metric> {
     find_cpu_family(get_host_cpu_family())
         .map(|family| family.metrics.clone())
         .unwrap_or_default()
+}
+
+pub fn host_tma_scenario() -> Option<TmaScenario> {
+    find_cpu_family(get_host_cpu_family())
+        .and_then(|family| family.scenarios.get("tma"))
+        .cloned()
 }
 
 #[cfg(target_arch = "x86_64")]

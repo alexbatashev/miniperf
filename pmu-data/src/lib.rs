@@ -1,6 +1,9 @@
 #![deny(missing_docs)]
 //! Serializable schema and stable identifiers for CPU PMU event tables.
 
+/// Arithmetic expression parser used by TMA scenario formulas.
+pub mod arith_parser;
+
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{de, Deserialize, Serialize};
@@ -72,6 +75,9 @@ pub struct PlatformDesc {
     /// Derived metrics defined for this PMU.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metrics: Vec<Metric>,
+    /// Top-down analysis scenarios defined for this PMU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenarios: Option<Vec<TmaScenario>>,
 }
 
 /// Description and raw encoding of one PMU event.
@@ -93,6 +99,39 @@ pub struct Alias {
     pub target: String,
     /// Platform-specific event name present in [`PlatformDesc::events`].
     pub origin: String,
+}
+
+/// A top-down analysis scenario and the counters needed to evaluate it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaScenario {
+    /// Stable scenario name, normally `tma`.
+    pub name: String,
+    /// PMU event names that must be sampled.
+    pub events: Vec<String>,
+    /// Named processor constants referenced by metric formulas.
+    pub constants: Vec<TmaConstant>,
+    /// Hierarchical metrics calculated by the scenario.
+    pub metrics: Vec<TmaMetric>,
+}
+
+/// A metric formula belonging to a top-down analysis scenario.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaMetric {
+    /// Stable hierarchical metric name.
+    pub name: String,
+    /// Human-readable metric description.
+    pub desc: String,
+    /// Formula referencing events, constants, or other TMA metrics.
+    pub formula: String,
+}
+
+/// A named integer constant referenced by a TMA formula.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaConstant {
+    /// Constant name without the `$` prefix.
+    pub name: String,
+    /// Constant value.
+    pub value: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

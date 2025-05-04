@@ -16,3 +16,4 @@ libc = "0.2.169"
 parking_lot = "0.12.3"
 smallvec = "1.13.2"
 shmem = { path = "../shmem/" }
+uuid = { version = "1", features = ["v7"] }

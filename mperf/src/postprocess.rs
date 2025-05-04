@@ -59,6 +59,10 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
             create_hotspots_view(&connection).await?;
             create_roofline_view(&connection).await?;
         }
+        Scenario::TMA => {
+            process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
+            create_tma_view(&connection, &info.scenario_info).await?;
+        }
     }
 
     persist_derived_metrics(&connection)?;
@@ -171,6 +175,13 @@ async fn process_strings(connection: &sqlite::Connection, res_dir: &Path) -> Res
     Ok(())
 }
 
+fn get_event_column_name(event: &(EventType, String)) -> String {
+    match event.0 {
+        EventType::PmuCustom => format!("pmu_{}", event.1.replace('.', "_")),
+        _ => event.0.to_string(),
+    }
+}
+
 async fn process_pmu_counters(
     connection: &sqlite::Connection,
     info: &ScenarioInfo,
@@ -180,11 +191,12 @@ async fn process_pmu_counters(
     let events = match info {
         ScenarioInfo::Snapshot(s) => &s.counters,
         ScenarioInfo::Roofline(r) => &r.counters,
+        ScenarioInfo::TMA(t) => &t.counters,
     };
 
     let str_events = events
         .iter()
-        .map(|evt| format!("{} INTEGER DEFAULT 0", evt))
+        .map(|event| format!("{} INTEGER DEFAULT 0", get_event_column_name(event)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -215,6 +227,13 @@ async fn process_pmu_counters(
 
     pb.reset(Some(map.len()));
     pb.write("Coolecting hotspots")?;
+
+    let strings_file = std::fs::File::open(res_dir.join("strings.json"))?;
+    let strings: Vec<IString> = serde_json::from_reader(strings_file)?;
+    let strings = strings
+        .into_iter()
+        .map(|string| (string.id, string.value))
+        .collect::<HashMap<_, _>>();
 
     let proc_map_file = std::fs::File::open(res_dir.join("proc_map.json"))?;
     let proc_map: Vec<ProcMapEntry> = serde_json::from_reader(proc_map_file)?;
@@ -376,7 +395,8 @@ async fn process_pmu_counters(
             }
         }
 
-        counters.insert(format!("{}", evt.ty), evt.value);
+        let event_name = strings.get(&evt.name).cloned().unwrap_or_default();
+        counters.insert(get_event_column_name(&(evt.ty, event_name)), evt.value);
     }
 
     if let Some(lead_event) = &lead_event {
@@ -1247,5 +1267,94 @@ mod metric_tests {
             statement.read::<String, _>("expression").unwrap(),
             "instructions / cycles"
         );
+    }
+}
+
+async fn create_tma_view(connection: &sqlite::Connection, info: &ScenarioInfo) -> Result<()> {
+    let ScenarioInfo::TMA(info) = info else {
+        unreachable!("TMA view requires TMA recording metadata");
+    };
+
+    let columns = info
+        .metrics
+        .iter()
+        .map(|metric| {
+            let expression = pmu_data::arith_parser::parse_expr(&metric.formula);
+            let sql =
+                build_tma_sql_expr(&info.metrics, &info.counters, &info.constants, &expression);
+            format!("{} AS {}", sql, metric.name.replace('.', "_"))
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+
+    connection.execute(format!(
+        "CREATE VIEW tma AS
+         SELECT
+             proc_map.func_name AS func_name,
+             COUNT(pmu_counters.pmu_cycles) AS num_samples,
+             SUM(pmu_counters.pmu_cycles) * 1.0 /
+                 NULLIF((SELECT SUM(pmu_cycles) FROM pmu_counters), 0) AS total,
+             SUM(pmu_counters.pmu_cycles) AS cycles,
+             SUM(pmu_counters.pmu_instructions) AS instructions,
+             SUM(pmu_counters.pmu_instructions) * 1.0 /
+                 NULLIF(SUM(pmu_counters.pmu_cycles), 0) AS ipc,
+             {columns}
+         FROM pmu_counters
+         INNER JOIN proc_map ON pmu_counters.ip = proc_map.ip
+         GROUP BY proc_map.func_name;"
+    ))?;
+    Ok(())
+}
+
+fn build_tma_sql_expr(
+    metrics: &[pmu_data::TmaMetric],
+    events: &[(EventType, String)],
+    constants: &[pmu_data::TmaConstant],
+    expression: &pmu_data::arith_parser::Expr,
+) -> String {
+    use pmu_data::arith_parser::{BinOp, Expr};
+
+    match expression {
+        Expr::Variable(variable) => events
+            .iter()
+            .find_map(|(event_type, name)| {
+                (name == variable).then(|| {
+                    let column = get_event_column_name(&(*event_type, name.clone()));
+                    if matches!(
+                        event_type,
+                        EventType::PmuCycles | EventType::PmuInstructions
+                    ) {
+                        format!("SUM(pmu_counters.{column})")
+                    } else {
+                        format!("SUM(pmu_counters.{column} / pmu_counters.confidence)")
+                    }
+                })
+            })
+            .unwrap_or_else(|| {
+                let metric = metrics
+                    .iter()
+                    .find(|metric| metric.name == *variable)
+                    .unwrap_or_else(|| panic!("unknown TMA variable '{variable}'"));
+                let nested = pmu_data::arith_parser::parse_expr(&metric.formula);
+                format!(
+                    "({})",
+                    build_tma_sql_expr(metrics, events, constants, &nested)
+                )
+            }),
+        Expr::Constant(name) => constants
+            .iter()
+            .find(|constant| constant.name == *name)
+            .map_or_else(|| "0".to_string(), |constant| constant.value.to_string()),
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs = build_tma_sql_expr(metrics, events, constants, lhs);
+            let rhs = build_tma_sql_expr(metrics, events, constants, rhs);
+            match op {
+                BinOp::Add => format!("({lhs}) + ({rhs})"),
+                BinOp::Sub => format!("({lhs}) - ({rhs})"),
+                BinOp::Mul => format!("({lhs}) * ({rhs})"),
+                BinOp::Div => format!("CAST(({lhs}) AS REAL) / NULLIF(CAST(({rhs}) AS REAL), 0)"),
+            }
+        }
+        Expr::Num(number) => number.to_string(),
     }
 }

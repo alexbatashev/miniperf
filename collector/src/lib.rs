@@ -1,12 +1,7 @@
 use lazy_static::lazy_static;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use shmem::proc_channel::Sender;
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    hash::{DefaultHasher, Hash, Hasher},
-    sync::Mutex,
-};
+use std::{cell::RefCell, collections::HashMap, sync::Mutex};
 
 use mperf_data::{Event, IPCMessage, IPCString};
 
@@ -26,7 +21,7 @@ lazy_static! {
         }
         mutex
     };
-    static ref STRINGS: RwLock<HashMap<String, u64>> = RwLock::new(HashMap::new());
+    static ref STRINGS: RwLock<HashMap<String, u128>> = RwLock::new(HashMap::new());
     static ref PROFILING_ENABLED: bool = std::env::var("MPERF_COLLECTOR_ENABLED").is_ok();
     static ref ROOFLINE_INSTR_ENABLED: bool =
         std::env::var("MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED").is_ok();
@@ -47,13 +42,13 @@ pub fn send_event(evt: Event) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn get_string_id(string: &str) -> u64 {
+pub fn get_string_id(string: &str) -> u128 {
     let reader = STRINGS.upgradable_read();
     if reader.contains_key(string) {
         return *reader.get(string).unwrap();
     }
 
-    let hash = {
+    let key = {
         let mut writer = RwLockUpgradableReadGuard::upgrade(reader);
 
         // We now have exclusive lock, double check no one has added our string
@@ -61,18 +56,16 @@ pub fn get_string_id(string: &str) -> u64 {
             return *writer.get(string).unwrap();
         }
 
-        let mut hasher = DefaultHasher::new();
-        string.hash(&mut hasher);
-        let hash = hasher.finish();
+        let id = uuid::Uuid::now_v7().as_u128();
 
-        writer.insert(string.to_string(), hash);
+        writer.insert(string.to_string(), id);
 
-        hash
+        id
     };
 
     let sender = SENDER.lock().unwrap();
     let res = sender.send_sync(IPCMessage::String(IPCString {
-        key: hash,
+        key,
         value: string.to_string(),
     }));
 
@@ -80,7 +73,7 @@ pub fn get_string_id(string: &str) -> u64 {
         eprintln!("Lost a string IPC message due to an error {:?}", res.err());
     }
 
-    hash
+    key
 }
 
 pub fn get_next_id() -> u128 {

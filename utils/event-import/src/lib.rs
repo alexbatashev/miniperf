@@ -44,6 +44,7 @@ pub fn import_intel(source: &Path, family_id: &str, name: &str) -> ImportResult<
         events: events.into_values().collect(),
         aliases: Some(aliases),
         metrics: metrics.into_values().collect(),
+        scenarios: None,
     })
 }
 
@@ -101,6 +102,7 @@ pub fn import_arm_telemetry(
         events: events.into_values().collect(),
         aliases: Some(aliases),
         metrics: Vec::new(),
+        scenarios: None,
     })
 }
 
