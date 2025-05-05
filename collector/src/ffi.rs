@@ -5,8 +5,7 @@ use mperf_data::{CallFrame, Event, EventType, Location};
 
 use crate::{
     get_next_id, get_string_id, get_timestamp, profiling_enabled, roofline_instrumentation_enabled,
-    send_event,
-    utils
+    send_event, utils,
 };
 
 #[derive(Debug, Clone, Copy)]
