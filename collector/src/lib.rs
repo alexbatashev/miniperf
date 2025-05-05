@@ -121,18 +121,18 @@ pub mod utils {
     extern "C" {
         fn pthread_threadid_np(thread: libc::pthread_t, thread_id: *mut u64) -> libc::c_int;
     }
-    pub fn gettid() -> u64 {
+    pub fn gettid() -> u32 {
         let mut result = 0;
         unsafe {
             let _ = pthread_threadid_np(0, &mut result);
         }
-        result
+        result as u32
     }
 }
 
 #[cfg(target_os = "linux")]
 mod utils {
-    pub fn gettid() -> u64 {
-        libc::gettid()
+    pub fn gettid() -> u32 {
+        libc::gettid() as u32
     }
 }
