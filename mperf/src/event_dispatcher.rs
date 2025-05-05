@@ -91,7 +91,7 @@ impl EventDispatcher {
     }
 
     pub fn unique_id(&self) -> u128 {
-       uuid::Uuid::now_v7().as_u128()
+        uuid::Uuid::now_v7().as_u128()
     }
 
     pub fn string_id(&self, string: &str) -> u64 {

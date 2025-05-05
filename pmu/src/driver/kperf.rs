@@ -1,31 +1,24 @@
 #![allow(dead_code)]
-// use crate::backends::{Backend, BackendCounters};
-// use crate::{CounterKind, CountersGroup};
+
+mod inprocess;
+mod system;
+
 use dlopen2::wrapper::{Container, WrapperApi};
+use inprocess::InProcessDriver;
 use libc::*;
-// use std::ffi::CStr;
 use std::{ffi::CStr, sync::Arc};
+use system::{
+    KPCDispatch, KPEPDispatch, KPepConfig, KPepDB, KPepEvent, KPC_CLASS_CONFIGURABLE_MASK,
+    KPERF_ACTION_MAX, KPERF_TIMER_MAX,
+};
 
 use crate::{Counter, Error, Process};
 
-use super::Sample;
+use super::{CounterResult, CountingDriver, Sample};
 
 const MAX_COUNTERS: usize = 6;
 
-const KPC_CLASS_FIXED: u32 = 0;
-const KPC_CLASS_CONFIGURABLE: u32 = 1;
-const KPC_CLASS_POWER: u32 = 2;
-const KPC_CLASS_RAWPMU: u32 = 3;
-
-const KPC_CLASS_FIXED_MASK: u32 = 1 << KPC_CLASS_FIXED;
-const KPC_CLASS_CONFIGURABLE_MASK: u32 = 1 << KPC_CLASS_CONFIGURABLE;
-const KPC_CLASS_POWER_MASK: u32 = 1 << KPC_CLASS_POWER;
-const KPC_CLASS_RAWPMU_MASK: u32 = 1 << KPC_CLASS_RAWPMU;
-
-const KPERF_ACTION_MAX: u32 = 32;
-const KPERF_TIMER_MAX: u32 = 8;
-
-pub enum CountingDriver {
+pub enum KPerfCountingDriver {
     InProcess(InProcessDriver),
     Sampling,
 }
@@ -43,135 +36,12 @@ pub struct SamplingDriverBuilder {
     pid: Option<u32>,
 }
 
-pub struct InProcessDriver {
-    kpc_dispatch: Arc<Container<KPCDispatch>>,
-    kpep_dispatch: Arc<Container<KPEPDispatch>>,
-    db: *const KPepDB,
-    cfg: *mut KPepConfig,
-    native_handles: Vec<NativeCounterHandle>,
-    counter_values_before: Vec<u64>,
-    counter_values_after: Vec<u64>,
-    counter_values: Vec<u64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CounterValue {
-    pub value: u64,
-    pub scaling: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct CounterResult {
-    values: Vec<(Counter, CounterValue)>,
-}
-
-struct NativeCounterHandle {
+pub struct NativeCounterHandle {
     pub kind: Counter,
     pub reg_id: usize,
 }
 
-#[repr(C)]
-struct KPepEvent {
-    name: *const c_char,
-    description: *const c_char,
-    errata: *const c_char,
-    alias: *const c_char,
-    fallback: *const c_char,
-    mask: u32,
-    number: u8,
-    umask: u8,
-    reserved: u8,
-    is_fixed: u8,
-}
-
-#[repr(C)]
-struct KPepDB {
-    name: *const c_char,
-    cpu_id: *const c_char,
-    marketing_name: *const c_char,
-    plist_data: *const u8,
-    event_map: *const u8,
-    event_arr: *const KPepEvent,
-    fixed_event_arr: *const *const KPepEvent,
-    alias_map: *const u8,
-    reserved1: size_t,
-    reserved2: size_t,
-    reserved3: size_t,
-    event_count: size_t,
-    alias_count: size_t,
-    fixed_count_counter: size_t,
-    config_counter_count: size_t,
-    power_counter_count: size_t,
-    architecture: u32,
-    fixed_counter_bits: u32,
-    config_counter_bits: u32,
-    power_counter_bits: u32,
-}
-
-#[repr(C)]
-struct KPepConfig {
-    db: *const KPepDB,
-    ev_arr: *const *const KPepEvent,
-    ev_map: *const size_t,
-    ev_idx: *const size_t,
-    flags: *const u32,
-    kpc_periods: *const u64,
-    event_count: size_t,
-    counter_count: size_t,
-    classes: u32,
-    config_counter: u32,
-    power_counter: u32,
-    reserved: u32,
-}
-
-#[derive(WrapperApi)]
-struct KPCDispatch {
-    kpc_cpu_string: unsafe extern "C" fn(buf: *mut c_char, buf_size: size_t) -> c_int,
-    kpc_pmu_version: unsafe extern "C" fn() -> u32,
-    kpc_set_counting: unsafe extern "C" fn(classes: u32) -> c_int,
-    kpc_set_thread_counting: unsafe extern "C" fn(classes: u32) -> c_int,
-    kpc_set_config: unsafe extern "C" fn(classes: u32, config: *mut u64) -> c_int,
-    kpc_get_thread_counters: unsafe extern "C" fn(tid: u32, buf_count: u32, buf: *mut u64) -> c_int,
-    kpc_force_all_ctrs_set: unsafe extern "C" fn(val: c_int) -> c_int,
-    kpc_get_counter_count: unsafe extern "C" fn(val: u32) -> u32,
-    kperf_action_count_set: unsafe extern "C" fn(val: u32) -> c_int,
-    kperf_timer_count_set: unsafe extern "C" fn(val: u32) -> c_int,
-    kperf_action_samplers_set: unsafe extern "C" fn(action_id: u32, sample: u32) -> c_int,
-    kperf_timer_period_set: unsafe extern "C" fn(action_id: u32, tick: u64) -> c_int,
-    kperf_timer_action_set: unsafe extern "C" fn(action_id: u32, timer_id: u32) -> c_int,
-    kperf_timer_pet_set: unsafe extern "C" fn(timer_id: u32) -> c_int,
-    kperf_sample_set: unsafe extern "C" fn(enabled: u32) -> c_int,
-}
-
-#[derive(WrapperApi)]
-struct KPEPDispatch {
-    kpep_config_create: unsafe extern "C" fn(db: *mut KPepDB, cfg: *mut *mut KPepConfig) -> c_int,
-    kpep_config_free: unsafe extern "C" fn(cfg: *mut KPepConfig),
-    kpep_db_create: unsafe extern "C" fn(name: *const c_char, db: *mut *mut KPepDB) -> c_int,
-    kpep_db_free: unsafe extern "C" fn(db: *mut KPepDB),
-    kpep_db_events_count: unsafe extern "C" fn(db: *const KPepDB, count: *mut size_t) -> c_int,
-    kpep_db_events:
-        unsafe extern "C" fn(db: *const KPepDB, buf: *mut *mut KPepEvent, buf_size: usize) -> c_int,
-    kpep_event_name: unsafe extern "C" fn(event: *const KPepEvent, name: *mut *const c_char),
-    kpep_event_description: unsafe extern "C" fn(event: *const KPepEvent, desc: *mut *const c_char),
-    kpep_config_force_counters: unsafe extern "C" fn(cfg: *mut KPepConfig) -> c_int,
-    kpep_config_add_event: unsafe extern "C" fn(
-        cfg: *mut KPepConfig,
-        evt: *mut *mut KPepEvent,
-        flag: u32,
-        err: *mut u32,
-    ) -> c_int,
-    kpep_config_kpc:
-        unsafe extern "C" fn(cfg: *mut KPepConfig, buf: *mut u64, buf_size: usize) -> c_int,
-    kpep_config_kpc_count:
-        unsafe extern "C" fn(cfg: *mut KPepConfig, count_ptr: *mut usize) -> c_int,
-    kpep_config_kpc_classes:
-        unsafe extern "C" fn(cfg: *mut KPepConfig, classes_ptr: *mut u32) -> c_int,
-    kpep_config_kpc_map:
-        unsafe extern "C" fn(cfg: *mut KPepConfig, buf: *mut usize, size: usize) -> c_int,
-}
-
-impl CountingDriver {
+impl KPerfCountingDriver {
     pub fn new(
         counters: &[Counter],
         pid: Option<&Process>,
@@ -203,7 +73,7 @@ impl CountingDriver {
             })
             .collect();
 
-        Ok(CountingDriver::InProcess(InProcessDriver {
+        Ok(KPerfCountingDriver::InProcess(InProcessDriver {
             kpc_dispatch: kpc_dispatch.into(),
             kpep_dispatch,
             db,
@@ -214,148 +84,32 @@ impl CountingDriver {
             counter_values: vec![0; counters.len()],
         }))
     }
-
-    pub fn start(&mut self) -> Result<(), Error> {
-        match self {
-            CountingDriver::InProcess(driver) => driver.start(),
-            CountingDriver::Sampling => todo!(),
-        }
-    }
-    pub fn stop(&mut self) -> Result<(), Error> {
-        match self {
-            CountingDriver::InProcess(driver) => driver.stop(),
-            CountingDriver::Sampling => todo!(),
-        }
-    }
-    pub fn reset(&mut self) -> Result<(), Error> {
-        match self {
-            CountingDriver::InProcess(driver) => driver.reset(),
-            CountingDriver::Sampling => todo!(),
-        }
-    }
-    pub fn counters(&mut self) -> Result<CounterResult, Box<dyn std::error::Error>> {
-        match self {
-            CountingDriver::InProcess(driver) => driver.counters(),
-            CountingDriver::Sampling => todo!(),
-        }
-    }
 }
 
-impl InProcessDriver {
+impl CountingDriver for KPerfCountingDriver {
     fn start(&mut self) -> Result<(), Error> {
-        let mut classes: u32 = 0;
-        if unsafe {
-            self.kpep_dispatch
-                .kpep_config_kpc_classes(self.cfg, &mut classes)
-                != 0
-        } {
-            return Err(Error::EnableFailed);
+        match self {
+            KPerfCountingDriver::InProcess(driver) => driver.start(),
+            KPerfCountingDriver::Sampling => todo!(),
         }
-
-        let mut reg_count: usize = 0;
-        if unsafe {
-            self.kpep_dispatch
-                .kpep_config_kpc_count(self.cfg, &mut reg_count)
-                != 0
-        } {
-            return Err(Error::EnableFailed);
-        }
-
-        let mut native_reg_map = vec![0; 32];
-        let ret = unsafe {
-            self.kpep_dispatch.kpep_config_kpc_map(
-                self.cfg,
-                native_reg_map.as_mut_ptr(),
-                native_reg_map.len() * std::mem::size_of::<usize>(),
-            )
-        };
-        if ret != 0 {
-            return Err(Error::EnableFailed);
-        }
-
-        (0..self.native_handles.len()).for_each(|i| {
-            self.native_handles[i].reg_id = native_reg_map[i];
-        });
-
-        let mut regs = vec![0; reg_count];
-        if unsafe {
-            self.kpep_dispatch.kpep_config_kpc(
-                self.cfg,
-                regs.as_mut_ptr(),
-                reg_count * std::mem::size_of::<u64>(),
-            ) != 0
-        } {
-            return Err(Error::EnableFailed);
-        }
-
-        if unsafe { self.kpc_dispatch.kpc_force_all_ctrs_set(1) != 0 } {
-            return Err(Error::EnableFailed);
-        }
-
-        if (classes & KPC_CLASS_CONFIGURABLE_MASK != 0)
-            && reg_count != 0
-            && unsafe { self.kpc_dispatch.kpc_set_config(classes, regs.as_mut_ptr()) != 0 }
-        {
-            return Err(Error::EnableFailed);
-        }
-
-        if unsafe { self.kpc_dispatch.kpc_set_counting(classes) != 0 } {
-            return Err(Error::EnableFailed);
-        }
-        if unsafe { self.kpc_dispatch.kpc_set_thread_counting(classes) != 0 } {
-            return Err(Error::EnableFailed);
-        }
-
-        if unsafe {
-            self.kpc_dispatch.kpc_get_thread_counters(
-                0,
-                32,
-                self.counter_values_before.as_mut_ptr(),
-            ) != 0
-        } {
-            return Err(Error::EnableFailed);
-        }
-
-        Ok(())
     }
     fn stop(&mut self) -> Result<(), Error> {
-        if unsafe {
-            self.kpc_dispatch
-                .kpc_get_thread_counters(0, 32, self.counter_values_after.as_mut_ptr())
-                != 0
-        } {
-            return Err(Error::EnableFailed);
+        match self {
+            KPerfCountingDriver::InProcess(driver) => driver.stop(),
+            KPerfCountingDriver::Sampling => todo!(),
         }
-        unsafe {
-            self.kpc_dispatch.kpc_set_counting(0);
-            self.kpc_dispatch.kpc_set_thread_counting(0);
-        }
-
-        for i in 0..self.counter_values.len() {
-            self.counter_values[i] += self.counter_values_after[i] - self.counter_values_before[i];
-        }
-
-        Ok(())
     }
     fn reset(&mut self) -> Result<(), Error> {
-        self.counter_values = vec![0; self.counter_values.len()];
-        Ok(())
+        match self {
+            KPerfCountingDriver::InProcess(driver) => driver.reset(),
+            KPerfCountingDriver::Sampling => todo!(),
+        }
     }
-    fn counters(&mut self) -> Result<CounterResult, Box<dyn std::error::Error>> {
-        let values = self
-            .native_handles
-            .iter()
-            .map(|handle| {
-                (
-                    handle.kind.clone(),
-                    CounterValue {
-                        value: self.counter_values[handle.reg_id],
-                        scaling: 1_f64,
-                    },
-                )
-            })
-            .collect();
-        Ok(CounterResult { values })
+    fn counters(&mut self) -> Result<CounterResult, std::io::Error> {
+        match self {
+            KPerfCountingDriver::InProcess(driver) => Ok(driver.counters().expect("")),
+            KPerfCountingDriver::Sampling => todo!(),
+        }
     }
 }
 
@@ -477,26 +231,6 @@ impl SamplingDriverBuilder {
 
     pub fn build(self) -> Result<SamplingDriver, Error> {
         todo!()
-    }
-}
-
-impl CounterResult {
-    pub fn get(&self, kind: Counter) -> Option<CounterValue> {
-        self.values
-            .iter()
-            .find(|(c, _)| *c == kind)
-            .map(|(_, v)| v)
-            .cloned()
-    }
-}
-
-impl IntoIterator for CounterResult {
-    type Item = (Counter, CounterValue);
-
-    type IntoIter = <Vec<(Counter, CounterValue)> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.values.into_iter()
     }
 }
 
