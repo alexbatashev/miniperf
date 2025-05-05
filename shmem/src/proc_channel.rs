@@ -1,3 +1,4 @@
+use futures::future::select;
 use libc::EAGAIN;
 use std::{
     marker::PhantomData,
@@ -175,13 +176,14 @@ impl<T: Sendable> Sender<T> {
             std::sync::atomic::fence(Ordering::SeqCst);
         }
 
-        self.inner.sem.post()?;
+        self.inner.sem.post();
 
         Ok(())
     }
 
     pub fn close(&self) -> Result<(), std::io::Error> {
-        self.inner.finish_sem.post()
+        self.inner.finish_sem.post();
+        Ok(())
     }
 
     fn head(&self) -> &AtomicUsize {
@@ -224,11 +226,7 @@ impl<T: Sendable> Receiver<T> {
     }
 
     pub fn recv_sync(&self) -> Option<T> {
-        if self.inner.sem.counter().ok()? == 0 && self.inner.finish_sem.counter().ok()? > 0 {
-            return None;
-        }
-
-        self.inner.sem.wait().ok()?;
+        self.inner.sem.wait();
 
         let size_offset = self
             .head()
@@ -250,28 +248,9 @@ impl<T: Sendable> Receiver<T> {
     }
 
     pub async fn recv(&self) -> Option<T> {
-        let _ = blocker(|| {
-            let res = self.inner.sem.try_wait();
-            if res.is_ok() {
-                return Ok(true);
-            }
+        select(self.inner.sem.wait(), self.inner.finish_sem.wait()).await;
 
-            let err = res.err().unwrap();
-            if let Some(code) = err.raw_os_error() {
-                if code == EAGAIN {
-                    if self.inner.finish_sem.counter()? > 0 {
-                        return Ok(true);
-                    }
-
-                    return Ok(false);
-                }
-            }
-
-            Err(err)
-        })
-        .await;
-
-        if self.empty() && self.inner.finish_sem.counter().ok()? > 0 {
+        if self.empty() && self.inner.finish_sem.counter() > 0 {
             return None;
         }
 
@@ -295,10 +274,7 @@ impl<T: Sendable> Receiver<T> {
     }
 
     pub fn empty(&self) -> bool {
-        match self.inner.sem.counter() {
-            Ok(c) => c == 0,
-            _ => true,
-        }
+        self.inner.sem.counter() == 0
     }
 
     fn head(&self) -> &AtomicUsize {
