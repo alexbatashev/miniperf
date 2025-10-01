@@ -274,6 +274,7 @@ impl TabsWidget {
 
     fn handle_event(&mut self, code: KeyCode) {
         match &mut self.tabs.write()[self.cur_tab] {
+            Tab::Hotspots(tab) => tab.handle_event(code),
             Tab::Flamegraph(tab) => tab.handle_event(code),
             _ => {}
         }
