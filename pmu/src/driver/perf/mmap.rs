@@ -102,6 +102,29 @@ impl Records {
             atomic.fetch_add(offset as u64, std::sync::atomic::Ordering::Release);
         }
     }
+
+    unsafe fn copy_from_ring(&self, absolute_offset: u64, dst: &mut [u8]) {
+        let data_offset = self.data_offset();
+        let data_size = self.data_size();
+        let base_ptr = (self.metadata as *const u8).add(data_offset);
+
+        let mut remaining = dst.len();
+        let mut dst_offset = 0usize;
+        let mut abs_offset = absolute_offset;
+
+        while remaining > 0 {
+            let start = (abs_offset % data_size as u64) as usize;
+            let chunk = std::cmp::min(remaining, data_size - start);
+            std::ptr::copy_nonoverlapping(
+                base_ptr.add(start),
+                dst.as_mut_ptr().add(dst_offset),
+                chunk,
+            );
+            dst_offset += chunk;
+            abs_offset += chunk as u64;
+            remaining -= chunk;
+        }
+    }
 }
 
 impl Iterator for Records {
@@ -115,79 +138,143 @@ impl Iterator for Records {
             return None;
         }
 
-        if data_tail + std::mem::size_of::<perf_event_header>() as u64 > data_head {
+        let available = data_head.saturating_sub(data_tail);
+        let header_size = std::mem::size_of::<perf_event_header>();
+
+        if available < header_size as u64 {
             return None;
         }
 
-        let mmap_base_ptr = self.metadata as *mut u8;
+        let mut header_buf = [0u8; std::mem::size_of::<perf_event_header>()];
+        unsafe {
+            self.copy_from_ring(data_tail, &mut header_buf);
+        }
 
-        let ptr_offset = self.data_offset() + (data_tail % self.data_size() as u64) as usize;
-        let event_ptr = unsafe { mmap_base_ptr.add(ptr_offset) };
-
-        let header = unsafe { &*(event_ptr as *const perf_event_header) };
+        let header =
+            unsafe { std::ptr::read_unaligned(header_buf.as_ptr() as *const perf_event_header) };
 
         if header.size == 0 {
+            self.update_tail(header_size);
+            return Some(MmapRecord::Unknown);
+        }
+
+        let record_size = header.size as usize;
+
+        if record_size < header_size {
+            self.update_tail(header_size);
+            return Some(MmapRecord::Unknown);
+        }
+
+        if record_size > self.data_size() {
+            self.update_tail(header_size);
+            return Some(MmapRecord::Unknown);
+        }
+
+        if available < header.size as u64 {
             return None;
         }
 
-        let record = if header.type_ == PERF_RECORD_SAMPLE {
-            let sample_format = unsafe { SampleFormat::read_from_ptr(event_ptr as *const u8) };
-            let values = unsafe { sample_format.read_values(event_ptr as *const u8) };
-            let callstack = unsafe { sample_format.read_callchain(event_ptr as *const u8) };
+        let mut record_buf = vec![0u8; record_size];
+        unsafe {
+            self.copy_from_ring(data_tail, &mut record_buf);
+        }
 
-            MmapRecord::Sample {
-                ip: sample_format.ip,
-                pid: sample_format.pid,
-                tid: sample_format.tid,
-                cpu: sample_format.cpu,
-                time: sample_format.time,
-                time_enabled: sample_format.read.time_enabled,
-                time_running: sample_format.read.time_running,
-                values,
-                callstack,
-            }
-        } else if header.type_ == PERF_RECORD_MMAP {
-            let mmap_record = unsafe { ProcMmap::read_from_ptr(event_ptr as *const u8) };
-            let filename = unsafe { ProcMmap::filename(event_ptr as *const u8) };
-            MmapRecord::Address {
-                pid: mmap_record.pid,
-                start: mmap_record.addr,
-                len: mmap_record.len,
-                offset: mmap_record.pgoff,
-                filename,
-            }
-        } else {
-            MmapRecord::Unknown
+        self.update_tail(record_size);
+
+        let record = match header.type_ {
+            PERF_RECORD_SAMPLE => match SampleFormat::read_from_bytes(&record_buf) {
+                Some(sample_format) => {
+                    let values = sample_format.read_values(&record_buf);
+                    let callstack = sample_format.read_callchain(&record_buf);
+
+                    MmapRecord::Sample {
+                        ip: sample_format.ip,
+                        pid: sample_format.pid,
+                        tid: sample_format.tid,
+                        cpu: sample_format.cpu,
+                        time: sample_format.time,
+                        time_enabled: sample_format.read.time_enabled,
+                        time_running: sample_format.read.time_running,
+                        values,
+                        callstack,
+                    }
+                }
+                None => MmapRecord::Unknown,
+            },
+            PERF_RECORD_MMAP => match ProcMmap::read_from_bytes(&record_buf) {
+                Some(mmap_record) => {
+                    let filename = ProcMmap::filename(&record_buf);
+                    MmapRecord::Address {
+                        pid: mmap_record.pid,
+                        start: mmap_record.addr,
+                        len: mmap_record.len,
+                        offset: mmap_record.pgoff,
+                        filename,
+                    }
+                }
+                None => MmapRecord::Unknown,
+            },
+            _ => MmapRecord::Unknown,
         };
-
-        self.update_tail(header.size as usize);
 
         Some(record)
     }
 }
 
 impl SampleFormat {
-    unsafe fn read_from_ptr(ptr: *const u8) -> Self {
-        std::ptr::read_volatile(ptr as *const _)
+    fn read_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+
+        Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) })
     }
 
-    unsafe fn read_values(&self, ptr: *const u8) -> SmallVec<[EventValue; 8]> {
-        std::slice::from_raw_parts(
-            ptr.add(std::mem::size_of::<SampleFormat>()) as *const EventValue,
-            self.read.nr as usize,
-        )
-        .to_smallvec()
+    fn read_values(&self, record: &[u8]) -> SmallVec<[EventValue; 8]> {
+        let values_offset = std::mem::size_of::<SampleFormat>();
+        let count = self.read.nr as usize;
+        let values_end = values_offset + count.saturating_mul(std::mem::size_of::<EventValue>());
+
+        if record.len() < values_end {
+            return SmallVec::new();
+        }
+
+        unsafe {
+            std::slice::from_raw_parts(
+                record.as_ptr().add(values_offset) as *const EventValue,
+                count,
+            )
+            .to_smallvec()
+        }
     }
 
-    unsafe fn read_callchain(&self, ptr: *const u8) -> SmallVec<[u64; 32]> {
-        let base_offset = std::mem::size_of::<SampleFormat>()
-            + self.read.nr as usize * std::mem::size_of::<EventValue>();
+    fn read_callchain(&self, record: &[u8]) -> SmallVec<[u64; 32]> {
+        let values_offset = std::mem::size_of::<SampleFormat>();
+        let values_size = self.read.nr as usize * std::mem::size_of::<EventValue>();
+        let base_offset = values_offset + values_size;
 
-        let nr_callchain = std::ptr::read(ptr.add(base_offset) as *const u64);
+        if record.len() < base_offset + std::mem::size_of::<u64>() {
+            return SmallVec::new();
+        }
 
-        let callchain_ptr = ptr.add(base_offset + std::mem::size_of::<u64>());
+        let mut len_bytes = [0u8; std::mem::size_of::<u64>()];
+        len_bytes.copy_from_slice(&record[base_offset..base_offset + std::mem::size_of::<u64>()]);
+        let nr_callchain = u64::from_ne_bytes(len_bytes) as usize;
 
-        let slice = std::slice::from_raw_parts(callchain_ptr as *const u64, nr_callchain as usize);
+        let callchain_offset = base_offset + std::mem::size_of::<u64>();
+        let callchain_end =
+            callchain_offset + nr_callchain.saturating_mul(std::mem::size_of::<u64>());
+
+        if record.len() < callchain_end {
+            return SmallVec::new();
+        }
+
+        let slice = unsafe {
+            std::slice::from_raw_parts(
+                record.as_ptr().add(callchain_offset) as *const u64,
+                nr_callchain,
+            )
+        };
 
         if slice.len() > 1 {
             slice[1..].to_smallvec()
@@ -198,15 +285,24 @@ impl SampleFormat {
 }
 
 impl ProcMmap {
-    unsafe fn read_from_ptr(ptr: *const u8) -> Self {
-        std::ptr::read_volatile(ptr as *const _)
+    fn read_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+
+        Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) })
     }
 
-    unsafe fn filename(ptr: *const u8) -> String {
-        CStr::from_ptr(ptr.add(std::mem::size_of::<Self>()) as *const libc::c_char)
-            .to_str()
-            .expect("assume kernel does not corrupt data")
-            .to_owned()
+    fn filename(bytes: &[u8]) -> String {
+        let start = std::mem::size_of::<Self>();
+        if bytes.len() <= start {
+            return String::new();
+        }
+
+        match CStr::from_bytes_until_nul(&bytes[start..]) {
+            Ok(cstr) => cstr.to_string_lossy().into_owned(),
+            Err(_) => String::new(),
+        }
     }
 }
 
