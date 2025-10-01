@@ -15,7 +15,6 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
-use crate::disassembly::{default_disassembler, DisassembleRequest};
 use crate::utils;
 
 pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()> {
@@ -29,13 +28,7 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
     let connection = sqlite::open(res_dir.join("perf.db"))?;
     connection.execute(
         "
-            CREATE TABLE proc_map (
-                ip INTEGER,
-                func_name TEXT,
-                file_name TEXT,
-                line INTEGER,
-                module_path TEXT
-            );
+            CREATE TABLE proc_map (ip INTEGER, func_name TEXT, file_name TEXT, line INTEGER);
             CREATE TABLE strings (id BINARY(128) NOT NULL, string TEXT NOT NULL);
         ",
     )?;
@@ -45,13 +38,11 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
     match info.scenario {
         Scenario::Snapshot => {
             process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
-            process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
         }
         Scenario::Roofline => {
             process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
             process_roofline_events(&connection, &info.scenario_info, res_dir, &mut pb).await?;
-            process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
             create_roofline_view(&connection).await?;
         }
@@ -133,9 +124,8 @@ async fn process_pmu_counters(
     let mut counters = HashMap::<String, u64>::new();
     let mut lead_event: Option<Event> = None;
 
-    let mut proc_map_stmt = connection.prepare(
-        "INSERT INTO proc_map (ip, func_name, file_name, line, module_path) VALUES (?, ?, ?, ?, ?);",
-    )?;
+    let mut proc_map_stmt = connection
+        .prepare("INSERT INTO proc_map (ip, func_name, file_name, line) VALUES (?, ?, ?, ?);")?;
 
     let mut known_ips = HashSet::<u64>::new();
 
@@ -259,12 +249,10 @@ async fn process_pmu_counters(
                             .unwrap_or("[unknown]".to_string());
                         let (file, line) = utils::find_location(pm, ip as usize)
                             .unwrap_or(("unknown".to_string(), 0));
-                        let module_path = utils::find_module_path(pm, ip as usize);
                         proc_map_stmt.bind((1, ip as i64))?;
                         proc_map_stmt.bind((2, sym_name.as_str()))?;
                         proc_map_stmt.bind((3, file.as_str()))?;
                         proc_map_stmt.bind((4, line as i64))?;
-                        proc_map_stmt.bind((5, module_path.as_deref()))?;
                         proc_map_stmt.next()?;
                     }
                 }
@@ -313,293 +301,6 @@ async fn process_pmu_counters(
     }
 
     Ok(())
-}
-
-async fn process_disassembly(
-    connection: &sqlite::Connection,
-    res_dir: &Path,
-    pb: &mut kdam::Bar,
-) -> Result<()> {
-    use sqlite::State;
-
-    populate_assembly_samples(connection)?;
-
-    connection.execute(
-        "
-        CREATE TABLE IF NOT EXISTS assembly_lines (
-            module_path TEXT NOT NULL,
-            symbol TEXT,
-            rel_address INTEGER NOT NULL,
-            runtime_address INTEGER NOT NULL,
-            instruction TEXT NOT NULL,
-            source_file TEXT,
-            source_line INTEGER,
-            PRIMARY KEY (module_path, runtime_address)
-        );
-        ",
-    )?;
-    connection.execute(
-        "CREATE INDEX IF NOT EXISTS idx_assembly_module_rel_address ON assembly_lines(module_path, rel_address);",
-    )?;
-
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS assembly_module_metadata (
-            module_path TEXT PRIMARY KEY,
-            load_bias INTEGER NOT NULL
-        );",
-    )?;
-
-    let mut module_stmt = connection.prepare(
-        "SELECT DISTINCT module_path FROM proc_map WHERE module_path IS NOT NULL AND module_path <> '';",
-    )?;
-    let mut modules = Vec::new();
-    while let State::Row = module_stmt.next()? {
-        modules.push(module_stmt.read::<String, _>(0)?);
-    }
-
-    if modules.is_empty() {
-        return Ok(());
-    }
-
-    let proc_map_file = std::fs::File::open(res_dir.join("proc_map.json"))?;
-    let proc_map: Vec<ProcMapEntry> = serde_json::from_reader(proc_map_file)?;
-
-    let mut module_bias = HashMap::<String, i64>::new();
-    for entry in proc_map {
-        let load_bias = entry.address as i64 - entry.offset as i64;
-        module_bias
-            .entry(entry.filename.clone())
-            .and_modify(|bias| {
-                if load_bias < *bias {
-                    *bias = load_bias;
-                }
-            })
-            .or_insert(load_bias);
-    }
-
-    let disassembler = match default_disassembler() {
-        Ok(disassembler) => disassembler,
-        Err(err) => {
-            eprintln!("skipping assembly extraction: {err}");
-            return Ok(());
-        }
-    };
-
-    pb.reset(Some(modules.len()));
-    pb.write("Extracting assembly")?;
-
-    let mut delete_stmt =
-        connection.prepare("DELETE FROM assembly_lines WHERE module_path = ?;")?;
-    let mut insert_stmt = connection.prepare(
-        "INSERT INTO assembly_lines (module_path, symbol, rel_address, runtime_address, instruction, source_file, source_line)
-         VALUES (?, ?, ?, ?, ?, ?, ?);",
-    )?;
-    let mut metadata_stmt = connection.prepare(
-        "INSERT INTO assembly_module_metadata (module_path, load_bias)
-         VALUES (?, ?)
-         ON CONFLICT(module_path) DO UPDATE SET load_bias = excluded.load_bias;",
-    )?;
-
-    connection.execute("BEGIN IMMEDIATE TRANSACTION;")?;
-
-    for (idx, module_path) in modules.iter().enumerate() {
-        pb.update_to(idx + 1)?;
-
-        let module_file = Path::new(module_path);
-        if !module_file.exists() {
-            continue;
-        }
-
-        let load_bias = module_bias.get(module_path).copied().unwrap_or(0);
-
-        metadata_stmt.reset()?;
-        metadata_stmt.bind((1, module_path.as_str()))?;
-        metadata_stmt.bind((2, load_bias))?;
-        let _ = metadata_stmt.next()?;
-
-        delete_stmt.reset()?;
-        delete_stmt.bind((1, module_path.as_str()))?;
-        let _ = delete_stmt.next()?;
-
-        let request = DisassembleRequest {
-            module_path: module_file.to_path_buf(),
-            load_bias,
-        };
-
-        let lines = match disassembler.disassemble(&request) {
-            Ok(lines) => lines,
-            Err(err) => {
-                eprintln!("failed to disassemble {}: {err}", module_path);
-                continue;
-            }
-        };
-
-        if lines.is_empty() {
-            continue;
-        }
-
-        let bias_u64 = if load_bias >= 0 { load_bias as u64 } else { 0 };
-        let bias_abs = if load_bias < 0 {
-            (-load_bias) as u64
-        } else {
-            0
-        };
-
-        let use_bias_as_base =
-            bias_u64 != 0 && lines.iter().all(|line| line.rel_address >= bias_u64);
-        let rel_base = if use_bias_as_base { bias_u64 } else { 0 };
-
-        for line in lines {
-            insert_stmt.reset()?;
-            insert_stmt.bind((1, module_path.as_str()))?;
-            insert_stmt.bind((2, line.symbol.as_deref()))?;
-            let rel_address = line.rel_address.saturating_sub(rel_base);
-            let runtime_address = if load_bias >= 0 {
-                bias_u64.saturating_add(rel_address)
-            } else {
-                if rel_address < bias_abs {
-                    continue;
-                }
-                rel_address - bias_abs
-            };
-            insert_stmt.bind((3, rel_address as i64))?;
-            insert_stmt.bind((4, runtime_address as i64))?;
-            insert_stmt.bind((5, line.instruction.as_str()))?;
-            insert_stmt.bind((6, line.source_file.as_deref()))?;
-            insert_stmt.bind((7, line.source_line.map(|v| v as i64)))?;
-            let _ = insert_stmt.next()?;
-        }
-    }
-
-    connection.execute("COMMIT;")?;
-
-    connection.execute("DROP VIEW IF EXISTS assembly_address_stats;")?;
-    connection.execute(
-        "
-        CREATE VIEW assembly_address_stats AS
-        SELECT
-            module_path,
-            func_name,
-            address,
-            SUM(samples) AS samples,
-            SUM(cycles) AS cycles,
-            SUM(instructions) AS instructions,
-            SUM(branch_misses) AS branch_misses,
-            SUM(branch_instructions) AS branch_instructions,
-            SUM(llc_misses) AS llc_misses,
-            SUM(llc_references) AS llc_references
-        FROM assembly_samples
-        GROUP BY module_path, func_name, address;
-        ",
-    )?;
-
-    Ok(())
-}
-
-fn populate_assembly_samples(connection: &sqlite::Connection) -> Result<()> {
-    use sqlite::State;
-
-    connection.execute(
-        "
-        CREATE TABLE IF NOT EXISTS assembly_samples (
-            module_path TEXT NOT NULL,
-            func_name TEXT NOT NULL,
-            address INTEGER NOT NULL,
-            samples INTEGER NOT NULL,
-            cycles INTEGER NOT NULL,
-            instructions INTEGER NOT NULL,
-            branch_misses INTEGER NOT NULL,
-            branch_instructions INTEGER NOT NULL,
-            llc_misses INTEGER NOT NULL,
-            llc_references INTEGER NOT NULL,
-            PRIMARY KEY (module_path, func_name, address)
-        );
-        ",
-    )?;
-
-    connection.execute("DELETE FROM assembly_samples;")?;
-
-    let mut select_stmt = connection.prepare("SELECT * FROM pmu_counters;")?;
-
-    let mut lookup_stmt =
-        connection.prepare("SELECT module_path, func_name FROM proc_map WHERE ip = ? LIMIT 1;")?;
-
-    let mut insert_stmt = connection.prepare(
-        "INSERT INTO assembly_samples (
-            module_path,
-            func_name,
-            address,
-            samples,
-            cycles,
-            instructions,
-            branch_misses,
-            branch_instructions,
-            llc_misses,
-            llc_references
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(module_path, func_name, address) DO UPDATE SET
-            samples = samples + excluded.samples,
-            cycles = cycles + excluded.cycles,
-            instructions = instructions + excluded.instructions,
-            branch_misses = branch_misses + excluded.branch_misses,
-            branch_instructions = branch_instructions + excluded.branch_instructions,
-            llc_misses = llc_misses + excluded.llc_misses,
-            llc_references = llc_references + excluded.llc_references;",
-    )?;
-
-    while let State::Row = select_stmt.next()? {
-        let ip = select_stmt.read::<i64, _>("ip")? as u64;
-
-        lookup_stmt.reset()?;
-        lookup_stmt.bind((1, ip as i64))?;
-
-        match lookup_stmt.next()? {
-            State::Row => {
-                let module_path = lookup_stmt.read::<Option<String>, _>(0)?;
-                let func_name = lookup_stmt.read::<Option<String>, _>(1)?;
-
-                let module_path = match module_path {
-                    Some(path) if !path.is_empty() => path,
-                    _ => continue,
-                };
-
-                let func_name = func_name.unwrap_or_else(|| "[unknown]".to_string());
-
-                let cycles = read_metric(&select_stmt, "pmu_cycles")?;
-                let instructions = read_metric(&select_stmt, "pmu_instructions")?;
-                let branch_misses = read_metric(&select_stmt, "pmu_branch_misses")?;
-                let branch_instructions = read_metric(&select_stmt, "pmu_branch_instructions")?;
-                let llc_misses = read_metric(&select_stmt, "pmu_llc_misses")?;
-                let llc_references = read_metric(&select_stmt, "pmu_llc_references")?;
-
-                insert_stmt.reset()?;
-                insert_stmt.bind((1, module_path.as_str()))?;
-                insert_stmt.bind((2, func_name.as_str()))?;
-                insert_stmt.bind((3, ip as i64))?;
-                insert_stmt.bind((4, 1_i64))?;
-                insert_stmt.bind((5, cycles))?;
-                insert_stmt.bind((6, instructions))?;
-                insert_stmt.bind((7, branch_misses))?;
-                insert_stmt.bind((8, branch_instructions))?;
-                insert_stmt.bind((9, llc_misses))?;
-                insert_stmt.bind((10, llc_references))?;
-                let _ = insert_stmt.next()?;
-            }
-            State::Done => {}
-        }
-    }
-
-    Ok(())
-}
-
-fn read_metric(stmt: &sqlite::Statement<'_>, name: &str) -> Result<i64> {
-    for idx in 0..stmt.column_count() {
-        if stmt.column_name(idx).unwrap_or("") == name {
-            let value = stmt.read::<Option<i64>, _>(idx)?;
-            return Ok(value.unwrap_or(0));
-        }
-    }
-    Ok(0)
 }
 
 async fn create_hotspots_view(connection: &sqlite::Connection) -> Result<()> {
