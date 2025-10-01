@@ -1,5 +1,4 @@
 mod counter_selection;
-mod disassembly;
 mod event_dispatcher;
 mod events_export;
 mod postprocess;
