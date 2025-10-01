@@ -1,4 +1,10 @@
-use std::ffi::{c_void, CString};
+use std::{
+    ffi::{c_void, CString},
+    future::Future,
+    hint::spin_loop,
+    sync::atomic::{AtomicU64, Ordering},
+    task::Poll,
+};
 
 use libc::{
     close, ftruncate, mmap, munmap, sem_init, shm_open, shm_unlink, MAP_FAILED, MAP_SHARED,
@@ -14,7 +20,7 @@ pub struct Shmem {
 }
 
 pub struct Semaphore {
-    sem: *mut libc::sem_t,
+    sem: *mut u64,
     is_owning: bool,
 }
 
@@ -61,7 +67,7 @@ impl Shmem {
         flags: i32,
     ) -> Result<(i32, *mut c_void), std::io::Error> {
         let name = CString::new(name)?;
-        let fd = shm_open(name.as_ptr(), flags, S_IRUSR | S_IWUSR);
+        let fd = shm_open(name.as_ptr(), flags, (S_IRUSR | S_IWUSR) as libc::c_uint);
 
         if fd == -1 {
             eprintln!("fd == -1\n");
@@ -101,81 +107,88 @@ impl Drop for Shmem {
 
 impl Semaphore {
     pub fn create(ptr: *mut ()) -> Result<Self, std::io::Error> {
-        if unsafe { sem_init(ptr as *mut libc::sem_t, 1, 0) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        let atomic = unsafe { AtomicU64::from_ptr(ptr as *mut u64) };
+
+        atomic.store(0, Ordering::SeqCst);
 
         Ok(Self {
-            sem: ptr as *mut libc::sem_t,
+            sem: ptr as *mut u64,
             is_owning: true,
         })
     }
 
     pub fn from_raw_ptr(ptr: *mut ()) -> Result<Self, std::io::Error> {
         Ok(Self {
-            sem: ptr as *mut libc::sem_t,
+            sem: ptr as *mut u64,
             is_owning: false,
         })
     }
 
     pub fn required_size() -> usize {
-        std::mem::size_of::<libc::sem_t>()
+        std::mem::size_of::<AtomicU64>()
     }
 
-    pub fn wait(&self) -> Result<(), std::io::Error> {
-        unsafe {
-            if libc::sem_wait(self.sem) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+    pub fn wait_sync(&self) {
+        let atomic = unsafe { AtomicU64::from_ptr(self.sem) };
+
+        while atomic.load(Ordering::Acquire) == 0 {
+            waste();
         }
 
-        Ok(())
+        atomic.fetch_sub(1, Ordering::AcqRel);
     }
 
-    pub fn try_wait(&self) -> Result<(), std::io::Error> {
-        unsafe {
-            if libc::sem_trywait(self.sem) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-
-        Ok(())
+    pub fn wait(&self) -> impl Future<Output = ()> {
+        AtomicFuture::new(self.sem)
     }
 
-    pub fn post(&self) -> Result<(), std::io::Error> {
-        unsafe {
-            if libc::sem_post(self.sem) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-
-        Ok(())
+    pub fn post(&self) {
+        let atomic = unsafe { AtomicU64::from_ptr(self.sem) };
+        atomic.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub fn counter(&self) -> Result<i32, std::io::Error> {
-        let mut res = 0;
-        unsafe {
-            if libc::sem_getvalue(self.sem, &mut res as *mut i32) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-
-        Ok(res)
-    }
-}
-
-impl Drop for Semaphore {
-    fn drop(&mut self) {
-        if self.is_owning {
-            unsafe {
-                libc::sem_destroy(self.sem);
-            }
-        }
+    pub fn counter(&self) -> u64 {
+        let atomic = unsafe { AtomicU64::from_ptr(self.sem) };
+        atomic.load(Ordering::Acquire)
     }
 }
 
 unsafe impl Send for Shmem {}
 unsafe impl Send for Semaphore {}
+unsafe impl Send for AtomicFuture {}
+
+#[inline]
+fn waste() {
+    for _ in 0..100 {
+        spin_loop()
+    }
+}
+
+struct AtomicFuture {
+    ptr: *mut u64,
+}
+
+impl AtomicFuture {
+    fn new(ptr: *mut u64) -> Self {
+        Self { ptr }
+    }
+}
+
+impl Future for AtomicFuture {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let atomic = unsafe { AtomicU64::from_ptr(self.ptr) };
+        if atomic.load(Ordering::Acquire) == 0 {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -205,17 +218,17 @@ mod tests {
         let semaphore1 =
             Semaphore::create(shmem1.as_mut_ptr()).expect("failed to create a semaphore");
 
-        semaphore1.post().expect("failed to post a semaphore");
+        semaphore1.post();
 
-        assert_eq!(semaphore1.counter().unwrap(), 1);
+        assert_eq!(semaphore1.counter(), 1);
 
         let semaphore2 =
             Semaphore::from_raw_ptr(shmem2.as_mut_ptr()).expect("failed to open a semaphore");
 
-        assert_eq!(semaphore2.counter().unwrap(), 1);
+        assert_eq!(semaphore2.counter(), 1);
 
-        assert!(semaphore2.wait().is_ok());
-        assert_eq!(semaphore2.counter().unwrap(), 0);
-        assert_eq!(semaphore1.counter().unwrap(), 0);
+        semaphore2.wait();
+        assert_eq!(semaphore2.counter(), 0);
+        assert_eq!(semaphore1.counter(), 0);
     }
 }

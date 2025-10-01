@@ -108,3 +108,25 @@ pub fn get_host_cpu_family() -> &'static str {
         None => "unknown",
     }
 }
+
+#[cfg(target_os = "macos")]
+pub fn get_host_cpu_family() -> &'static str {
+    let output = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg("machdep.cpu.brand_string")
+        .output()
+        .expect("Failed to get CPU ID");
+    let model = String::from_utf8(output.stdout).expect("Failed to parse CPU model");
+
+    if model.starts_with("Apple M1") {
+        pmu_data::APPLE_M1
+    } else if model.starts_with("Apple M2") {
+        pmu_data::APPLE_M2
+    } else if model.starts_with("Apple M3") {
+        pmu_data::APPLE_M3
+    } else if model.starts_with("Apple M4") {
+        pmu_data::APPLE_M4
+    } else {
+        unimplemented!()
+    }
+}
