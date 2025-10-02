@@ -103,3 +103,13 @@ pub fn find_location(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<(String, u32
             })
     })
 }
+
+pub fn find_module_path(pmes: &[ResolvedPME<'_>], ip: usize) -> Option<String> {
+    pmes.iter().find_map(|entry| {
+        if ip < entry.address || ip > entry.address + entry.size {
+            return None;
+        }
+
+        Some(entry.name.to_string())
+    })
+}
