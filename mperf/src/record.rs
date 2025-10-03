@@ -509,6 +509,7 @@ fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scena
             .collect(),
         metrics: scenario.metrics,
         constants: scenario.constants,
+        ui: scenario.ui,
     }))
 }
 

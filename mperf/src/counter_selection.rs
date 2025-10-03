@@ -10,6 +10,8 @@ pub fn get_pmu_counters(scenario: Scenario) -> Vec<Counter> {
             Counter::LLCMisses,
             Counter::BranchMisses,
             Counter::BranchInstructions,
+            Counter::StalledCyclesBackend,
+            Counter::StalledCyclesFrontend,
             Counter::CpuClock,
             Counter::CpuMigrations,
             Counter::PageFaults,

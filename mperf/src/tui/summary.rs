@@ -1,6 +1,9 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use mperf_data::RecordInfo;
@@ -20,7 +23,6 @@ pub struct SummaryTab {
     connection: Arc<Mutex<Connection>>,
     stat: Arc<RwLock<Stat>>,
     load_started: Arc<AtomicBool>,
-    load_complete: Arc<AtomicBool>,
     load_error: Arc<RwLock<Option<String>>>,
 }
 
@@ -28,12 +30,13 @@ pub struct SummaryTab {
 struct Stat {
     cycles: u64,
     instructions: u64,
-    branch_instructions: u64,
-    branch_misses: u64,
-    cache_references: u64,
-    cache_misses: u64,
-    stalled_cycles_frontend: u64,
-    stalled_cycles_backend: u64,
+    branch_instructions: Option<u64>,
+    branch_misses: Option<u64>,
+    cache_references: Option<u64>,
+    cache_misses: Option<u64>,
+    stalled_cycles_frontend: Option<u64>,
+    stalled_cycles_backend: Option<u64>,
+    initialized: bool,
 }
 
 impl SummaryTab {
@@ -43,7 +46,6 @@ impl SummaryTab {
             connection,
             stat: Arc::new(RwLock::new(Stat::default())),
             load_started: Arc::new(AtomicBool::new(false)),
-            load_complete: Arc::new(AtomicBool::new(false)),
             load_error: Arc::new(RwLock::new(None)),
         }
     }
@@ -63,53 +65,100 @@ impl SummaryTab {
     async fn fetch_data(self) {
         let conn = self.connection.lock();
         let result: Result<Stat, String> = (|| {
-            use sqlite::State;
+            let available_columns: HashSet<String> = conn
+                .prepare("PRAGMA table_info(pmu_counters);")
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|row| {
+                    let row = row.map_err(|error| error.to_string())?;
+                    Ok(row.read::<&str, _>("name").to_string())
+                })
+                .collect::<Result<_, String>>()?;
 
-            let mut statement = conn
-            .prepare(
-                "SELECT
-            SUM(pmu_cycles) as pmu_cycles,
-            SUM(pmu_instructions) as pmu_instructions,
-            CAST(SUM(pmu_llc_references * 1.0 / confidence) AS INTEGER) AS pmu_llc_references,
-            CAST(SUM(pmu_llc_misses * 1.0 / confidence) AS INTEGER) AS pmu_llc_misses,
-            CAST(SUM(pmu_branch_instructions * 1.0 / confidence) AS INTEGER) AS pmu_branch_instructions,
-            CAST(SUM(pmu_branch_misses * 1.0 / confidence) AS INTEGER) AS pmu_branch_misses,
-            CAST(SUM(pmu_stalled_cycles_frontend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_frontend,
-            CAST(SUM(pmu_stalled_cycles_backend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_backend
+            let has_branch = available_columns.contains("pmu_branch_instructions")
+                && available_columns.contains("pmu_branch_misses");
+            let has_cache = available_columns.contains("pmu_llc_references")
+                && available_columns.contains("pmu_llc_misses");
+            let has_stalled = available_columns.contains("pmu_stalled_cycles_frontend")
+                && available_columns.contains("pmu_stalled_cycles_backend");
 
-            FROM pmu_counters;
-        ",
-            )
-            .map_err(|error| error.to_string())?;
+            let mut select_parts = vec![
+                "SUM(pmu_cycles) AS pmu_cycles".to_string(),
+                "SUM(pmu_instructions) AS pmu_instructions".to_string(),
+            ];
 
-            if statement.next().map_err(|error| error.to_string())? != State::Row {
-                return Err("summary query returned no rows".to_string());
+            if has_branch {
+                select_parts.push(
+                "CAST(SUM(pmu_branch_instructions * 1.0 / confidence) AS INTEGER) AS pmu_branch_instructions"
+                    .to_string(),
+            );
+                select_parts.push(
+                "CAST(SUM(pmu_branch_misses * 1.0 / confidence) AS INTEGER) AS pmu_branch_misses"
+                    .to_string(),
+            );
+            } else {
+                select_parts.push("0 AS pmu_branch_instructions".to_string());
+                select_parts.push("0 AS pmu_branch_misses".to_string());
             }
 
-            let read = |name| {
-                statement
-                    .read::<Option<i64>, _>(name)
-                    .map(|value| value.unwrap_or_default() as u64)
-                    .map_err(|error| error.to_string())
-            };
+            if has_cache {
+                select_parts.push(
+                "CAST(SUM(pmu_llc_references * 1.0 / confidence) AS INTEGER) AS pmu_llc_references"
+                    .to_string(),
+            );
+                select_parts.push(
+                    "CAST(SUM(pmu_llc_misses * 1.0 / confidence) AS INTEGER) AS pmu_llc_misses"
+                        .to_string(),
+                );
+            } else {
+                select_parts.push("0 AS pmu_llc_references".to_string());
+                select_parts.push("0 AS pmu_llc_misses".to_string());
+            }
+
+            if has_stalled {
+                select_parts.push(
+                "CAST(SUM(pmu_stalled_cycles_frontend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_frontend"
+                    .to_string(),
+            );
+                select_parts.push(
+                "CAST(SUM(pmu_stalled_cycles_backend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_backend"
+                    .to_string(),
+            );
+            } else {
+                select_parts.push("0 AS pmu_stalled_cycles_frontend".to_string());
+                select_parts.push("0 AS pmu_stalled_cycles_backend".to_string());
+            }
+
+            let query = format!("SELECT {} FROM pmu_counters;", select_parts.join(",\n"));
+            let mut rows = conn
+                .prepare(&query)
+                .map_err(|error| error.to_string())?
+                .into_iter();
+            let row = rows
+                .next()
+                .ok_or_else(|| "summary query returned no rows".to_string())?
+                .map_err(|error| error.to_string())?;
+
             Ok(Stat {
-                cycles: read("pmu_cycles")?,
-                instructions: read("pmu_instructions")?,
-                branch_instructions: read("pmu_branch_instructions")?,
-                branch_misses: read("pmu_branch_misses")?,
-                cache_references: read("pmu_llc_references")?,
-                cache_misses: read("pmu_llc_misses")?,
-                stalled_cycles_frontend: read("pmu_stalled_cycles_frontend")?,
-                stalled_cycles_backend: read("pmu_stalled_cycles_backend")?,
+                cycles: row.read::<i64, _>("pmu_cycles") as u64,
+                instructions: row.read::<i64, _>("pmu_instructions") as u64,
+                branch_instructions: has_branch
+                    .then(|| row.read::<i64, _>("pmu_branch_instructions") as u64),
+                branch_misses: has_branch.then(|| row.read::<i64, _>("pmu_branch_misses") as u64),
+                cache_references: has_cache
+                    .then(|| row.read::<i64, _>("pmu_llc_references") as u64),
+                cache_misses: has_cache.then(|| row.read::<i64, _>("pmu_llc_misses") as u64),
+                stalled_cycles_frontend: has_stalled
+                    .then(|| row.read::<i64, _>("pmu_stalled_cycles_frontend") as u64),
+                stalled_cycles_backend: has_stalled
+                    .then(|| row.read::<i64, _>("pmu_stalled_cycles_backend") as u64),
+                initialized: true,
             })
         })();
         drop(conn);
 
         match result {
-            Ok(stat) => {
-                *self.stat.write() = stat;
-                self.load_complete.store(true, Ordering::Release);
-            }
+            Ok(stat) => *self.stat.write() = stat,
             Err(error) => {
                 *self.load_error.write() = Some(format!("Could not load summary data:\n\n{error}"));
             }
@@ -122,14 +171,6 @@ impl Widget for SummaryTab {
     where
         Self: Sized,
     {
-        if let Some(error) = self.load_error.read().clone() {
-            Paragraph::new(error)
-                .block(Block::bordered().title("Summary error"))
-                .wrap(Wrap { trim: true })
-                .render(area, buf);
-            return;
-        }
-
         let horizontal = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]);
         let [summary_area, _right_area] = horizontal.areas(area);
 
@@ -151,18 +192,71 @@ impl Widget for SummaryTab {
         {
             let stat = self.stat.read();
 
-            if !self.load_complete.load(Ordering::Acquire) {
+            if let Some(error) = self.load_error.read().clone() {
+                Paragraph::new(error)
+                    .wrap(Wrap { trim: true })
+                    .render(stat_table_area, buf);
+            } else if !stat.initialized {
                 let counter = 0;
                 let pb = ratatui::widgets::Gauge::default()
                     .block(Block::bordered().title("Loading data..."))
                     .gauge_style(Style::new().white().on_black().italic())
                     .percent(counter);
                 pb.render(stat_table_area, buf);
-            } else if stat.cycles == 0 {
-                Paragraph::new("No counter samples were found in this recording.")
-                    .wrap(Wrap { trim: true })
-                    .render(stat_table_area, buf);
             } else {
+                let ipc = if stat.cycles > 0 {
+                    format!("{:.2}", stat.instructions as f64 / stat.cycles as f64)
+                } else {
+                    "N/A".to_string()
+                };
+
+                let branch_instruction_count = format_optional_count(stat.branch_instructions);
+                let branch_per_cycle = match (stat.branch_instructions, stat.cycles) {
+                    (Some(branch_instr), cycles) if cycles > 0 => {
+                        format!("{:.2} per cycle", branch_instr as f64 / cycles as f64)
+                    }
+                    _ => "N/A".to_string(),
+                };
+
+                let branch_miss_count = format_optional_count(stat.branch_misses);
+                let branch_miss_pct = match (stat.branch_misses, stat.branch_instructions) {
+                    (Some(misses), Some(instructions)) if instructions > 0 => {
+                        format!("{:.2}%", misses as f64 / instructions as f64 * 100_f64)
+                    }
+                    _ => "N/A".to_string(),
+                };
+
+                let branch_mpki = match (stat.branch_misses, stat.instructions) {
+                    (Some(misses), instructions) if instructions > 0 => {
+                        format!("{:.2}", misses as f64 / instructions as f64 * 1000.0)
+                    }
+                    _ => "N/A".to_string(),
+                };
+
+                let cache_ref_count = format_optional_count(stat.cache_references);
+                let cache_miss_count = format_optional_count(stat.cache_misses);
+                let cache_miss_pct = match (stat.cache_misses, stat.cache_references) {
+                    (Some(misses), Some(references)) if misses + references > 0 => {
+                        format!(
+                            "{:.2}%",
+                            misses as f64 / (misses + references) as f64 * 100_f64
+                        )
+                    }
+                    _ => "N/A".to_string(),
+                };
+                let cache_mpki = match (stat.cache_misses, stat.instructions) {
+                    (Some(misses), instructions) if instructions > 0 => {
+                        format!("{:.2}", misses as f64 / instructions as f64 * 1000.0)
+                    }
+                    _ => "N/A".to_string(),
+                };
+                let stalled_backend_count = format_optional_count(stat.stalled_cycles_backend);
+                let stalled_backend_pct =
+                    format_optional_ratio(stat.stalled_cycles_backend, stat.cycles);
+                let stalled_frontend_count = format_optional_count(stat.stalled_cycles_frontend);
+                let stalled_frontend_pct =
+                    format_optional_ratio(stat.stalled_cycles_frontend, stat.cycles);
+
                 let rows = [
                     Row::new([
                         "Cycles".to_string(),
@@ -174,74 +268,38 @@ impl Widget for SummaryTab {
                         stat.instructions.to_formatted_string(&Locale::en),
                         "".to_string(),
                     ]),
-                    Row::new([
-                        "IPC".to_string(),
-                        format!("{:.2}", stat.instructions as f64 / stat.cycles as f64),
-                        "".to_string(),
-                    ]),
+                    Row::new(["IPC".to_string(), ipc, "".to_string()]),
                     Row::new([
                         "Branch instructions".to_string(),
-                        stat.branch_instructions.to_formatted_string(&Locale::en),
-                        format!(
-                            "{:.2} per cycle",
-                            stat.branch_instructions as f64 / stat.cycles as f64
-                        ),
+                        branch_instruction_count,
+                        branch_per_cycle,
                     ]),
                     Row::new([
                         "Branch misses".to_string(),
-                        stat.branch_misses.to_formatted_string(&Locale::en),
-                        format!(
-                            "{:.2}%",
-                            stat.branch_misses as f64 / stat.branch_instructions as f64 * 100_f64
-                        ),
+                        branch_miss_count,
+                        branch_miss_pct,
                     ]),
-                    Row::new([
-                        "Branch MPKI".to_string(),
-                        format!(
-                            "{:.2}",
-                            stat.branch_misses as f64 / stat.instructions as f64 * 1000.0
-                        ),
-                        "".to_string(),
-                    ]),
+                    Row::new(["Branch MPKI".to_string(), branch_mpki, "".to_string()]),
                     Row::new([
                         "Last level cache references".to_string(),
-                        stat.cache_references.to_formatted_string(&Locale::en),
+                        cache_ref_count,
                         "".to_string(),
                     ]),
                     Row::new([
                         "Last level cache misses".to_string(),
-                        stat.cache_misses.to_formatted_string(&Locale::en),
-                        format!(
-                            "{:.2}%",
-                            stat.cache_misses as f64
-                                / (stat.cache_misses + stat.cache_references) as f64
-                                * 100_f64
-                        ),
+                        cache_miss_count,
+                        cache_miss_pct,
                     ]),
-                    Row::new([
-                        "Cache MPKI".to_string(),
-                        format!(
-                            "{:.2}",
-                            stat.cache_misses as f64 / stat.instructions as f64 * 1000.0
-                        ),
-                        "".to_string(),
-                    ]),
+                    Row::new(["Cache MPKI".to_string(), cache_mpki, "".to_string()]),
                     Row::new([
                         "Stalled cycles backend".to_string(),
-                        stat.stalled_cycles_backend.to_formatted_string(&Locale::en),
-                        format!(
-                            "{:.2}%",
-                            stat.stalled_cycles_backend as f64 / stat.cycles as f64 * 100.0
-                        ),
+                        stalled_backend_count,
+                        stalled_backend_pct,
                     ]),
                     Row::new([
                         "Stalled cycles frontend".to_string(),
-                        stat.stalled_cycles_frontend
-                            .to_formatted_string(&Locale::en),
-                        format!(
-                            "{:.2}%",
-                            stat.stalled_cycles_frontend as f64 / stat.cycles as f64 * 100.0
-                        ),
+                        stalled_frontend_count,
+                        stalled_frontend_pct,
                     ]),
                 ];
                 let widths = [
@@ -262,9 +320,12 @@ impl Widget for SummaryTab {
             .command
             .unwrap_or(vec!["".to_string()])
             .join(" ");
+
         let rows = [
             Row::new(["Scenario", self.record_info.scenario.name()]),
             Row::new(["Command", command.as_str()]),
+            Row::new(["CPU family", self.record_info.cpu_model.as_str()]),
+            Row::new(["CPU vendor", self.record_info.cpu_vendor.as_str()]),
         ];
         let widths = [Constraint::Percentage(20), Constraint::Percentage(80)];
 
@@ -276,5 +337,18 @@ impl Widget for SummaryTab {
 
         let info_table = Table::new(rows, widths).column_spacing(1);
         info_table.render(info_table_area, buf);
+    }
+}
+
+fn format_optional_count(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_formatted_string(&Locale::en))
+        .unwrap_or_else(|| "N/A".to_string())
+}
+
+fn format_optional_ratio(value: Option<u64>, total: u64) -> String {
+    match (value, total) {
+        (Some(value), total) if total > 0 => format!("{:.2}%", value as f64 / total as f64 * 100.0),
+        _ => "N/A".to_string(),
     }
 }

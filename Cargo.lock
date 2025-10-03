@@ -1199,6 +1199,7 @@ dependencies = [
  "miniperf-symbolize",
  "perf-event-open-sys2",
  "prettyplease",
+ "proc-macro2",
  "proc_getter",
  "quote",
  "serde",
