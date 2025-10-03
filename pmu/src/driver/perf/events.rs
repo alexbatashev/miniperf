@@ -8,8 +8,6 @@ pub fn list_supported_counters() -> Vec<Counter> {
         Counter::BranchMisses,
         Counter::LLCMisses,
         Counter::LLCReferences,
-        Counter::StalledCyclesFrontend,
-        Counter::StalledCyclesBackend,
         Counter::CpuClock,
         Counter::PageFaults,
         Counter::CpuMigrations,

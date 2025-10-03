@@ -5,10 +5,11 @@ use std::{
 };
 
 use anyhow::Result;
+use config::scenario_ui;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use flamegraph::FlamegraphTab;
-use hotspots::HotspotsTab;
 use loops::LoopsTab;
+use metrics_table::MetricsTableTab;
 use mperf_data::{RecordInfo, Scenario};
 use parking_lot::{Mutex, RwLock};
 use ratatui::{
@@ -22,9 +23,10 @@ use summary::SummaryTab;
 use tokio::fs::{self};
 use tokio_stream::StreamExt;
 
+mod config;
 mod flamegraph;
-mod hotspots;
 mod loops;
+mod metrics_table;
 mod summary;
 
 pub async fn tui_main(res_dir: &Path) -> Result<()> {
@@ -183,25 +185,25 @@ impl Widget for &TabsWidget {
 #[derive(Clone)]
 enum Tab {
     Summary(SummaryTab),
-    Hotspots(HotspotsTab),
+    MetricsTable(MetricsTableTab),
     Loops(LoopsTab),
     Flamegraph(FlamegraphTab),
 }
 
 impl Tab {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> String {
         match self {
-            Tab::Summary(_) => " Summary ",
-            Tab::Hotspots(_) => " Hotspots ",
-            Tab::Loops(_) => " Loops ",
-            Tab::Flamegraph(_) => " Flamegraph ",
+            Tab::Summary(_) => " Summary ".to_string(),
+            Tab::MetricsTable(tab) => tab.title().to_string(),
+            Tab::Loops(_) => " Loops ".to_string(),
+            Tab::Flamegraph(_) => " Flamegraph ".to_string(),
         }
     }
 
     fn run(&self) {
         match self {
             Tab::Summary(summary) => summary.run(),
-            Tab::Hotspots(hotspots) => hotspots.run(),
+            Tab::MetricsTable(table) => table.run(),
             Tab::Loops(loops) => loops.run(),
             Tab::Flamegraph(fg) => fg.run(),
         }
@@ -237,22 +239,25 @@ impl TabsWidget {
             sqlite::open(res_dir.join("perf.db")).expect("Failed to open DB"),
         ));
 
-        match info.scenario {
-            Scenario::Snapshot => {
-                write_tabs.push(Tab::Summary(SummaryTab::new(
+        let ui = scenario_ui(&info);
+
+        for tab in ui.tabs.iter() {
+            match tab {
+                pmu_data::TabSpec::Summary => write_tabs.push(Tab::Summary(SummaryTab::new(
                     info.clone(),
                     connection.clone(),
-                )));
-                write_tabs.push(Tab::Hotspots(HotspotsTab::new(connection.clone())));
-                write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())));
-            }
-            Scenario::Roofline => {
-                write_tabs.push(Tab::Summary(SummaryTab::new(
-                    info.clone(),
-                    connection.clone(),
-                )));
-                write_tabs.push(Tab::Loops(LoopsTab::new(connection.clone())));
-                write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())));
+                ))),
+                pmu_data::TabSpec::Flamegraph => {
+                    write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())))
+                }
+                pmu_data::TabSpec::Loops => {
+                    if matches!(info.scenario, Scenario::Roofline) {
+                        write_tabs.push(Tab::Loops(LoopsTab::new(connection.clone())));
+                    }
+                }
+                pmu_data::TabSpec::MetricsTable(spec) => write_tabs.push(Tab::MetricsTable(
+                    MetricsTableTab::new(spec.clone(), connection.clone()),
+                )),
             }
         }
     }
@@ -274,7 +279,7 @@ impl TabsWidget {
 
     fn handle_event(&mut self, code: KeyCode) {
         match &mut self.tabs.write()[self.cur_tab] {
-            Tab::Hotspots(tab) => tab.handle_event(code),
+            Tab::MetricsTable(tab) => tab.handle_event(code),
             Tab::Flamegraph(tab) => tab.handle_event(code),
             _ => {}
         }
@@ -288,7 +293,7 @@ impl Widget for &Tab {
     {
         match self {
             Tab::Summary(tab) => tab.clone().render(area, buf),
-            Tab::Hotspots(tab) => tab.clone().render(area, buf),
+            Tab::MetricsTable(tab) => tab.clone().render(area, buf),
             Tab::Loops(tab) => tab.clone().render(area, buf),
             Tab::Flamegraph(tab) => tab.clone().render(area, buf),
         }

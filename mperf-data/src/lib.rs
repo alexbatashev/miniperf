@@ -1,4 +1,5 @@
 use clap::ValueEnum;
+use pmu_data::{Constant, Metric, ScenarioUi};
 use serde::{Deserialize, Serialize};
 
 mod event;
@@ -11,25 +12,37 @@ pub use ipc::{IPCMessage, IPCString};
 pub enum Scenario {
     Snapshot,
     Roofline,
+    TMA,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotInfo {
     pub pid: i32,
-    pub counters: Vec<EventType>,
+    pub counters: Vec<(EventType, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RooflineInfo {
     pub perf_pid: i32,
-    pub counters: Vec<EventType>,
+    pub counters: Vec<(EventType, String)>,
     pub inst_pid: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TMAInfo {
+    pub pid: i32,
+    pub counters: Vec<(EventType, String)>,
+    pub metrics: Vec<Metric>,
+    pub constants: Vec<Constant>,
+    #[serde(default)]
+    pub ui: Option<ScenarioUi>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ScenarioInfo {
     Snapshot(SnapshotInfo),
     Roofline(RooflineInfo),
+    TMA(TMAInfo),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +59,7 @@ impl Scenario {
         match self {
             Scenario::Snapshot => "Snapshot",
             Scenario::Roofline => "Roofline",
+            Scenario::TMA => "Top-Down",
         }
     }
 }

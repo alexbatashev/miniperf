@@ -1,4 +1,6 @@
-use serde::{de, Deserialize, Serialize};
+pub mod arith_parser;
+
+use serde::{Deserialize, Serialize, de};
 
 // Well-known CPU families
 pub const AMDZEN1: &str = "zen1";
@@ -31,6 +33,7 @@ pub struct PlatformDesc {
     pub arch: String,
     pub max_counters: Option<usize>,
     pub leader_event: Option<String>,
+    pub scenarios: Option<Vec<Scenario>>,
     pub events: Vec<EventDesc>,
     pub aliases: Option<Vec<Alias>>,
 }
@@ -47,6 +50,170 @@ pub struct EventDesc {
 pub struct Alias {
     pub target: String,
     pub origin: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Scenario {
+    pub name: String,
+    pub events: Vec<String>,
+    pub constants: Vec<Constant>,
+    pub metrics: Vec<Metric>,
+    #[serde(default)]
+    pub ui: Option<ScenarioUi>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Metric {
+    pub name: String,
+    pub desc: String,
+    pub formula: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Constant {
+    pub name: String,
+    pub value: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct ScenarioUi {
+    #[serde(default)]
+    pub tabs: Vec<TabSpec>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TabSpec {
+    Summary,
+    Flamegraph,
+    Loops,
+    MetricsTable(MetricsTableSpec),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsTableSpec {
+    pub view: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default = "default_true")]
+    pub include_default_columns: bool,
+    #[serde(default)]
+    pub columns: Vec<MetricColumnSpec>,
+    #[serde(default)]
+    pub order_by: Option<OrderSpec>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub sticky_columns: Option<usize>,
+    #[serde(default)]
+    pub function_column: Option<String>,
+    #[serde(default)]
+    pub enable_assembly: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrderSpec {
+    pub column: String,
+    #[serde(default)]
+    pub direction: SortDirection,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl Default for SortDirection {
+    fn default() -> Self {
+        SortDirection::Desc
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricColumnSpec {
+    pub key: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub format: ValueFormat,
+    #[serde(default)]
+    pub width: Option<u16>,
+    #[serde(default)]
+    pub sticky: bool,
+    #[serde(default)]
+    pub optional: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueFormat {
+    Auto,
+    Text,
+    Integer,
+    Float,
+    Float1,
+    Float2,
+    Float3,
+    Percent,
+    Percent1,
+    Percent2,
+    Percent3,
+}
+
+impl Default for ValueFormat {
+    fn default() -> Self {
+        ValueFormat::Auto
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scenario_ui_parses_from_json() {
+        let json = r#"
+        {
+            "name": "tma",
+            "events": [],
+            "constants": [],
+            "metrics": [],
+            "ui": {
+                "tabs": [
+                    { "kind": "summary" },
+                    {
+                        "kind": "metrics_table",
+                        "view": "hotspots",
+                        "columns": [
+                            { "key": "func_name", "label": "Function", "format": "text", "sticky": true }
+                        ]
+                    }
+                ]
+            }
+        }
+        "#;
+
+        let scenario: Scenario = serde_json::from_str(json).expect("failed to parse scenario json");
+        assert!(scenario.ui.is_some());
+        let ui = scenario.ui.unwrap();
+        assert_eq!(ui.tabs.len(), 2);
+        match &ui.tabs[1] {
+            TabSpec::MetricsTable(spec) => {
+                assert_eq!(spec.view, "hotspots");
+                assert!(spec.include_default_columns);
+                assert_eq!(spec.columns.len(), 1);
+                assert_eq!(spec.columns[0].key, "func_name");
+            }
+            _ => panic!("expected metrics_table tab"),
+        }
+    }
 }
 
 fn serialize_hex<S>(v: &u64, serializer: S) -> Result<S::Ok, S::Error>

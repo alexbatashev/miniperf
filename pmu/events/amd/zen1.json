@@ -3,11 +3,1012 @@
   "name": "AMD Zen or Zen+ architecture",
   "vendor": "AMD",
   "arch": "x86_64",
+  "scenarios": [
+    {
+      "name": "tma",
+      "events": [
+        "cycles",
+        "instructions",
+        "uops_retired",
+        "ic_fetch_stall.ic_stall_back_pressure",
+        "ic_fetch_stall.ic_stall_dq_empty",
+        "ex_ret_brn_misp",
+        "ic_fw32",
+        "ic_fw32_miss",
+        "ex_ret_brn_resync",
+        "l2_fill_pending.l2_fill_busy"
+      ],
+      "constants": [
+        {
+          "name": "max_retired_width",
+          "value": 8
+        },
+        {
+          "name": "branch_mispredict_penalty",
+          "value": 13
+        }
+      ],
+      "metrics": [
+        {
+          "name": "retiring",
+          "desc": "Fraction of cycles useful work completed",
+          "formula": "uops_retired / ($max_retired_width * cycles)"
+        },
+        {
+          "name": "fe_bound",
+          "desc": "Fraction of cycles Fetch/Decode not supplied",
+          "formula": "ic_fetch_stall.ic_stall_dq_empty / cycles"
+        },
+        {
+          "name": "bad_speculation",
+          "desc": "Fraction of cycles lost to branch misprediction",
+          "formula": "(ex_ret_brn_misp * $branch_mispredict_penalty) / cycles"
+        },
+        {
+          "name": "be_bound",
+          "desc": "Fraction of cycles backend was out of resources",
+          "formula": "ic_fetch_stall.ic_stall_back_pressure / cycles"
+        }
+      ],
+      "ui": {
+        "tabs": [
+          { "kind": "summary" },
+          {
+            "kind": "metrics_table",
+            "view": "tma",
+            "title": "TMA Metrics",
+            "function_column": "func_name",
+            "enable_assembly": true,
+            "sticky_columns": 1,
+            "order_by": { "column": "total", "direction": "desc" },
+            "limit": 50,
+            "columns": [
+              {
+                "key": "retiring",
+                "label": "Retiring",
+                "format": "percent2",
+                "width": 120
+              },
+              {
+                "key": "fe_bound",
+                "label": "FE Bound",
+                "format": "percent2",
+                "width": 12
+              },
+              {
+                "key": "bad_speculation",
+                "label": "Bad Speculation",
+                "format": "percent2",
+                "width": 15
+              },
+              {
+                "key": "be_bound",
+                "label": "BE Bound",
+                "format": "percent2",
+                "width": 12
+              }
+            ]
+          },
+          { "kind": "flamegraph" }
+        ]
+      }
+    }
+  ],
   "events": [
     {
+      "name": "bp_l1_btb_correct",
+      "desc": "L1 BTB Correction.",
+      "code": "0x8a"
+    },
+    {
+      "name": "bp_l2_btb_correct",
+      "desc": "L2 BTB Correction.",
+      "code": "0x8b"
+    },
+    {
+      "name": "bp_dyn_ind_pred",
+      "desc": "Indirect Branch Prediction for potential multi-target branch (speculative).",
+      "code": "0x8e"
+    },
+    {
+      "name": "bp_de_redirect",
+      "desc": "Decoder Overrides Existing Branch Prediction (speculative).",
+      "code": "0x91"
+    },
+    {
+      "name": "bp_l1_tlb_fetch_hit",
+      "desc": "The number of instruction fetches that hit in the L1 ITLB.",
+      "code": "0x94"
+    },
+    {
+      "name": "ic_fw32",
+      "desc": "The number of 32B fetch windows transferred from IC pipe to DE instruction decoder (includes non-cacheable and cacheable fill responses).",
+      "code": "0x80"
+    },
+    {
+      "name": "ic_fw32_miss",
+      "desc": "The number of 32B fetch windows tried to read the L1 IC and missed in the full tag.",
+      "code": "0x81"
+    },
+    {
+      "name": "ic_cache_fill_l2",
+      "desc": "The number of 64 byte instruction cache line was fulfilled from the L2 cache.",
+      "code": "0x82"
+    },
+    {
+      "name": "ic_cache_fill_sys",
+      "desc": "The number of 64 byte instruction cache line fulfilled from system memory or another cache.",
+      "code": "0x83"
+    },
+    {
+      "name": "bp_l1_tlb_miss_l2_hit",
+      "desc": "The number of instruction fetches that miss in the L1 ITLB but hit in the L2 ITLB.",
+      "code": "0x84"
+    },
+    {
+      "name": "bp_l1_tlb_miss_l2_miss",
+      "desc": "The number of instruction fetches that miss in both the L1 and L2 TLBs.",
+      "code": "0x85"
+    },
+    {
+      "name": "bp_snp_re_sync",
+      "desc": "The number of pipeline restarts caused by invalidating probes that hit on the instruction stream currently being executed. This would happen if the active instruction stream was being modified by another processor in an MP system - typically a highly unlikely event.",
+      "code": "0x86"
+    },
+    {
+      "name": "ic_fetch_stall.ic_stall_any",
+      "desc": "Instruction Pipe Stall. IC pipe was stalled during this clock cycle for any reason (nothing valid in pipe ICM1).",
+      "code": "0x487"
+    },
+    {
+      "name": "ic_fetch_stall.ic_stall_dq_empty",
+      "desc": "Instruction Pipe Stall. IC pipe was stalled during this clock cycle (including IC to OC fetches) due to DQ empty.",
+      "code": "0x287"
+    },
+    {
+      "name": "ic_fetch_stall.ic_stall_back_pressure",
+      "desc": "Instruction Pipe Stall. IC pipe was stalled during this clock cycle (including IC to OC fetches) due to back-pressure.",
+      "code": "0x187"
+    },
+    {
+      "name": "ic_cache_inval.l2_invalidating_probe",
+      "desc": "IC line invalidated due to L2 invalidating probe (external or LS). The number of instruction cache lines invalidated. A non-SMC event is CMC (cross modifying code), either from the other thread of the core or another core.",
+      "code": "0x28c"
+    },
+    {
+      "name": "ic_cache_inval.fill_invalidated",
+      "desc": "IC line invalidated due to overwriting fill response. The number of instruction cache lines invalidated. A non-SMC event is CMC (cross modifying code), either from the other thread of the core or another core.",
+      "code": "0x18c"
+    },
+    {
+      "name": "bp_tlb_rel",
+      "desc": "The number of ITLB reload requests.",
+      "code": "0x99"
+    },
+    {
+      "name": "l2_request_g1.rd_blk_l",
+      "desc": "All L2 Cache Requests (Breakdown 1 - Common). Data cache reads (including hardware and software prefetch).",
+      "code": "0x8060"
+    },
+    {
+      "name": "l2_request_g1.rd_blk_x",
+      "desc": "All L2 Cache Requests (Breakdown 1 - Common). Data cache stores.",
+      "code": "0x4060"
+    },
+    {
+      "name": "l2_request_g1.ls_rd_blk_c_s",
+      "desc": "All L2 Cache Requests (Breakdown 1 - Common). Data cache shared reads.",
+      "code": "0x2060"
+    },
+    {
+      "name": "l2_request_g1.cacheable_ic_read",
+      "desc": "All L2 Cache Requests (Breakdown 1 - Common). Instruction cache reads.",
+      "code": "0x1060"
+    },
+    {
+      "name": "l2_request_g1.change_to_x",
+      "desc": "All L2 Cache Requests (Breakdown 1 - Common). Data cache state change requests. Request change to writable, check L2 for current state.",
+      "code": "0x860"
+    },
+    {
+      "name": "l2_request_g1.prefetch_l2_cmd",
+      "desc": "All L2 Cache Requests (Breakdown 1 - Common). PrefetchL2Cmd.",
+      "code": "0x460"
+    },
+    {
+      "name": "l2_request_g1.l2_hw_pf",
+      "desc": "All L2 Cache Requests (Breakdown 1 - Common). L2 Prefetcher. All prefetches accepted by L2 pipeline, hit or miss. Types of PF and L2 hit/miss broken out in a separate perfmon event.",
+      "code": "0x260"
+    },
+    {
+      "name": "l2_request_g1.group2",
+      "desc": "Miscellaneous events covered in more detail by l2_request_g2 (PMCx061).",
+      "code": "0x160"
+    },
+    {
+      "name": "l2_request_g1.all_no_prefetch",
+      "desc": "",
+      "code": "0xf960"
+    },
+    {
+      "name": "l2_request_g2.group1",
+      "desc": "Miscellaneous events covered in more detail by l2_request_g1 (PMCx060).",
+      "code": "0x8061"
+    },
+    {
+      "name": "l2_request_g2.ls_rd_sized",
+      "desc": "All L2 Cache Requests (Breakdown 2 - Rare). Data cache read sized.",
+      "code": "0x4061"
+    },
+    {
+      "name": "l2_request_g2.ls_rd_sized_nc",
+      "desc": "All L2 Cache Requests (Breakdown 2 - Rare). Data cache read sized non-cacheable.",
+      "code": "0x2061"
+    },
+    {
+      "name": "l2_request_g2.ic_rd_sized",
+      "desc": "All L2 Cache Requests (Breakdown 2 - Rare). Instruction cache read sized.",
+      "code": "0x1061"
+    },
+    {
+      "name": "l2_request_g2.ic_rd_sized_nc",
+      "desc": "All L2 Cache Requests (Breakdown 2 - Rare). Instruction cache read sized non-cacheable.",
+      "code": "0x861"
+    },
+    {
+      "name": "l2_request_g2.smc_inval",
+      "desc": "All L2 Cache Requests (Breakdown 2 - Rare). Self-modifying code invalidates.",
+      "code": "0x461"
+    },
+    {
+      "name": "l2_request_g2.bus_locks_originator",
+      "desc": "All L2 Cache Requests (Breakdown 2 - Rare). Bus locks.",
+      "code": "0x261"
+    },
+    {
+      "name": "l2_request_g2.bus_locks_responses",
+      "desc": "All L2 Cache Requests (Breakdown 2 - Rare). Bus lock response.",
+      "code": "0x161"
+    },
+    {
+      "name": "l2_latency.l2_cycles_waiting_on_fills",
+      "desc": "Total cycles spent waiting for L2 fills to complete from L3 or memory, divided by four. Event counts are for both threads. To calculate average latency, the number of fills from both threads must be used.",
+      "code": "0x162"
+    },
+    {
+      "name": "l2_wcb_req.wcb_write",
+      "desc": "LS to L2 WCB write requests. LS (Load/Store unit) to L2 WCB (Write Combining Buffer) write requests.",
+      "code": "0x4063"
+    },
+    {
+      "name": "l2_wcb_req.wcb_close",
+      "desc": "LS to L2 WCB close requests. LS (Load/Store unit) to L2 WCB (Write Combining Buffer) close requests.",
+      "code": "0x2063"
+    },
+    {
+      "name": "l2_wcb_req.zero_byte_store",
+      "desc": "LS to L2 WCB zero byte store requests. LS (Load/Store unit) to L2 WCB (Write Combining Buffer) zero byte store requests.",
+      "code": "0x463"
+    },
+    {
+      "name": "l2_wcb_req.cl_zero",
+      "desc": "LS to L2 WCB cache line zeroing requests. LS (Load/Store unit) to L2 WCB (Write Combining Buffer) cache line zeroing requests.",
+      "code": "0x163"
+    },
+    {
+      "name": "l2_cache_req_stat.ls_rd_blk_cs",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Data cache shared read hit in L2",
+      "code": "0x8064"
+    },
+    {
+      "name": "l2_cache_req_stat.ls_rd_blk_l_hit_x",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Data cache read hit in L2.",
+      "code": "0x4064"
+    },
+    {
+      "name": "l2_cache_req_stat.ls_rd_blk_l_hit_s",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Data cache read hit on shared line in L2.",
+      "code": "0x2064"
+    },
+    {
+      "name": "l2_cache_req_stat.ls_rd_blk_x",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Data cache store or state change hit in L2.",
+      "code": "0x1064"
+    },
+    {
+      "name": "l2_cache_req_stat.ls_rd_blk_c",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Data cache request miss in L2 (all types).",
+      "code": "0x864"
+    },
+    {
+      "name": "l2_cache_req_stat.ic_fill_hit_x",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Instruction cache hit modifiable line in L2.",
+      "code": "0x464"
+    },
+    {
+      "name": "l2_cache_req_stat.ic_fill_hit_s",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Instruction cache hit clean line in L2.",
+      "code": "0x264"
+    },
+    {
+      "name": "l2_cache_req_stat.ic_fill_miss",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Instruction cache request miss in L2.",
+      "code": "0x164"
+    },
+    {
+      "name": "l2_cache_req_stat.ic_access_in_l2",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Instruction cache requests in L2.",
+      "code": "0x764"
+    },
+    {
+      "name": "l2_cache_req_stat.ic_dc_miss_in_l2",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Instruction cache request miss in L2 and Data cache request miss in L2 (all types).",
+      "code": "0x964"
+    },
+    {
+      "name": "l2_cache_req_stat.ic_dc_hit_in_l2",
+      "desc": "Core to L2 cacheable request access status (not including L2 Prefetch). Instruction cache request hit in L2 and Data cache request hit in L2 (all types).",
+      "code": "0xf664"
+    },
+    {
+      "name": "l2_fill_pending.l2_fill_busy",
+      "desc": "Cycles with fill pending from L2. Total cycles spent with one or more fill requests in flight from L2.",
+      "code": "0x16d"
+    },
+    {
+      "name": "l2_pf_hit_l2",
+      "desc": "L2 prefetch hit in L2. Use l2_cache_hits_from_l2_hwpf instead.",
+      "code": "0xff70"
+    },
+    {
+      "name": "l2_pf_miss_l2_hit_l3",
+      "desc": "L2 prefetcher hits in L3. Counts all L2 prefetches accepted by the L2 pipeline which miss the L2 cache and hit the L3.",
+      "code": "0xff71"
+    },
+    {
+      "name": "l2_pf_miss_l2_l3",
+      "desc": "L2 prefetcher misses in L3. All L2 prefetches accepted by the L2 pipeline which miss the L2 and the L3 caches.",
+      "code": "0xff72"
+    },
+    {
+      "name": "l3_request_g1.caching_l3_cache_accesses",
+      "desc": "Caching: L3 cache accesses",
+      "code": "0x8001"
+    },
+    {
+      "name": "l3_lookup_state.all_l3_req_typs",
+      "desc": "All L3 Request Types",
+      "code": "0xff04"
+    },
+    {
+      "name": "l3_comb_clstr_state.other_l3_miss_typs",
+      "desc": "Other L3 Miss Request Types",
+      "code": "0xfe06"
+    },
+    {
+      "name": "l3_comb_clstr_state.request_miss",
+      "desc": "L3 cache misses",
+      "code": "0x106"
+    },
+    {
+      "name": "xi_sys_fill_latency",
+      "desc": "L3 Cache Miss Latency. Total cycles for all transactions divided by 16. Ignores SliceMask and ThreadMask.",
+      "code": "0x90"
+    },
+    {
+      "name": "xi_ccx_sdp_req1.all_l3_miss_req_typs",
+      "desc": "All L3 Miss Request Types. Ignores SliceMask and ThreadMask.",
+      "code": "0x3f9a"
+    },
+    {
       "name": "ex_ret_instr",
-      "desc": "Retired Instructions",
+      "desc": "Retired Instructions.",
       "code": "0xc0"
+    },
+    {
+      "name": "ex_ret_cops",
+      "desc": "The number of uOps retired. This includes all processor activity (instructions, exceptions, interrupts, microcode assists, etc.). The number of events logged per cycle can vary from 0 to 4.",
+      "code": "0xc1"
+    },
+    {
+      "name": "ex_ret_brn",
+      "desc": "The number of branch instructions retired. This includes all types of architectural control flow changes, including exceptions and interrupts.",
+      "code": "0xc2"
+    },
+    {
+      "name": "ex_ret_brn_misp",
+      "desc": "The number of branch instructions retired, of any type, that were not correctly predicted. This includes those for which prediction is not attempted (far control transfers, exceptions and interrupts).",
+      "code": "0xc3"
+    },
+    {
+      "name": "ex_ret_brn_tkn",
+      "desc": "The number of taken branches that were retired. This includes all types of architectural control flow changes, including exceptions and interrupts.",
+      "code": "0xc4"
+    },
+    {
+      "name": "ex_ret_brn_tkn_misp",
+      "desc": "The number of retired taken branch instructions that were mispredicted.",
+      "code": "0xc5"
+    },
+    {
+      "name": "ex_ret_brn_far",
+      "desc": "The number of far control transfers retired including far call/jump/return, IRET, SYSCALL and SYSRET, plus exceptions and interrupts. Far control transfers are not subject to branch prediction.",
+      "code": "0xc6"
+    },
+    {
+      "name": "ex_ret_brn_resync",
+      "desc": "The number of resync branches. These reflect pipeline restarts due to certain microcode assists and events such as writes to the active instruction stream, among other things. Each occurrence reflects a restart penalty similar to a branch mispredict. This is relatively rare.",
+      "code": "0xc7"
+    },
+    {
+      "name": "ex_ret_near_ret",
+      "desc": "The number of near return instructions (RET or RET Iw) retired.",
+      "code": "0xc8"
+    },
+    {
+      "name": "ex_ret_near_ret_mispred",
+      "desc": "The number of near returns retired that were not correctly predicted by the return address predictor. Each such mispredict incurs the same penalty as a mispredicted conditional branch instruction.",
+      "code": "0xc9"
+    },
+    {
+      "name": "ex_ret_brn_ind_misp",
+      "desc": "Retired Indirect Branch Instructions Mispredicted.",
+      "code": "0xca"
+    },
+    {
+      "name": "ex_ret_mmx_fp_instr.sse_instr",
+      "desc": "The number of MMX, SSE or x87 instructions retired. The UnitMask allows the selection of the individual classes of instructions as given in the table. Each increment represents one complete instruction. Since this event includes non-numeric instructions it is not suitable for measuring MFLOPS. SSE instructions (SSE, SSE2, SSE3, SSSE3, SSE4A, SSE41, SSE42, AVX).",
+      "code": "0x4cb"
+    },
+    {
+      "name": "ex_ret_mmx_fp_instr.mmx_instr",
+      "desc": "The number of MMX, SSE or x87 instructions retired. The UnitMask allows the selection of the individual classes of instructions as given in the table. Each increment represents one complete instruction. Since this event includes non-numeric instructions it is not suitable for measuring MFLOPS. MMX instructions.",
+      "code": "0x2cb"
+    },
+    {
+      "name": "ex_ret_mmx_fp_instr.x87_instr",
+      "desc": "The number of MMX, SSE or x87 instructions retired. The UnitMask allows the selection of the individual classes of instructions as given in the table. Each increment represents one complete instruction. Since this event includes non-numeric instructions it is not suitable for measuring MFLOPS. x87 instructions.",
+      "code": "0x1cb"
+    },
+    {
+      "name": "ex_ret_cond",
+      "desc": "Retired Conditional Branch Instructions.",
+      "code": "0xd1"
+    },
+    {
+      "name": "ex_div_busy",
+      "desc": "Div Cycles Busy count.",
+      "code": "0xd3"
+    },
+    {
+      "name": "ex_div_count",
+      "desc": "Div Op Count.",
+      "code": "0xd4"
+    },
+    {
+      "name": "ex_tagged_ibs_ops.ibs_count_rollover",
+      "desc": "Tagged IBS Ops. Number of times an op could not be tagged by IBS because of a previous tagged op that has not retired.",
+      "code": "0x5cf"
+    },
+    {
+      "name": "ex_tagged_ibs_ops.ibs_tagged_ops_ret",
+      "desc": "Tagged IBS Ops. Number of Ops tagged by IBS that retired.",
+      "code": "0x3cf"
+    },
+    {
+      "name": "ex_tagged_ibs_ops.ibs_tagged_ops",
+      "desc": "Tagged IBS Ops. Number of Ops tagged by IBS.",
+      "code": "0x2cf"
+    },
+    {
+      "name": "ex_ret_fus_brnch_inst",
+      "desc": "The number of fused retired branch instructions retired per cycle. The number of events logged per cycle can vary from 0 to 3.",
+      "code": "0x1d0"
+    },
+    {
+      "name": "remote_outbound_data_controller_0",
+      "desc": "Remote Link Controller Outbound Packet Types: Data (32B): Remote Link Controller 0",
+      "code": "0x9c7"
+    },
+    {
+      "name": "remote_outbound_data_controller_1",
+      "desc": "Remote Link Controller Outbound Packet Types: Data (32B): Remote Link Controller 1",
+      "code": "0xa07"
+    },
+    {
+      "name": "remote_outbound_data_controller_2",
+      "desc": "Remote Link Controller Outbound Packet Types: Data (32B): Remote Link Controller 2",
+      "code": "0xa47"
+    },
+    {
+      "name": "remote_outbound_data_controller_3",
+      "desc": "Remote Link Controller Outbound Packet Types: Data (32B): Remote Link Controller 3",
+      "code": "0xa87"
+    },
+    {
+      "name": "dram_channel_data_controller_0",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x3807"
+    },
+    {
+      "name": "dram_channel_data_controller_1",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x3847"
+    },
+    {
+      "name": "dram_channel_data_controller_2",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x3887"
+    },
+    {
+      "name": "dram_channel_data_controller_3",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x38c7"
+    },
+    {
+      "name": "dram_channel_data_controller_4",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x3907"
+    },
+    {
+      "name": "dram_channel_data_controller_5",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x3947"
+    },
+    {
+      "name": "dram_channel_data_controller_6",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x3987"
+    },
+    {
+      "name": "dram_channel_data_controller_7",
+      "desc": "DRAM Channel Controller Request Types: Requests with Data (64B): DRAM Channel Controller 0",
+      "code": "0x39c7"
+    },
+    {
+      "name": "fpu_pipe_assignment.dual",
+      "desc": "The number of operations (uOps) and dual-pipe uOps dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number multi-pipe uOps assigned to all pipes.",
+      "code": "0xf000"
+    },
+    {
+      "name": "fpu_pipe_assignment.dual3",
+      "desc": "The number of operations (uOps) and dual-pipe uOps dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number multi-pipe uOps assigned to pipe 3.",
+      "code": "0x8000"
+    },
+    {
+      "name": "fpu_pipe_assignment.dual2",
+      "desc": "The number of operations (uOps) and dual-pipe uOps dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number multi-pipe uOps assigned to pipe 2.",
+      "code": "0x4000"
+    },
+    {
+      "name": "fpu_pipe_assignment.dual1",
+      "desc": "The number of operations (uOps) and dual-pipe uOps dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number multi-pipe uOps assigned to pipe 1.",
+      "code": "0x2000"
+    },
+    {
+      "name": "fpu_pipe_assignment.dual0",
+      "desc": "The number of operations (uOps) and dual-pipe uOps dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number multi-pipe uOps assigned to pipe 0.",
+      "code": "0x1000"
+    },
+    {
+      "name": "fpu_pipe_assignment.total",
+      "desc": "The number of operations (uOps) and dual-pipe uOps dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number uOps assigned to all pipes.",
+      "code": "0xf00"
+    },
+    {
+      "name": "fpu_pipe_assignment.total3",
+      "desc": "The number of operations (uOps) dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one-cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number uOps assigned to pipe 3.",
+      "code": "0x800"
+    },
+    {
+      "name": "fpu_pipe_assignment.total2",
+      "desc": "The number of operations (uOps) dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number uOps assigned to pipe 2.",
+      "code": "0x400"
+    },
+    {
+      "name": "fpu_pipe_assignment.total1",
+      "desc": "The number of operations (uOps) dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number uOps assigned to pipe 1.",
+      "code": "0x200"
+    },
+    {
+      "name": "fpu_pipe_assignment.total0",
+      "desc": "The number of operations (uOps) dispatched to each of the 4 FPU execution pipelines. This event reflects how busy the FPU pipelines are and may be used for workload characterization. This includes all operations performed by x87, MMX, and SSE instructions, including moves. Each increment represents a one- cycle dispatch event. This event is a speculative event. Since this event includes non-numeric operations it is not suitable for measuring MFLOPS. Total number uOps assigned to pipe 0.",
+      "code": "0x100"
+    },
+    {
+      "name": "fp_sched_empty",
+      "desc": "This is a speculative event. The number of cycles in which the FPU scheduler is empty. Note that some Ops like FP loads bypass the scheduler.",
+      "code": "0x1"
+    },
+    {
+      "name": "fp_retx87_fp_ops.all",
+      "desc": "The number of x87 floating-point Ops that have retired. The number of events logged per cycle can vary from 0 to 8.",
+      "code": "0x702"
+    },
+    {
+      "name": "fp_retx87_fp_ops.div_sqr_r_ops",
+      "desc": "The number of x87 floating-point Ops that have retired. The number of events logged per cycle can vary from 0 to 8. Divide and square root Ops.",
+      "code": "0x402"
+    },
+    {
+      "name": "fp_retx87_fp_ops.mul_ops",
+      "desc": "The number of x87 floating-point Ops that have retired. The number of events logged per cycle can vary from 0 to 8. Multiply Ops.",
+      "code": "0x202"
+    },
+    {
+      "name": "fp_retx87_fp_ops.add_sub_ops",
+      "desc": "The number of x87 floating-point Ops that have retired. The number of events logged per cycle can vary from 0 to 8. Add/subtract Ops.",
+      "code": "0x102"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.all",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15.",
+      "code": "0xff03"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.dp_mult_add_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Double precision multiply-add FLOPS. Multiply-add counts as 2 FLOPS.",
+      "code": "0x8003"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.dp_div_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Double precision divide/square root FLOPS.",
+      "code": "0x4003"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.dp_mult_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Double precision multiply FLOPS.",
+      "code": "0x2003"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.dp_add_sub_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Double precision add/subtract FLOPS.",
+      "code": "0x1003"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.sp_mult_add_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Single precision multiply-add FLOPS. Multiply-add counts as 2 FLOPS.",
+      "code": "0x803"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.sp_div_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Single-precision divide/square root FLOPS.",
+      "code": "0x403"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.sp_mult_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Single-precision multiply FLOPS.",
+      "code": "0x203"
+    },
+    {
+      "name": "fp_ret_sse_avx_ops.sp_add_sub_flops",
+      "desc": "This is a retire-based event. The number of retired SSE/AVX FLOPS. The number of events logged per cycle can vary from 0 to 64. This event can count above 15. Single-precision add/subtract FLOPS.",
+      "code": "0x103"
+    },
+    {
+      "name": "fp_num_mov_elim_scal_op.optimized",
+      "desc": "This is a dispatch based speculative event, and is useful for measuring the effectiveness of the Move elimination and Scalar code optimization schemes. Number of Scalar Ops optimized.",
+      "code": "0x804"
+    },
+    {
+      "name": "fp_num_mov_elim_scal_op.opt_potential",
+      "desc": "This is a dispatch based speculative event, and is useful for measuring the effectiveness of the Move elimination and Scalar code optimization schemes. Number of Ops that are candidates for optimization (have Z-bit either set or pass).",
+      "code": "0x404"
+    },
+    {
+      "name": "fp_num_mov_elim_scal_op.sse_mov_ops_elim",
+      "desc": "This is a dispatch based speculative event, and is useful for measuring the effectiveness of the Move elimination and Scalar code optimization schemes. Number of SSE Move Ops eliminated.",
+      "code": "0x204"
+    },
+    {
+      "name": "fp_num_mov_elim_scal_op.sse_mov_ops",
+      "desc": "This is a dispatch based speculative event, and is useful for measuring the effectiveness of the Move elimination and Scalar code optimization schemes. Number of SSE Move Ops.",
+      "code": "0x104"
+    },
+    {
+      "name": "fp_retired_ser_ops.x87_ctrl_ret",
+      "desc": "The number of serializing Ops retired. x87 control word mispredict traps due to mispredictions in RC or PC, or changes in mask bits.",
+      "code": "0x805"
+    },
+    {
+      "name": "fp_retired_ser_ops.x87_bot_ret",
+      "desc": "The number of serializing Ops retired. x87 bottom-executing uOps retired.",
+      "code": "0x405"
+    },
+    {
+      "name": "fp_retired_ser_ops.sse_ctrl_ret",
+      "desc": "The number of serializing Ops retired. SSE control word mispredict traps due to mispredictions in RC, FTZ or DAZ, or changes in mask bits.",
+      "code": "0x205"
+    },
+    {
+      "name": "fp_retired_ser_ops.sse_bot_ret",
+      "desc": "The number of serializing Ops retired. SSE bottom-executing uOps retired.",
+      "code": "0x105"
+    },
+    {
+      "name": "ls_locks.bus_lock",
+      "desc": "Bus lock when a locked operations crosses a cache boundary or is done on an uncacheable memory type.",
+      "code": "0x125"
+    },
+    {
+      "name": "ls_dispatch.ld_st_dispatch",
+      "desc": "Counts the number of operations dispatched to the LS unit. Unit Masks ADDed. Load-op-Stores.",
+      "code": "0x429"
+    },
+    {
+      "name": "ls_dispatch.store_dispatch",
+      "desc": "Counts the number of stores dispatched to the LS unit. Unit Masks ADDed.",
+      "code": "0x229"
+    },
+    {
+      "name": "ls_dispatch.ld_dispatch",
+      "desc": "Counts the number of loads dispatched to the LS unit. Unit Masks ADDed.",
+      "code": "0x129"
+    },
+    {
+      "name": "ls_stlf",
+      "desc": "Number of STLF hits.",
+      "code": "0x35"
+    },
+    {
+      "name": "ls_dc_accesses",
+      "desc": "The number of accesses to the data cache for load and store references. This may include certain microcode scratchpad accesses, although these are generally rare. Each increment represents an eight-byte access, although the instruction may only be accessing a portion of that. This event is a speculative event.",
+      "code": "0x40"
+    },
+    {
+      "name": "ls_mab_alloc.dc_prefetcher",
+      "desc": "LS MAB allocates by type - DC prefetcher.",
+      "code": "0x841"
+    },
+    {
+      "name": "ls_mab_alloc.stores",
+      "desc": "LS MAB allocates by type - stores.",
+      "code": "0x241"
+    },
+    {
+      "name": "ls_mab_alloc.loads",
+      "desc": "LS MAB allocates by type - loads.",
+      "code": "0x141"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.all",
+      "desc": "L1 DTLB Miss or Reload off all sizes.",
+      "code": "0xff45"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_1g_l2_miss",
+      "desc": "L1 DTLB Miss of a page of 1G size.",
+      "code": "0x8045"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_2m_l2_miss",
+      "desc": "L1 DTLB Miss of a page of 2M size.",
+      "code": "0x4045"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_32k_l2_miss",
+      "desc": "L1 DTLB Miss of a page of 32K size.",
+      "code": "0x2045"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_4k_l2_miss",
+      "desc": "L1 DTLB Miss of a page of 4K size.",
+      "code": "0x1045"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_1g_l2_hit",
+      "desc": "L1 DTLB Reload of a page of 1G size.",
+      "code": "0x845"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_2m_l2_hit",
+      "desc": "L1 DTLB Reload of a page of 2M size.",
+      "code": "0x445"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_32k_l2_hit",
+      "desc": "L1 DTLB Reload of a page of 32K size.",
+      "code": "0x245"
+    },
+    {
+      "name": "ls_l1_d_tlb_miss.tlb_reload_4k_l2_hit",
+      "desc": "L1 DTLB Reload of a page of 4K size.",
+      "code": "0x145"
+    },
+    {
+      "name": "ls_tablewalker.iside",
+      "desc": "Total Page Table Walks on I-side.",
+      "code": "0xc46"
+    },
+    {
+      "name": "ls_tablewalker.ic_type1",
+      "desc": "Total Page Table Walks IC Type 1.",
+      "code": "0x846"
+    },
+    {
+      "name": "ls_tablewalker.ic_type0",
+      "desc": "Total Page Table Walks IC Type 0.",
+      "code": "0x446"
+    },
+    {
+      "name": "ls_tablewalker.dside",
+      "desc": "Total Page Table Walks on D-side.",
+      "code": "0x346"
+    },
+    {
+      "name": "ls_tablewalker.dc_type1",
+      "desc": "Total Page Table Walks DC Type 1.",
+      "code": "0x246"
+    },
+    {
+      "name": "ls_tablewalker.dc_type0",
+      "desc": "Total Page Table Walks DC Type 0.",
+      "code": "0x146"
+    },
+    {
+      "name": "ls_misal_accesses",
+      "desc": "Misaligned loads.",
+      "code": "0x47"
+    },
+    {
+      "name": "ls_pref_instr_disp.prefetch_nta",
+      "desc": "Software Prefetch Instructions (PREFETCHNTA instruction) Dispatched.",
+      "code": "0x44b"
+    },
+    {
+      "name": "ls_pref_instr_disp.store_prefetch_w",
+      "desc": "Software Prefetch Instructions (3DNow PREFETCHW instruction) Dispatched.",
+      "code": "0x24b"
+    },
+    {
+      "name": "ls_pref_instr_disp.load_prefetch_w",
+      "desc": "Software Prefetch Instructions Dispatched. Prefetch, Prefetch_T0_T1_T2.",
+      "code": "0x14b"
+    },
+    {
+      "name": "ls_inef_sw_pref.mab_mch_cnt",
+      "desc": "The number of software prefetches that did not fetch data outside of the processor core. Software PREFETCH instruction saw a match on an already-allocated miss request buffer.",
+      "code": "0x252"
+    },
+    {
+      "name": "ls_inef_sw_pref.data_pipe_sw_pf_dc_hit",
+      "desc": "The number of software prefetches that did not fetch data outside of the processor core. Software PREFETCH instruction saw a DC hit.",
+      "code": "0x152"
+    },
+    {
+      "name": "ls_not_halted_cyc",
+      "desc": "Cycles not in Halt.",
+      "code": "0x76"
+    },
+    {
+      "name": "ic_oc_mode_switch.oc_ic_mode_switch",
+      "desc": "OC Mode Switch. OC to IC mode switch.",
+      "code": "0x48a"
+    },
+    {
+      "name": "ic_oc_mode_switch.ic_oc_mode_switch",
+      "desc": "OC Mode Switch. IC to OC mode switch.",
+      "code": "0x38a"
+    },
+    {
+      "name": "de_dis_dispatch_token_stalls0.retire_token_stall",
+      "desc": "Cycles where a dispatch group is valid but does not get dispatched due to a token stall. RETIRE Tokens unavailable.",
+      "code": "0x40af"
+    },
+    {
+      "name": "de_dis_dispatch_token_stalls0.agsq_token_stall",
+      "desc": "Cycles where a dispatch group is valid but does not get dispatched due to a token stall. AGSQ Tokens unavailable.",
+      "code": "0x20af"
+    },
+    {
+      "name": "de_dis_dispatch_token_stalls0.alu_token_stall",
+      "desc": "Cycles where a dispatch group is valid but does not get dispatched due to a token stall. ALU tokens total unavailable.",
+      "code": "0x10af"
+    },
+    {
+      "name": "de_dis_dispatch_token_stalls0.alsq3_0_token_stall",
+      "desc": "Cycles where a dispatch group is valid but does not get dispatched due to a token stall. ALSQ 3_0 Tokens unavailable.",
+      "code": "0x8af"
+    },
+    {
+      "name": "de_dis_dispatch_token_stalls0.alsq3_token_stall",
+      "desc": "Cycles where a dispatch group is valid but does not get dispatched due to a token stall. ALSQ 3 Tokens unavailable.",
+      "code": "0x4af"
+    },
+    {
+      "name": "de_dis_dispatch_token_stalls0.alsq2_token_stall",
+      "desc": "Cycles where a dispatch group is valid but does not get dispatched due to a token stall. ALSQ 2 Tokens unavailable.",
+      "code": "0x2af"
+    },
+    {
+      "name": "de_dis_dispatch_token_stalls0.alsq1_token_stall",
+      "desc": "Cycles where a dispatch group is valid but does not get dispatched due to a token stall. ALSQ 1 Tokens unavailable.",
+      "code": "0x1af"
+    },
+    {
+      "name": "all_dc_accesses",
+      "desc": "All L1 Data Cache Accesses",
+      "code": "0x729"
+    },
+    {
+      "name": "l2_cache_accesses_from_ic_misses",
+      "desc": "L2 Cache Accesses from L1 Instruction Cache Misses (including prefetch)",
+      "code": "0x1060"
+    },
+    {
+      "name": "l2_cache_accesses_from_dc_misses",
+      "desc": "L2 Cache Accesses from L1 Data Cache Misses (including prefetch)",
+      "code": "0xc860"
+    },
+    {
+      "name": "l2_cache_misses_from_ic_miss",
+      "desc": "L2 Cache Misses from L1 Instruction Cache Misses",
+      "code": "0x164"
+    },
+    {
+      "name": "l2_cache_misses_from_dc_misses",
+      "desc": "L2 Cache Misses from L1 Data Cache Misses",
+      "code": "0x864"
+    },
+    {
+      "name": "l2_cache_hits_from_ic_misses",
+      "desc": "L2 Cache Hits from L1 Instruction Cache Misses",
+      "code": "0x664"
+    },
+    {
+      "name": "l2_cache_hits_from_dc_misses",
+      "desc": "L2 Cache Hits from L1 Data Cache Misses",
+      "code": "0x7064"
+    },
+    {
+      "name": "l2_cache_hits_from_l2_hwpf",
+      "desc": "L2 Cache Hits from L2 HWPF",
+      "code": "0xff70"
+    },
+    {
+      "name": "l3_accesses",
+      "desc": "L3 Accesses",
+      "code": "0xff04"
+    },
+    {
+      "name": "l3_misses",
+      "desc": "L3 Misses (includes Chg2X)",
+      "code": "0x104"
+    },
+    {
+      "name": "l2_itlb_misses",
+      "desc": "L2 ITLB Misses & Instruction page walks",
+      "code": "0x785"
+    },
+    {
+      "name": "l1_dtlb_misses",
+      "desc": "L1 DTLB Misses",
+      "code": "0xff45"
+    },
+    {
+      "name": "l2_dtlb_misses",
+      "desc": "L2 DTLB Misses & Data page walks",
+      "code": "0xf045"
+    },
+    {
+      "name": "all_tlbs_flushed",
+      "desc": "All TLBs Flushed",
+      "code": "0xdf78"
+    },
+    {
+      "name": "uops_dispatched",
+      "desc": "Micro-ops Dispatched",
+      "code": "0x3aa"
+    },
+    {
+      "name": "sse_avx_stalls",
+      "desc": "Mixed SSE/AVX Stalls",
+      "code": "0xe0e"
+    },
+    {
+      "name": "uops_retired",
+      "desc": "Micro-ops Retired",
+      "code": "0xc1"
     }
   ]
 }

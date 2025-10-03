@@ -91,6 +91,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
         time_enabled: 0,
         time_running: 0,
         value: 0,
+        name: 0,
         timestamp: handle.timestamp,
         callstack: smallvec![start_frame],
     };
@@ -131,6 +132,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         time_enabled: 0,
         time_running: 0,
         value: 0,
+        name: 0,
         timestamp,
         callstack: smallvec![],
     };
@@ -165,6 +167,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
             time_enabled: 0,
             time_running: 0,
             value,
+            name: 0,
             timestamp,
             callstack: smallvec![],
         };
