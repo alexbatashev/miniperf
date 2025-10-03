@@ -61,18 +61,38 @@ fn expr<'src>() -> impl Parser<'src, &'src str, Expr> {
             .or(constant())
             .or(variable())
             .or(expr.clone().delimited_by(just("("), just(")")))
-            .padded().boxed();
+            .padded()
+            .boxed();
 
-        let product_op = just("*").padded().to(BinOp::Mul).or(just("/").padded().to(BinOp::Div));
-        let product = atom.clone().foldl(product_op.then(atom).repeated(), |lhs, (op, rhs)| {
-           Expr::Binary{ op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
-        });
+        let product_op = just("*")
+            .padded()
+            .to(BinOp::Mul)
+            .or(just("/").padded().to(BinOp::Div));
+        let product = atom
+            .clone()
+            .foldl(product_op.then(atom).repeated(), |lhs, (op, rhs)| {
+                Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                }
+            });
 
-        let sum_op = just("+").padded().to(BinOp::Add).or(just("-").padded().to(BinOp::Sub));
+        let sum_op = just("+")
+            .padded()
+            .to(BinOp::Add)
+            .or(just("-").padded().to(BinOp::Sub));
 
-        let sum = product.clone().foldl(sum_op.then(product.clone()).repeated(), |lhs, (op, rhs)| {
-            Expr::Binary{ op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
-        });
+        let sum =
+            product
+                .clone()
+                .foldl(sum_op.then(product.clone()).repeated(), |lhs, (op, rhs)| {
+                    Expr::Binary {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }
+                });
 
         sum
     })

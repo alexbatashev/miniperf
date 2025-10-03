@@ -134,7 +134,10 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
 
     Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
         pid: process.pid(),
-        counters: counters.iter().map(|counter| (counter_to_event_ty(counter), counter.name().to_string())).collect(),
+        counters: counters
+            .iter()
+            .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
+            .collect(),
     }))
 }
 
@@ -259,7 +262,10 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
 
     Ok(ScenarioInfo::Roofline(RooflineInfo {
         perf_pid,
-        counters: counters.iter().map(|counter| (counter_to_event_ty(counter), counter.name().to_string())).collect(),
+        counters: counters
+            .iter()
+            .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
+            .collect(),
         inst_pid,
     }))
 }
@@ -292,16 +298,11 @@ fn create_shmem_pipe(
                 IPCMessage::Event(mut event) => {
                     for stack in event.callstack.iter_mut() {
                         if let CallFrame::Location(loc) = stack {
-                            loc.function_name = strings
-                                .get(&loc.function_name)
-                                .cloned()
-                                .unwrap_or_default()
-                                as u128;
-                            loc.file_name = strings
-                                .get(&loc.file_name)
-                                .cloned()
-                                .unwrap_or_default()
-                                as u128;
+                            loc.function_name =
+                                strings.get(&loc.function_name).cloned().unwrap_or_default()
+                                    as u128;
+                            loc.file_name =
+                                strings.get(&loc.file_name).cloned().unwrap_or_default() as u128;
                         }
                     }
 
@@ -392,8 +393,12 @@ fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scena
 
     Ok(ScenarioInfo::TMA(mperf_data::TMAInfo {
         pid: process.pid(),
-        counters: counters.iter().map(|counter| (counter_to_event_ty(counter), counter.name().to_string())).collect(),
+        counters: counters
+            .iter()
+            .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
+            .collect(),
         metrics: scenario.metrics.clone(),
         constants: scenario.constants.clone(),
+        ui: scenario.ui.clone(),
     }))
 }

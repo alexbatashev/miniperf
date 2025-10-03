@@ -57,6 +57,7 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
         }
         Scenario::TMA => {
             process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
+            process_disassembly(&connection, res_dir, &mut pb).await?;
             create_tma_view(&connection, &info.scenario_info).await?;
         }
     }

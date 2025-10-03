@@ -16,7 +16,7 @@
         "ic_fw32",
         "ic_fw32_miss",
         "ex_ret_brn_resync",
-        "l2_fill_pending.l2_fill_busy" 
+        "l2_fill_pending.l2_fill_busy"
       ],
       "constants": [
         {
@@ -49,7 +49,49 @@
           "desc": "Fraction of cycles backend was out of resources",
           "formula": "ic_fetch_stall.ic_stall_back_pressure / cycles"
         }
-      ]
+      ],
+      "ui": {
+        "tabs": [
+          { "kind": "summary" },
+          {
+            "kind": "metrics_table",
+            "view": "tma",
+            "title": "TMA Metrics",
+            "function_column": "func_name",
+            "enable_assembly": true,
+            "sticky_columns": 1,
+            "order_by": { "column": "total", "direction": "desc" },
+            "limit": 50,
+            "columns": [
+              {
+                "key": "retiring",
+                "label": "Retiring",
+                "format": "percent2",
+                "width": 120
+              },
+              {
+                "key": "fe_bound",
+                "label": "FE Bound",
+                "format": "percent2",
+                "width": 12
+              },
+              {
+                "key": "bad_speculation",
+                "label": "Bad Speculation",
+                "format": "percent2",
+                "width": 15
+              },
+              {
+                "key": "be_bound",
+                "label": "BE Bound",
+                "format": "percent2",
+                "width": 12
+              }
+            ]
+          },
+          { "kind": "flamegraph" }
+        ]
+      }
     }
   ],
   "events": [

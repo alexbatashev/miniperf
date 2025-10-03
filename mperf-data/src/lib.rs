@@ -1,5 +1,5 @@
 use clap::ValueEnum;
-use pmu_data::{Constant, Metric};
+use pmu_data::{Constant, Metric, ScenarioUi};
 use serde::{Deserialize, Serialize};
 
 mod event;
@@ -34,6 +34,8 @@ pub struct TMAInfo {
     pub counters: Vec<(EventType, String)>,
     pub metrics: Vec<Metric>,
     pub constants: Vec<Constant>,
+    #[serde(default)]
+    pub ui: Option<ScenarioUi>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

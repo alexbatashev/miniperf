@@ -1,11 +1,7 @@
 use lazy_static::lazy_static;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use shmem::proc_channel::Sender;
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    sync::Mutex,
-};
+use std::{cell::RefCell, collections::HashMap, sync::Mutex};
 
 use mperf_data::{Event, IPCMessage, IPCString};
 
