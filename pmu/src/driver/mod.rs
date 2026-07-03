@@ -49,9 +49,31 @@ pub trait SamplingDriver {
     fn stop(&mut self) -> Result<(), Error>;
 }
 
+/// Identifies the core cluster a counter value was measured on, on a
+/// heterogeneous (big.LITTLE) system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreId {
+    /// Family id, e.g. `"cortex_a720"`.
+    pub family_id: String,
+    /// Human readable name, e.g. `"ARM Cortex-A720"`.
+    pub name: String,
+    /// sysfs cpumask for the cluster, e.g. `"0,5-11"`.
+    pub cpus: String,
+}
+
+/// A single measured counter value, tagged with the core it was measured on.
 #[derive(Debug, Clone)]
+pub struct CounterEntry {
+    /// The core cluster this value came from. `None` on homogeneous systems and
+    /// for software counters, which are not PMU-specific.
+    pub core: Option<CoreId>,
+    pub counter: Counter,
+    pub value: CounterValue,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct CounterResult {
-    values: SmallVec<[(Counter, CounterValue); 16]>,
+    entries: SmallVec<[CounterEntry; 16]>,
 }
 
 /// Sampling driver produces records that describe events
@@ -74,6 +96,9 @@ pub struct Sample {
     pub tid: u32,
     /// CPU ID that the event occured on
     pub cpu: u32,
+    /// Family id of the core cluster this sample came from (e.g.
+    /// `"cortex_a720"`), on a heterogeneous system. `None` on homogeneous hosts.
+    pub core: Option<String>,
     /// Timestamp
     pub time: u64,
     pub time_enabled: u64,
@@ -212,21 +237,59 @@ impl SamplingDriverBuilder {
 }
 
 impl CounterResult {
+    pub fn from_entries(entries: SmallVec<[CounterEntry; 16]>) -> Self {
+        CounterResult { entries }
+    }
+
+    /// Faithful total for a counter, summed across every core it was measured
+    /// on. On a homogeneous system this is simply the single value.
     pub fn get(&self, kind: Counter) -> Option<CounterValue> {
-        self.values
+        let matching: SmallVec<[&CounterEntry; 8]> =
+            self.entries.iter().filter(|e| e.counter == kind).collect();
+
+        if matching.is_empty() {
+            return None;
+        }
+
+        let value = matching.iter().map(|e| e.value.value).sum();
+        let scaling = matching.iter().map(|e| e.value.scaling).sum::<f64>() / matching.len() as f64;
+
+        Some(CounterValue { value, scaling })
+    }
+
+    /// Value of a counter on one specific core.
+    pub fn get_for(&self, core: &Option<CoreId>, kind: Counter) -> Option<CounterValue> {
+        self.entries
             .iter()
-            .find(|(c, _)| *c == kind)
-            .map(|(_, v)| v)
-            .cloned()
+            .find(|e| e.core == *core && e.counter == kind)
+            .map(|e| e.value.clone())
+    }
+
+    /// The distinct cores present, in first-seen order. Empty on homogeneous
+    /// systems (all entries are untagged).
+    pub fn cores(&self) -> Vec<CoreId> {
+        let mut cores: Vec<CoreId> = Vec::new();
+        for entry in &self.entries {
+            if let Some(core) = &entry.core {
+                if !cores.contains(core) {
+                    cores.push(core.clone());
+                }
+            }
+        }
+        cores
+    }
+
+    pub fn entries(&self) -> &[CounterEntry] {
+        &self.entries
     }
 }
 
 impl IntoIterator for CounterResult {
-    type Item = (Counter, CounterValue);
+    type Item = CounterEntry;
 
-    type IntoIter = <SmallVec<[(Counter, CounterValue); 16]> as IntoIterator>::IntoIter;
+    type IntoIter = <SmallVec<[CounterEntry; 16]> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.values.into_iter()
+        self.entries.into_iter()
     }
 }

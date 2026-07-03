@@ -43,6 +43,7 @@ pub fn direct(
 
         handles.push(NativeCounterHandle {
             kind: cntr.clone(),
+            core: None,
             id,
             fd: new_fd,
             leader: false,
@@ -142,7 +143,7 @@ pub fn grouped(
         handles.push(get_native_handle(
             cycles_fd,
             Counter::Cycles,
-            !leader.is_some(),
+            leader.is_none(),
         )?);
 
         let instr_fd =
@@ -180,6 +181,7 @@ fn get_native_handle(fd: i32, cntr: Counter, leader: bool) -> Result<NativeCount
 
     Ok(NativeCounterHandle {
         kind: cntr,
+        core: None,
         id,
         fd,
         leader,

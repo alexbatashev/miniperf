@@ -43,11 +43,23 @@ pub async fn do_record(
         None
     };
 
+    let (cpu_vendor, cpu_model) = pmu::host_cpu_description();
+
+    let cores = pmu::host_core_clusters()
+        .into_iter()
+        .map(|c| mperf_data::CoreCluster {
+            family_id: c.family_id,
+            name: c.name,
+            cpus: c.cpus,
+        })
+        .collect();
+
     let ri = RecordInfo {
         scenario,
         command: json_command,
-        cpu_model: "Unknown".to_string(),
-        cpu_vendor: "Unknown".to_string(),
+        cpu_model,
+        cpu_vendor,
+        cores,
         scenario_info: info,
     };
 
@@ -90,6 +102,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
                     ty: counter_to_event_ty(&sample.counter),
                     thread_id: sample.tid,
                     process_id: sample.pid,
+                    cpu: sample.cpu,
                     time_enabled: sample.time_enabled,
                     time_running: sample.time_running,
                     value: sample.value,
@@ -175,6 +188,7 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
                     ty: counter_to_event_ty(&sample.counter),
                     thread_id: sample.tid,
                     process_id: sample.pid,
+                    cpu: sample.cpu,
                     time_enabled: sample.time_enabled,
                     time_running: sample.time_running,
                     value: sample.value,
