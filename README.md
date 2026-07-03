@@ -126,6 +126,29 @@ This will display detailed analysis based on the recorded profile.
 
 ## Platform-Specific Notes
 
+### AArch64 (Arm)
+
+- CPU cores are identified from `MIDR_EL1` (implementer + part number). Cortex-A720
+  and Cortex-A520 are shipped with curated PMU event sets; other cores fall back
+  to the architectural events exposed by `perf_event`.
+- On heterogeneous (big.LITTLE) systems each cluster exposes its own PMU with a
+  distinct `perf_event` type. `mperf stat` opens every hardware counter on *each*
+  cluster's PMU, so a task is counted correctly wherever it runs. Results are
+  reported per core cluster plus a faithful total summed across clusters. Per-core
+  values are raw on-cluster counts (never extrapolated across clusters).
+- `mperf record` likewise samples on every cluster's PMU, so execution on any core
+  is captured. In addition to the merged `flamegraph_cycles.{svg,folded}`, per-core
+  flamegraphs are written as `flamegraph_cycles_<family>.{svg,folded}` (and the same
+  for instructions), e.g. `flamegraph_cycles_cortex_a720.svg`.
+- By default the detected primary (first recognized) core determines the CPU
+  family used for event names and sampling. To target a specific cluster
+  explicitly — for example to profile the little cluster — set
+  `MINIPERF_CPU_FAMILY` and pin the workload to that cluster:
+
+  ```sh
+  MINIPERF_CPU_FAMILY=cortex_a520 taskset -c 1-4 mperf stat -- ./workload
+  ```
+
 ### SpacemiT X60
 
 - SpacemiT X60 cores do not implement overflow interrupt for cycles or

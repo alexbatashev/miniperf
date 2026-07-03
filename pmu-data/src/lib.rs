@@ -23,6 +23,9 @@ pub const SIFIVE_U7: &str = "sifive_u7";
 
 pub const SPACEMIT_X60: &str = "spacemit_x60";
 
+pub const ARM_CORTEX_A520: &str = "cortex_a520";
+pub const ARM_CORTEX_A720: &str = "cortex_a720";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlatformDesc {
     pub family_id: String,

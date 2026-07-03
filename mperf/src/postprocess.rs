@@ -18,6 +18,10 @@ use tokio::{
 use crate::disassembly::{default_disassembler, DisassembleRequest};
 use crate::utils;
 
+/// A core cluster resolved for post-processing: `(family_id, display name,
+/// inclusive CPU ranges)`.
+type ClusterRanges = (String, String, Vec<(u32, u32)>);
+
 pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()> {
     let mut pb = pb;
 
@@ -139,8 +143,22 @@ async fn process_pmu_counters(
 
     let mut known_ips = HashSet::<u64>::new();
 
+    // Core-cluster topology, used to attribute samples per core on
+    // heterogeneous (big.LITTLE) systems. Empty on homogeneous hosts.
+    let clusters: Vec<ClusterRanges> = {
+        let data = std::fs::read_to_string(res_dir.join("info.json"))?;
+        let ri: RecordInfo = serde_json::from_str(&data)?;
+        ri.cores
+            .into_iter()
+            .map(|c| (c.family_id, c.name, parse_cpumask(&c.cpus)))
+            .collect()
+    };
+
     let mut flamegraph_cycles = HashMap::<String, u64>::new();
     let mut flamegraph_instructions = HashMap::<String, u64>::new();
+    // family_id -> (display name, folded stack -> value)
+    let mut per_core_cycles = HashMap::<String, (String, HashMap<String, u64>)>::new();
+    let mut per_core_instructions = HashMap::<String, (String, HashMap<String, u64>)>::new();
 
     while (cursor.position() as usize) < map.len() {
         let evt = Event::read_binary(&mut cursor).expect("Failed to decode event");
@@ -172,9 +190,27 @@ async fn process_pmu_counters(
             .join(";");
 
         if evt.ty == EventType::PmuCycles {
-            *flamegraph_cycles.entry(func_names).or_default() += evt.value;
+            *flamegraph_cycles.entry(func_names.clone()).or_default() += evt.value;
+            if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
+                *per_core_cycles
+                    .entry(family_id)
+                    .or_insert_with(|| (name, HashMap::new()))
+                    .1
+                    .entry(func_names)
+                    .or_default() += evt.value;
+            }
         } else if evt.ty == EventType::PmuInstructions {
-            *flamegraph_instructions.entry(func_names).or_default() += evt.value;
+            *flamegraph_instructions
+                .entry(func_names.clone())
+                .or_default() += evt.value;
+            if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
+                *per_core_instructions
+                    .entry(family_id)
+                    .or_insert_with(|| (name, HashMap::new()))
+                    .1
+                    .entry(func_names)
+                    .or_default() += evt.value;
+            }
         }
 
         if evt.correlation_id
@@ -274,42 +310,74 @@ async fn process_pmu_counters(
         counters.insert(format!("{}", evt.ty), evt.value);
     }
 
-    let flamegraph_cycles = flamegraph_cycles
-        .into_iter()
-        .map(|(key, value)| format!("{} {}", key, value))
-        .collect::<Vec<_>>();
-    let flamegraph_instructions = flamegraph_instructions
+    write_flamegraph(res_dir, "flamegraph_cycles", flamegraph_cycles).await?;
+    write_flamegraph(res_dir, "flamegraph_instructions", flamegraph_instructions).await?;
+
+    // Per-core flamegraphs on heterogeneous systems, e.g.
+    // `flamegraph_cycles_cortex_a720.folded`.
+    for (family_id, (_name, map)) in per_core_cycles {
+        write_flamegraph(res_dir, &format!("flamegraph_cycles_{family_id}"), map).await?;
+    }
+    for (family_id, (_name, map)) in per_core_instructions {
+        write_flamegraph(
+            res_dir,
+            &format!("flamegraph_instructions_{family_id}"),
+            map,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Parse a sysfs cpumask list such as `"0,5-11"` into inclusive `(start, end)`
+/// ranges.
+fn parse_cpumask(mask: &str) -> Vec<(u32, u32)> {
+    mask.trim()
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            match part.split_once('-') {
+                Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
+                None => {
+                    let v: u32 = part.parse().ok()?;
+                    Some((v, v))
+                }
+            }
+        })
+        .collect()
+}
+
+/// Find the `(family_id, name)` of the core cluster a CPU belongs to.
+fn cluster_of(clusters: &[ClusterRanges], cpu: u32) -> Option<(String, String)> {
+    if cpu == u32::MAX {
+        return None;
+    }
+    clusters
+        .iter()
+        .find(|(_, _, ranges)| ranges.iter().any(|(a, b)| cpu >= *a && cpu <= *b))
+        .map(|(family_id, name, _)| (family_id.clone(), name.clone()))
+}
+
+/// Write a folded stack collapse map to `<stem>.folded` and `<stem>.svg`.
+async fn write_flamegraph(res_dir: &Path, stem: &str, map: HashMap<String, u64>) -> Result<()> {
+    let lines = map
         .into_iter()
         .map(|(key, value)| format!("{} {}", key, value))
         .collect::<Vec<_>>();
 
     let mut options = inferno::flamegraph::Options::default();
     options.reverse_stack_order = false;
-    let fg_file = std::fs::File::create(res_dir.join("flamegraph_cycles.svg"))?;
-    inferno::flamegraph::from_lines(
-        &mut options,
-        flamegraph_cycles.iter().map(|s| s.as_str()),
-        &fg_file,
-    )?;
-    let fg_file = std::fs::File::create(res_dir.join("flamegraph_instructions.svg"))?;
-    inferno::flamegraph::from_lines(
-        &mut options,
-        flamegraph_instructions.iter().map(|s| s.as_str()),
-        &fg_file,
-    )?;
+    let svg = std::fs::File::create(res_dir.join(format!("{stem}.svg")))?;
+    inferno::flamegraph::from_lines(&mut options, lines.iter().map(|s| s.as_str()), &svg)?;
 
-    let mut fg_file = File::create(res_dir.join("flamegraph_cycles.folded")).await?;
-
-    for fc in flamegraph_cycles {
-        fg_file.write_all(fc.as_bytes()).await?;
-        fg_file.write_all("\n".as_bytes()).await?;
-    }
-
-    let mut fg_file = File::create(res_dir.join("flamegraph_instructions.folded")).await?;
-
-    for fi in flamegraph_instructions {
-        fg_file.write_all(fi.as_bytes()).await?;
-        fg_file.write_all("\n".as_bytes()).await?;
+    let mut folded = File::create(res_dir.join(format!("{stem}.folded"))).await?;
+    for line in &lines {
+        folded.write_all(line.as_bytes()).await?;
+        folded.write_all(b"\n").await?;
     }
 
     Ok(())

@@ -65,6 +65,10 @@ pub struct Event {
     pub ty: EventType,
     pub thread_id: u32,
     pub process_id: u32,
+    /// Logical CPU the sample fired on. Used to attribute samples to a core
+    /// cluster on heterogeneous (big.LITTLE) systems. `u32::MAX` when unknown
+    /// (e.g. synthetic instrumentation events).
+    pub cpu: u32,
     pub time_enabled: u64,
     pub time_running: u64,
     pub value: u64,

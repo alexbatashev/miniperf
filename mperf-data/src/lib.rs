@@ -32,12 +32,27 @@ pub enum ScenarioInfo {
     Roofline(RooflineInfo),
 }
 
+/// A cluster of cores on a heterogeneous (big.LITTLE) system, used to attribute
+/// samples to a specific core type during post-processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreCluster {
+    /// Family id, e.g. `"cortex_a720"`.
+    pub family_id: String,
+    /// Human readable name, e.g. `"ARM Cortex-A720"`.
+    pub name: String,
+    /// sysfs cpumask string, e.g. `"0,5-11"`.
+    pub cpus: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordInfo {
     pub scenario: Scenario,
     pub command: Option<Vec<String>>,
     pub cpu_model: String,
     pub cpu_vendor: String,
+    /// Core clusters on a heterogeneous host (empty on homogeneous systems).
+    #[serde(default)]
+    pub cores: Vec<CoreCluster>,
     pub scenario_info: ScenarioInfo,
 }
 

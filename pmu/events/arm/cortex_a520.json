@@ -1,0 +1,747 @@
+{
+  "family_id": "cortex_a520",
+  "name": "ARM Cortex-A520",
+  "vendor": "ARM",
+  "arch": "aarch64",
+  "aliases": [
+    {
+      "target": "cycles",
+      "origin": "CPU_CYCLES"
+    },
+    {
+      "target": "instructions",
+      "origin": "INST_RETIRED"
+    },
+    {
+      "target": "branches",
+      "origin": "BR_RETIRED"
+    },
+    {
+      "target": "branch_misses",
+      "origin": "BR_MIS_PRED_RETIRED"
+    },
+    {
+      "target": "cache_references",
+      "origin": "LL_CACHE_RD"
+    },
+    {
+      "target": "cache_misses",
+      "origin": "LL_CACHE_MISS_RD"
+    },
+    {
+      "target": "stalled_cycles_frontend",
+      "origin": "STALL_FRONTEND"
+    },
+    {
+      "target": "stalled_cycles_backend",
+      "origin": "STALL_BACKEND"
+    }
+  ],
+  "events": [
+    {
+      "name": "BR_MIS_PRED",
+      "desc": "Mispredicted or not predicted branch speculatively executed",
+      "code": "0x10"
+    },
+    {
+      "name": "BR_PRED",
+      "desc": "Predictable branch speculatively executed",
+      "code": "0x12"
+    },
+    {
+      "name": "BR_IMMED_SPEC",
+      "desc": "Branch speculatively executed, immediate branch",
+      "code": "0x78"
+    },
+    {
+      "name": "BR_RETURN_SPEC",
+      "desc": "Branch speculatively executed, procedure return",
+      "code": "0x79"
+    },
+    {
+      "name": "BR_INDIRECT_SPEC",
+      "desc": "Branch speculatively executed, indirect branch",
+      "code": "0x7a"
+    },
+    {
+      "name": "BR_COND_PRED",
+      "desc": "Predicted conditional branch executed. This event counts when any branch that the conditional predictor can predict is retired. This event still counts when branch prediction is disabled due to the Memory Management Unit (MMU) being off",
+      "code": "0xc9"
+    },
+    {
+      "name": "BR_INDIRECT_MIS_PRED",
+      "desc": "Indirect branch mispredicted. This event counts when any indirect branch that the Branch Target Address Cache (BTAC) can predict is retired and has mispredicted either the condition or the address. This event still counts when branch prediction is disabled due to the MMU being off",
+      "code": "0xca"
+    },
+    {
+      "name": "BR_INDIRECT_ADDR_MIS_PRED",
+      "desc": "Indirect branch mispredicted due to address miscompare. This event counts when any indirect branch that the BTAC can predict is retired, was taken, correctly predicted the condition, and has mispredicted the address. This event still counts when branch prediction is disabled due to the MMU being off",
+      "code": "0xcb"
+    },
+    {
+      "name": "BR_COND_MIS_PRED",
+      "desc": "Conditional branch mispredicted. This event counts when any branch that the conditional predictor can predict is retired and has mispredicted the condition. This event still counts when branch prediction is disabled due to the MMU being off. Conditional indirect branches that correctly predict the condition but mispredict the address do not count",
+      "code": "0xcc"
+    },
+    {
+      "name": "BR_INDIRECT_ADDR_PRED",
+      "desc": "Indirect branch with predicted address executed. This event counts when any indirect branch that the BTAC can predict is retired, was taken, and correctly predicted the condition. This event still counts when branch prediction is disabled due to the MMU being off",
+      "code": "0xcd"
+    },
+    {
+      "name": "BR_RETURN_ADDR_PRED",
+      "desc": "Procedure return with predicted address executed. This event counts when any procedure return that the call-return stack can predict is retired, was taken, and correctly predicted the condition. This event still counts when branch prediction is disabled due to the MMU being off",
+      "code": "0xce"
+    },
+    {
+      "name": "BR_RETURN_ADDR_MIS_PRED",
+      "desc": "Procedure return mispredicted due to address miscompare. This event counts when any procedure return that the call-return stack can predict is retired, was taken, correctly predicted the condition, and has mispredicted the address. This event still counts when branch prediction is disabled due to the MMU being off",
+      "code": "0xcf"
+    },
+    {
+      "name": "CPU_CYCLES",
+      "desc": "Cycle",
+      "code": "0x11"
+    },
+    {
+      "name": "BUS_ACCESS",
+      "desc": "Attributable Bus access",
+      "code": "0x19"
+    },
+    {
+      "name": "BUS_CYCLES",
+      "desc": "Bus cycle",
+      "code": "0x1d"
+    },
+    {
+      "name": "BUS_ACCESS_RD",
+      "desc": "Bus access read",
+      "code": "0x60"
+    },
+    {
+      "name": "BUS_ACCESS_WR",
+      "desc": "Bus access write",
+      "code": "0x61"
+    },
+    {
+      "name": "L1I_CACHE_REFILL",
+      "desc": "Level 1 instruction cache refill",
+      "code": "0x01"
+    },
+    {
+      "name": "L1I_TLB_REFILL",
+      "desc": "Attributable Level 1 instruction TLB refill",
+      "code": "0x02"
+    },
+    {
+      "name": "L1D_CACHE_REFILL",
+      "desc": "Level 1 data cache refill",
+      "code": "0x03"
+    },
+    {
+      "name": "L1D_CACHE",
+      "desc": "Level 1 data cache access",
+      "code": "0x04"
+    },
+    {
+      "name": "L1D_TLB_REFILL",
+      "desc": "Attributable Level 1 data TLB refill",
+      "code": "0x05"
+    },
+    {
+      "name": "L1I_CACHE",
+      "desc": "Attributable Level 1 instruction cache access",
+      "code": "0x14"
+    },
+    {
+      "name": "L1D_CACHE_WB",
+      "desc": "Attributable Level 1 data cache write-back",
+      "code": "0x15"
+    },
+    {
+      "name": "L2D_CACHE",
+      "desc": "Level 2 data cache access",
+      "code": "0x16"
+    },
+    {
+      "name": "L2D_CACHE_REFILL",
+      "desc": "Level 2 data refill",
+      "code": "0x17"
+    },
+    {
+      "name": "L2D_CACHE_WB",
+      "desc": "Attributable Level 2 data cache write-back",
+      "code": "0x18"
+    },
+    {
+      "name": "L2D_CACHE_ALLOCATE",
+      "desc": "Attributable Level 2 data cache allocation without refill",
+      "code": "0x20"
+    },
+    {
+      "name": "L1D_TLB",
+      "desc": "Attributable Level 1 data or unified TLB access",
+      "code": "0x25"
+    },
+    {
+      "name": "L1I_TLB",
+      "desc": "Attributable Level 1 instruction TLB access",
+      "code": "0x26"
+    },
+    {
+      "name": "L3D_CACHE",
+      "desc": "Attributable Level 3 data cache access",
+      "code": "0x2b"
+    },
+    {
+      "name": "L2D_TLB_REFILL",
+      "desc": "Attributable Level 2 data TLB refill",
+      "code": "0x2d"
+    },
+    {
+      "name": "L2D_TLB",
+      "desc": "Attributable Level 2 data or unified TLB access",
+      "code": "0x2f"
+    },
+    {
+      "name": "DTLB_WALK",
+      "desc": "Access to data TLB causes a translation table walk",
+      "code": "0x34"
+    },
+    {
+      "name": "ITLB_WALK",
+      "desc": "Access to instruction TLB that causes a translation table walk",
+      "code": "0x35"
+    },
+    {
+      "name": "LL_CACHE_RD",
+      "desc": "Attributable Last level cache memory read",
+      "code": "0x36"
+    },
+    {
+      "name": "LL_CACHE_MISS_RD",
+      "desc": "Last level cache miss, read",
+      "code": "0x37"
+    },
+    {
+      "name": "L1D_CACHE_LMISS_RD",
+      "desc": "Level 1 data cache long-latency read miss",
+      "code": "0x39"
+    },
+    {
+      "name": "L1D_CACHE_RD",
+      "desc": "L1D cache access, read",
+      "code": "0x40"
+    },
+    {
+      "name": "L1D_CACHE_WR",
+      "desc": "L1D cache access, write",
+      "code": "0x41"
+    },
+    {
+      "name": "L1D_CACHE_REFILL_RD",
+      "desc": "L1D cache refill, read",
+      "code": "0x42"
+    },
+    {
+      "name": "L1D_CACHE_REFILL_WR",
+      "desc": "L1D cache refill, write",
+      "code": "0x43"
+    },
+    {
+      "name": "L1D_CACHE_REFILL_INNER",
+      "desc": "L1D cache refill, inner",
+      "code": "0x44"
+    },
+    {
+      "name": "L1D_CACHE_REFILL_OUTER",
+      "desc": "L1D cache refill, outer",
+      "code": "0x45"
+    },
+    {
+      "name": "L2D_CACHE_RD",
+      "desc": "L2D cache access, read",
+      "code": "0x50"
+    },
+    {
+      "name": "L2D_CACHE_WR",
+      "desc": "L2D cache access, write",
+      "code": "0x51"
+    },
+    {
+      "name": "L2D_CACHE_REFILL_RD",
+      "desc": "L2D cache refill, read",
+      "code": "0x52"
+    },
+    {
+      "name": "L2D_CACHE_REFILL_WR",
+      "desc": "L2D cache refill, write",
+      "code": "0x53"
+    },
+    {
+      "name": "L3D_CACHE_RD",
+      "desc": "Attributable Level 3 data or unified cache access, read",
+      "code": "0xa0"
+    },
+    {
+      "name": "L3D_CACHE_REFILL_RD",
+      "desc": "Attributable Level 3 data or unified cache refill, read",
+      "code": "0xa2"
+    },
+    {
+      "name": "L2D_CACHE_REFILL_PREFETCH",
+      "desc": "L2 cache refill due to prefetch. If the complex is configured with a per-complex L2 cache, this event does not count. If the complex is configured without a per-complex L2 cache, this event counts the cluster cache event, as defined by L3D_CACHE_REFILL_PREFETCH. If neither a per-complex cache or a cluster cache is configured, this event is not implemented",
+      "code": "0xc1"
+    },
+    {
+      "name": "L1D_CACHE_REFILL_PREFETCH",
+      "desc": "L1 data cache refill due to prefetch. This event counts any linefills from the prefetcher that cause an allocation into the L1 data cache",
+      "code": "0xc2"
+    },
+    {
+      "name": "L2D_WS_MODE",
+      "desc": "L2 cache write streaming mode. This event counts for each cycle where the core is in write streaming mode and is not allocating writes into the L2 cache",
+      "code": "0xc3"
+    },
+    {
+      "name": "L1D_WS_MODE_ENTRY",
+      "desc": "L1 data cache entering write streaming mode. This event counts for each entry into write streaming mode",
+      "code": "0xc4"
+    },
+    {
+      "name": "L1D_WS_MODE",
+      "desc": "L1 data cache write streaming mode. This event counts for each cycle where the core is in write streaming mode and is not allocating writes into the L1 data cache",
+      "code": "0xc5"
+    },
+    {
+      "name": "L3D_WS_MODE",
+      "desc": "L3 cache write streaming mode. This event counts for each cycle where the core is in write streaming mode and is not allocating writes into the L3 cache",
+      "code": "0xc7"
+    },
+    {
+      "name": "LL_WS_MODE",
+      "desc": "Last level cache write streaming mode. This event counts for each cycle where the core is in write streaming mode and is not allocating writes into the system cache",
+      "code": "0xc8"
+    },
+    {
+      "name": "L2D_WALK_TLB",
+      "desc": "L2 TLB walk cache access. This event does not count if the MMU is disabled",
+      "code": "0xd0"
+    },
+    {
+      "name": "L2D_WALK_TLB_REFILL",
+      "desc": "L2 TLB walk cache refill. This event does not count if the MMU is disabled",
+      "code": "0xd1"
+    },
+    {
+      "name": "L2D_S2_TLB",
+      "desc": "L2 TLB IPA cache access. This event counts on each access to the IPA cache. If a single translation table walk needs to make multiple accesses to the IPA cache, each access is counted. If stage 2 translation is disabled, this event does not count",
+      "code": "0xd4"
+    },
+    {
+      "name": "L2D_S2_TLB_REFILL",
+      "desc": "L2 TLB IPA cache refill. This event counts on each refill of the IPA cache. If a single translation table walk needs to make multiple accesses to the IPA cache, each access that causes a refill is counted. If stage 2 translation is disabled, this event does not count",
+      "code": "0xd5"
+    },
+    {
+      "name": "L2D_CACHE_STASH_DROPPED",
+      "desc": "L2 cache stash dropped. This event counts on each stash request that is received from the interconnect or the Accelerator Coherency Port (ACP), that targets L2 cache and is dropped due to lack of buffer space to hold the request",
+      "code": "0xd6"
+    },
+    {
+      "name": "L1I_CACHE_LMISS",
+      "desc": "Level 1 instruction cache long-latency read miss",
+      "code": "0x4006"
+    },
+    {
+      "name": "L2D_CACHE_LMISS_RD",
+      "desc": "Level 2 data cache long-latency read miss",
+      "code": "0x4009"
+    },
+    {
+      "name": "L3D_CACHE_LMISS_RD",
+      "desc": "Level 3 data cache long-latency read miss",
+      "code": "0x400b"
+    },
+    {
+      "name": "EXC_TAKEN",
+      "desc": "Exception taken",
+      "code": "0x09"
+    },
+    {
+      "name": "MEMORY_ERROR",
+      "desc": "Local memory error",
+      "code": "0x1a"
+    },
+    {
+      "name": "EXC_IRQ",
+      "desc": "Exception taken, IRQ",
+      "code": "0x86"
+    },
+    {
+      "name": "EXC_FIQ",
+      "desc": "Exception taken, FIQ",
+      "code": "0x87"
+    },
+    {
+      "name": "LD_RETIRED",
+      "desc": "Instruction architecturally executed, condition code check pass, load",
+      "code": "0x06"
+    },
+    {
+      "name": "ST_RETIRED",
+      "desc": "Instruction architecturally executed, condition code check pass, store",
+      "code": "0x07"
+    },
+    {
+      "name": "INST_RETIRED",
+      "desc": "Instruction architecturally executed",
+      "code": "0x08"
+    },
+    {
+      "name": "EXC_RETURN",
+      "desc": "Instruction architecturally executed, condition check pass, exception return",
+      "code": "0x0a"
+    },
+    {
+      "name": "CID_WRITE_RETIRED",
+      "desc": "Instruction architecturally executed, condition code check pass, write to CONTEXTIDR",
+      "code": "0x0b"
+    },
+    {
+      "name": "PC_WRITE_RETIRED",
+      "desc": "Instruction architecturally executed, condition code check pass, software change of the PC",
+      "code": "0x0c"
+    },
+    {
+      "name": "BR_IMMED_RETIRED",
+      "desc": "Instruction architecturally executed, immediate branch",
+      "code": "0x0d"
+    },
+    {
+      "name": "BR_RETURN_RETIRED",
+      "desc": "Instruction architecturally executed, condition code check pass, procedure return",
+      "code": "0x0e"
+    },
+    {
+      "name": "INST_SPEC",
+      "desc": "Operation speculatively executed",
+      "code": "0x1b"
+    },
+    {
+      "name": "TTBR_WRITE_RETIRED",
+      "desc": "Instruction architecturally executed, Condition code check pass, write to TTBR",
+      "code": "0x1c"
+    },
+    {
+      "name": "BR_RETIRED",
+      "desc": "Instruction architecturally executed, branch",
+      "code": "0x21"
+    },
+    {
+      "name": "BR_MIS_PRED_RETIRED",
+      "desc": "Instruction architecturally executed, mispredicted branch",
+      "code": "0x22"
+    },
+    {
+      "name": "OP_RETIRED",
+      "desc": "Micro-operation architecturally executed",
+      "code": "0x3a"
+    },
+    {
+      "name": "OP_SPEC",
+      "desc": "Micro-operation speculatively executed",
+      "code": "0x3b"
+    },
+    {
+      "name": "LD_SPEC",
+      "desc": "Operation speculatively executed, load",
+      "code": "0x70"
+    },
+    {
+      "name": "ST_SPEC",
+      "desc": "Operation speculatively executed, store",
+      "code": "0x71"
+    },
+    {
+      "name": "LDST_SPEC",
+      "desc": "Operation speculatively executed, load or store",
+      "code": "0x72"
+    },
+    {
+      "name": "DP_SPEC",
+      "desc": "Operation speculatively executed, integer data processing",
+      "code": "0x73"
+    },
+    {
+      "name": "ASE_SPEC",
+      "desc": "Operation speculatively executed, Advanced SIMD instruction",
+      "code": "0x74"
+    },
+    {
+      "name": "VFP_SPEC",
+      "desc": "Operation speculatively executed, floating-point instruction",
+      "code": "0x75"
+    },
+    {
+      "name": "PC_WRITE_SPEC",
+      "desc": "Operation speculatively executed, software change of the PC",
+      "code": "0x76"
+    },
+    {
+      "name": "CRYPTO_SPEC",
+      "desc": "Operation speculatively executed, Cryptographic instruction",
+      "code": "0x77"
+    },
+    {
+      "name": "SVE_INST_RETIRED",
+      "desc": "Instruction architecturally executed, SVE.",
+      "code": "0x8002"
+    },
+    {
+      "name": "SVE_INST_SPEC",
+      "desc": "SVE operations speculatively executed",
+      "code": "0x8006"
+    },
+    {
+      "name": "FP_HP_SPEC",
+      "desc": "Floating-point half-precision operations speculatively executed",
+      "code": "0x8014"
+    },
+    {
+      "name": "FP_SP_SPEC",
+      "desc": "Floating-point single-precision operations speculatively executed",
+      "code": "0x8018"
+    },
+    {
+      "name": "FP_DP_SPEC",
+      "desc": "Floating-point double-precision operations speculatively executed",
+      "code": "0x801c"
+    },
+    {
+      "name": "ASE_SVE_INT8_SPEC",
+      "desc": "Advanced SIMD and SVE 8-bit integer operations speculatively executed",
+      "code": "0x80e3"
+    },
+    {
+      "name": "ASE_SVE_INT16_SPEC",
+      "desc": "Advanced SIMD and SVE 16-bit integer operations speculatively executed",
+      "code": "0x80e7"
+    },
+    {
+      "name": "ASE_SVE_INT32_SPEC",
+      "desc": "Advanced SIMD and SVE 32-bit integer operations speculatively executed",
+      "code": "0x80eb"
+    },
+    {
+      "name": "ASE_SVE_INT64_SPEC",
+      "desc": "Advanced SIMD and SVE 64-bit integer operations speculatively executed",
+      "code": "0x80ef"
+    },
+    {
+      "name": "MEM_ACCESS",
+      "desc": "Data memory access",
+      "code": "0x13"
+    },
+    {
+      "name": "REMOTE_ACCESS_RD",
+      "desc": "Attributable memory read access to another socket in a multi-socket system",
+      "code": "0x38"
+    },
+    {
+      "name": "MEM_ACCESS_RD",
+      "desc": "Data memory access, read",
+      "code": "0x66"
+    },
+    {
+      "name": "MEM_ACCESS_WR",
+      "desc": "Data memory access, write",
+      "code": "0x67"
+    },
+    {
+      "name": "LDST_ALIGN_LAT",
+      "desc": "Access with additional latency from alignment",
+      "code": "0x4020"
+    },
+    {
+      "name": "LD_ALIGN_LAT",
+      "desc": "Load with additional latency from alignment",
+      "code": "0x4021"
+    },
+    {
+      "name": "ST_ALIGN_LAT",
+      "desc": "Store with additional latency from alignment",
+      "code": "0x4022"
+    },
+    {
+      "name": "MEM_ACCESS_CHECKED",
+      "desc": "Checked data memory access",
+      "code": "0x4024"
+    },
+    {
+      "name": "MEM_ACCESS_CHECKED_RD",
+      "desc": "Checked data memory access, read",
+      "code": "0x4025"
+    },
+    {
+      "name": "MEM_ACCESS_CHECKED_WR",
+      "desc": "Checked data memory access, write",
+      "code": "0x4026"
+    },
+    {
+      "name": "STALL_FRONTEND",
+      "desc": "No operation issued because of the frontend",
+      "code": "0x23"
+    },
+    {
+      "name": "STALL_BACKEND",
+      "desc": "No operation issued due to the backend",
+      "code": "0x24"
+    },
+    {
+      "name": "STALL",
+      "desc": "No operation sent for execution",
+      "code": "0x3c"
+    },
+    {
+      "name": "STALL_SLOT_BACKEND",
+      "desc": "No operation sent for execution on a slot due to the backend",
+      "code": "0x3d"
+    },
+    {
+      "name": "STALL_SLOT_FRONTEND",
+      "desc": "No operation sent for execution on a slot due to the frontend",
+      "code": "0x3e"
+    },
+    {
+      "name": "STALL_SLOT",
+      "desc": "No operation sent for execution on a slot",
+      "code": "0x3f"
+    },
+    {
+      "name": "STALL_FRONTEND_CACHE",
+      "desc": "No operation issued due to the frontend, cache miss. This event counts every cycle that the Data Processing Unit (DPU) instruction queue is empty and there is an instruction cache miss being processed",
+      "code": "0xe1"
+    },
+    {
+      "name": "STALL_FRONTEND_TLB",
+      "desc": "No operation issued due to the frontend, TLB miss. This event counts every cycle that the DPU instruction queue is empty and there is an instruction L1 TLB miss being processed",
+      "code": "0xe2"
+    },
+    {
+      "name": "STALL_FRONTEND_PDERR",
+      "desc": "No operation issued due to the frontend, pre-decode error",
+      "code": "0xe3"
+    },
+    {
+      "name": "STALL_BACKEND_ILOCK",
+      "desc": "No operation issued due to the backend interlock. This event counts every cycle where the issue of an operation is stalled and there is an interlock. Stall cycles due to a stall in the Wr stage are excluded",
+      "code": "0xe4"
+    },
+    {
+      "name": "STALL_BACKEND_ILOCK_ADDR",
+      "desc": "No operation issued due to the backend, address interlock. This event counts every cycle where the issue of an operation is stalled and there is an interlock on an address operand. This type of interlock is caused by a load/store instruction waiting for data to calculate the address. Stall cycles due to a stall in the Wr stage are excluded",
+      "code": "0xe5"
+    },
+    {
+      "name": "STALL_BACKEND_ILOCK_VPU",
+      "desc": "No operation issued due to the backend, interlock, or the Vector Processing Unit (VPU). This event counts every cycle where there is a stall or an interlock that is caused by a VPU instruction. Stall cycles due to a stall in the Wr stage are excluded",
+      "code": "0xe6"
+    },
+    {
+      "name": "STALL_BACKEND_LD",
+      "desc": "No operation issued due to the backend, load. This event counts every cycle where there is a stall in the Wr stage due to a load",
+      "code": "0xe7"
+    },
+    {
+      "name": "STALL_BACKEND_ST",
+      "desc": "No operation issued due to the backend, store. This event counts every cycle where there is a stall in the Wr stage due to a store",
+      "code": "0xe8"
+    },
+    {
+      "name": "STALL_BACKEND_LD_CACHE",
+      "desc": "No operation issued due to the backend, load, cache miss. This event counts every cycle where there is a stall in the Wr stage due to a load that is waiting on data. The event counts for stalls that are caused by missing the cache or where the data is Non-cacheable",
+      "code": "0xe9"
+    },
+    {
+      "name": "STALL_BACKEND_LD_TLB",
+      "desc": "No operation issued due to the backend, load, TLB miss. This event counts every cycle where there is a stall in the Wr stage due to a load that misses in the L1 TLB",
+      "code": "0xea"
+    },
+    {
+      "name": "STALL_BACKEND_ST_STB",
+      "desc": "No operation issued due to the backend, store, Store Buffer (STB) full. This event counts every cycle where there is a stall in the Wr stage because of a store operation that is waiting due to the STB being full",
+      "code": "0xeb"
+    },
+    {
+      "name": "STALL_BACKEND_ST_TLB",
+      "desc": "No operation issued due to the backend, store, TLB miss. This event counts every cycle where there is a stall in the Wr stage because of a store operation that has missed in the L1 TLB",
+      "code": "0xec"
+    },
+    {
+      "name": "STALL_BACKEND_VPU_HAZARD",
+      "desc": "No operation issued due to the backend, VPU hazard. This event counts every cycle where the core stalls due to contention for the VPU with the other core",
+      "code": "0xed"
+    },
+    {
+      "name": "STALL_SLOT_BACKEND_ILOCK",
+      "desc": "Issue slot not issued due to interlock. For each cycle, this event counts each dispatch slot that does not issue due to an interlock",
+      "code": "0xee"
+    },
+    {
+      "name": "STALL_BACKEND_MEM",
+      "desc": "Memory stall cycles",
+      "code": "0x4005"
+    },
+    {
+      "name": "TRB_WRAP",
+      "desc": "Trace buffer current write pointer wrapped",
+      "code": "0x400c"
+    },
+    {
+      "name": "TRB_TRIG",
+      "desc": "Trace buffer Trigger Event",
+      "code": "0x400e"
+    },
+    {
+      "name": "TRCEXTOUT0",
+      "desc": "PE Trace Unit external output 0",
+      "code": "0x4010"
+    },
+    {
+      "name": "TRCEXTOUT1",
+      "desc": "PE Trace Unit external output 1",
+      "code": "0x4011"
+    },
+    {
+      "name": "TRCEXTOUT2",
+      "desc": "PE Trace Unit external output 2",
+      "code": "0x4012"
+    },
+    {
+      "name": "TRCEXTOUT3",
+      "desc": "PE Trace Unit external output 3",
+      "code": "0x4013"
+    },
+    {
+      "name": "CTI_TRIGOUT4",
+      "desc": "Cross-trigger Interface output trigger 4",
+      "code": "0x4018"
+    },
+    {
+      "name": "CTI_TRIGOUT5",
+      "desc": "Cross-trigger Interface output trigger 5 ",
+      "code": "0x4019"
+    },
+    {
+      "name": "CTI_TRIGOUT6",
+      "desc": "Cross-trigger Interface output trigger 6",
+      "code": "0x401a"
+    },
+    {
+      "name": "CTI_TRIGOUT7",
+      "desc": "Cross-trigger Interface output trigger 7",
+      "code": "0x401b"
+    }
+  ]
+}
