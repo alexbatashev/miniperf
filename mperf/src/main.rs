@@ -7,6 +7,11 @@ mod processing;
 mod record;
 mod stat;
 mod tui;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod unwind;
 mod utils;
 
 use std::{
@@ -34,6 +39,9 @@ enum Commands {
     Stat {
         #[arg(short, long)]
         pid: Option<u32>,
+        /// Comma-separated event names (use `mperf list` to discover them).
+        #[arg(short = 'e', long = "event", value_delimiter = ',')]
+        events: Vec<String>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -60,9 +68,11 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::Stat { pid, command } => {
-            return do_stat(pid, command);
-        }
+        Commands::Stat {
+            pid,
+            events,
+            command,
+        } => return do_stat(pid, command, events),
         Commands::List => {
             let events = pmu::list_supported_counters(pmu::DriverKind::Default);
             for event in events {

@@ -20,7 +20,7 @@ workflow.
 
 ### Building from source
 
-miniperf is implemented in Rust and requires Cap'n Proto as a dependency.
+miniperf is implemented in Rust.
 
 #### Requirements
 
@@ -44,7 +44,7 @@ a Clang plugin to make it work:
 ```sh
 mkdir target/clang_plugin && cd target/clang_plugin
 cmake -DCMAKE_BUILD_TYPE=Release -GNinja -DLLVM_DIR=$HOME/llvm-project/build/lib/cmake/llvm ../../utils/clang_plugin/
-````
+```
 
 ## Usage
 
@@ -88,6 +88,13 @@ Performance counter stats for '/bin/ls -lah':
 +-------------------------+-----------+-----------------+---------+-----------------------------------------------------------+
 ```
 
+Use `mperf list` to discover model-specific PMU events and select one or more
+with `-e`:
+
+```sh
+mperf stat -e L1D.REPLACEMENT,BR_MISP_RETIRED.ALL_BRANCHES -- ./workload
+```
+
 ### Recording Profiles
 
 Record detailed performance profiles for in-depth analysis:
@@ -104,6 +111,34 @@ Available Scenarios
   This runs collection in two passes:
     1. First to collect PMU (Performance Monitoring Unit) counters
     2. Second to gather loop statistics
+
+#### Call-stack collection overhead
+
+On x86-64, `mperf record` first requests Intel Last Branch Record call stacks.
+LBR collection adds only the hardware branch entries to each sample and avoids
+copying the user stack. Opening the perf event is also the runtime capability
+probe: AMD systems, VMs, and Intel PMUs without call-stack LBR support
+automatically retry in DWARF mode.
+
+DWARF mode captures the user registers and up to 8 KiB of stack, then unwinds
+that data after the target exits; the raw state is stored once and reused by all
+counters in the group. This produces useful stacks for optimized binaries that
+omit frame pointers, at the cost of up to 8 KiB of ring-buffer traffic and
+result data per interrupt (the kernel reports the bytes it could actually copy).
+
+Library users can trade stack depth and recording overhead with
+`SamplingDriverBuilder::stack_dump_size`, or select
+`UnwindMode::FramePointer` to disable register/stack capture and retain the
+kernel callchain path. `UnwindMode::Lbr` explicitly requests the LBR-first mode
+with the same automatic DWARF fallback.
+
+#### Symbols and separate debug information
+
+Postprocessing expands DWARF inline frames and uses the shared
+`miniperf-symbolize` library for symbols and source locations. It understands
+`.gnu_debuglink`, system and miniperf build-id caches, and
+`/tmp/perf-<pid>.map` JIT symbol files. See [`symbolize/README.md`](symbolize/README.md)
+for lookup order, cache paths, and the explicitly opt-in debuginfod behavior.
 
 #### Building instrumented application
 
@@ -125,6 +160,15 @@ mperf show <output_directory>
 This will display detailed analysis based on the recorded profile.
 
 ## Platform-Specific Notes
+
+### Intel Tiger Lake
+
+- Models 0x8c and 0x8d are detected as Tiger Lake.
+- The checked-in table contains 231 core events generated from Linux perf's
+  Tiger Lake PMU data. See `pmu/events/intel/README.md` for the source,
+  attribution, licensing, and regeneration command.
+- Unsupported architectural counters are omitted with a notice instead of
+  aborting the entire `stat` or sampling run.
 
 ### AArch64 (Arm)
 

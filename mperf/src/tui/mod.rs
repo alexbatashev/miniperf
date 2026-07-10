@@ -1,10 +1,13 @@
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use flamegraph::FlamegraphTab;
 use hotspots::HotspotsTab;
@@ -15,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Flex, Layout},
     style::{palette, Style, Stylize},
     text::Line,
-    widgets::{Block, Cell, Clear, Row, Table, Tabs, Widget},
+    widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Widget},
     DefaultTerminal, Frame,
 };
 use summary::SummaryTab;
@@ -148,6 +151,8 @@ impl App {
 struct TabsWidget {
     cur_tab: usize,
     tabs: Arc<RwLock<Vec<Tab>>>,
+    load_started: Arc<AtomicBool>,
+    load_error: Arc<RwLock<Option<String>>>,
 }
 
 impl Widget for &TabsWidget {
@@ -156,7 +161,16 @@ impl Widget for &TabsWidget {
         Self: Sized,
     {
         let read_tabs = self.tabs.read();
-        if read_tabs.len() == 0 {
+        if read_tabs.is_empty() {
+            let message = self
+                .load_error
+                .read()
+                .clone()
+                .unwrap_or_else(|| "Loading results…".to_string());
+            Paragraph::new(message)
+                .block(Block::bordered().title("Results error"))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .render(area, buf);
             return;
         }
 
@@ -221,21 +235,31 @@ impl TabsWidget {
                 return;
             }
         }
+        if self
+            .load_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
         let this = self.clone();
         tokio::spawn(this.fetch_data(res_dir.to_owned()));
     }
 
     async fn fetch_data(self, res_dir: PathBuf) {
-        let data = fs::read_to_string(res_dir.join("info.json"))
-            .await
-            .expect("failed to read info.json");
-        let info: RecordInfo = serde_json::from_str(&data).expect("failed to parse info.json");
-
+        let (info, connection) = match load_results(&res_dir).await {
+            Ok(results) => results,
+            Err(error) => {
+                *self.load_error.write() = Some(format!(
+                    "Could not open results directory '{}':\n\n{error:#}",
+                    res_dir.display()
+                ));
+                return;
+            }
+        };
+        let connection = Arc::new(Mutex::new(connection));
         let mut write_tabs = self.tabs.write();
-
-        let connection = Arc::new(Mutex::new(
-            sqlite::open(res_dir.join("perf.db")).expect("Failed to open DB"),
-        ));
 
         match info.scenario {
             Scenario::Snapshot => {
@@ -258,6 +282,9 @@ impl TabsWidget {
     }
 
     fn next_tab(&mut self) {
+        if self.tabs.read().is_empty() {
+            return;
+        }
         self.cur_tab += 1;
         if self.cur_tab >= self.tabs.read().len() {
             self.cur_tab = 0;
@@ -265,6 +292,9 @@ impl TabsWidget {
     }
 
     fn previous_tab(&mut self) {
+        if self.tabs.read().is_empty() {
+            return;
+        }
         if self.cur_tab == 0 {
             self.cur_tab = self.tabs.read().len() - 1;
         } else {
@@ -273,12 +303,36 @@ impl TabsWidget {
     }
 
     fn handle_event(&mut self, code: KeyCode) {
-        match &mut self.tabs.write()[self.cur_tab] {
+        let mut tabs = self.tabs.write();
+        let Some(tab) = tabs.get_mut(self.cur_tab) else {
+            return;
+        };
+        match tab {
             Tab::Hotspots(tab) => tab.handle_event(code),
             Tab::Flamegraph(tab) => tab.handle_event(code),
             _ => {}
         }
     }
+}
+
+async fn load_results(res_dir: &Path) -> Result<(RecordInfo, sqlite::Connection)> {
+    let info_path = res_dir.join("info.json");
+    let data = fs::read_to_string(&info_path)
+        .await
+        .with_context(|| format!("failed to read {}", info_path.display()))?;
+    let info = parse_record_info(&data)?;
+
+    let db_path = res_dir.join("perf.db");
+    let connection =
+        sqlite::open(&db_path).with_context(|| format!("failed to open {}", db_path.display()))?;
+    Ok((info, connection))
+}
+
+fn parse_record_info(data: &str) -> Result<RecordInfo> {
+    let info: RecordInfo =
+        serde_json::from_str(data).context("failed to parse info.json metadata")?;
+    info.ensure_supported_format()?;
+    Ok(info)
 }
 
 impl Widget for &Tab {
@@ -292,5 +346,32 @@ impl Widget for &Tab {
             Tab::Loops(tab) => tab.clone().render(area, buf),
             Tab::Flamegraph(tab) => tab.clone().render(area, buf),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info_json(version: u32) -> String {
+        format!(
+            r#"{{"format_version":{version},"scenario":"Snapshot","command":null,"cpu_model":"test","cpu_vendor":"test","scenario_info":{{"Snapshot":{{"pid":1,"counters":[]}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn corrupt_metadata_is_reported() {
+        let error = parse_record_info("not json").unwrap_err().to_string();
+        assert!(error.contains("failed to parse info.json"));
+    }
+
+    #[test]
+    fn newer_results_format_is_rejected() {
+        let version = mperf_data::CURRENT_FORMAT_VERSION + 1;
+        let error = parse_record_info(&info_json(version))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("format version {version}")));
+        assert!(error.contains("upgrade mperf"));
     }
 }

@@ -1,0 +1,9 @@
+[package]
+name = "event-import"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pmu-data = { package = "miniperf-pmu-data", path = "../../pmu-data" }
+serde_json = "1.0.138"

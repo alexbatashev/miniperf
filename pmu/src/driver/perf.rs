@@ -14,13 +14,15 @@ use events::resolve_counter_for_family;
 use libc::{close, mmap, munmap, sysconf, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
 use mmap::{EventValue, ReadFormat, Records};
 use perf_event_open_sys::bindings::{
-    perf_event_attr, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID, PERF_SAMPLE_IP,
-    PERF_SAMPLE_READ, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    perf_event_attr, PERF_SAMPLE_BRANCH_CALL_STACK, PERF_SAMPLE_BRANCH_STACK,
+    PERF_SAMPLE_BRANCH_USER, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
+    PERF_SAMPLE_IP, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER,
+    PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 use smallvec::SmallVec;
 
-use crate::driver::{ProcAddr, Sample};
+use crate::driver::{ProcAddr, Sample, UnwindMode};
 use crate::{Counter, Error, Record};
 
 pub use events::list_supported_counters;
@@ -45,6 +47,9 @@ pub struct PerfSamplingDriver {
     mmap_pages: usize,
     running: Arc<AtomicBool>,
     thread_handle: Option<thread::JoinHandle<()>>,
+    enable_on_start: bool,
+    sample_regs_user: u64,
+    sample_branch_stack: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,38 +121,38 @@ impl PerfCountingDriver {
             }
         };
 
-        let open = |attr: &mut perf_event_attr| -> Option<(i32, u64)> {
+        let open = |counter: &Counter, attr: &mut perf_event_attr| -> Result<(i32, u64), Error> {
             let fd = unsafe { sys::perf_event_open(attr, pid.unwrap_or(0), -1, -1, 0) };
             if fd < 0 {
-                return None;
+                return Err(Error::perf_event_open(counter, None));
             }
             let mut id: u64 = 0;
             if unsafe { sys::ioctls::ID(fd, &mut id) } < 0 {
+                let error = Error::perf_ioctl("ID", counter);
                 unsafe { close(fd) };
-                return None;
+                return Err(error);
             }
-            Some((fd, id))
+            Ok((fd, id))
         };
 
         let mut native_handles: Vec<NativeCounterHandle> = Vec::new();
 
         for cntr in &counters {
             if cntr.is_software() {
-                let (type_, config) = counter_type_config(cntr);
+                let (type_, config) = counter_type_config(cntr)?;
                 let mut attr = base_counter_attr();
                 attr.type_ = type_;
                 attr.config = config;
                 apply_flags(&mut attr);
 
-                if let Some((fd, id)) = open(&mut attr) {
-                    native_handles.push(NativeCounterHandle {
-                        kind: cntr.clone(),
-                        core: None,
-                        id,
-                        fd,
-                        leader: false,
-                    });
-                }
+                let (fd, id) = open(cntr, &mut attr)?;
+                native_handles.push(NativeCounterHandle {
+                    kind: cntr.clone(),
+                    core: None,
+                    id,
+                    fd,
+                    leader: false,
+                });
                 continue;
             }
 
@@ -156,23 +161,24 @@ impl PerfCountingDriver {
                     continue; // this cluster's family does not implement it
                 };
 
-                let mut attr = build_pmu_attr(&resolved, pmu.pmu_type);
+                let mut attr = build_pmu_attr(&resolved, pmu.pmu_type)?;
                 apply_flags(&mut attr);
 
-                if let Some((fd, id)) = open(&mut attr) {
-                    native_handles.push(NativeCounterHandle {
-                        kind: cntr.clone(),
-                        core: Some(core_id_of(pmu)),
-                        id,
-                        fd,
-                        leader: false,
-                    });
-                }
+                let (fd, id) = open(cntr, &mut attr)?;
+                native_handles.push(NativeCounterHandle {
+                    kind: cntr.clone(),
+                    core: Some(core_id_of(pmu)),
+                    id,
+                    fd,
+                    leader: false,
+                });
             }
         }
 
         if native_handles.is_empty() {
-            return Err(Error::CounterCreationFail);
+            return Err(Error::InvalidConfiguration(
+                "no counters could be opened".to_owned(),
+            ));
         }
 
         Ok(PerfCountingDriver { native_handles })
@@ -200,7 +206,7 @@ impl CountingDriver for PerfCountingDriver {
             let res_enable = unsafe { sys::ioctls::ENABLE(handle.fd, 0) };
 
             if res_enable < 0 {
-                return Err(Error::EnableFailed);
+                return Err(Error::perf_ioctl("ENABLE", &handle.kind));
             }
         }
 
@@ -212,7 +218,7 @@ impl CountingDriver for PerfCountingDriver {
             let res_enable = unsafe { sys::ioctls::DISABLE(handle.fd, 0) };
 
             if res_enable < 0 {
-                return Err(Error::EnableFailed);
+                return Err(Error::perf_ioctl("DISABLE", &handle.kind));
             }
         }
 
@@ -226,7 +232,7 @@ impl CountingDriver for PerfCountingDriver {
             let res_enable = unsafe { sys::ioctls::RESET(handle.fd, 0) };
 
             if res_enable < 0 {
-                return Err(Error::EnableFailed);
+                return Err(Error::perf_ioctl("RESET", &handle.kind));
             }
         }
 
@@ -310,12 +316,33 @@ unsafe impl Send for PerfSamplingDriver {}
 unsafe impl Sync for PerfSamplingDriver {}
 
 impl SamplingDriver for PerfSamplingDriver {
+    fn counters(&self) -> Vec<Counter> {
+        let mut counters = Vec::new();
+        for handle in &self.native_handles {
+            if !counters.contains(&handle.kind) {
+                counters.push(handle.kind.clone());
+            }
+        }
+        counters
+    }
+
     fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
+        if self.enable_on_start {
+            for handle in self.native_handles.iter().filter(|handle| handle.leader) {
+                let result =
+                    unsafe { sys::ioctls::ENABLE(handle.fd, sys::bindings::PERF_IOC_FLAG_GROUP) };
+                if result < 0 {
+                    return Err(Error::perf_ioctl("ENABLE group", &handle.kind));
+                }
+            }
+        }
         self.running.store(true, Ordering::SeqCst);
 
         let running = self.running.clone();
         let mmaps = self.mmaps.clone();
         let native_handles = self.native_handles.clone();
+        let sample_regs_user = self.sample_regs_user;
+        let sample_branch_stack = self.sample_branch_stack;
 
         #[derive(Clone, Default)]
         struct LastSample {
@@ -327,14 +354,12 @@ impl SamplingDriver for PerfSamplingDriver {
         let handle = thread::spawn(move || {
             let mut last_samples_map = HashMap::<(usize, u32, u32, u32, u64), LastSample>::new();
 
-            while running.load(Ordering::SeqCst) {
+            loop {
                 for (idx, &mmap) in mmaps.iter().enumerate() {
-                    let records = Records::from_ptr(mmap.ptr);
+                    let records =
+                        Records::from_ptr(mmap.ptr, sample_regs_user, sample_branch_stack);
 
                     for record in records.into_iter() {
-                        if !running.load(Ordering::SeqCst) {
-                            break;
-                        }
                         match record {
                             mmap::MmapRecord::Sample {
                                 ip,
@@ -346,14 +371,19 @@ impl SamplingDriver for PerfSamplingDriver {
                                 time_running,
                                 values,
                                 callstack,
+                                user_regs,
+                                user_stack,
                             } => {
                                 let uid = uuid::Uuid::now_v7();
+                                let mut user_regs = user_regs;
+                                let mut user_stack = Some(user_stack);
 
                                 for value in values {
-                                    let handle = native_handles
-                                        .iter()
-                                        .find(|handle| handle.id == value.id)
-                                        .unwrap();
+                                    let Some(handle) =
+                                        native_handles.iter().find(|handle| handle.id == value.id)
+                                    else {
+                                        continue;
+                                    };
                                     let last_sample = last_samples_map
                                         .get(&(idx, cpu, pid, tid, value.id))
                                         .cloned()
@@ -372,6 +402,11 @@ impl SamplingDriver for PerfSamplingDriver {
                                         counter: handle.kind.clone(),
                                         value: value.value - last_sample.value,
                                         callstack: callstack.clone(),
+                                        // Every grouped counter shares this correlation id and
+                                        // call stack. Carry the large raw state once; postprocess
+                                        // reuses its result for the sibling counter events.
+                                        user_regs: user_regs.take(),
+                                        user_stack: user_stack.take().unwrap_or_default(),
                                     });
 
                                     last_samples_map.insert(
@@ -406,6 +441,9 @@ impl SamplingDriver for PerfSamplingDriver {
                     }
                 }
 
+                if !running.load(Ordering::SeqCst) {
+                    break;
+                }
                 thread::sleep(Duration::from_micros(100));
             }
         });
@@ -425,14 +463,14 @@ impl SamplingDriver for PerfSamplingDriver {
                 unsafe { sys::ioctls::DISABLE(handle.fd, sys::bindings::PERF_IOC_FLAG_GROUP) };
 
             if res_enable < 0 {
-                return Err(Error::EnableFailed);
+                return Err(Error::perf_ioctl("DISABLE", &handle.kind));
             }
         }
 
         self.running.store(false, Ordering::SeqCst);
 
         if let Some(handle) = self.thread_handle.take() {
-            handle.join().map_err(|_| Error::EnableFailed)?;
+            handle.join().map_err(|_| Error::WorkerPanicked)?;
         }
 
         Ok(())
@@ -440,23 +478,43 @@ impl SamplingDriver for PerfSamplingDriver {
 }
 
 /// Apply the sampling-specific attribute flags shared by every counter.
-fn apply_sampling_flags(attr: &mut perf_event_attr, sample_freq: u64) {
+fn apply_sampling_flags(
+    attr: &mut perf_event_attr,
+    sample_freq: u64,
+    unwind_mode: UnwindMode,
+    stack_dump_size: u32,
+    enable_on_exec: bool,
+) {
     attr.set_exclude_kernel(1);
     attr.set_exclude_user(0);
     attr.set_exclusive(0);
     attr.set_inherit(0);
-    attr.set_enable_on_exec(1);
+    attr.set_enable_on_exec(enable_on_exec.into());
 
     attr.sample_freq = sample_freq;
     attr.set_freq(1);
 
-    attr.sample_type = (PERF_SAMPLE_IP
+    let mut sample_type = (PERF_SAMPLE_IP
         | PERF_SAMPLE_TID
         | PERF_SAMPLE_TIME
         | PERF_SAMPLE_ID
         | PERF_SAMPLE_CPU
         | PERF_SAMPLE_READ
         | PERF_SAMPLE_CALLCHAIN) as u64;
+
+    if unwind_mode == UnwindMode::Dwarf {
+        let regs = dwarf_register_mask();
+        if regs != 0 {
+            sample_type |= (PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER) as u64;
+            attr.sample_regs_user = regs;
+            attr.sample_stack_user = stack_dump_size;
+        }
+    }
+    if unwind_mode == UnwindMode::Lbr && cfg!(target_arch = "x86_64") {
+        sample_type |= PERF_SAMPLE_BRANCH_STACK as u64;
+        attr.branch_sample_type = (PERF_SAMPLE_BRANCH_CALL_STACK | PERF_SAMPLE_BRANCH_USER) as u64;
+    }
+    attr.sample_type = sample_type;
 
     attr.set_mmap(1);
 }
@@ -467,6 +525,8 @@ impl PerfSamplingDriver {
         sample_freq: u64,
         pid: Option<i32>,
         prefer_raw_events: bool,
+        unwind_mode: UnwindMode,
+        stack_dump_size: u32,
     ) -> Result<PerfSamplingDriver, Error> {
         // On a heterogeneous (big.LITTLE) host, open a sampling group on each
         // cluster's PMU so the profile captures execution wherever the task
@@ -474,18 +534,42 @@ impl PerfSamplingDriver {
         let core_pmus = crate::cpu_family::host_core_pmus();
         if core_pmus.len() > 1 {
             #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-            return Self::new_per_core(counters, sample_freq, pid, &core_pmus);
+            return Self::new_per_core(
+                counters,
+                sample_freq,
+                pid,
+                &core_pmus,
+                unwind_mode,
+                stack_dump_size,
+            );
         }
 
         let mut attrs = get_native_counters(counters, prefer_raw_events)?;
 
         for attr in &mut attrs {
-            apply_sampling_flags(attr, sample_freq);
+            apply_sampling_flags(
+                attr,
+                sample_freq,
+                unwind_mode,
+                stack_dump_size,
+                pid.is_some(),
+            );
         }
 
-        let native_handles = binding::grouped(counters, &mut attrs, pid)?;
+        let native_handles = if pid.is_none() {
+            binding::grouped_all(counters, &mut attrs, pid)?
+        } else if counters.contains(&Counter::Cycles) {
+            binding::grouped(counters, &mut attrs, pid)?
+        } else {
+            binding::grouped_software(counters, &mut attrs, pid)?
+        };
 
-        Self::from_handles(native_handles)
+        Self::from_handles(
+            native_handles,
+            dwarf_mask_for_mode(unwind_mode),
+            unwind_mode == UnwindMode::Lbr,
+            pid.is_none(),
+        )
     }
 
     /// Faithful per-core sampling: open a sampling group on every cluster's PMU
@@ -498,6 +582,8 @@ impl PerfSamplingDriver {
         sample_freq: u64,
         pid: Option<i32>,
         core_pmus: &[crate::cpu_family::CorePmu],
+        unwind_mode: UnwindMode,
+        stack_dump_size: u32,
     ) -> Result<PerfSamplingDriver, Error> {
         let mut native_handles: Vec<NativeCounterHandle> = Vec::new();
 
@@ -509,13 +595,23 @@ impl PerfSamplingDriver {
                 .map(|cntr| {
                     let resolved = resolve_counter_for_family(cntr, pmu.family_id, true)
                         .unwrap_or_else(|| cntr.clone());
-                    let mut attr = build_pmu_attr(&resolved, pmu.pmu_type);
-                    apply_sampling_flags(&mut attr, sample_freq);
-                    attr
+                    let mut attr = build_pmu_attr(&resolved, pmu.pmu_type)?;
+                    apply_sampling_flags(
+                        &mut attr,
+                        sample_freq,
+                        unwind_mode,
+                        stack_dump_size,
+                        pid.is_some(),
+                    );
+                    Ok(attr)
                 })
-                .collect();
+                .collect::<Result<Vec<_>, Error>>()?;
 
-            let mut handles = binding::grouped(counters, &mut attrs, pid)?;
+            let mut handles = if pid.is_none() {
+                binding::grouped_all(counters, &mut attrs, pid)?
+            } else {
+                binding::grouped(counters, &mut attrs, pid)?
+            };
             for handle in &mut handles {
                 handle.core = Some(core.clone());
             }
@@ -523,38 +619,54 @@ impl PerfSamplingDriver {
             native_handles.extend(handles);
         }
 
-        Self::from_handles(native_handles)
+        Self::from_handles(
+            native_handles,
+            dwarf_mask_for_mode(unwind_mode),
+            unwind_mode == UnwindMode::Lbr,
+            pid.is_none(),
+        )
     }
 
     /// Map every group-leader handle's ring buffer and assemble the driver.
-    fn from_handles(native_handles: Vec<NativeCounterHandle>) -> Result<PerfSamplingDriver, Error> {
+    fn from_handles(
+        native_handles: Vec<NativeCounterHandle>,
+        sample_regs_user: u64,
+        sample_branch_stack: bool,
+        enable_on_start: bool,
+    ) -> Result<PerfSamplingDriver, Error> {
         let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
         let mmap_pages = 512;
 
-        let mmaps = native_handles
-            .iter()
-            .filter(|native_handle| native_handle.leader)
-            .map(|handle| unsafe {
+        let length = page_size * (mmap_pages + 1);
+        let mut mmaps: Vec<UnsafeMmap> = Vec::new();
+        for handle in native_handles.iter().filter(|handle| handle.leader) {
+            let ptr = unsafe {
                 let ptr = mmap(
                     std::ptr::null_mut(),
-                    page_size * (mmap_pages + 1),
+                    length,
                     PROT_READ | PROT_WRITE,
                     MAP_SHARED,
                     handle.fd,
                     0,
                 ) as *mut u8;
                 if ptr as *mut libc::c_void == MAP_FAILED {
-                    let err = std::io::Error::last_os_error();
-                    panic!(
-                        "Failed to map {:?} : len = {} fd = {}",
-                        err.raw_os_error(),
-                        page_size * (mmap_pages + 1),
-                        handle.fd
-                    );
+                    let source = std::io::Error::last_os_error();
+                    for mmap in &mmaps {
+                        munmap(mmap.ptr.cast(), length);
+                    }
+                    for native_handle in &native_handles {
+                        close(native_handle.fd);
+                    }
+                    return Err(Error::PerfMmap {
+                        counter: handle.kind.name().to_owned(),
+                        length,
+                        source,
+                    });
                 }
-                UnsafeMmap { ptr }
-            })
-            .collect();
+                ptr
+            };
+            mmaps.push(UnsafeMmap { ptr });
+        }
 
         Ok(PerfSamplingDriver {
             native_handles,
@@ -563,8 +675,37 @@ impl PerfSamplingDriver {
             mmap_pages,
             running: Arc::new(AtomicBool::new(false)),
             thread_handle: None,
+            sample_regs_user,
+            sample_branch_stack,
+            enable_on_start,
         })
     }
+}
+
+fn dwarf_mask_for_mode(mode: UnwindMode) -> u64 {
+    if mode == UnwindMode::Dwarf {
+        dwarf_register_mask()
+    } else {
+        0
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dwarf_register_mask() -> u64 {
+    // Linux's PERF_REGS_MASK: segment registers DS/ES/FS/GS (bits 12..15)
+    // cannot be requested through PERF_SAMPLE_REGS_USER on x86-64.
+    ((1_u64 << sys::bindings::PERF_REG_X86_64_MAX) - 1) & !(0xf_u64 << 12)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn dwarf_register_mask() -> u64 {
+    // x0..x29, link register, SP, and PC.
+    (1_u64 << sys::bindings::PERF_REG_ARM64_MAX) - 1
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn dwarf_register_mask() -> u64 {
+    0
 }
 
 impl Drop for PerfSamplingDriver {
@@ -601,8 +742,8 @@ fn base_counter_attr() -> perf_event_attr {
 
 /// Map a resolved counter to its `(type_, config)` pair using the legacy
 /// generic encodings (`PERF_TYPE_HARDWARE`/`SOFTWARE`/`RAW`).
-fn counter_type_config(cntr: &Counter) -> (u32, u64) {
-    match cntr {
+fn counter_type_config(cntr: &Counter) -> Result<(u32, u64), Error> {
+    Ok(match cntr {
         Counter::Cycles => (
             sys::bindings::PERF_TYPE_HARDWARE,
             sys::bindings::PERF_COUNT_HW_CPU_CYCLES as u64,
@@ -652,8 +793,12 @@ fn counter_type_config(cntr: &Counter) -> (u32, u64) {
             sys::bindings::PERF_COUNT_SW_PAGE_FAULTS as u64,
         ),
         Counter::Internal { code, .. } => (sys::bindings::PERF_TYPE_RAW, *code),
-        Counter::Custom(_) => todo!(),
-    }
+        Counter::Custom(name) => {
+            return Err(Error::InvalidConfiguration(format!(
+                "custom counter '{name}' was not resolved"
+            )))
+        }
+    })
 }
 
 fn get_native_counters(
@@ -665,8 +810,8 @@ fn get_native_counters(
         .map(|cntr| {
             let mut attrs = base_counter_attr();
 
-            let cntr = process_counter(cntr, prefer_raw_counters);
-            let (type_, config) = counter_type_config(&cntr);
+            let cntr = process_counter(cntr, prefer_raw_counters)?;
+            let (type_, config) = counter_type_config(&cntr)?;
             attrs.type_ = type_;
             attrs.config = config;
 
@@ -689,9 +834,9 @@ fn get_native_counters(
                 }
             }
 
-            attrs
+            Ok(attrs)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, Error>>()?;
 
     Ok(attrs)
 }
@@ -701,9 +846,9 @@ fn get_native_counters(
 /// count only while the task runs on that cluster; software events are left on
 /// the generic software PMU.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-fn build_pmu_attr(resolved: &Counter, pmu_type: u32) -> perf_event_attr {
+fn build_pmu_attr(resolved: &Counter, pmu_type: u32) -> Result<perf_event_attr, Error> {
     let mut attrs = base_counter_attr();
-    let (type_, config) = counter_type_config(resolved);
+    let (type_, config) = counter_type_config(resolved)?;
 
     if type_ == sys::bindings::PERF_TYPE_RAW {
         attrs.type_ = pmu_type;
@@ -721,7 +866,7 @@ fn build_pmu_attr(resolved: &Counter, pmu_type: u32) -> perf_event_attr {
         attrs.config = config;
     }
 
-    attrs
+    Ok(attrs)
 }
 
 /// Map a generic `PERF_COUNT_HW_*` config value to the equivalent AArch64

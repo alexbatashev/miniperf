@@ -17,6 +17,7 @@ pub struct HotspotsTab {
     is_running: Arc<RwLock<bool>>,
     connection: Arc<Mutex<Connection>>,
     state: Arc<Mutex<HotspotsState>>,
+    load_error: Arc<RwLock<Option<String>>>,
 }
 
 struct HSRow {
@@ -94,6 +95,14 @@ impl Widget for HotspotsTab {
     where
         Self: Sized,
     {
+        if let Some(error) = self.load_error.read().clone() {
+            Paragraph::new(error)
+                .block(Block::bordered().title("Hotspots error"))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .render(area, buf);
+            return;
+        }
+
         let hotspots = self.hotspots.read();
 
         let vertical = Layout::vertical([Constraint::Fill(1)]).vertical_margin(0);
@@ -235,6 +244,7 @@ impl HotspotsTab {
             connection,
             is_running: Arc::new(RwLock::new(false)),
             state: Arc::new(Mutex::new(HotspotsState::default())),
+            load_error: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -252,25 +262,58 @@ impl HotspotsTab {
 
     async fn fetch_data(self) {
         let conn = self.connection.lock();
-        let rows = conn
+        let result: Result<Vec<HSRow>, String> = conn
             .prepare("SELECT * FROM hotspots ORDER BY total DESC LIMIT 50;")
-            .unwrap()
-            .into_iter()
-            .map(|row| -> HSRow {
-                let row = row.unwrap();
-                HSRow {
-                    func_name: row.read::<&str, _>("func_name").to_string(),
-                    total: row.read::<f64, _>("total"),
-                    cycles: row.read::<i64, _>("cycles") as u64,
-                    instructions: row.read::<i64, _>("instructions") as u64,
-                    ipc: row.read::<f64, _>("ipc") as f64,
-                    branch_miss_rate: row.try_read::<f64, _>("branch_miss_rate").ok(),
-                    branch_mpki: row.try_read::<f64, _>("branch_mpki").ok(),
-                    cache_miss_rate: row.try_read::<f64, _>("cache_miss_rate").ok(),
-                    cache_mpki: row.try_read::<f64, _>("cache_mpki").ok(),
-                }
-            })
-            .collect();
+            .map_err(|error| error.to_string())
+            .and_then(|statement| {
+                statement
+                    .into_iter()
+                    .map(|row| -> Result<HSRow, String> {
+                        let row = row.map_err(|error| error.to_string())?;
+                        Ok(HSRow {
+                            func_name: row
+                                .try_read::<&str, _>("func_name")
+                                .map_err(|error| error.to_string())?
+                                .to_string(),
+                            total: row
+                                .try_read::<f64, _>("total")
+                                .map_err(|error| error.to_string())?,
+                            cycles: row
+                                .try_read::<i64, _>("cycles")
+                                .map_err(|error| error.to_string())?
+                                as u64,
+                            instructions: row
+                                .try_read::<i64, _>("instructions")
+                                .map_err(|error| error.to_string())?
+                                as u64,
+                            ipc: row
+                                .try_read::<f64, _>("ipc")
+                                .map_err(|error| error.to_string())?,
+                            branch_miss_rate: row
+                                .try_read::<Option<f64>, _>("branch_miss_rate")
+                                .map_err(|error| error.to_string())?,
+                            branch_mpki: row
+                                .try_read::<Option<f64>, _>("branch_mpki")
+                                .map_err(|error| error.to_string())?,
+                            cache_miss_rate: row
+                                .try_read::<Option<f64>, _>("cache_miss_rate")
+                                .map_err(|error| error.to_string())?,
+                            cache_mpki: row
+                                .try_read::<Option<f64>, _>("cache_mpki")
+                                .map_err(|error| error.to_string())?,
+                        })
+                    })
+                    .collect()
+            });
+        drop(conn);
+
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                *self.load_error.write() = Some(format!("Could not load hotspot data:\n\n{error}"));
+                return;
+            }
+        };
 
         let mut hotspots = self.hotspots.write();
         *hotspots = rows;
@@ -409,8 +452,12 @@ impl HotspotsTab {
                 State::Done => 0,
             };
 
-            let start_runtime = ordered_addresses.first().copied().unwrap();
-            let end_runtime = ordered_addresses.last().copied().unwrap();
+            let Some(start_runtime) = ordered_addresses.first().copied() else {
+                return Err("No samples recorded for the selected hotspot".to_string());
+            };
+            let Some(end_runtime) = ordered_addresses.last().copied() else {
+                return Err("No samples recorded for the selected hotspot".to_string());
+            };
             let start_rel = start_runtime as i64 - load_bias;
             let end_rel = end_runtime as i64 - load_bias;
 
@@ -446,7 +493,7 @@ impl HotspotsTab {
                 resolved_symbol = Some(func_name.clone());
             }
 
-            let selected_symbol = resolved_symbol.unwrap();
+            let selected_symbol = resolved_symbol.unwrap_or_else(|| func_name.clone());
 
             let mut lines_stmt = conn
                 .prepare(
@@ -950,7 +997,6 @@ impl HotspotsTab {
                             "Unable to open assembly view for the selected hotspot".to_string(),
                         );
                     }
-                    return;
                 }
             }
             _ => {}

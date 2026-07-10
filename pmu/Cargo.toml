@@ -1,24 +1,49 @@
 [package]
-name = "pmu"
+name = "miniperf-pmu"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
+description = "Low-overhead Linux perf event timing and in-memory sampling"
+license = "Apache-2.0"
+repository = "https://github.com/alexbatashev/miniperf"
+homepage = "https://github.com/alexbatashev/miniperf"
+readme = "README.md"
+keywords = ["performance", "profiling", "perf", "pmu", "benchmark"]
+categories = ["development-tools::profiling"]
+include = ["src/**", "events/**", "examples/**", "build.rs", "README.md", "CHANGELOG.md"]
+
+[lib]
+name = "pmu"
+
+[features]
+default = ["events-native"]
+events-native = []
+events-x86-64 = []
+events-aarch64 = []
+events-riscv64 = []
+symbolize = ["dep:symbolize"]
+criterion = ["dep:criterion"]
 
 [dependencies]
 cfg-if = "1.0.0"
 libc = "0.2.144"
 thiserror = "2.0.9"
-pmu-data = { path = "../pmu-data/" }
+pmu-data = { package = "miniperf-pmu-data", path = "../pmu-data/", version = "0.1.0" }
 lazy_static = "1.5.0"
 smallvec = "1.13.2"
 itertools = "0.14.0"
 uuid = { version = "1.16.0", features = ["v7"] }
 hashbrown = "0.15.2"
+criterion = { version = "0.5.1", optional = true, default-features = false }
+symbolize = { package = "miniperf-symbolize", path = "../symbolize", version = "0.1.0", optional = true }
 
 [dev-dependencies]
 insta = "1.42.2"
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 proc_getter = "0.0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
 dlopen2 = "0.7.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -27,8 +52,20 @@ perf-event-open-sys2 = "5.0.6"
 [build-dependencies]
 serde = "1.0.217"
 serde_json = "1.0.138"
-pmu-data = { path = "../pmu-data/" }
+pmu-data = { package = "miniperf-pmu-data", path = "../pmu-data/", version = "0.1.0" }
 glob = "0.3.2"
 quote = "1.0.38"
 prettyplease = "0.2.29"
 syn = "2.0.96"
+
+[[example]]
+name = "quick_sample"
+required-features = ["symbolize"]
+
+[[example]]
+name = "criterion_counter"
+required-features = ["criterion"]
+
+[package.metadata.docs.rs]
+features = ["symbolize", "criterion", "events-native"]
+rustdoc-args = ["--cfg", "docsrs"]

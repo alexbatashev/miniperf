@@ -5,8 +5,12 @@ use perf_event_open_sys::bindings::{
 };
 use smallvec::{SmallVec, ToSmallVec};
 
+use crate::driver::UserRegs;
+
 pub struct Records {
     metadata: *mut perf_event_mmap_page,
+    sample_regs_user: u64,
+    sample_branch_stack: bool,
 }
 
 #[repr(C)]
@@ -16,7 +20,16 @@ pub(crate) struct EventValue {
     pub id: u64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct BranchEntry {
+    from: u64,
+    to: u64,
+    flags: u64,
+}
+
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Avoid another allocation per perf ring record.
 pub enum MmapRecord {
     Sample {
         ip: u64,
@@ -26,8 +39,10 @@ pub enum MmapRecord {
         time: u64,
         time_enabled: u64,
         time_running: u64,
-        values: SmallVec<[EventValue; 8]>,
-        callstack: SmallVec<[u64; 32]>,
+        values: SmallVec<[EventValue; 4]>,
+        callstack: SmallVec<[u64; 8]>,
+        user_regs: Option<UserRegs>,
+        user_stack: Vec<u8>,
     },
     Address {
         pid: u32,
@@ -72,9 +87,11 @@ struct ProcMmap {
 }
 
 impl Records {
-    pub fn from_ptr(ptr: *mut u8) -> Records {
+    pub fn from_ptr(ptr: *mut u8, sample_regs_user: u64, sample_branch_stack: bool) -> Records {
         Records {
             metadata: ptr as *mut perf_event_mmap_page,
+            sample_regs_user,
+            sample_branch_stack,
         }
     }
 
@@ -185,7 +202,18 @@ impl Iterator for Records {
             PERF_RECORD_SAMPLE => match SampleFormat::read_from_bytes(&record_buf) {
                 Some(sample_format) => {
                     let values = sample_format.read_values(&record_buf);
-                    let callstack = sample_format.read_callchain(&record_buf);
+                    let mut callstack = sample_format.read_callchain(&record_buf);
+                    if self.sample_branch_stack {
+                        let lbr_callstack = sample_format.read_branch_callstack(&record_buf);
+                        if lbr_callstack.len() > 1 {
+                            callstack = lbr_callstack;
+                        }
+                    }
+                    let (user_regs, user_stack) = sample_format.read_user_state(
+                        &record_buf,
+                        self.sample_regs_user,
+                        self.sample_branch_stack,
+                    );
 
                     MmapRecord::Sample {
                         ip: sample_format.ip,
@@ -197,6 +225,8 @@ impl Iterator for Records {
                         time_running: sample_format.read.time_running,
                         values,
                         callstack,
+                        user_regs,
+                        user_stack,
                     }
                 }
                 None => MmapRecord::Unknown,
@@ -230,7 +260,7 @@ impl SampleFormat {
         Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) })
     }
 
-    fn read_values(&self, record: &[u8]) -> SmallVec<[EventValue; 8]> {
+    fn read_values(&self, record: &[u8]) -> SmallVec<[EventValue; 4]> {
         let values_offset = std::mem::size_of::<SampleFormat>();
         let count = self.read.nr as usize;
         let values_end = values_offset + count.saturating_mul(std::mem::size_of::<EventValue>());
@@ -248,7 +278,7 @@ impl SampleFormat {
         }
     }
 
-    fn read_callchain(&self, record: &[u8]) -> SmallVec<[u64; 32]> {
+    fn read_callchain(&self, record: &[u8]) -> SmallVec<[u64; 8]> {
         let values_offset = std::mem::size_of::<SampleFormat>();
         let values_size = self.read.nr as usize * std::mem::size_of::<EventValue>();
         let base_offset = values_offset + values_size;
@@ -282,6 +312,107 @@ impl SampleFormat {
             slice.to_smallvec()
         }
     }
+
+    fn callchain_end(&self, record: &[u8]) -> Option<usize> {
+        let base = std::mem::size_of::<SampleFormat>()
+            .checked_add((self.read.nr as usize).checked_mul(std::mem::size_of::<EventValue>())?)?;
+        let nr = read_u64(record, base)? as usize;
+        base.checked_add(std::mem::size_of::<u64>())?
+            .checked_add(nr.checked_mul(std::mem::size_of::<u64>())?)
+            .filter(|end| *end <= record.len())
+    }
+
+    fn branch_stack_end(&self, record: &[u8]) -> Option<usize> {
+        let base = self.callchain_end(record)?;
+        let nr = read_u64(record, base)? as usize;
+        base.checked_add(8)?
+            .checked_add(nr.checked_mul(std::mem::size_of::<BranchEntry>())?)
+            .filter(|end| *end <= record.len())
+    }
+
+    fn read_branch_callstack(&self, record: &[u8]) -> SmallVec<[u64; 8]> {
+        let Some(base) = self.callchain_end(record) else {
+            return SmallVec::new();
+        };
+        let Some(nr) = read_u64(record, base).map(|value| value as usize) else {
+            return SmallVec::new();
+        };
+        let entries_offset = base + 8;
+        let Some(end) = self.branch_stack_end(record) else {
+            return SmallVec::new();
+        };
+        let mut frames = SmallVec::with_capacity(nr.saturating_add(1));
+        frames.push(self.ip);
+        for offset in (entries_offset..end).step_by(std::mem::size_of::<BranchEntry>()) {
+            let from = read_u64(record, offset).unwrap_or_default();
+            if from != 0 && frames.last().copied() != Some(from) {
+                frames.push(from);
+            }
+        }
+        frames
+    }
+
+    fn read_user_state(
+        &self,
+        record: &[u8],
+        mask: u64,
+        sample_branch_stack: bool,
+    ) -> (Option<UserRegs>, Vec<u8>) {
+        if mask == 0 {
+            return (None, Vec::new());
+        }
+
+        let Some(mut offset) = (if sample_branch_stack {
+            self.branch_stack_end(record)
+        } else {
+            self.callchain_end(record)
+        }) else {
+            return (None, Vec::new());
+        };
+        let Some(abi) = read_u64(record, offset) else {
+            return (None, Vec::new());
+        };
+        offset += std::mem::size_of::<u64>();
+
+        let value_count = if abi == 0 {
+            0
+        } else {
+            mask.count_ones() as usize
+        };
+        let Some(values_end) = offset.checked_add(value_count.saturating_mul(8)) else {
+            return (None, Vec::new());
+        };
+        if values_end > record.len() {
+            return (None, Vec::new());
+        }
+        let values = (0..value_count)
+            .map(|index| read_u64(record, offset + index * 8).unwrap_or_default())
+            .collect();
+        offset = values_end;
+
+        let regs = (abi != 0).then_some(UserRegs { abi, mask, values });
+        let Some(stack_size) = read_u64(record, offset).map(|value| value as usize) else {
+            return (regs, Vec::new());
+        };
+        offset += 8;
+        let Some(stack_end) = offset.checked_add(stack_size) else {
+            return (regs, Vec::new());
+        };
+        if stack_end > record.len() {
+            return (regs, Vec::new());
+        }
+        let stack = record[offset..stack_end].to_vec();
+        // PERF_SAMPLE_STACK_USER appends dyn_size after the requested-size byte array.
+        let dynamic_size = read_u64(record, stack_end).unwrap_or(stack_size as u64) as usize;
+        let dynamic_size = dynamic_size.min(stack.len());
+        (regs, stack[..dynamic_size].to_vec())
+    }
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let value: [u8; 8] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u64::from_ne_bytes(value))
 }
 
 impl ProcMmap {
@@ -617,9 +748,122 @@ mod test {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
 
-        let records = Records::from_ptr(test_data.as_mut_ptr());
+        let records = Records::from_ptr(test_data.as_mut_ptr(), 0, false);
         let decoded = records.into_iter().collect::<Vec<_>>();
 
         insta::assert_debug_snapshot!(decoded);
+    }
+
+    #[test]
+    fn dwarf_user_state_fixture() {
+        use super::{ReadFormat, SampleFormat};
+
+        let sample = SampleFormat {
+            header: perf_event_open_sys::bindings::perf_event_header::default(),
+            ip: 0x1234,
+            pid: 7,
+            tid: 8,
+            time: 9,
+            id: 10,
+            cpu: 11,
+            _res: 0,
+            read: ReadFormat {
+                nr: 0,
+                time_enabled: 12,
+                time_running: 13,
+            },
+        };
+        let sample_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&sample as *const SampleFormat).cast::<u8>(),
+                std::mem::size_of::<SampleFormat>(),
+            )
+        };
+        let mut bytes = sample_bytes.to_vec();
+        bytes.extend_from_slice(&2_u64.to_ne_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_ne_bytes());
+        bytes.extend_from_slice(&0x1234_u64.to_ne_bytes());
+        bytes.extend_from_slice(&2_u64.to_ne_bytes()); // PERF_SAMPLE_REGS_ABI_64
+        let mask = 0b111_u64;
+        for value in [0xaa_u64, 0xbb, 0xcc] {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        bytes.extend_from_slice(&8_u64.to_ne_bytes());
+        bytes.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        bytes.extend_from_slice(&5_u64.to_ne_bytes());
+
+        let (regs, stack) = sample.read_user_state(&bytes, mask, false);
+        insta::assert_debug_snapshot!((regs, stack), @r###"
+        (
+            Some(
+                UserRegs {
+                    abi: 2,
+                    mask: 7,
+                    values: [
+                        170,
+                        187,
+                        204,
+                    ],
+                },
+            ),
+            [
+                1,
+                2,
+                3,
+                4,
+                5,
+            ],
+        )
+        "###);
+    }
+
+    #[test]
+    fn lbr_call_stack_fixture() {
+        use super::{ReadFormat, SampleFormat};
+
+        let sample = SampleFormat {
+            header: perf_event_open_sys::bindings::perf_event_header::default(),
+            ip: 0x400123,
+            pid: 7,
+            tid: 8,
+            time: 9,
+            id: 10,
+            cpu: 11,
+            _res: 0,
+            read: ReadFormat {
+                nr: 0,
+                time_enabled: 12,
+                time_running: 13,
+            },
+        };
+        let sample_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&sample as *const SampleFormat).cast::<u8>(),
+                std::mem::size_of::<SampleFormat>(),
+            )
+        };
+        let mut bytes = sample_bytes.to_vec();
+        bytes.extend_from_slice(&1_u64.to_ne_bytes());
+        bytes.extend_from_slice(&0x400123_u64.to_ne_bytes());
+        bytes.extend_from_slice(&3_u64.to_ne_bytes());
+        for (from, to) in [
+            (0x400100_u64, 0x500000_u64),
+            (0x300200, 0x400000),
+            (0x200300, 0x300000),
+        ] {
+            bytes.extend_from_slice(&from.to_ne_bytes());
+            bytes.extend_from_slice(&to.to_ne_bytes());
+            bytes.extend_from_slice(&0_u64.to_ne_bytes());
+        }
+
+        let callstack = sample.read_branch_callstack(&bytes);
+        insta::assert_debug_snapshot!(callstack, @r###"
+        [
+            4194595,
+            4194560,
+            3146240,
+            2097920,
+        ]
+        "###);
     }
 }

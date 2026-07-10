@@ -58,6 +58,7 @@ pub async fn do_record(
         .collect();
 
     let ri = RecordInfo {
+        format_version: mperf_data::CURRENT_FORMAT_VERSION,
         scenario,
         command: json_command,
         cpu_model,
@@ -134,6 +135,12 @@ fn snapshot(
                     value: sample.value,
                     timestamp: sample.time,
                     callstack,
+                    user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
+                        abi: regs.abi,
+                        mask: regs.mask,
+                        values: regs.values,
+                    }),
+                    user_stack: sample.user_stack,
                 };
 
                 sample_dispatcher.publish_event_sync(event);
@@ -305,6 +312,12 @@ async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Resul
                     value: sample.value,
                     timestamp: sample.time,
                     callstack,
+                    user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
+                        abi: regs.abi,
+                        mask: regs.mask,
+                        values: regs.values,
+                    }),
+                    user_stack: sample.user_stack,
                 };
 
                 dispatcher.publish_event_sync(event);

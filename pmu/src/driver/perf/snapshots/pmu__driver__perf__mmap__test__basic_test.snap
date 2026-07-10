@@ -35,6 +35,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Address {
         pid: 14844,
@@ -97,6 +99,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 139677355392595,
@@ -130,6 +134,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Address {
         pid: 14844,
@@ -159,6 +165,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 18446744072168465747,
@@ -190,6 +198,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -210,6 +220,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -230,6 +242,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -250,6 +264,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -270,6 +286,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -290,6 +308,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -310,6 +330,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -330,6 +352,8 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
     Sample {
         ip: 4199300,
@@ -350,5 +374,7 @@ expression: decoded
             139677348725515,
             4198789,
         ],
+        user_regs: None,
+        user_stack: [],
     },
 ]
