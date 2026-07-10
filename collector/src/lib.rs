@@ -90,7 +90,23 @@ pub fn get_next_id() -> u128 {
         last as u128
     });
 
-    ((std::process::id() as u128) << 96) | ((unsafe { libc::gettid() as u128 }) << 64) | counter
+    ((std::process::id() as u128) << 96) | ((current_thread_id() as u128) << 64) | counter
+}
+
+pub(crate) fn current_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::gettid() as u64 }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut tid = 0_u64;
+        unsafe {
+            libc::pthread_threadid_np(0, &mut tid);
+        }
+        tid
+    }
 }
 
 pub fn profiling_enabled() -> bool {

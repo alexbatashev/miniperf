@@ -93,7 +93,7 @@ impl EventDispatcher {
     pub fn unique_id(&self) -> u128 {
         let mut counter = self.last_unique_id.get_or(|| RefCell::new(0)).borrow_mut();
         let id = ((std::process::id() as u128) << 96)
-            | ((unsafe { libc::gettid() } as u128) << 64)
+            | ((current_thread_id() as u128) << 64)
             | (*counter as u128);
         *counter += 1;
         id
@@ -158,8 +158,14 @@ impl EventDispatcher {
     }
 
     pub fn publish_proc_map_sync(&self, map: ProcMapEntry) {
-        if let Err(err) = self.proc_map_tx.blocking_send(map) {
-            eprintln!("lost proc map entry: {:?}", err);
+        // This is called both from the sampling thread (a plain OS thread) and
+        // inline from the async `record` flow, which runs on a tokio worker.
+        // `blocking_send` panics inside a runtime ("cannot block the current
+        // thread from within a runtime"), so use the non-blocking `try_send`.
+        // Proc-map entries are few (hundreds) relative to the channel capacity,
+        // so this does not drop in practice; a full channel is logged, not fatal.
+        if let Err(err) = self.proc_map_tx.try_send(map) {
+            eprintln!("lost proc map entry: {err:?}");
         }
     }
 
@@ -172,6 +178,22 @@ impl EventDispatcher {
         if pid == 0 {
             return;
         }
+    }
+}
+
+fn current_thread_id() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::gettid() as u64 }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut tid = 0_u64;
+        unsafe {
+            libc::pthread_threadid_np(0, &mut tid);
+        }
+        tid
     }
 }
 

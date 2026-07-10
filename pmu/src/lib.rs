@@ -5,7 +5,8 @@ mod process;
 pub use cpu_family::host_cpu_description;
 pub use driver::{
     list_supported_counters, CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver,
-    CountingDriverBuilder, DriverKind, Record, SamplingDriver, SamplingDriverBuilder,
+    CountingDriverBuilder, DriverKind, MeasurementQuality, Record, SamplingDriver,
+    SamplingDriverBuilder,
 };
 pub use process::Process;
 
@@ -62,6 +63,8 @@ pub enum Error {
     CounterCreationFail,
     #[error("Failed to enable counters")]
     EnableFailed,
+    #[error("macOS KPC/kperf access was denied; try running this command with sudo")]
+    PermissionDenied,
 }
 
 impl Counter {

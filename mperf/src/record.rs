@@ -18,10 +18,13 @@ use crate::{
     postprocess::perform_postprocessing, utils::counter_to_event_ty, Scenario,
 };
 
+#[cfg(target_os = "macos")]
+const VM_PROT_EXECUTE: i32 = 0x4;
+
 pub async fn do_record(
     scenario: Scenario,
     output_directory: &Path,
-    _pid: Option<u32>,
+    pid: Option<u32>,
     command: Vec<String>,
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
@@ -29,7 +32,7 @@ pub async fn do_record(
     let (dispatcher, join_handle) = EventDispatcher::new(output_directory);
 
     let info = match scenario {
-        Scenario::Snapshot => snapshot(dispatcher.clone(), &command)?,
+        Scenario::Snapshot => snapshot(dispatcher.clone(), pid, &command)?,
         Scenario::Roofline => roofline(dispatcher.clone(), &command).await?,
     };
 
@@ -80,16 +83,39 @@ pub async fn do_record(
     Ok(())
 }
 
-fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
-    let process = Process::new(command, &[])?;
+fn snapshot(
+    dispatcher: Arc<EventDispatcher>,
+    pid: Option<u32>,
+    command: &[String],
+) -> Result<ScenarioInfo> {
+    if pid.is_none() && command.is_empty() {
+        anyhow::bail!("record snapshot requires a command or --pid");
+    }
+
+    let process = if pid.is_none() {
+        Some(Process::new(command, &[])?)
+    } else {
+        None
+    };
 
     let counters = get_pmu_counters(Scenario::Snapshot);
 
-    let mut driver = pmu::SamplingDriverBuilder::new()
-        .counters(&counters)
-        .process(&process)
-        .build()?;
+    let mut builder = pmu::SamplingDriverBuilder::new().counters(&counters);
+    if let Some(process) = &process {
+        builder = builder.process(process);
+    } else if let Some(pid) = pid {
+        builder = builder.pid(pid as i32);
+    }
+    let mut driver = builder.build()?;
+    let recorded_pid = pid.unwrap_or_else(|| process.as_ref().unwrap().pid() as u32) as i32;
+    // On macOS Process::new returns an already-exec'd, suspended child, so its
+    // dyld mappings are available before the first instruction is profiled.
+    // Attached processes are already live on every platform.
+    if cfg!(target_os = "macos") || pid.is_some() {
+        publish_process_maps(dispatcher.clone(), recorded_pid);
+    }
 
+    let sample_dispatcher = dispatcher.clone();
     driver.start(Arc::new(move |record| {
         match record {
             Record::Sample(sample) => {
@@ -110,7 +136,7 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
                     callstack,
                 };
 
-                dispatcher.publish_event_sync(event);
+                sample_dispatcher.publish_event_sync(event);
             }
             Record::ProcAddr(addr) => {
                 let entry = ProcMapEntry {
@@ -121,18 +147,103 @@ fn snapshot(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scen
                     pid: addr.pid,
                 };
 
-                dispatcher.publish_proc_map_sync(entry);
+                sample_dispatcher.publish_proc_map_sync(entry);
             }
         };
     }))?;
-    process.cont();
-    process.wait()?;
+    if let Some(process) = &process {
+        process.cont();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        publish_process_maps(dispatcher.clone(), recorded_pid);
+        process.wait()?;
+    } else if let Some(pid) = pid {
+        while unsafe { libc::kill(pid as i32, 0) } == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
     driver.stop()?;
 
     Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
-        pid: process.pid(),
+        pid: recorded_pid,
         counters: counters.iter().map(counter_to_event_ty).collect(),
     }))
+}
+
+fn publish_process_maps(dispatcher: Arc<EventDispatcher>, pid: i32) {
+    #[cfg(target_os = "macos")]
+    if let Ok(images) = proc_maps::mac_maps::get_dyld_info(pid as proc_maps::Pid) {
+        if !images.is_empty() {
+            let mut link_bases = HashMap::<PathBuf, Option<u64>>::new();
+            for image in images {
+                // proc-maps exposes every LC_SEGMENT_64 command, including
+                // __PAGEZERO. It is not mapped and its multi-gigabyte virtual
+                // span would falsely claim most user addresses during symbol
+                // lookup.
+                if !macos_segment_is_executable(image.segment.vmsize, image.segment.initprot) {
+                    continue;
+                }
+                let link_base = *link_bases
+                    .entry(image.filename.clone())
+                    .or_insert_with(|| mach_o_text_address(&image.filename));
+                let link_address = link_base
+                    .and_then(|base| {
+                        let slide = (image.address as u64).checked_sub(base)?;
+                        image.segment.vmaddr.checked_sub(slide)
+                    })
+                    .unwrap_or(image.segment.fileoff);
+                let entry = ProcMapEntry {
+                    filename: image.filename.to_string_lossy().to_string(),
+                    address: image.segment.vmaddr as usize,
+                    size: image.segment.vmsize as usize,
+                    // For Mach-O, addr2line consumes link-time virtual
+                    // addresses. Store the unslid segment VM address here so
+                    // `runtime - address + offset` reconstructs that address.
+                    offset: link_address as usize,
+                    pid: pid as u32,
+                };
+                dispatcher.publish_proc_map_sync(entry);
+            }
+            return;
+        }
+    }
+
+    let Ok(maps) = proc_maps::get_process_maps(pid as proc_maps::Pid) else {
+        return;
+    };
+
+    for map in maps {
+        if !map.is_exec() {
+            continue;
+        }
+        let Some(filename) = map.filename() else {
+            continue;
+        };
+        let entry = ProcMapEntry {
+            filename: filename.to_string_lossy().to_string(),
+            address: map.start(),
+            size: map.size(),
+            offset: 0,
+            pid: pid as u32,
+        };
+        dispatcher.publish_proc_map_sync(entry);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mach_o_text_address(path: &Path) -> Option<u64> {
+    use object::{Object, ObjectSegment};
+
+    let data = std::fs::read(path).ok()?;
+    let object = object::File::parse(data.as_slice()).ok()?;
+    object
+        .segments()
+        .find(|segment| segment.name().ok().flatten() == Some("__TEXT"))
+        .map(|segment| segment.address())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_segment_is_executable(size: u64, initial_protection: i32) -> bool {
+    size > 0 && initial_protection & VM_PROT_EXECUTE != 0
 }
 
 fn get_exe_dir() -> std::io::Result<PathBuf> {
@@ -302,4 +413,23 @@ fn create_shmem_pipe(
     });
 
     Ok((pipe_name, task))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{mach_o_text_address, macos_segment_is_executable, VM_PROT_EXECUTE};
+
+    #[test]
+    fn finds_link_time_text_address_in_current_mach_o() {
+        let executable = std::env::current_exe().unwrap();
+        assert!(mach_o_text_address(&executable).is_some());
+    }
+
+    #[test]
+    fn rejects_non_executable_mach_o_segments() {
+        assert!(!macos_segment_is_executable(0x1_0000_0000, 0));
+        assert!(!macos_segment_is_executable(0x1000, 1));
+        assert!(!macos_segment_is_executable(0, VM_PROT_EXECUTE));
+        assert!(macos_segment_is_executable(0x1000, VM_PROT_EXECUTE));
+    }
 }

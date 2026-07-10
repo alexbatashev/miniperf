@@ -61,7 +61,7 @@ impl Shmem {
         flags: i32,
     ) -> Result<(i32, *mut c_void), std::io::Error> {
         let name = CString::new(name)?;
-        let fd = shm_open(name.as_ptr(), flags, S_IRUSR | S_IWUSR);
+        let fd = shm_open(name.as_ptr(), flags, (S_IRUSR | S_IWUSR) as libc::c_uint);
 
         if fd == -1 {
             eprintln!("fd == -1\n");
@@ -92,8 +92,9 @@ impl Drop for Shmem {
         }
         if self.is_owning {
             unsafe {
-                let name = self.name.as_str().as_ptr() as *const libc::c_char;
-                shm_unlink(name);
+                if let Ok(name) = CString::new(self.name.as_str()) {
+                    shm_unlink(name.as_ptr());
+                }
             }
         }
     }
@@ -155,7 +156,7 @@ impl Semaphore {
     pub fn counter(&self) -> Result<i32, std::io::Error> {
         let mut res = 0;
         unsafe {
-            if libc::sem_getvalue(self.sem, &mut res as *mut i32) != 0 {
+            if sem_getvalue(self.sem, &mut res as *mut i32) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
         }
@@ -176,6 +177,16 @@ impl Drop for Semaphore {
 
 unsafe impl Send for Shmem {}
 unsafe impl Send for Semaphore {}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn sem_getvalue(sem: *mut libc::sem_t, sval: *mut libc::c_int) -> libc::c_int;
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn sem_getvalue(sem: *mut libc::sem_t, sval: *mut libc::c_int) -> libc::c_int {
+    libc::sem_getvalue(sem, sval)
+}
 
 #[cfg(test)]
 mod tests {

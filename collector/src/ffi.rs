@@ -4,8 +4,8 @@ use std::ffi::CStr;
 use mperf_data::{CallFrame, Event, EventType, Location};
 
 use crate::{
-    get_next_id, get_string_id, get_timestamp, profiling_enabled, roofline_instrumentation_enabled,
-    send_event,
+    current_thread_id, get_next_id, get_string_id, get_timestamp, profiling_enabled,
+    roofline_instrumentation_enabled, send_event,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -86,7 +86,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
         correlation_id: 0,
         parent_id: 0,
         ty: EventType::RooflineLoopStart,
-        thread_id: libc::gettid() as u32,
+        thread_id: current_thread_id() as u32,
         process_id: std::process::id(),
         cpu: u32::MAX,
         time_enabled: 0,
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         correlation_id: handle.id,
         parent_id: 0,
         ty: EventType::RooflineLoopEnd,
-        thread_id: libc::gettid() as u32,
+        thread_id: current_thread_id() as u32,
         process_id: std::process::id(),
         cpu: u32::MAX,
         time_enabled: 0,
@@ -162,7 +162,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
             correlation_id: 0,
             parent_id: handle.id,
             ty,
-            thread_id: libc::gettid() as u32,
+            thread_id: current_thread_id() as u32,
             process_id: std::process::id(),
             cpu: u32::MAX,
             time_enabled: 0,

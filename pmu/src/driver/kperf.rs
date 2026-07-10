@@ -1,29 +1,71 @@
 #![allow(dead_code)]
-// use crate::backends::{Backend, BackendCounters};
-// use crate::{CounterKind, CountersGroup};
+
 use dlopen2::wrapper::{Container, WrapperApi};
-use libc::*;
-// use std::ffi::CStr;
-use std::sync::Arc;
+use libc::{c_char, c_int, c_uint, c_void, size_t};
+use smallvec::SmallVec;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::{CStr, CString};
+use std::mem::size_of;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use crate::Counter;
+use crate::driver::{
+    CounterEntry, CounterResult, CounterValue, CountingDriver, MeasurementQuality, Record, Sample,
+    SamplingCallback, SamplingDriver,
+};
+use crate::{Counter, Error};
 
-const MAX_COUNTERS: usize = 6;
+/// Upper bound on counters the kernel can write per CPU (arm64 is 11, x86_64 is
+/// 32). Used purely as buffer headroom — the kpc read paths do no length
+/// checking, so a generous guard turns any miscount into wasted space instead of
+/// heap corruption.
+const KPC_MAX_COUNTERS: usize = 32;
 
 const KPC_CLASS_FIXED: u32 = 0;
 const KPC_CLASS_CONFIGURABLE: u32 = 1;
-const KPC_CLASS_POWER: u32 = 2;
-const KPC_CLASS_RAWPMU: u32 = 3;
 
 const KPC_CLASS_FIXED_MASK: u32 = 1 << KPC_CLASS_FIXED;
 const KPC_CLASS_CONFIGURABLE_MASK: u32 = 1 << KPC_CLASS_CONFIGURABLE;
-const KPC_CLASS_POWER_MASK: u32 = 1 << KPC_CLASS_POWER;
-const KPC_CLASS_RAWPMU_MASK: u32 = 1 << KPC_CLASS_RAWPMU;
 
-pub struct Driver {
-    kpc_dispatch: Arc<Container<KPCDispatch>>,
-    kpep_dispatch: Arc<Container<KPEPDispatch>>,
-    db: *const KPepDB,
+const DBG_PERF: u32 = 37;
+const DBG_FUNC_START: u32 = 1;
+const DBG_FUNC_END: u32 = 2;
+const KDBG_EVENTID_MASK: u32 = 0xffff_fffc;
+
+const PERF_SAMPLE: u32 = kdbg_eventid(DBG_PERF, 0, 0);
+const PERF_TI_DATA: u32 = kdbg_eventid(DBG_PERF, 1, 1);
+const PERF_STK_UHDR: u32 = 0x2502_0018;
+const PERF_STK_UDATA: u32 = 0x2502_0010;
+const PERF_KPC_DATA_THREAD: u32 = kdbg_eventid(DBG_PERF, 6, 8);
+
+const SAMPLE_META_UPEND: u64 = 1 << 1;
+const CALLSTACK_VALID: u64 = 1 << 0;
+const CALLSTACK_HAS_ASYNC: u64 = 1 << 9;
+
+const SAMPLER_TH_INFO: u32 = 1 << 0;
+const SAMPLER_USTACK: u32 = 1 << 3;
+const SAMPLER_PMC_THREAD: u32 = 1 << 4;
+
+const CTL_KERN: c_int = 1;
+const KERN_KDEBUG: c_int = 24;
+const KERN_KDENABLE: c_int = 3;
+const KERN_KDSETBUF: c_int = 4;
+const KERN_KDSETUP: c_int = 6;
+const KERN_KDREMOVE: c_int = 7;
+const KERN_KDREADTR: c_int = 10;
+const KERN_KDSET_TYPEFILTER: c_int = 22;
+
+const KDEBUG_ENABLE_TRACE: c_uint = 1;
+const KDBG_TYPEFILTER_BITMAP_SIZE: usize = (256 * 256) / 8;
+const KDBG_BYTES_PER_CLASS: usize = 256 / 8;
+
+const RUSAGE_INFO_V4: c_int = 4;
+
+const fn kdbg_eventid(class: u32, subclass: u32, code: u32) -> u32 {
+    ((class & 0xff) << 24) | ((subclass & 0xff) << 16) | ((code & 0x3fff) << 2)
 }
 
 #[repr(C)]
@@ -42,53 +84,112 @@ struct KPepEvent {
 
 #[repr(C)]
 struct KPepDB {
-    name: *const c_char,
-    cpu_id: *const c_char,
-    marketing_name: *const c_char,
-    plist_data: *const u8,
-    event_map: *const u8,
-    event_arr: *const KPepEvent,
-    fixed_event_arr: *const *const KPepEvent,
-    alias_map: *const u8,
-    reserved1: size_t,
-    reserved2: size_t,
-    reserved3: size_t,
-    event_count: size_t,
-    alias_count: size_t,
-    fixed_count_counter: size_t,
-    config_counter_count: size_t,
-    power_counter_count: size_t,
-    architecture: u32,
-    fixed_counter_bits: u32,
-    config_counter_bits: u32,
-    power_counter_bits: u32,
+    _private: [u8; 0],
 }
 
 #[repr(C)]
 struct KPepConfig {
-    db: *const KPepDB,
-    ev_arr: *const *const KPepEvent,
-    ev_map: *const size_t,
-    ev_idx: *const size_t,
-    flags: *const u32,
-    kpc_periods: *const u64,
-    event_count: size_t,
-    counter_count: size_t,
-    classes: u32,
-    config_counter: u32,
-    power_counter: u32,
-    reserved: u32,
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KdBuf {
+    timestamp: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+    arg5: u64,
+    debugid: u32,
+    cpuid: u32,
+    unused: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RUsageInfoV4 {
+    ri_uuid: [u8; 16],
+    ri_user_time: u64,
+    ri_system_time: u64,
+    ri_pkg_idle_wkups: u64,
+    ri_interrupt_wkups: u64,
+    ri_pageins: u64,
+    ri_wired_size: u64,
+    ri_resident_size: u64,
+    ri_phys_footprint: u64,
+    ri_proc_start_abstime: u64,
+    ri_proc_exit_abstime: u64,
+    ri_child_user_time: u64,
+    ri_child_system_time: u64,
+    ri_child_pkg_idle_wkups: u64,
+    ri_child_interrupt_wkups: u64,
+    ri_child_pageins: u64,
+    ri_child_elapsed_abstime: u64,
+    ri_diskio_bytesread: u64,
+    ri_diskio_byteswritten: u64,
+    ri_cpu_time_qos_default: u64,
+    ri_cpu_time_qos_maintenance: u64,
+    ri_cpu_time_qos_background: u64,
+    ri_cpu_time_qos_utility: u64,
+    ri_cpu_time_qos_legacy: u64,
+    ri_cpu_time_qos_user_initiated: u64,
+    ri_cpu_time_qos_user_interactive: u64,
+    ri_billed_system_time: u64,
+    ri_serviced_system_time: u64,
+    ri_logical_writes: u64,
+    ri_lifetime_max_phys_footprint: u64,
+    ri_instructions: u64,
+    ri_cycles: u64,
+    ri_billed_energy: u64,
+    ri_serviced_energy: u64,
+    ri_interval_max_phys_footprint: u64,
+    ri_runnable_time: u64,
+}
+
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+extern "C" {
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
 }
 
 #[derive(WrapperApi)]
 struct KPCDispatch {
     kpc_cpu_string: unsafe extern "C" fn(buf: *mut c_char, buf_size: size_t) -> c_int,
     kpc_pmu_version: unsafe extern "C" fn() -> u32,
+    kpc_get_counting: unsafe extern "C" fn() -> u32,
     kpc_set_counting: unsafe extern "C" fn(classes: u32) -> c_int,
     kpc_set_thread_counting: unsafe extern "C" fn(classes: u32) -> c_int,
+    kpc_get_config_count: unsafe extern "C" fn(classes: u32) -> u32,
+    kpc_get_counter_count: unsafe extern "C" fn(classes: u32) -> u32,
     kpc_set_config: unsafe extern "C" fn(classes: u32, config: *mut u64) -> c_int,
+    kpc_set_period: unsafe extern "C" fn(classes: u32, period: *mut u64) -> c_int,
+    kpc_get_cpu_counters: unsafe extern "C" fn(
+        all_cpus: c_int,
+        classes: u32,
+        curcpu: *mut c_int,
+        buf: *mut u64,
+    ) -> c_int,
     kpc_get_thread_counters: unsafe extern "C" fn(tid: u32, buf_count: u32, buf: *mut u64) -> c_int,
     kpc_force_all_ctrs_set: unsafe extern "C" fn(val: c_int) -> c_int,
+}
+
+#[derive(WrapperApi)]
+struct KPerfDispatch {
+    kperf_reset: unsafe extern "C" fn(),
+    kperf_ns_to_ticks: unsafe extern "C" fn(ns: u64) -> u64,
+    kperf_action_count_set: unsafe extern "C" fn(count: c_uint) -> c_int,
+    kperf_action_samplers_set: unsafe extern "C" fn(actionid: c_uint, samplers: u32) -> c_int,
+    kperf_action_ucallstack_depth_set: unsafe extern "C" fn(actionid: c_uint, depth: u32) -> c_int,
+    kperf_action_filter_set_by_pid: unsafe extern "C" fn(actionid: c_uint, pid: c_int) -> c_int,
+    kperf_timer_count_set: unsafe extern "C" fn(count: c_uint) -> c_int,
+    kperf_timer_period_set: unsafe extern "C" fn(timerid: c_uint, ticks: u64) -> c_int,
+    kperf_timer_action_set: unsafe extern "C" fn(timerid: c_uint, actionid: c_uint) -> c_int,
+    kperf_sample_set: unsafe extern "C" fn(enabled: c_int) -> c_int,
 }
 
 #[derive(WrapperApi)]
@@ -97,6 +198,11 @@ struct KPEPDispatch {
     kpep_config_free: unsafe extern "C" fn(cfg: *mut KPepConfig),
     kpep_db_create: unsafe extern "C" fn(name: *const c_char, db: *mut *mut KPepDB) -> c_int,
     kpep_db_free: unsafe extern "C" fn(db: *mut KPepDB),
+    kpep_db_event: unsafe extern "C" fn(
+        db: *const KPepDB,
+        name: *const c_char,
+        event: *mut *mut KPepEvent,
+    ) -> c_int,
     kpep_db_events_count: unsafe extern "C" fn(db: *const KPepDB, count: *mut size_t) -> c_int,
     kpep_db_events:
         unsafe extern "C" fn(db: *const KPepDB, buf: *mut *mut KPepEvent, buf_size: usize) -> c_int,
@@ -111,6 +217,8 @@ struct KPEPDispatch {
     ) -> c_int,
     kpep_config_kpc:
         unsafe extern "C" fn(cfg: *mut KPepConfig, buf: *mut u64, buf_size: usize) -> c_int,
+    kpep_config_kpc_periods:
+        unsafe extern "C" fn(cfg: *mut KPepConfig, buf: *mut u64, buf_size: usize) -> c_int,
     kpep_config_kpc_count:
         unsafe extern "C" fn(cfg: *mut KPepConfig, count_ptr: *mut usize) -> c_int,
     kpep_config_kpc_classes:
@@ -119,41 +227,2245 @@ struct KPEPDispatch {
         unsafe extern "C" fn(cfg: *mut KPepConfig, buf: *mut usize, size: usize) -> c_int,
 }
 
+#[derive(Clone)]
+struct KPerfContext {
+    kpc: Arc<Container<KPCDispatch>>,
+    kperf: Arc<Container<KPerfDispatch>>,
+    kpep: Arc<Container<KPEPDispatch>>,
+    db: *mut KPepDB,
+}
+
+unsafe impl Send for KPerfContext {}
+unsafe impl Sync for KPerfContext {}
+
+pub struct KPerfCountingDriver {
+    ctx: KPerfContext,
+    handles: Vec<NativeCounterHandle>,
+    programs: Vec<KpcProgram>,
+    classes: u32,
+    kpc_count: usize,
+    cpu_count: usize,
+    /// Whether privileged kpc hardware counting is usable. When false (e.g. no
+    /// root / KPC access denied) we still report whatever `proc_pid_rusage`
+    /// provides (cycles, instructions, page faults, cpu-clock) rather than
+    /// failing outright — "some data rather than none".
+    hw_available: bool,
+    before: Option<CounterSnapshot>,
+    after: Option<CounterSnapshot>,
+    pid: Option<i32>,
+    multiplex_counts: Option<Arc<Mutex<MultiplexCounts>>>,
+    multiplex_running: Arc<AtomicBool>,
+    multiplex_thread: Option<thread::JoinHandle<()>>,
+    taskinfo_latest: Arc<Mutex<Option<libc::proc_taskinfo>>>,
+    taskinfo_running: Arc<AtomicBool>,
+    taskinfo_thread: Option<thread::JoinHandle<()>>,
+    pid_sampler: Option<KPerfSamplingDriver>,
+    estimated_counts: Arc<Mutex<Vec<EstimatedCounterValue>>>,
+}
+
+pub struct KPerfSamplingDriver {
+    ctx: KPerfContext,
+    handles: Vec<NativeCounterHandle>,
+    programs: Vec<KpcProgram>,
+    classes: u32,
+    kpc_count: usize,
+    sample_freq: u64,
+    pid: Option<i32>,
+    capture_callstacks: bool,
+    running: Arc<AtomicBool>,
+    thread_handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Clone)]
 struct NativeCounterHandle {
-    // pub kind: CounterKind,
-    pub reg_id: usize,
+    counter: Counter,
+    program_index: Option<usize>,
+    kpc_index: Option<usize>,
 }
 
-struct KPerfCounters {
-    kpc_dispatch: Arc<Container<KPCDispatch>>,
-    kpep_dispatch: Arc<Container<KPEPDispatch>>,
-    native_handles: Vec<NativeCounterHandle>,
-    counter_values_before: Vec<u64>,
-    counter_values_after: Vec<u64>,
-    config: *mut KPepConfig,
+#[derive(Clone)]
+struct KpcProgram {
+    handles: Vec<NativeCounterHandle>,
+    classes: u32,
+    kpc_count: usize,
+    config: Vec<u64>,
+    periods: Vec<u64>,
 }
 
-impl Driver {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let kpc_dispatch: Container<KPCDispatch> =
-            unsafe { Container::load("/System/Library/PrivateFrameworks/kperf.framework/kperf") }?;
-        let kpep_dispatch: Container<KPEPDispatch> = unsafe {
-            Container::load("/System/Library/PrivateFrameworks/kperfdata.framework/kperfdata")
-        }?;
+#[derive(Default)]
+struct MultiplexCounts {
+    counts: Vec<(Counter, u64)>,
+    running_ns: Vec<(Counter, u64)>,
+    started_at: Option<Instant>,
+    stopped_at: Option<Instant>,
+}
 
-        let mut db: *mut KPepDB = std::ptr::null_mut();
-        if unsafe { kpep_dispatch.kpep_db_create(std::ptr::null(), &mut db) } != 0 {
-            panic!("Failed to load kpep database");
+/// A read-time view of the multiplexer's accumulators. `value()` scales a
+/// counter's raw total by (total wall time / time this counter was actually
+/// scheduled), the same estimate `perf` reports for multiplexed events.
+struct MultiplexView {
+    enabled_ns: u64,
+    counts: Vec<(Counter, u64)>,
+    running_ns: Vec<(Counter, u64)>,
+}
+
+#[derive(Clone)]
+struct EstimatedCounterValue {
+    counter: Counter,
+    value: u64,
+    time_enabled: u64,
+    time_running: u64,
+    samples: u64,
+}
+
+impl MultiplexView {
+    fn value(&self, counter: &Counter) -> Option<(u64, f64)> {
+        let raw = find_counter_value(&self.counts, counter)?;
+        let running_ns = find_counter_value(&self.running_ns, counter)?;
+        if running_ns == 0 || self.enabled_ns == 0 {
+            return None;
+        }
+        let scaling = self.enabled_ns as f64 / running_ns as f64;
+        Some(((raw as f64 * scaling).round() as u64, scaling))
+    }
+}
+
+#[derive(Clone, Default)]
+struct CounterSnapshot {
+    kpc: Vec<u64>,
+    rusage: Option<RUsageInfoV4>,
+    taskinfo: Option<libc::proc_taskinfo>,
+    taskinfo_exact: bool,
+}
+
+struct StackBuilder {
+    frames_left: usize,
+    flags: u64,
+    synchronous_frames: usize,
+    async_start_index: usize,
+    async_frames: usize,
+    frames: SmallVec<[u64; 32]>,
+}
+
+impl StackBuilder {
+    fn finish(self) -> SmallVec<[u64; 32]> {
+        if self.flags & CALLSTACK_VALID == 0 {
+            return SmallVec::new();
         }
 
-        Ok(Driver {
-            kpc_dispatch: kpc_dispatch.into(),
-            kpep_dispatch: kpep_dispatch.into(),
+        let synchronous_len = self.synchronous_frames.min(self.frames.len());
+        let async_len = self
+            .async_frames
+            .min(self.frames.len().saturating_sub(synchronous_len));
+        let mut synchronous = SmallVec::<[u64; 32]>::from_slice(&self.frames[..synchronous_len]);
+        let async_frames = &self.frames[synchronous_len..synchronous_len + async_len];
+
+        // backtrace_user() records the interrupted PC followed by the frame
+        // pointer chain. kperf then appends the saved LR (arm64) or stack-top
+        // return address (x86_64) as the final synchronous entry so consumers
+        // can repair leaf functions that have not established a frame yet.
+        // Put that fixup immediately after the sampled PC to reconstruct the
+        // logical leaf-to-root call chain. Async frames, when present, follow
+        // the synchronous portion and must not be mistaken for the fixup.
+        let fixup = (synchronous.len() > 1).then(|| synchronous.pop()).flatten();
+
+        // Swift async frames replace the physical-stack suffix at the index
+        // reported by XNU. They are not an independent rootward suffix.
+        if self.flags & CALLSTACK_HAS_ASYNC != 0 && !async_frames.is_empty() {
+            synchronous.truncate(self.async_start_index.min(synchronous.len()));
+        }
+
+        if let Some(fixup) = fixup {
+            if fixup != 0 && synchronous.get(1).copied() != Some(fixup) {
+                synchronous.insert(1.min(synchronous.len()), fixup);
+            }
+        }
+
+        if self.flags & CALLSTACK_HAS_ASYNC != 0 {
+            synchronous.extend(async_frames.iter().copied());
+        }
+        synchronous.retain(|frame| *frame != 0);
+        synchronous
+    }
+}
+
+#[derive(Clone, Default)]
+struct PendingSample {
+    time: u64,
+    pid: u32,
+    tid: u32,
+    trace_tid: u64,
+    cpu: u32,
+    kpc_values: Vec<u64>,
+    callstack: SmallVec<[u64; 32]>,
+    forced_pid: Option<u32>,
+}
+
+struct DeferredSample {
+    sample: PendingSample,
+    handles: Vec<NativeCounterHandle>,
+    program_epoch: u64,
+    time_enabled_multiplier: u64,
+}
+
+#[derive(Default)]
+struct KdebugDecodeState {
+    pending_stacks: HashMap<u64, StackBuilder>,
+    pending_samples: HashMap<u64, PendingSample>,
+    deferred_samples: HashMap<u64, VecDeque<DeferredSample>>,
+    last_kpc_values: HashMap<(u32, u32, u64, usize), LastKpcValue>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LastKpcValue {
+    time: u64,
+    value: u64,
+}
+
+impl KPerfContext {
+    fn new() -> Result<Self, Error> {
+        let kpc: Container<KPCDispatch> = unsafe {
+            Container::load("/System/Library/PrivateFrameworks/kperf.framework/kperf")
+                .map_err(|_| Error::CounterCreationFail)?
+        };
+        let kperf: Container<KPerfDispatch> = unsafe {
+            Container::load("/System/Library/PrivateFrameworks/kperf.framework/kperf")
+                .map_err(|_| Error::CounterCreationFail)?
+        };
+        let kpep: Container<KPEPDispatch> = unsafe {
+            Container::load("/System/Library/PrivateFrameworks/kperfdata.framework/kperfdata")
+                .map_err(|_| Error::CounterCreationFail)?
+        };
+
+        let kpc: Arc<Container<KPCDispatch>> = kpc.into();
+        let kperf: Arc<Container<KPerfDispatch>> = kperf.into();
+        let kpep: Arc<Container<KPEPDispatch>> = kpep.into();
+        let db = create_kpep_db(&kpc, &kpep)?;
+
+        Ok(KPerfContext {
+            kpc,
+            kperf,
+            kpep,
             db,
         })
     }
 }
 
-pub fn list_software_counters() -> Vec<Counter> {
-    vec![]
+fn create_kpep_db(
+    kpc: &Container<KPCDispatch>,
+    kpep: &Container<KPEPDispatch>,
+) -> Result<*mut KPepDB, Error> {
+    let mut names = Vec::<String>::new();
+    let mut cpu = [0_i8; 128];
+
+    if unsafe { kpc.kpc_cpu_string(cpu.as_mut_ptr(), cpu.len()) } == 0 {
+        if let Ok(name) = unsafe { CStr::from_ptr(cpu.as_ptr()) }.to_str() {
+            if !name.is_empty() {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    names.extend(
+        [
+            "as5-2",
+            "as5-1",
+            "as5",
+            "as4-2",
+            "as4-1",
+            "as4",
+            "as3",
+            "as2",
+            "as1",
+            "a16",
+            "a15",
+            "a14",
+            "a13",
+            "a12",
+            "a11",
+            "a10",
+            "a9",
+            "a8",
+            "a7",
+            "icelake",
+            "cometlake",
+            "kabylake",
+            "skylake",
+            "broadwell",
+            "haswell",
+            "ivybridge",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+
+    let mut db: *mut KPepDB = ptr::null_mut();
+    if unsafe { kpep.kpep_db_create(ptr::null(), &mut db) } == 0 && !db.is_null() {
+        return Ok(db);
+    }
+
+    for name in names {
+        let Ok(c_name) = CString::new(name) else {
+            continue;
+        };
+        db = ptr::null_mut();
+        if unsafe { kpep.kpep_db_create(c_name.as_ptr(), &mut db) } == 0 && !db.is_null() {
+            return Ok(db);
+        }
+    }
+
+    Err(Error::CounterCreationFail)
+}
+
+impl Drop for KPerfContext {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.kpep) == 1 && !self.db.is_null() {
+            unsafe { self.kpep.kpep_db_free(self.db) };
+            self.db = ptr::null_mut();
+        }
+    }
+}
+
+impl KPerfCountingDriver {
+    pub fn new(counters: Vec<Counter>, pid: Option<i32>) -> Result<Self, Error> {
+        let ctx = KPerfContext::new()?;
+        // Build the kpc program layout but do not apply it yet: applying requires
+        // privileged access, and we want construction to succeed even without root
+        // so the rusage-based counters (cycles/instructions/...) still work.
+        let config = build_kpc_config(&ctx, &counters, 0, false)?;
+        let cpu_count = logical_cpu_count().unwrap_or(1);
+
+        Ok(KPerfCountingDriver {
+            ctx,
+            handles: config.handles,
+            programs: config.programs,
+            classes: config.classes,
+            kpc_count: config.kpc_count,
+            cpu_count,
+            hw_available: false,
+            before: None,
+            after: None,
+            pid,
+            multiplex_counts: None,
+            multiplex_running: Arc::new(AtomicBool::new(false)),
+            multiplex_thread: None,
+            taskinfo_latest: Arc::new(Mutex::new(None)),
+            taskinfo_running: Arc::new(AtomicBool::new(false)),
+            taskinfo_thread: None,
+            pid_sampler: None,
+            estimated_counts: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    fn read_snapshot(&self) -> Result<CounterSnapshot, std::io::Error> {
+        let mut snapshot = CounterSnapshot::default();
+        if self.hw_available && self.kpc_count > 0 {
+            // kpc_get_cpu_counters(all_cpus=1) writes counter_count u64 values per
+            // CPU, indexed by physical cpu_number(), so the buffer must be sized for
+            // logical_cpu_max, not the number of online CPUs. It returns 0 on
+            // success; a nonzero return means the read failed, in which case the
+            // zero-initialised buffer yields a zero delta (harmless) rather than an
+            // error that would discard the whole snapshot. The extra KPC_MAX_COUNTERS
+            // of headroom is pure defence: the kernel only asserts on the buffer
+            // pointer (no length check), so any miscount would otherwise corrupt the
+            // heap. Reads still use `kpc_count` as the stride, so the guard slots
+            // stay zero and never affect the totals.
+            let mut kpc = vec![0_u64; self.cpu_count * self.kpc_count + KPC_MAX_COUNTERS];
+            unsafe {
+                self.ctx.kpc.kpc_get_cpu_counters(
+                    1,
+                    self.classes,
+                    ptr::null_mut(),
+                    kpc.as_mut_ptr(),
+                );
+            }
+            kpc.truncate(self.cpu_count * self.kpc_count);
+            snapshot.kpc = kpc;
+        }
+
+        if let Some(pid) = self.pid {
+            snapshot.rusage = read_rusage(pid).ok();
+            snapshot.taskinfo = read_taskinfo(pid).ok();
+            snapshot.taskinfo_exact = snapshot.taskinfo.is_some();
+        }
+
+        Ok(snapshot)
+    }
+}
+
+impl CountingDriver for KPerfCountingDriver {
+    fn start(&mut self) -> Result<(), Error> {
+        if self.pid.is_some() {
+            self.before = self.read_snapshot().ok();
+            self.start_taskinfo_monitor();
+            self.start_pid_estimator();
+            return Ok(());
+        }
+
+        // Multiplex only when the configurable events don't fit in one program.
+        // Multiplexing reads the same system-wide kpc counters, so it applies
+        // whether or not a specific pid was requested.
+        if self.programs.len() > 1 {
+            self.start_multiplexer()?;
+            self.start_taskinfo_monitor();
+            return Ok(());
+        }
+
+        // Enable system-wide hardware counting. This is privileged; if it fails
+        // (no root / KPC access denied / another client owns the PMU) we keep
+        // going with hardware unavailable and fall back to rusage-derived
+        // counters, rather than aborting the whole run.
+        self.hw_available = self.enable_hw_counting();
+        self.before = self.read_snapshot().ok();
+        self.start_taskinfo_monitor();
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), Error> {
+        if self.pid.is_some() {
+            self.stop_pid_estimator();
+            self.capture_final_process_snapshot();
+            return Ok(());
+        }
+
+        if self.multiplex_thread.is_some() {
+            return self.stop_multiplexer();
+        }
+
+        self.capture_final_process_snapshot();
+        if self.hw_available {
+            unsafe {
+                self.ctx.kpc.kpc_set_counting(0);
+            }
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<(), Error> {
+        if let Some(multiplex_counts) = &self.multiplex_counts {
+            if let Ok(mut counts) = multiplex_counts.lock() {
+                *counts = MultiplexCounts::default();
+            }
+        }
+        self.before = self.read_snapshot().ok();
+        self.after = None;
+        Ok(())
+    }
+
+    fn counters(&mut self) -> Result<CounterResult, std::io::Error> {
+        // Snapshot (single-program) reads need an `after`; multiplexing keeps its
+        // own accumulator and reads no snapshot here.
+        let multiplexing = self.multiplex_counts.is_some();
+        if !multiplexing && self.after.is_none() {
+            self.after = Some(self.read_snapshot()?);
+        }
+        let before = self.before.clone().unwrap_or_default();
+        let after = self.after.clone().unwrap_or_default();
+        let mux = self.multiplex_view();
+
+        let mut entries = SmallVec::<[CounterEntry; 16]>::with_capacity(self.handles.len());
+        for handle in &self.handles {
+            // Prefer the accurate per-process rusage value for the counters it
+            // provides (cycles, instructions, page faults, cpu-clock). This holds
+            // whether or not we are multiplexing the configurable PMU events.
+            if self.pid.is_some() {
+                if let Some((value, quality)) = process_counter(&handle.counter, &before, &after) {
+                    entries.push(CounterEntry {
+                        core: None,
+                        counter: handle.counter.clone(),
+                        value: CounterValue {
+                            value,
+                            scaling: 1.0,
+                            quality,
+                        },
+                    });
+                    continue;
+                }
+                if let Some((value, scaling)) = self.estimated_counter(&handle.counter) {
+                    entries.push(CounterEntry {
+                        core: None,
+                        counter: handle.counter.clone(),
+                        value: CounterValue {
+                            value,
+                            scaling,
+                            quality: MeasurementQuality::Estimated,
+                        },
+                    });
+                }
+                // kpc_get_cpu_counters is system-wide. Never present that value
+                // as if it belonged to the requested PID; programmable events
+                // require the PID-filtered PMC_THREAD estimator.
+                continue;
+            }
+
+            // Otherwise the hardware value: either the userspace-multiplexed and
+            // scaled estimate, or the system-wide kpc snapshot delta.
+            let (value, scaling) = match &mux {
+                Some(mux) => {
+                    let Some(value) = mux.value(&handle.counter) else {
+                        continue;
+                    };
+                    value
+                }
+                None => {
+                    if !self.hw_available {
+                        continue;
+                    }
+                    let Some(idx) = handle.kpc_index else {
+                        continue;
+                    };
+                    (
+                        sum_counter_delta(&before.kpc, &after.kpc, self.kpc_count, idx),
+                        1.0,
+                    )
+                }
+            };
+
+            entries.push(CounterEntry {
+                core: None,
+                counter: handle.counter.clone(),
+                value: CounterValue {
+                    value,
+                    scaling,
+                    quality: if mux.is_some() {
+                        MeasurementQuality::Scaled
+                    } else {
+                        MeasurementQuality::Exact
+                    },
+                },
+            });
+        }
+
+        Ok(CounterResult::from_entries(entries))
+    }
+}
+
+/// Exact process-scoped values exposed by Darwin's recount/proc accounting.
+/// Programmable PMU events are intentionally absent here: KPC's direct read is
+/// system-wide and its userspace thread getter can only read the caller.
+fn process_counter(
+    counter: &Counter,
+    before: &CounterSnapshot,
+    after: &CounterSnapshot,
+) -> Option<(u64, MeasurementQuality)> {
+    match counter {
+        Counter::Cycles => Some((
+            after
+                .rusage
+                .as_ref()?
+                .ri_cycles
+                .saturating_sub(before.rusage.as_ref()?.ri_cycles),
+            MeasurementQuality::Exact,
+        )),
+        Counter::Instructions => Some((
+            after
+                .rusage
+                .as_ref()?
+                .ri_instructions
+                .saturating_sub(before.rusage.as_ref()?.ri_instructions),
+            MeasurementQuality::Exact,
+        )),
+        Counter::PageFaults => Some((
+            nonnegative_i32(after.taskinfo.as_ref()?.pti_faults)
+                .saturating_sub(nonnegative_i32(before.taskinfo.as_ref()?.pti_faults)),
+            taskinfo_quality(after),
+        )),
+        Counter::ContextSwitches => Some((
+            nonnegative_i32(after.taskinfo.as_ref()?.pti_csw)
+                .saturating_sub(nonnegative_i32(before.taskinfo.as_ref()?.pti_csw)),
+            taskinfo_quality(after),
+        )),
+        Counter::CpuClock => Some((
+            mach_ticks_to_nanos(
+                after
+                    .rusage
+                    .as_ref()?
+                    .ri_user_time
+                    .saturating_add(after.rusage.as_ref()?.ri_system_time)
+                    .saturating_sub(
+                        before
+                            .rusage
+                            .as_ref()?
+                            .ri_user_time
+                            .saturating_add(before.rusage.as_ref()?.ri_system_time),
+                    ),
+            ),
+            MeasurementQuality::Exact,
+        )),
+        _ => None,
+    }
+}
+
+fn taskinfo_quality(snapshot: &CounterSnapshot) -> MeasurementQuality {
+    if snapshot.taskinfo_exact {
+        MeasurementQuality::Exact
+    } else {
+        MeasurementQuality::Estimated
+    }
+}
+
+fn nonnegative_i32(value: i32) -> u64 {
+    value.max(0) as u64
+}
+
+impl KPerfCountingDriver {
+    fn start_multiplexer(&mut self) -> Result<(), Error> {
+        // Best-effort: without privileges the per-segment reads simply yield
+        // zeros instead of aborting the run.
+        self.hw_available = unsafe { self.ctx.kpc.kpc_force_all_ctrs_set(1) } == 0;
+
+        let counts = Arc::new(Mutex::new(MultiplexCounts {
+            started_at: Some(Instant::now()),
+            ..MultiplexCounts::default()
+        }));
+        self.multiplex_running.store(true, Ordering::SeqCst);
+
+        let ctx = self.ctx.clone();
+        let programs = self.programs.clone();
+        let cpu_count = self.cpu_count;
+        let counts_for_thread = counts.clone();
+        let running = self.multiplex_running.clone();
+
+        let handle = thread::spawn(move || {
+            while running.load(Ordering::SeqCst) {
+                for program in &programs {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    if apply_kpc_program(&ctx, program).is_err() {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+
+                    unsafe {
+                        ctx.kpc.kpc_set_counting(program.classes);
+                    }
+
+                    let before = read_program_kpc(&ctx, program, cpu_count).unwrap_or_default();
+                    let segment_start = Instant::now();
+                    let quantum = Duration::from_millis(50);
+                    while running.load(Ordering::SeqCst) && segment_start.elapsed() < quantum {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    let elapsed_ns =
+                        segment_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                    let after = read_program_kpc(&ctx, program, cpu_count).unwrap_or_default();
+
+                    unsafe {
+                        ctx.kpc.kpc_set_counting(0);
+                    }
+
+                    if let Ok(mut counts) = counts_for_thread.lock() {
+                        for handle in &program.handles {
+                            let Some(idx) = handle.kpc_index else {
+                                continue;
+                            };
+                            let delta = sum_counter_delta(&before, &after, program.kpc_count, idx);
+                            add_counter_value(&mut counts.counts, handle.counter.clone(), delta);
+                            add_counter_value(
+                                &mut counts.running_ns,
+                                handle.counter.clone(),
+                                elapsed_ns,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Ok(mut counts) = counts_for_thread.lock() {
+                counts.stopped_at = Some(Instant::now());
+            }
+            unsafe {
+                ctx.kpc.kpc_set_counting(0);
+            }
+        });
+
+        self.multiplex_counts = Some(counts);
+        self.multiplex_thread = Some(handle);
+        Ok(())
+    }
+
+    fn stop_multiplexer(&mut self) -> Result<(), Error> {
+        self.multiplex_running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.multiplex_thread.take() {
+            handle.join().map_err(|_| Error::EnableFailed)?;
+        }
+        // Capture the child's final rusage while it is still a zombie, so the
+        // rusage overlay (cycles/instructions/...) works in multiplex mode too.
+        self.capture_final_process_snapshot();
+        Ok(())
+    }
+
+    fn start_taskinfo_monitor(&mut self) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        if self.taskinfo_thread.is_some() {
+            return;
+        }
+
+        if let Ok(mut latest) = self.taskinfo_latest.lock() {
+            *latest = None;
+        }
+        self.taskinfo_running.store(true, Ordering::SeqCst);
+        let running = self.taskinfo_running.clone();
+        let latest = self.taskinfo_latest.clone();
+        self.taskinfo_thread = Some(thread::spawn(move || {
+            while running.load(Ordering::SeqCst) {
+                if let Ok(info) = read_taskinfo(pid) {
+                    if let Ok(mut slot) = latest.lock() {
+                        *slot = Some(info);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }));
+    }
+
+    fn capture_final_process_snapshot(&mut self) {
+        self.after = self.read_snapshot().ok();
+        self.taskinfo_running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.taskinfo_thread.take() {
+            let _ = handle.join();
+        }
+
+        let fallback = self
+            .taskinfo_latest
+            .lock()
+            .ok()
+            .and_then(|latest| latest.clone());
+        let Some(after) = self.after.as_mut() else {
+            return;
+        };
+        if after.taskinfo.is_none() {
+            after.taskinfo = fallback;
+            after.taskinfo_exact = false;
+        }
+    }
+
+    fn start_pid_estimator(&mut self) {
+        let Some(pid) = self.pid else {
+            return;
+        };
+        let counters: Vec<Counter> = self
+            .handles
+            .iter()
+            .filter(|handle| handle.kpc_index.is_some())
+            .map(|handle| handle.counter.clone())
+            .collect();
+        if counters.is_empty() {
+            return;
+        }
+
+        if let Ok(mut counts) = self.estimated_counts.lock() {
+            counts.clear();
+        }
+        let Ok(mut sampler) =
+            KPerfSamplingDriver::new_with_callstacks(&counters, 200, Some(pid), false)
+        else {
+            return;
+        };
+
+        let counts = self.estimated_counts.clone();
+        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+            let Record::Sample(sample) = record else {
+                return;
+            };
+            let Ok(mut values) = counts.lock() else {
+                return;
+            };
+            if let Some(value) = values
+                .iter_mut()
+                .find(|value| value.counter == sample.counter)
+            {
+                value.value = value.value.saturating_add(sample.value);
+                value.time_enabled = value.time_enabled.saturating_add(sample.time_enabled);
+                value.time_running = value.time_running.saturating_add(sample.time_running);
+                value.samples = value.samples.saturating_add(1);
+            } else {
+                values.push(EstimatedCounterValue {
+                    counter: sample.counter,
+                    value: sample.value,
+                    time_enabled: sample.time_enabled,
+                    time_running: sample.time_running,
+                    samples: 1,
+                });
+            }
+        });
+
+        if sampler.start(callback).is_ok() {
+            self.pid_sampler = Some(sampler);
+        }
+    }
+
+    fn stop_pid_estimator(&mut self) {
+        if let Some(mut sampler) = self.pid_sampler.take() {
+            let _ = sampler.stop();
+        }
+    }
+
+    fn estimated_counter(&self, counter: &Counter) -> Option<(u64, f64)> {
+        let values = self.estimated_counts.lock().ok()?;
+        let value = values
+            .iter()
+            .find(|value| &value.counter == counter && value.samples > 1)?;
+        if value.time_running == 0 || value.time_enabled == 0 {
+            return None;
+        }
+        let scaling = value.time_enabled as f64 / value.time_running as f64;
+        Some(((value.value as f64 * scaling).round() as u64, scaling))
+    }
+
+    /// Snapshot of the userspace multiplexer's accumulators, or `None` when not
+    /// multiplexing. Lets `counters()` treat multiplexed and single-program
+    /// hardware values uniformly (with the rusage overlay layered on top).
+    fn multiplex_view(&self) -> Option<MultiplexView> {
+        let counts = self.multiplex_counts.as_ref()?.lock().ok()?;
+        let started_at = counts.started_at?;
+        let stopped_at = counts.stopped_at.unwrap_or_else(Instant::now);
+        let enabled_ns = stopped_at
+            .saturating_duration_since(started_at)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+
+        Some(MultiplexView {
+            enabled_ns,
+            counts: counts.counts.clone(),
+            running_ns: counts.running_ns.clone(),
+        })
+    }
+
+    /// Apply the (single) kpc program and switch on system-wide counting.
+    /// Returns whether hardware counting actually became available. All failures
+    /// are treated as "hardware unavailable" (typically missing privileges) so
+    /// the caller can transparently fall back to rusage-derived counters.
+    fn enable_hw_counting(&mut self) -> bool {
+        let Some(program) = self.programs.first() else {
+            // No hardware events requested (e.g. only software counters).
+            return false;
+        };
+        if program.config.is_empty() && program.classes == 0 {
+            return false;
+        }
+
+        if apply_kpc_program(&self.ctx, program).is_err() {
+            return false;
+        }
+
+        if self.classes != 0 && unsafe { self.ctx.kpc.kpc_set_counting(self.classes) } != 0 {
+            return false;
+        }
+
+        true
+    }
+}
+
+impl KPerfSamplingDriver {
+    pub fn new(counters: &[Counter], sample_freq: u64, pid: Option<i32>) -> Result<Self, Error> {
+        Self::new_with_callstacks(counters, sample_freq, pid, true)
+    }
+
+    fn new_with_callstacks(
+        counters: &[Counter],
+        sample_freq: u64,
+        pid: Option<i32>,
+        capture_callstacks: bool,
+    ) -> Result<Self, Error> {
+        let ctx = KPerfContext::new()?;
+        let config = build_kpc_config(&ctx, counters, sample_period_from_freq(sample_freq), true)?;
+
+        Ok(KPerfSamplingDriver {
+            ctx,
+            handles: config.handles,
+            programs: config.programs,
+            classes: config.classes,
+            kpc_count: config.kpc_count,
+            sample_freq,
+            pid,
+            capture_callstacks,
+            running: Arc::new(AtomicBool::new(false)),
+            thread_handle: None,
+        })
+    }
+}
+
+impl SamplingDriver for KPerfSamplingDriver {
+    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
+        setup_kdebug_buffer().map_err(|_| Error::EnableFailed)?;
+
+        let period_ns = 1_000_000_000_u64 / self.sample_freq.max(1);
+        let samplers = SAMPLER_TH_INFO
+            | SAMPLER_PMC_THREAD
+            | if self.capture_callstacks {
+                SAMPLER_USTACK
+            } else {
+                0
+            };
+        if let Err(err) = configure_kperf_timer_sampler(
+            &self.ctx,
+            self.classes,
+            self.pid.unwrap_or(-1),
+            period_ns,
+            samplers,
+            self.capture_callstacks.then_some(64),
+        ) {
+            unsafe {
+                self.ctx.kperf.kperf_sample_set(0);
+                self.ctx.kperf.kperf_reset();
+                self.ctx.kpc.kpc_set_thread_counting(0);
+                self.ctx.kpc.kpc_set_counting(0);
+            }
+            teardown_kdebug_buffer();
+            return Err(err);
+        }
+
+        self.running.store(true, Ordering::SeqCst);
+        let running = self.running.clone();
+        let ctx = self.ctx.clone();
+        let programs = self.programs.clone();
+        let mut handles = programs
+            .first()
+            .map(|program| program.handles.clone())
+            .unwrap_or_default();
+        let mut kpc_count = programs
+            .first()
+            .map(|program| program.kpc_count)
+            .unwrap_or(self.kpc_count);
+        let pid_filter = self.pid.map(|pid| pid as u32);
+
+        let handle = thread::spawn(move || {
+            let mut state = KdebugDecodeState::default();
+            let mut active_program = 0_usize;
+            let mut program_epoch = 0_u64;
+            let mut last_switch = Instant::now();
+
+            loop {
+                let is_running = running.load(Ordering::SeqCst);
+                let mut records = vec![KdBuf::default(); 4096];
+                match read_kdebug_records(&mut records) {
+                    Ok(0) => {
+                        if !is_running {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Ok(count) => {
+                        for rec in records.into_iter().take(count) {
+                            if let Some(pid) = pid_filter {
+                                // Kdebug records carry thread ID, not PID. Kperf's action filter
+                                // handles PID selection in the kernel; this guard is intentionally
+                                // only for future records that include PID metadata.
+                                let _ = pid;
+                            }
+                            handle_kdebug_record(
+                                rec,
+                                &handles,
+                                kpc_count,
+                                pid_filter,
+                                program_epoch,
+                                programs.len().max(1) as u64,
+                                &mut state,
+                                &callback,
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        if !is_running {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+
+                if is_running
+                    && programs.len() > 1
+                    && last_switch.elapsed() >= Duration::from_millis(50)
+                {
+                    rotate_sampling_program(
+                        &ctx,
+                        &programs,
+                        &mut active_program,
+                        &mut program_epoch,
+                        &mut handles,
+                        &mut kpc_count,
+                        pid_filter,
+                        &mut state,
+                        &callback,
+                    );
+                    last_switch = Instant::now();
+                }
+            }
+
+            discard_incomplete_deferred_samples(&mut state);
+        });
+        self.thread_handle = Some(handle);
+
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), Error> {
+        unsafe {
+            self.ctx.kperf.kperf_sample_set(0);
+        }
+        // User stacks requested by a timer interrupt are delivered later from
+        // an AST. Give those ASTs a bounded chance to run before stopping trace
+        // emission, then drain the now-finite kdebug buffer in the reader.
+        thread::sleep(Duration::from_millis(5));
+        unsafe {
+            self.ctx.kperf.kperf_reset();
+            self.ctx.kpc.kpc_set_thread_counting(0);
+            self.ctx.kpc.kpc_set_counting(0);
+        }
+        let _ = sysctl_kdebug_set(KERN_KDENABLE, 0);
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(handle) = self.thread_handle.take() {
+            handle.join().map_err(|_| Error::EnableFailed)?;
+        }
+        teardown_kdebug_buffer();
+        Ok(())
+    }
+}
+
+struct BuiltConfig {
+    handles: Vec<NativeCounterHandle>,
+    programs: Vec<KpcProgram>,
+    classes: u32,
+    kpc_count: usize,
+}
+
+fn build_kpc_config(
+    ctx: &KPerfContext,
+    counters: &[Counter],
+    period: u64,
+    apply_first: bool,
+) -> Result<BuiltConfig, Error> {
+    let mut remaining: Vec<Counter> = counters
+        .iter()
+        .filter(|counter| !counter.is_software())
+        .cloned()
+        .collect();
+    let mut programs = Vec::<KpcProgram>::new();
+
+    while !remaining.is_empty() {
+        let Some(program) = build_single_kpc_program(ctx, &remaining, period)? else {
+            break;
+        };
+
+        let before = remaining.len();
+        remaining.retain(|counter| {
+            !program
+                .handles
+                .iter()
+                .any(|handle| handle.counter == *counter && handle.kpc_index.is_some())
+        });
+
+        if remaining.len() == before {
+            break;
+        }
+        programs.push(program);
+    }
+
+    for (program_index, program) in programs.iter_mut().enumerate() {
+        for handle in &mut program.handles {
+            handle.program_index = Some(program_index);
+        }
+    }
+
+    let mut handles = Vec::new();
+    for counter in counters {
+        let native = programs
+            .iter()
+            .flat_map(|program| program.handles.iter())
+            .find(|handle| handle.counter == *counter)
+            .cloned()
+            .unwrap_or_else(|| NativeCounterHandle {
+                counter: counter.clone(),
+                program_index: None,
+                kpc_index: None,
+            });
+        handles.push(native);
+    }
+
+    let classes = programs.first().map(|program| program.classes).unwrap_or(0);
+    let kpc_count = programs
+        .first()
+        .map(|program| program.kpc_count)
+        .unwrap_or(0);
+
+    if apply_first {
+        if let Some(program) = programs.first() {
+            apply_kpc_program(ctx, program)?;
+        }
+    }
+
+    Ok(BuiltConfig {
+        handles,
+        programs,
+        classes,
+        kpc_count,
+    })
+}
+
+fn build_single_kpc_program(
+    ctx: &KPerfContext,
+    counters: &[Counter],
+    period: u64,
+) -> Result<Option<KpcProgram>, Error> {
+    let mut cfg: *mut KPepConfig = ptr::null_mut();
+    if unsafe { ctx.kpep.kpep_config_create(ctx.db, &mut cfg) } != 0 || cfg.is_null() {
+        return Err(Error::CounterCreationFail);
+    }
+
+    let result = (|| {
+        // Take ownership of all counters up front (best effort — needs root). This
+        // is what frees the power-manager-reserved configurable PMCs, which in
+        // turn changes kpc_get_counter_count(). We must query the counts and the
+        // register map in the SAME forced state that reads will later run in, or
+        // the kernel writes more counters per CPU than the read buffer was sized
+        // for (a heap-corrupting overflow). Failure here is fine: without root the
+        // hardware counters are never read.
+        unsafe {
+            ctx.kpc.kpc_force_all_ctrs_set(1);
+            ctx.kpep.kpep_config_force_counters(cfg);
+        }
+
+        let mut configured = Vec::<Counter>::new();
+        for counter in counters.iter().filter(|c| !c.is_software()) {
+            let Some(mut event) = resolve_event(ctx, counter) else {
+                continue;
+            };
+            let mut err = 0_u32;
+            let rc = unsafe { ctx.kpep.kpep_config_add_event(cfg, &mut event, 0, &mut err) };
+            if rc == 0 {
+                configured.push(counter.clone());
+            }
+        }
+
+        let mut config_count = 0_usize;
+        unsafe {
+            ctx.kpep.kpep_config_kpc_count(cfg, &mut config_count);
+        }
+        let mut classes = 0_u32;
+        unsafe {
+            ctx.kpep.kpep_config_kpc_classes(cfg, &mut classes);
+        }
+        let counter_count = if classes == 0 {
+            0
+        } else {
+            unsafe { ctx.kpc.kpc_get_counter_count(classes) as usize }
+        };
+
+        let mut config = Vec::new();
+        let mut periods = Vec::new();
+        if config_count > 0 {
+            config = vec![0_u64; config_count];
+            if unsafe {
+                ctx.kpep
+                    .kpep_config_kpc(cfg, config.as_mut_ptr(), config.len() * size_of::<u64>())
+            } != 0
+            {
+                return Err(Error::CounterCreationFail);
+            }
+            if period > 0 {
+                // kpc_set_period reads counter_count entries (kernel-side), while
+                // kperfdata's kpep_config_kpc_periods writes config_count entries.
+                // On Apple Silicon those differ when FIXED and CONFIGURABLE classes
+                // are mixed (config_count omits the fixed counters). Size for the
+                // larger so kpc_set_period never reads past the buffer; the extra
+                // slots keep the caller-supplied period as a harmless default.
+                periods = vec![period; counter_count.max(config_count)];
+                if unsafe {
+                    ctx.kpep.kpep_config_kpc_periods(
+                        cfg,
+                        periods.as_mut_ptr(),
+                        periods.len() * size_of::<u64>(),
+                    )
+                } != 0
+                {
+                    periods.fill(period);
+                }
+            }
+        }
+
+        // kperfdata writes this map using the KPC config count as its capacity
+        // (see XNU's cpu_counters tests), not the number of events requested.
+        let mut map = vec![usize::MAX; config_count.max(configured.len())];
+        if !map.is_empty() {
+            unsafe {
+                ctx.kpep
+                    .kpep_config_kpc_map(cfg, map.as_mut_ptr(), map.len() * size_of::<usize>());
+            }
+        }
+
+        let mut handles = Vec::new();
+        for counter in &configured {
+            let kpc_index = configured
+                .iter()
+                .position(|c| c == counter)
+                .and_then(|pos| map.get(pos).copied())
+                .filter(|idx| *idx != usize::MAX);
+            handles.push(NativeCounterHandle {
+                counter: counter.clone(),
+                program_index: None,
+                kpc_index,
+            });
+        }
+
+        if handles.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(KpcProgram {
+            handles,
+            classes,
+            kpc_count: counter_count,
+            config,
+            periods,
+        }))
+    })();
+
+    unsafe {
+        ctx.kpep.kpep_config_free(cfg);
+    }
+
+    result
+}
+
+fn apply_kpc_program(ctx: &KPerfContext, program: &KpcProgram) -> Result<(), Error> {
+    if program.config.is_empty() {
+        return Ok(());
+    }
+
+    if unsafe { ctx.kpc.kpc_force_all_ctrs_set(1) } != 0 {
+        return Err(Error::PermissionDenied);
+    }
+
+    let mut config = program.config.clone();
+    if unsafe { ctx.kpc.kpc_set_config(program.classes, config.as_mut_ptr()) } != 0 {
+        return Err(Error::PermissionDenied);
+    }
+
+    if !program.periods.is_empty() {
+        let mut periods = program.periods.clone();
+        unsafe {
+            ctx.kpc
+                .kpc_set_period(program.classes, periods.as_mut_ptr());
+        }
+    }
+
+    Ok(())
+}
+
+fn enable_sampling_kpc_program(ctx: &KPerfContext, program: &KpcProgram) -> Result<(), Error> {
+    apply_kpc_program(ctx, program)?;
+    if program.classes == 0 {
+        return Ok(());
+    }
+    unsafe {
+        if ctx.kpc.kpc_set_counting(program.classes) != 0 {
+            return Err(Error::EnableFailed);
+        }
+        if ctx.kpc.kpc_set_thread_counting(program.classes) != 0 {
+            ctx.kpc.kpc_set_counting(0);
+            return Err(Error::EnableFailed);
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rotate_sampling_program(
+    ctx: &KPerfContext,
+    programs: &[KpcProgram],
+    active_program: &mut usize,
+    program_epoch: &mut u64,
+    handles: &mut Vec<NativeCounterHandle>,
+    kpc_count: &mut usize,
+    pid_filter: Option<u32>,
+    state: &mut KdebugDecodeState,
+    callback: &Arc<dyn SamplingCallback>,
+) {
+    // Stop generation first, then decode all buffered KPC records with the old
+    // epoch/slot mapping. A deferred AST stack may arrive later, but its sample
+    // already owns the old handles and epoch.
+    unsafe {
+        ctx.kperf.kperf_sample_set(0);
+    }
+    loop {
+        let mut records = vec![KdBuf::default(); 4096];
+        match read_kdebug_records(&mut records) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                for rec in records.into_iter().take(count) {
+                    handle_kdebug_record(
+                        rec,
+                        handles,
+                        *kpc_count,
+                        pid_filter,
+                        *program_epoch,
+                        programs.len() as u64,
+                        state,
+                        callback,
+                    );
+                }
+            }
+        }
+    }
+
+    unsafe {
+        ctx.kpc.kpc_set_thread_counting(0);
+        ctx.kpc.kpc_set_counting(0);
+    }
+
+    let next_program = (*active_program + 1) % programs.len();
+    let selected = if enable_sampling_kpc_program(ctx, &programs[next_program]).is_ok() {
+        next_program
+    } else {
+        // Keep profiling with the old program if the transition fails, but use
+        // a new epoch because stopping/reprogramming invalidates slot deltas.
+        let _ = enable_sampling_kpc_program(ctx, &programs[*active_program]);
+        *active_program
+    };
+
+    *active_program = selected;
+    *handles = programs[selected].handles.clone();
+    *kpc_count = programs[selected].kpc_count;
+    *program_epoch = program_epoch.saturating_add(1);
+    unsafe {
+        ctx.kperf.kperf_sample_set(1);
+    }
+}
+
+fn read_program_kpc(
+    ctx: &KPerfContext,
+    program: &KpcProgram,
+    cpu_count: usize,
+) -> Result<Vec<u64>, std::io::Error> {
+    if program.kpc_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Over-allocate by KPC_MAX_COUNTERS as a guard against any counter-count
+    // miscount (see read_snapshot); the kernel does no length checking. The read
+    // stride stays program.kpc_count, so the truncated buffer holds exactly the
+    // real per-CPU counter blocks.
+    let mut kpc = vec![0_u64; cpu_count * program.kpc_count + KPC_MAX_COUNTERS];
+    unsafe {
+        ctx.kpc
+            .kpc_get_cpu_counters(1, program.classes, ptr::null_mut(), kpc.as_mut_ptr());
+    }
+    kpc.truncate(cpu_count * program.kpc_count);
+    Ok(kpc)
+}
+
+fn add_counter_value(values: &mut Vec<(Counter, u64)>, counter: Counter, delta: u64) {
+    if let Some((_, value)) = values.iter_mut().find(|(existing, _)| *existing == counter) {
+        *value = value.saturating_add(delta);
+    } else {
+        values.push((counter, delta));
+    }
+}
+
+fn find_counter_value(values: &[(Counter, u64)], counter: &Counter) -> Option<u64> {
+    values
+        .iter()
+        .find_map(|(existing, value)| (existing == counter).then_some(*value))
+}
+
+fn resolve_event(ctx: &KPerfContext, counter: &Counter) -> Option<*mut KPepEvent> {
+    let candidates: &[&str] = match counter {
+        Counter::Cycles => &[
+            "Cycles",
+            "cycles",
+            "FIXED_CYCLES",
+            "CORE_ACTIVE_CYCLE",
+            "CPU_CLK_UNHALTED.THREAD",
+        ],
+        Counter::Instructions => &[
+            "Instructions",
+            "instructions",
+            "FIXED_INSTRUCTIONS",
+            "INST_RETIRED",
+        ],
+        Counter::BranchInstructions => &[
+            "branches",
+            "INST_BRANCH",
+            "BRANCH_INDIR_NONSPEC",
+            "BR_INST_RETIRED.ALL_BRANCHES",
+            "ARM_BR_PRED",
+        ],
+        Counter::BranchMisses => &[
+            "branch_misses",
+            "BRANCH_MISPRED_NONSPEC",
+            "BRANCH_COND_MISPRED_NONSPEC",
+            "BR_MISP_RETIRED.ALL_BRANCHES",
+            "ARM_BR_MIS_PRED",
+        ],
+        Counter::LLCReferences => &[
+            "cache_references",
+            "LLC_REFERENCES",
+            "L2D_CACHE",
+            "L2D_CACHE_REFILL",
+            "ARM_L1D_CACHE",
+        ],
+        Counter::LLCMisses => &[
+            "cache_misses",
+            "LLC_MISSES",
+            "L2D_CACHE_REFILL",
+            "ARM_L1D_CACHE_REFILL",
+        ],
+        Counter::StalledCyclesFrontend => &[
+            "stalled_cycles_frontend",
+            "ARM_STALL_FRONTEND",
+            "ARM_STALL_SLOT_FRONTEND",
+            "STALL_FRONTEND",
+        ],
+        Counter::StalledCyclesBackend => &[
+            "stalled_cycles_backend",
+            "ARM_STALL_BACKEND",
+            "ARM_STALL_SLOT_BACKEND",
+            "STALL_BACKEND",
+        ],
+        Counter::Custom(name) => return resolve_event_by_name(ctx, name),
+        Counter::Internal { name, .. } => return resolve_event_by_name(ctx, name),
+        _ => return None,
+    };
+
+    candidates
+        .iter()
+        .find_map(|name| resolve_event_by_name(ctx, name))
+}
+
+fn resolve_event_by_name(ctx: &KPerfContext, name: &str) -> Option<*mut KPepEvent> {
+    let c_name = CString::new(name).ok()?;
+    let mut event: *mut KPepEvent = ptr::null_mut();
+    let rc = unsafe { ctx.kpep.kpep_db_event(ctx.db, c_name.as_ptr(), &mut event) };
+    (rc == 0 && !event.is_null()).then_some(event)
+}
+
+fn sum_counter_delta(before: &[u64], after: &[u64], width: usize, idx: usize) -> u64 {
+    if width == 0 || before.len() != after.len() {
+        return 0;
+    }
+
+    after
+        .chunks(width)
+        .zip(before.chunks(width))
+        .map(|(a, b)| {
+            a.get(idx)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(b.get(idx).copied().unwrap_or(0))
+        })
+        .sum()
+}
+
+fn sample_period_from_freq(freq: u64) -> u64 {
+    // PMI periods are event-count periods. Use a conservative default so the
+    // timer sampler remains the primary source even if the PMU accepts periods.
+    (1_000_000_000_u64 / freq.max(1)).max(100_000)
+}
+
+fn logical_cpu_count() -> Option<usize> {
+    let mut cpus: c_int = 0;
+    let mut len = size_of::<c_int>();
+    let name = CString::new("hw.logicalcpu_max").ok()?;
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut cpus as *mut _ as *mut c_void,
+            &mut len,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && cpus > 0).then_some(cpus as usize)
+}
+
+fn read_rusage(pid: i32) -> Result<RUsageInfoV4, std::io::Error> {
+    let mut info = RUsageInfoV4::default();
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            RUSAGE_INFO_V4,
+            &mut info as *mut _ as *mut libc::rusage_info_t,
+        )
+    };
+    if rc == 0 {
+        Ok(info)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn read_taskinfo(pid: i32) -> Result<libc::proc_taskinfo, std::io::Error> {
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_taskinfo>() };
+    let expected = size_of::<libc::proc_taskinfo>() as c_int;
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut info as *mut _ as *mut c_void,
+            expected,
+        )
+    };
+    if bytes == expected {
+        Ok(info)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Log which kperf configuration step failed (with errno) and map it to the
+/// generic enable error. kperf's private calls give little detail, so the step
+/// name plus errno is the most useful signal when sampling setup fails.
+fn kperf_step_failed(step: &str) -> Error {
+    let err = std::io::Error::last_os_error();
+    eprintln!("kperf sampling setup failed at {step}: {err}");
+    Error::EnableFailed
+}
+
+fn setup_kdebug_buffer() -> Result<(), std::io::Error> {
+    // KDREMOVE also establishes/validates ktrace ownership. Do not ignore an
+    // EBUSY from another live trace consumer and then clobber its session.
+    sysctl_kdebug_set(KERN_KDREMOVE, 0)?;
+
+    let result = (|| {
+        sysctl_kdebug_set(KERN_KDSETBUF, 262_144)?;
+        sysctl_kdebug_set(KERN_KDSETUP, 0)?;
+        install_perf_typefilter()?;
+        sysctl_kdebug_set(KERN_KDENABLE, KDEBUG_ENABLE_TRACE as c_int)
+    })();
+
+    if result.is_err() {
+        let _ = sysctl_kdebug_set(KERN_KDENABLE, 0);
+        let _ = sysctl_kdebug_set(KERN_KDREMOVE, 0);
+    }
+    result
+}
+
+fn install_perf_typefilter() -> Result<(), std::io::Error> {
+    let mut bitmap = vec![0_u8; KDBG_TYPEFILTER_BITMAP_SIZE];
+    let start = DBG_PERF as usize * KDBG_BYTES_PER_CLASS;
+    bitmap[start..start + KDBG_BYTES_PER_CLASS].fill(0xff);
+
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDSET_TYPEFILTER];
+    let mut size = bitmap.len();
+    // This legacy sysctl consumes the bitmap through oldp/oldlen even though it
+    // is an input. XNU also forces DBG_TRACE on alongside our DBG_PERF class.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as c_uint,
+            bitmap.as_mut_ptr() as *mut c_void,
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn configure_kperf_timer_sampler(
+    ctx: &KPerfContext,
+    classes: u32,
+    pid: i32,
+    period_ns: u64,
+    samplers: u32,
+    user_stack_depth: Option<u32>,
+) -> Result<(), Error> {
+    unsafe {
+        if ctx.kpc.kpc_force_all_ctrs_set(1) != 0 {
+            return Err(Error::PermissionDenied);
+        }
+        if classes != 0 {
+            if ctx.kpc.kpc_set_counting(classes) != 0 {
+                return Err(Error::PermissionDenied);
+            }
+            if ctx.kpc.kpc_set_thread_counting(classes) != 0 {
+                return Err(Error::PermissionDenied);
+            }
+        }
+        ctx.kperf.kperf_reset();
+        // The kernel's `actionc` only ever grows for the boot: it refuses to
+        // shrink (`kperf_action_set_count` returns EINVAL when count < actionc)
+        // and `kperf_reset` clears each action's config but never lowers the
+        // count. So if any tool (Instruments, powermetrics, a prior run) already
+        // grew it past 1, `action_count_set(1)` fails — yet action slot 1 still
+        // exists, and this very (failed) write already made us the ktrace owner
+        // via ktrace_configure. Treat that as non-fatal and configure slot 1; a
+        // genuinely broken state still surfaces on the samplers/timer calls below.
+        if ctx.kperf.kperf_action_count_set(1) != 0 {
+            eprintln!("kperf: action table already has multiple slots; reusing slot 1");
+        }
+        if ctx.kperf.kperf_action_samplers_set(1, samplers) != 0 {
+            return Err(kperf_step_failed("kperf_action_samplers_set"));
+        }
+        if let Some(depth) = user_stack_depth {
+            if ctx.kperf.kperf_action_ucallstack_depth_set(1, depth) != 0 {
+                return Err(kperf_step_failed("kperf_action_ucallstack_depth_set"));
+            }
+        }
+        if pid > 0 && ctx.kperf.kperf_action_filter_set_by_pid(1, pid) != 0 {
+            return Err(kperf_step_failed("kperf_action_filter_set_by_pid"));
+        }
+        if ctx.kperf.kperf_timer_count_set(1) != 0 {
+            return Err(kperf_step_failed("kperf_timer_count_set"));
+        }
+        let ticks = ctx.kperf.kperf_ns_to_ticks(period_ns.max(1));
+        if ctx.kperf.kperf_timer_period_set(0, ticks) != 0 {
+            return Err(kperf_step_failed("kperf_timer_period_set"));
+        }
+        if ctx.kperf.kperf_timer_action_set(0, 1) != 0 {
+            return Err(kperf_step_failed("kperf_timer_action_set"));
+        }
+        if ctx.kperf.kperf_sample_set(1) != 0 {
+            return Err(kperf_step_failed("kperf_sample_set"));
+        }
+    }
+
+    Ok(())
+}
+
+fn teardown_kdebug_buffer() {
+    let _ = sysctl_kdebug_set(KERN_KDENABLE, 0);
+    let _ = sysctl_kdebug_set(KERN_KDREMOVE, 0);
+}
+
+fn sysctl_kdebug_set(op: c_int, value: c_int) -> Result<(), std::io::Error> {
+    let mut mib = [CTL_KERN, KERN_KDEBUG, op, value];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as c_uint,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn read_kdebug_records(records: &mut [KdBuf]) -> Result<usize, std::io::Error> {
+    let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADTR];
+    let mut size = records.len() * size_of::<KdBuf>();
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as c_uint,
+            records.as_mut_ptr() as *mut c_void,
+            &mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(size)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn handle_kdebug_record(
+    rec: KdBuf,
+    handles: &[NativeCounterHandle],
+    kpc_count: usize,
+    forced_pid: Option<u32>,
+    program_epoch: u64,
+    time_enabled_multiplier: u64,
+    state: &mut KdebugDecodeState,
+    callback: &Arc<dyn SamplingCallback>,
+) {
+    let event = rec.debugid & KDBG_EVENTID_MASK;
+    match event {
+        PERF_SAMPLE if (rec.debugid & DBG_FUNC_START) == DBG_FUNC_START => {
+            state.pending_samples.insert(
+                rec.arg5,
+                PendingSample {
+                    time: mach_ticks_to_nanos(rec.timestamp),
+                    pid: 0,
+                    tid: rec.arg5 as u32,
+                    trace_tid: rec.arg5,
+                    cpu: rec.cpuid,
+                    kpc_values: Vec::with_capacity(kpc_count),
+                    callstack: SmallVec::new(),
+                    forced_pid,
+                },
+            );
+        }
+        PERF_SAMPLE if (rec.debugid & DBG_FUNC_END) == DBG_FUNC_END => {
+            let mut sample =
+                state
+                    .pending_samples
+                    .remove(&rec.arg5)
+                    .unwrap_or_else(|| PendingSample {
+                        time: mach_ticks_to_nanos(rec.timestamp),
+                        pid: 0,
+                        tid: rec.arg5 as u32,
+                        trace_tid: rec.arg5,
+                        cpu: rec.cpuid,
+                        kpc_values: Vec::new(),
+                        callstack: SmallVec::new(),
+                        forced_pid,
+                    });
+            sample.callstack = take_pending_stack(state, &sample);
+            finish_pending_sample(
+                sample,
+                rec.arg2,
+                handles,
+                program_epoch,
+                time_enabled_multiplier,
+                state,
+                callback,
+            );
+        }
+        PERF_TI_DATA => {
+            let key = rec.arg5;
+            let sample = state.pending_samples.entry(key).or_insert(PendingSample {
+                time: mach_ticks_to_nanos(rec.timestamp),
+                pid: rec.arg1 as u32,
+                tid: rec.arg2 as u32,
+                trace_tid: rec.arg5,
+                cpu: rec.cpuid,
+                kpc_values: Vec::with_capacity(kpc_count),
+                callstack: SmallVec::new(),
+                forced_pid,
+            });
+            sample.pid = rec.arg1 as u32;
+            sample.tid = rec.arg2 as u32;
+        }
+        PERF_STK_UHDR => {
+            // XNU logs the synchronous frame count in arg2 and the async
+            // (notably Swift concurrency) frame count in arg4. UDATA then
+            // contains the concatenated frame sequence.
+            let frames = rec.arg2.saturating_add(rec.arg4) as usize;
+            state.pending_stacks.insert(
+                rec.arg5,
+                StackBuilder {
+                    frames_left: frames,
+                    flags: rec.arg1,
+                    synchronous_frames: rec.arg2 as usize,
+                    async_start_index: rec.arg3 as usize,
+                    async_frames: rec.arg4 as usize,
+                    frames: SmallVec::new(),
+                },
+            );
+        }
+        PERF_STK_UDATA => {
+            if let Some(stack) = state.pending_stacks.get_mut(&rec.arg5) {
+                for addr in [rec.arg1, rec.arg2, rec.arg3, rec.arg4] {
+                    if stack.frames_left == 0 {
+                        break;
+                    }
+                    stack.frames.push(addr);
+                    stack.frames_left -= 1;
+                }
+            }
+        }
+        PERF_KPC_DATA_THREAD => {
+            if let Some(sample) = state.pending_samples.get_mut(&rec.arg5) {
+                if (rec.debugid & DBG_FUNC_START) == DBG_FUNC_START {
+                    sample.kpc_values.clear();
+                }
+
+                for value in [rec.arg1, rec.arg2, rec.arg3, rec.arg4] {
+                    if sample.kpc_values.len() >= kpc_count {
+                        break;
+                    }
+                    sample.kpc_values.push(value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn mach_ticks_to_nanos(ticks: u64) -> u64 {
+    static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+        let rc = unsafe { mach_timebase_info(&mut info) };
+        if rc != 0 || info.numer == 0 || info.denom == 0 {
+            (1, 1)
+        } else {
+            (info.numer as u64, info.denom as u64)
+        }
+    });
+
+    ((ticks as u128).saturating_mul(numer as u128) / denom as u128).min(u64::MAX as u128) as u64
+}
+
+fn take_pending_stack(
+    state: &mut KdebugDecodeState,
+    sample: &PendingSample,
+) -> SmallVec<[u64; 32]> {
+    state
+        .pending_stacks
+        .remove(&sample.trace_tid)
+        .or_else(|| state.pending_stacks.remove(&(sample.pid as u64)))
+        .map(StackBuilder::finish)
+        .unwrap_or_default()
+}
+
+fn finish_pending_sample(
+    mut sample: PendingSample,
+    sample_meta_flags: u64,
+    handles: &[NativeCounterHandle],
+    program_epoch: u64,
+    time_enabled_multiplier: u64,
+    state: &mut KdebugDecodeState,
+    callback: &Arc<dyn SamplingCallback>,
+) {
+    if sample.pid == 0 {
+        if let Some(pid) = sample.forced_pid {
+            sample.pid = pid;
+        }
+    }
+
+    if !sample.kpc_values.is_empty() {
+        if sample_meta_flags & SAMPLE_META_UPEND != 0 && sample.callstack.is_empty() {
+            state
+                .deferred_samples
+                .entry(sample.trace_tid)
+                .or_default()
+                .push_back(DeferredSample {
+                    sample,
+                    handles: handles.to_vec(),
+                    program_epoch,
+                    time_enabled_multiplier,
+                });
+        } else {
+            emit_pending_sample(
+                sample,
+                handles,
+                program_epoch,
+                time_enabled_multiplier,
+                state,
+                callback,
+            );
+        }
+        return;
+    }
+
+    // A pended user callstack is logged later by XNU's kperf AST as a second
+    // generic sample containing USTACK + TH_INFO but no PMC payload. Join it to
+    // the timer/KPC sample instead of emitting a bogus one-count PMU event.
+    if sample.callstack.is_empty() {
+        return;
+    }
+    let Some(queue) = state.deferred_samples.get_mut(&sample.trace_tid) else {
+        return;
+    };
+    let Some(mut deferred) = queue.pop_front() else {
+        return;
+    };
+    if queue.is_empty() {
+        state.deferred_samples.remove(&sample.trace_tid);
+    }
+    deferred.sample.callstack = sample.callstack;
+    emit_pending_sample(
+        deferred.sample,
+        &deferred.handles,
+        deferred.program_epoch,
+        deferred.time_enabled_multiplier,
+        state,
+        callback,
+    );
+}
+
+fn discard_incomplete_deferred_samples(state: &mut KdebugDecodeState) {
+    // A timer sample marked SAMPLE_META_UPEND has no user IP of its own. If
+    // shutdown wins the race with the AST-side stack group, emitting that
+    // counter delta produces an ip=0/empty-stack row and a blank flamegraph
+    // entry. Treat these tail samples as lost rather than inventing a location.
+    state.deferred_samples.clear();
+}
+
+fn emit_pending_sample(
+    sample: PendingSample,
+    handles: &[NativeCounterHandle],
+    program_epoch: u64,
+    time_enabled_multiplier: u64,
+    state: &mut KdebugDecodeState,
+    callback: &Arc<dyn SamplingCallback>,
+) {
+    let callstack = sample.callstack;
+    let ip = callstack.first().copied().unwrap_or_default();
+    let event_id = uuid::Uuid::now_v7().as_u128();
+
+    if sample.kpc_values.is_empty() {
+        return;
+    }
+
+    for handle in handles {
+        let Some(idx) = handle.kpc_index else {
+            continue;
+        };
+        let Some(value) = sample.kpc_values.get(idx).copied() else {
+            continue;
+        };
+        let key = (sample.pid, sample.tid, program_epoch, idx);
+        let last = state.last_kpc_values.get(&key).copied();
+
+        state.last_kpc_values.insert(
+            key,
+            LastKpcValue {
+                time: sample.time,
+                value,
+            },
+        );
+
+        // The first observation for a thread/physical-slot/program epoch only
+        // establishes a baseline. Emitting it as a zero-valued sample creates
+        // bogus rows and zero-weight flamegraph stacks.
+        let Some(last) = last else {
+            continue;
+        };
+        let time_delta = sample.time.saturating_sub(last.time).max(1);
+        let value_delta = value.saturating_sub(last.value);
+
+        callback.call(Record::Sample(Sample {
+            event_id,
+            ip,
+            pid: sample.pid,
+            tid: sample.tid,
+            cpu: sample.cpu,
+            core: None,
+            time: sample.time,
+            time_enabled: time_delta.saturating_mul(time_enabled_multiplier.max(1)),
+            time_running: time_delta,
+            counter: handle.counter.clone(),
+            value: value_delta,
+            callstack: callstack.clone(),
+        }));
+    }
+}
+
+pub fn list_supported_counters() -> Vec<Counter> {
+    let mut counters = vec![
+        Counter::Cycles,
+        Counter::Instructions,
+        Counter::LLCReferences,
+        Counter::LLCMisses,
+        Counter::BranchInstructions,
+        Counter::BranchMisses,
+        Counter::StalledCyclesFrontend,
+        Counter::StalledCyclesBackend,
+        Counter::CpuClock,
+        Counter::PageFaults,
+    ];
+
+    if let Ok(ctx) = KPerfContext::new() {
+        let mut count = 0_usize;
+        if unsafe { ctx.kpep.kpep_db_events_count(ctx.db, &mut count) } == 0 && count > 0 {
+            let mut events = vec![ptr::null_mut(); count];
+            if unsafe {
+                ctx.kpep.kpep_db_events(
+                    ctx.db,
+                    events.as_mut_ptr(),
+                    count * size_of::<*mut KPepEvent>(),
+                )
+            } == 0
+            {
+                for event in events.into_iter().filter(|event| !event.is_null()) {
+                    let mut name = ptr::null();
+                    let mut desc = ptr::null();
+                    unsafe {
+                        ctx.kpep.kpep_event_name(event, &mut name);
+                        ctx.kpep.kpep_event_description(event, &mut desc);
+                    }
+                    if !name.is_null() {
+                        let name = unsafe { CStr::from_ptr(name) }
+                            .to_string_lossy()
+                            .to_string();
+                        let desc = if desc.is_null() {
+                            String::new()
+                        } else {
+                            unsafe { CStr::from_ptr(desc) }
+                                .to_string_lossy()
+                                .to_string()
+                        };
+                        counters.push(Counter::Internal {
+                            name,
+                            desc,
+                            code: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    counters
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(debugid: u32, tid: u64, args: [u64; 4]) -> KdBuf {
+        KdBuf {
+            timestamp: 100,
+            arg1: args[0],
+            arg2: args[1],
+            arg3: args[2],
+            arg4: args[3],
+            arg5: tid,
+            debugid,
+            cpuid: 3,
+            unused: 0,
+        }
+    }
+
+    fn one_counter_handles() -> Vec<NativeCounterHandle> {
+        vec![NativeCounterHandle {
+            counter: Counter::Cycles,
+            program_index: Some(0),
+            kpc_index: Some(0),
+        }]
+    }
+
+    #[test]
+    fn moves_appended_user_stack_fixup_after_sampled_pc() {
+        let stack = StackBuilder {
+            frames_left: 0,
+            flags: CALLSTACK_VALID,
+            synchronous_frames: 4,
+            async_start_index: 0,
+            async_frames: 0,
+            frames: SmallVec::from_slice(&[0x10, 0x30, 0x40, 0x20]),
+        }
+        .finish();
+
+        assert_eq!(stack.as_slice(), &[0x10, 0x20, 0x30, 0x40]);
+    }
+
+    #[test]
+    fn does_not_duplicate_user_stack_fixup() {
+        let stack = StackBuilder {
+            frames_left: 0,
+            flags: CALLSTACK_VALID,
+            synchronous_frames: 4,
+            async_start_index: 0,
+            async_frames: 0,
+            frames: SmallVec::from_slice(&[0x10, 0x20, 0x30, 0x20]),
+        }
+        .finish();
+
+        assert_eq!(stack.as_slice(), &[0x10, 0x20, 0x30]);
+    }
+
+    #[test]
+    fn consumes_zero_fixup_before_async_frames() {
+        let stack = StackBuilder {
+            frames_left: 0,
+            flags: CALLSTACK_VALID | CALLSTACK_HAS_ASYNC,
+            synchronous_frames: 2,
+            async_start_index: 1,
+            async_frames: 2,
+            frames: SmallVec::from_slice(&[0x10, 0, 0x80, 0x90]),
+        }
+        .finish();
+
+        assert_eq!(stack.as_slice(), &[0x10, 0x80, 0x90]);
+    }
+
+    #[test]
+    fn joins_pended_user_stack_to_timer_kpc_sample() {
+        let handles = one_counter_handles();
+        let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
+        let emitted_for_callback = emitted.clone();
+        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+            emitted_for_callback.lock().unwrap().push(record);
+        });
+        let mut state = KdebugDecodeState::default();
+        let tid = 42;
+        let pid = 7;
+        state.last_kpc_values.insert(
+            (pid as u32, tid as u32, 0, 0),
+            LastKpcValue {
+                time: 50,
+                value: 900,
+            },
+        );
+
+        // Timer sample: XNU logs TH_INFO + PMC_THREAD, marks the user stack as
+        // pended, and ends this generic sample before the AST runs.
+        for rec in [
+            record(PERF_SAMPLE | DBG_FUNC_START, tid, [0, 0, 0, 0]),
+            record(PERF_TI_DATA, tid, [pid, tid, 0, 0]),
+            record(PERF_KPC_DATA_THREAD | DBG_FUNC_START, tid, [1_000, 0, 0, 0]),
+            record(
+                PERF_SAMPLE | DBG_FUNC_END,
+                tid,
+                [0, SAMPLE_META_UPEND, 0, 0],
+            ),
+        ] {
+            handle_kdebug_record(
+                rec,
+                &handles,
+                1,
+                Some(pid as u32),
+                0,
+                1,
+                &mut state,
+                &callback,
+            );
+        }
+        assert!(emitted.lock().unwrap().is_empty());
+
+        // AST sample: a separate generic sample contains the deferred stack but
+        // no KPC data. arg2 is the synchronous count and arg4 the async count.
+        for rec in [
+            record(PERF_SAMPLE | DBG_FUNC_START, tid, [0, 0, 0, 0]),
+            record(
+                PERF_STK_UHDR,
+                tid,
+                [CALLSTACK_VALID | CALLSTACK_HAS_ASYNC, 2, 1, 1],
+            ),
+            record(PERF_STK_UDATA, tid, [0x10, 0x20, 0x30, 0]),
+            record(PERF_TI_DATA, tid, [pid, tid, 0, 0]),
+            record(PERF_SAMPLE | DBG_FUNC_END, tid, [0, 0, 0, 0]),
+        ] {
+            handle_kdebug_record(
+                rec,
+                &handles,
+                1,
+                Some(pid as u32),
+                0,
+                1,
+                &mut state,
+                &callback,
+            );
+        }
+
+        let records = emitted.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let Record::Sample(sample) = &records[0] else {
+            panic!("expected sample");
+        };
+        assert_eq!(sample.pid, pid as u32);
+        assert_eq!(sample.tid, tid as u32);
+        assert_eq!(sample.cpu, 3);
+        assert_eq!(sample.counter, Counter::Cycles);
+        assert_eq!(sample.callstack.as_slice(), &[0x10, 0x20, 0x30]);
+        assert_eq!(sample.ip, 0x10);
+    }
+
+    #[test]
+    fn does_not_emit_unmatched_stack_only_group_as_hardware_sample() {
+        let handles = one_counter_handles();
+        let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
+        let emitted_for_callback = emitted.clone();
+        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+            emitted_for_callback.lock().unwrap().push(record);
+        });
+        let mut state = KdebugDecodeState::default();
+        let tid = 42;
+
+        for rec in [
+            record(PERF_SAMPLE | DBG_FUNC_START, tid, [0, 0, 0, 0]),
+            record(PERF_STK_UHDR, tid, [CALLSTACK_VALID, 1, 0, 0]),
+            record(PERF_STK_UDATA, tid, [0x10, 0, 0, 0]),
+            record(PERF_SAMPLE | DBG_FUNC_END, tid, [0, 0, 0, 0]),
+        ] {
+            handle_kdebug_record(rec, &handles, 1, Some(7), 0, 1, &mut state, &callback);
+        }
+
+        assert!(emitted.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn discards_deferred_timer_sample_without_ast_stack_at_shutdown() {
+        let mut state = KdebugDecodeState::default();
+        state.deferred_samples.insert(
+            42,
+            VecDeque::from([DeferredSample {
+                sample: PendingSample {
+                    trace_tid: 42,
+                    kpc_values: vec![1_000],
+                    ..PendingSample::default()
+                },
+                handles: one_counter_handles(),
+                program_epoch: 0,
+                time_enabled_multiplier: 1,
+            }]),
+        );
+
+        discard_incomplete_deferred_samples(&mut state);
+
+        assert!(state.deferred_samples.is_empty());
+    }
+
+    #[test]
+    fn starts_a_fresh_physical_slot_baseline_for_each_program_epoch() {
+        let handles = one_counter_handles();
+        let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
+        let emitted_for_callback = emitted.clone();
+        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+            emitted_for_callback.lock().unwrap().push(record);
+        });
+        let mut state = KdebugDecodeState::default();
+        let tid = 42;
+
+        for (epoch, raw_value) in [(0, 100), (0, 150), (1, 200)] {
+            for rec in [
+                record(PERF_SAMPLE | DBG_FUNC_START, tid, [0, 0, 0, 0]),
+                record(PERF_TI_DATA, tid, [7, tid, 0, 0]),
+                record(
+                    PERF_KPC_DATA_THREAD | DBG_FUNC_START,
+                    tid,
+                    [raw_value, 0, 0, 0],
+                ),
+                record(PERF_SAMPLE | DBG_FUNC_END, tid, [0, 0, 0, 0]),
+            ] {
+                handle_kdebug_record(rec, &handles, 1, Some(7), epoch, 1, &mut state, &callback);
+            }
+        }
+
+        let records = emitted.lock().unwrap();
+        let values: Vec<u64> = records
+            .iter()
+            .map(|record| match record {
+                Record::Sample(sample) => sample.value,
+                Record::ProcAddr(_) => panic!("expected sample"),
+            })
+            .collect();
+        assert_eq!(values, [50]);
+    }
+
+    #[test]
+    fn partitions_oversubscribed_native_events_into_multiple_programs() {
+        let counters = list_supported_counters()
+            .into_iter()
+            .filter(|counter| matches!(counter, Counter::Internal { .. }))
+            .take(24)
+            .collect::<Vec<_>>();
+        assert!(counters.len() > 8, "kpep exposed too few native events");
+
+        let ctx = KPerfContext::new().expect("load kperf/kpep context");
+        let config =
+            build_kpc_config(&ctx, &counters, 1_000_000, false).expect("partition native events");
+
+        assert!(config.programs.len() > 1);
+        assert_eq!(
+            config
+                .handles
+                .iter()
+                .filter(|handle| handle.kpc_index.is_some())
+                .count(),
+            counters.len()
+        );
+    }
 }

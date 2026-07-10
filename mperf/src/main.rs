@@ -32,6 +32,8 @@ struct Cli {
 enum Commands {
     List,
     Stat {
+        #[arg(short, long)]
+        pid: Option<u32>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -58,8 +60,8 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::Stat { command } => {
-            return do_stat(command);
+        Commands::Stat { pid, command } => {
+            return do_stat(pid, command);
         }
         Commands::List => {
             let events = pmu::list_supported_counters(pmu::DriverKind::Default);
