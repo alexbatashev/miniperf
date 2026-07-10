@@ -29,7 +29,12 @@ fn software_counters() -> Vec<Counter> {
     ]
 }
 
-pub fn do_stat(pid: Option<u32>, command: Vec<String>, event_names: Vec<String>) -> Result<()> {
+pub fn do_stat(
+    pid: Option<u32>,
+    command: Vec<String>,
+    event_names: Vec<String>,
+    topdown_level: Option<u8>,
+) -> Result<()> {
     if pid.is_none() && command.is_empty() {
         anyhow::bail!(
             "stat requires a command, or --pid with a command used as the measurement duration"
@@ -49,7 +54,22 @@ pub fn do_stat(pid: Option<u32>, command: Vec<String>, event_names: Vec<String>)
 
     let supported = pmu::list_supported_counters(pmu::DriverKind::Default);
     let host_metrics = pmu::host_metrics();
-    let (mut counters, metrics) = if event_names.is_empty() {
+    let (mut counters, metrics) = if topdown_level.is_some() {
+        let scenario =
+            pmu::host_tma_scenario().expect("architectural TMA fallback is always available");
+        let counters = scenario
+            .events
+            .iter()
+            .map(|event| match event.as_str() {
+                "cycles" => Counter::Cycles,
+                "instructions" => Counter::Instructions,
+                "stalled_cycles_frontend" => Counter::StalledCyclesFrontend,
+                "stalled_cycles_backend" => Counter::StalledCyclesBackend,
+                _ => Counter::Custom(event.clone()),
+            })
+            .collect();
+        (counters, Vec::new())
+    } else if event_names.is_empty() {
         let mut defaults = pmu_counters();
         defaults.extend(software_counters());
         let applicable = applicable_metrics(&host_metrics, &defaults);
@@ -98,6 +118,13 @@ pub fn do_stat(pid: Option<u32>, command: Vec<String>, event_names: Vec<String>)
 
     let result = driver.counters()?;
 
+    if let Some(level) = topdown_level {
+        let scenario =
+            pmu::host_tma_scenario().expect("architectural TMA fallback is always available");
+        render_topdown(&scenario, level, &result);
+        return Ok(());
+    }
+
     let selected_pmu: Vec<Counter> = counters
         .iter()
         .filter(|counter| !counter.is_software())
@@ -140,6 +167,123 @@ Performance counter stats for '{}':
     }
 
     Ok(())
+}
+
+fn render_topdown(scenario: &pmu_data::TmaScenario, level: u8, result: &pmu::CounterResult) {
+    let values = scenario
+        .events
+        .iter()
+        .filter_map(|name| {
+            let counter = match name.as_str() {
+                "cycles" => Counter::Cycles,
+                "instructions" => Counter::Instructions,
+                "stalled_cycles_frontend" => Counter::StalledCyclesFrontend,
+                "stalled_cycles_backend" => Counter::StalledCyclesBackend,
+                _ => Counter::Custom(name.clone()),
+            };
+            result
+                .get(counter)
+                .map(|value| (name.clone(), value.value as f64))
+        })
+        .collect::<HashMap<_, _>>();
+    let constants = scenario
+        .constants
+        .iter()
+        .map(|constant| (constant.name.clone(), constant.value as f64))
+        .collect::<HashMap<_, _>>();
+    let mut rows = scenario
+        .metrics
+        .iter()
+        .filter_map(|metric| {
+            metric_depth(&metric.name)
+                .le(&level)
+                .then(|| {
+                    eval_tma(&metric.formula, &values, &constants)
+                        .ok()
+                        .map(|value| (metric, value))
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    println!("Top-down analysis ({})", scenario.name);
+    for (index, (metric, value)) in rows.iter().enumerate() {
+        let marker = if index == 0 { "*" } else { " " };
+        let indent = "  ".repeat(metric_depth(&metric.name).saturating_sub(1) as usize);
+        println!(
+            "{marker} {indent}{:<28} {:>6.2}%  {}",
+            metric
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(&metric.name)
+                .replace('_', " "),
+            value * 100.0,
+            metric.desc
+        );
+    }
+    println!("* dominant path at requested level");
+}
+
+fn metric_depth(name: &str) -> u8 {
+    name.matches('.').count() as u8 + 1
+}
+
+fn eval_tma(
+    formula: &str,
+    values: &HashMap<String, f64>,
+    constants: &HashMap<String, f64>,
+) -> Result<f64> {
+    fn eval(
+        expr: &pmu_data::arith_parser::Expr,
+        values: &HashMap<String, f64>,
+        constants: &HashMap<String, f64>,
+    ) -> Result<f64> {
+        use pmu_data::arith_parser::{BinOp, Expr};
+        match expr {
+            Expr::Variable(name) => values
+                .get(name)
+                .copied()
+                .ok_or_else(|| anyhow!("missing event {name}")),
+            Expr::Constant(name) => constants
+                .get(name)
+                .copied()
+                .ok_or_else(|| anyhow!("missing constant {name}")),
+            Expr::Num(value) => Ok(*value),
+            Expr::Binary { op, lhs, rhs } => {
+                let (left, right) = (eval(lhs, values, constants)?, eval(rhs, values, constants)?);
+                Ok(match op {
+                    BinOp::Add => left + right,
+                    BinOp::Sub => left - right,
+                    BinOp::Mul => left * right,
+                    BinOp::Div => left / right,
+                    BinOp::Eq => (left == right) as u8 as f64,
+                    BinOp::Lt => (left < right) as u8 as f64,
+                    BinOp::Le => (left <= right) as u8 as f64,
+                    BinOp::Gt => (left > right) as u8 as f64,
+                    BinOp::Ge => (left >= right) as u8 as f64,
+                })
+            }
+            Expr::Call { name, args } => {
+                let args = args
+                    .iter()
+                    .map(|arg| eval(arg, values, constants))
+                    .collect::<Result<Vec<_>>>()?;
+                match name.to_ascii_lowercase().as_str() {
+                    "min" if args.len() == 2 => Ok(args[0].min(args[1])),
+                    "max" if args.len() == 2 => Ok(args[0].max(args[1])),
+                    "abs" if args.len() == 1 => Ok(args[0].abs()),
+                    "if" if args.len() == 3 => Ok(if args[0] != 0.0 { args[1] } else { args[2] }),
+                    _ => Err(anyhow!("unsupported TMA function {name}")),
+                }
+            }
+        }
+    }
+    eval(
+        &pmu_data::arith_parser::try_parse_expr(formula).map_err(|error| anyhow!(error))?,
+        values,
+        constants,
+    )
 }
 
 /// Render one counter table for a given scope. `get` returns the counter value

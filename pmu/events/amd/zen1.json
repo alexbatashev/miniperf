@@ -3,6 +3,7 @@
   "name": "AMD Zen or Zen+ architecture",
   "vendor": "AMD",
   "arch": "x86_64",
+  "max_counters": 4,
   "scenarios": [
     {
       "name": "tma",
@@ -17,6 +18,13 @@
         "ic_fw32_miss",
         "ex_ret_brn_resync",
         "l2_fill_pending.l2_fill_busy"
+      ],
+      "groups": [
+        { "name": "retiring", "events": ["cycles", "instructions", "uops_retired"] },
+        { "name": "fe_bound", "events": ["cycles", "instructions", "ic_fetch_stall.ic_stall_dq_empty"] },
+        { "name": "bad_speculation", "events": ["cycles", "instructions", "ex_ret_brn_misp"] },
+        { "name": "be_bound", "events": ["cycles", "instructions", "ic_fetch_stall.ic_stall_back_pressure"] }
+        ,{ "name": "be_bound_l2", "events": ["cycles", "instructions", "ic_fetch_stall.ic_stall_back_pressure", "l2_fill_pending.l2_fill_busy"] }
       ],
       "constants": [
         {
@@ -33,21 +41,37 @@
           "name": "retiring",
           "desc": "Fraction of cycles useful work completed",
           "formula": "uops_retired / ($max_retired_width * cycles)"
+          ,"group": "retiring"
         },
         {
           "name": "fe_bound",
           "desc": "Fraction of cycles Fetch/Decode not supplied",
           "formula": "ic_fetch_stall.ic_stall_dq_empty / cycles"
+          ,"group": "fe_bound"
         },
         {
           "name": "bad_speculation",
           "desc": "Fraction of cycles lost to branch misprediction",
           "formula": "(ex_ret_brn_misp * $branch_mispredict_penalty) / cycles"
+          ,"group": "bad_speculation"
         },
         {
           "name": "be_bound",
           "desc": "Fraction of cycles backend was out of resources",
           "formula": "ic_fetch_stall.ic_stall_back_pressure / cycles"
+          ,"group": "be_bound"
+        },
+        {
+          "name": "be_bound.memory_bound",
+          "desc": "Backend pressure coincident with outstanding L2 fills",
+          "formula": "l2_fill_pending.l2_fill_busy / cycles",
+          "group": "be_bound_l2"
+        },
+        {
+          "name": "be_bound.core_bound",
+          "desc": "Backend pressure not coincident with outstanding L2 fills",
+          "formula": "(ic_fetch_stall.ic_stall_back_pressure - l2_fill_pending.l2_fill_busy) / cycles",
+          "group": "be_bound_l2"
         }
       ],
       "ui": {

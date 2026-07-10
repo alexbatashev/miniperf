@@ -3,6 +3,23 @@
   "name": "ARM Cortex-A520",
   "vendor": "ARM",
   "arch": "aarch64",
+  "scenarios": [
+    {
+      "name": "tma",
+      "events": ["cycles", "instructions", "stalled_cycles_frontend", "stalled_cycles_backend"],
+      "groups": [
+        {"name":"retiring","events":["cycles","instructions"]},
+        {"name":"fe_bound","events":["cycles","instructions","stalled_cycles_frontend"]},
+        {"name":"be_bound","events":["cycles","instructions","stalled_cycles_backend"]}
+      ],
+      "constants": [{"name":"retire_width","value":2}],
+      "metrics": [
+        {"name":"retiring","desc":"Estimated retired instruction throughput","formula":"instructions / ($retire_width * cycles)","group":"retiring"},
+        {"name":"fe_bound","desc":"Frontend stall cycles","formula":"stalled_cycles_frontend / cycles","group":"fe_bound"},
+        {"name":"be_bound","desc":"Backend stall cycles","formula":"stalled_cycles_backend / cycles","group":"be_bound"}
+      ]
+    }
+  ],
   "aliases": [
     {
       "target": "cycles",

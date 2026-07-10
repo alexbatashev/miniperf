@@ -5,6 +5,70 @@
   "arch": "x86_64",
   "max_counters": 8,
   "leader_event": null,
+  "scenarios": [
+    {
+      "name": "tma",
+      "events": [
+        "cycles",
+        "instructions",
+        "TOPDOWN.SLOTS_P",
+        "UOPS_RETIRED.SLOTS",
+        "IDQ_UOPS_NOT_DELIVERED.CORE",
+        "TOPDOWN.BACKEND_BOUND_SLOTS",
+        "UOPS_ISSUED.ANY",
+        "INT_MISC.RECOVERY_CYCLES",
+        "CYCLE_ACTIVITY.STALLS_MEM_ANY"
+      ],
+      "groups": [
+        { "name": "retiring", "events": ["cycles", "instructions", "TOPDOWN.SLOTS_P", "UOPS_RETIRED.SLOTS"] },
+        { "name": "fe_bound", "events": ["cycles", "instructions", "TOPDOWN.SLOTS_P", "IDQ_UOPS_NOT_DELIVERED.CORE"] },
+        { "name": "be_bound", "events": ["cycles", "instructions", "TOPDOWN.SLOTS_P", "TOPDOWN.BACKEND_BOUND_SLOTS"] },
+        { "name": "bad_speculation", "events": ["cycles", "instructions", "TOPDOWN.SLOTS_P", "UOPS_ISSUED.ANY", "UOPS_RETIRED.SLOTS", "INT_MISC.RECOVERY_CYCLES"] }
+        ,{ "name": "be_bound_l2", "events": ["cycles", "instructions", "TOPDOWN.SLOTS_P", "TOPDOWN.BACKEND_BOUND_SLOTS", "CYCLE_ACTIVITY.STALLS_MEM_ANY"] }
+      ],
+      "constants": [
+        { "name": "pipeline_width", "value": 4 }
+      ],
+      "metrics": [
+        {
+          "name": "retiring",
+          "desc": "Fraction of Top-down slots used by retired uops",
+          "formula": "UOPS_RETIRED.SLOTS / TOPDOWN.SLOTS_P",
+          "group": "retiring"
+        },
+        {
+          "name": "fe_bound",
+          "desc": "Fraction of slots not delivered by the front end",
+          "formula": "IDQ_UOPS_NOT_DELIVERED.CORE / TOPDOWN.SLOTS_P",
+          "group": "fe_bound"
+        },
+        {
+          "name": "bad_speculation",
+          "desc": "Fraction of slots lost to issued but unretired work and recovery",
+          "formula": "(UOPS_ISSUED.ANY - UOPS_RETIRED.SLOTS + ($pipeline_width * INT_MISC.RECOVERY_CYCLES)) / TOPDOWN.SLOTS_P",
+          "group": "bad_speculation"
+        },
+        {
+          "name": "be_bound",
+          "desc": "Fraction of slots blocked on backend resources",
+          "formula": "TOPDOWN.BACKEND_BOUND_SLOTS / TOPDOWN.SLOTS_P",
+          "group": "be_bound"
+        },
+        {
+          "name": "be_bound.memory_bound",
+          "desc": "Backend slots stalled by outstanding demand memory loads",
+          "formula": "($pipeline_width * CYCLE_ACTIVITY.STALLS_MEM_ANY) / TOPDOWN.SLOTS_P",
+          "group": "be_bound_l2"
+        },
+        {
+          "name": "be_bound.core_bound",
+          "desc": "Backend slots not attributed to outstanding demand memory loads",
+          "formula": "(TOPDOWN.BACKEND_BOUND_SLOTS - ($pipeline_width * CYCLE_ACTIVITY.STALLS_MEM_ANY)) / TOPDOWN.SLOTS_P",
+          "group": "be_bound_l2"
+        }
+      ]
+    }
+  ],
   "events": [
     {
       "name": "ARITH.DIVIDER_ACTIVE",

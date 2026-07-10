@@ -76,8 +76,8 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
     let func_name = get_string_id(&handle.info.func_name);
 
     let start_frame = CallFrame::Location(Location {
-        function_name: func_name as u128,
-        file_name: filename as u128,
+        function_name: func_name,
+        file_name: filename,
         line: handle.info.line,
     });
 

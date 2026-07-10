@@ -1,5 +1,5 @@
 use clap::ValueEnum;
-use pmu_data::{ScenarioUi, TmaConstant, TmaMetric};
+use pmu_data::{ScenarioUi, TmaConstant, TmaGroup, TmaMetric};
 use serde::{Deserialize, Serialize};
 
 mod event;
@@ -39,6 +39,11 @@ pub struct RooflineInfo {
 pub struct TMAInfo {
     pub pid: i32,
     pub counters: Vec<(EventType, String)>,
+    #[serde(default)]
+    pub groups: Vec<TmaGroup>,
+    /// True only when the recording used a precise PMU sampling source.
+    #[serde(default)]
+    pub precise_attribution: bool,
     pub metrics: Vec<TmaMetric>,
     pub constants: Vec<TmaConstant>,
     #[serde(default)]

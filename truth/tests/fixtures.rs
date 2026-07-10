@@ -6,6 +6,10 @@ const KNOWN_SLEEPER_FIXTURES: [&str; 2] = [
     env!("TRUTH_KNOWN_SLEEPER_FP"),
     env!("TRUTH_KNOWN_SLEEPER_NO_FP"),
 ];
+const TMA_FIXTURES: [&str; 2] = [
+    env!("TRUTH_POINTER_CHASE_FP"),
+    env!("TRUTH_BRANCH_HEAVY_FP"),
+];
 
 #[test]
 fn f6_1_fixture_variants_are_executable() {
@@ -29,6 +33,12 @@ fn f6_1_fixture_variants_are_executable() {
         assert!(
             status.success(),
             "08-M1 known_sleeper: controlled fixture {fixture} failed"
+        );
+    }
+    for fixture in TMA_FIXTURES {
+        assert!(
+            Command::new(fixture).status().unwrap().success(),
+            "TMA fixture {fixture} failed"
         );
     }
 }

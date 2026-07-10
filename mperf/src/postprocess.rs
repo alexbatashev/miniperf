@@ -169,7 +169,7 @@ async fn process_strings(connection: &sqlite::Connection, res_dir: &Path) -> Res
     for s in strings {
         connection.execute(format!(
             "INSERT INTO strings (id, string) VALUES ({}, '{}');",
-            s.id as u128, s.value
+            s.id, s.value
         ))?;
     }
 
@@ -197,7 +197,10 @@ async fn process_pmu_counters(
 
     let str_events = events
         .iter()
-        .map(|event| format!("{} INTEGER DEFAULT 0", get_event_column_name(event)))
+        // NULL means this event was not a member of the sampled perf group;
+        // zero means it was a member but observed no delta.  TMA needs this
+        // distinction to keep a formula inside its coherent group.
+        .map(|event| format!("{} INTEGER", get_event_column_name(event)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -210,6 +213,7 @@ async fn process_pmu_counters(
                 time_enabled INTEGER NOT NULL,
                 time_running INTEGER NOT NULL,
                 confidence REAL NOT NULL,
+                timestamp INTEGER NOT NULL,
                 ip INTEGER NOT NULL,
                 call_stack TEXT,
                 {}
@@ -462,11 +466,12 @@ fn insert_counter_group(
                 time_enabled,
                 time_running,
                 confidence,
+                timestamp,
                 ip,
                 call_stack,
                 {}
             )
-            VALUES ({}, {}, {}, {}, {}, {}, {}, \"[{}]\", {});
+            VALUES ({}, {}, {}, {}, {}, {}, {}, {}, \"[{}]\", {});
         ",
         keys.join(", "),
         lead_event.unique_id,
@@ -475,6 +480,7 @@ fn insert_counter_group(
         lead_event.time_enabled,
         lead_event.time_running,
         confidence,
+        lead_event.timestamp,
         lead_event.callstack.first().map(|f| f.as_ip()).unwrap_or(0),
         lead_event
             .callstack
@@ -484,6 +490,57 @@ fn insert_counter_group(
             .join(", "),
         values.join(", "),
     ))?;
+    Ok(())
+}
+
+/// Persist one-second metric intervals and a machine-readable dominant verdict.
+/// Keeping this as tables (rather than only a view) makes the data available to
+/// the summary UI and exporters without re-running formula expansion.
+fn create_tma_intervals_and_summary(
+    connection: &sqlite::Connection,
+    info: &mperf_data::TMAInfo,
+) -> Result<()> {
+    connection.execute("CREATE TABLE tma_intervals (start_ns INTEGER NOT NULL, metric TEXT NOT NULL, value REAL);
+                        CREATE TABLE tma_summary (metric TEXT PRIMARY KEY, value REAL, verdict TEXT);")?;
+    for metric in &info.metrics {
+        let expression = pmu_data::arith_parser::try_parse_expr(&metric.formula)
+            .map_err(|error| anyhow::anyhow!("invalid TMA formula '{}': {error}", metric.name))?;
+        let marker = metric
+            .group
+            .as_ref()
+            .and_then(|name| {
+                info.groups
+                    .iter()
+                    .find(|group| &group.name == name)
+                    .and_then(|group| {
+                        group.events.iter().find(|event| {
+                            event.as_str() != "cycles" && event.as_str() != "instructions"
+                        })
+                    })
+            })
+            .map(|event| tma_marker_column(&info.counters, event));
+        let sql = build_tma_sql_expr(
+            &info.metrics,
+            &info.counters,
+            &info.constants,
+            &expression,
+            marker.as_deref(),
+        );
+        let escaped = metric.name.replace('\'', "''");
+        connection.execute(format!(
+            "INSERT INTO tma_intervals (start_ns, metric, value)
+             SELECT (timestamp / 1000000000) * 1000000000, '{escaped}', {sql}
+             FROM pmu_counters GROUP BY timestamp / 1000000000;"
+        ))?;
+        connection.execute(format!(
+            "INSERT INTO tma_summary (metric, value)
+             SELECT '{escaped}', {sql} FROM pmu_counters;"
+        ))?;
+    }
+    connection.execute(
+        "UPDATE tma_summary SET verdict = 'dominant' WHERE metric =
+         (SELECT metric FROM tma_summary WHERE value IS NOT NULL ORDER BY value DESC LIMIT 1);",
+    )?;
     Ok(())
 }
 
@@ -1281,12 +1338,34 @@ async fn create_tma_view(connection: &sqlite::Connection, info: &ScenarioInfo) -
         .metrics
         .iter()
         .map(|metric| {
-            let expression = pmu_data::arith_parser::parse_expr(&metric.formula);
-            let sql =
-                build_tma_sql_expr(&info.metrics, &info.counters, &info.constants, &expression);
-            format!("{} AS {}", sql, metric.name.replace('.', "_"))
+            let expression =
+                pmu_data::arith_parser::try_parse_expr(&metric.formula).map_err(|error| {
+                    anyhow::anyhow!("invalid TMA formula '{}': {error}", metric.name)
+                })?;
+            let marker = metric
+                .group
+                .as_ref()
+                .and_then(|name| {
+                    info.groups
+                        .iter()
+                        .find(|group| &group.name == name)
+                        .and_then(|group| {
+                            group.events.iter().find(|event| {
+                                event.as_str() != "cycles" && event.as_str() != "instructions"
+                            })
+                        })
+                })
+                .map(|event| tma_marker_column(&info.counters, event));
+            let sql = build_tma_sql_expr(
+                &info.metrics,
+                &info.counters,
+                &info.constants,
+                &expression,
+                marker.as_deref(),
+            );
+            Ok::<String, anyhow::Error>(format!("{} AS {}", sql, metric.name.replace('.', "_")))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>>>()?
         .join(",\n");
 
     connection.execute(format!(
@@ -1305,7 +1384,16 @@ async fn create_tma_view(connection: &sqlite::Connection, info: &ScenarioInfo) -
          INNER JOIN proc_map ON pmu_counters.ip = proc_map.ip
          GROUP BY proc_map.func_name;"
     ))?;
+    create_tma_intervals_and_summary(connection, info)?;
     Ok(())
+}
+
+fn tma_marker_column(events: &[(EventType, String)], event: &str) -> String {
+    events
+        .iter()
+        .find(|(_, name)| name == event)
+        .map(get_event_column_name)
+        .unwrap_or_else(|| format!("pmu_{}", event.replace('.', "_")))
 }
 
 fn build_tma_sql_expr(
@@ -1313,6 +1401,7 @@ fn build_tma_sql_expr(
     events: &[(EventType, String)],
     constants: &[pmu_data::TmaConstant],
     expression: &pmu_data::arith_parser::Expr,
+    marker: Option<&str>,
 ) -> String {
     use pmu_data::arith_parser::{BinOp, Expr};
 
@@ -1322,14 +1411,20 @@ fn build_tma_sql_expr(
             .find_map(|(event_type, name)| {
                 (name == variable).then(|| {
                     let column = get_event_column_name(&(*event_type, name.clone()));
-                    if matches!(
+                    let value = if matches!(
                         event_type,
                         EventType::PmuCycles | EventType::PmuInstructions
                     ) {
                         format!("SUM(pmu_counters.{column})")
                     } else {
                         format!("SUM(pmu_counters.{column} / pmu_counters.confidence)")
-                    }
+                    };
+                    marker.map_or(value.clone(), |marker| {
+                        format!(
+                            "SUM(CASE WHEN pmu_counters.{marker} IS NOT NULL THEN ({}) END)",
+                            value.trim_start_matches("SUM(").trim_end_matches(')')
+                        )
+                    })
                 })
             })
             .unwrap_or_else(|| {
@@ -1340,21 +1435,44 @@ fn build_tma_sql_expr(
                 let nested = pmu_data::arith_parser::parse_expr(&metric.formula);
                 format!(
                     "({})",
-                    build_tma_sql_expr(metrics, events, constants, &nested)
+                    build_tma_sql_expr(metrics, events, constants, &nested, marker)
                 )
             }),
         Expr::Constant(name) => constants
             .iter()
             .find(|constant| constant.name == *name)
-            .map_or_else(|| "0".to_string(), |constant| constant.value.to_string()),
+            // A missing constant must make the metric unavailable, never turn
+            // into a plausible-looking zero-valued result.
+            .map_or_else(|| "NULL".to_string(), |constant| constant.value.to_string()),
         Expr::Binary { op, lhs, rhs } => {
-            let lhs = build_tma_sql_expr(metrics, events, constants, lhs);
-            let rhs = build_tma_sql_expr(metrics, events, constants, rhs);
+            let lhs = build_tma_sql_expr(metrics, events, constants, lhs, marker);
+            let rhs = build_tma_sql_expr(metrics, events, constants, rhs, marker);
             match op {
                 BinOp::Add => format!("({lhs}) + ({rhs})"),
                 BinOp::Sub => format!("({lhs}) - ({rhs})"),
                 BinOp::Mul => format!("({lhs}) * ({rhs})"),
                 BinOp::Div => format!("CAST(({lhs}) AS REAL) / NULLIF(CAST(({rhs}) AS REAL), 0)"),
+                BinOp::Eq => format!("({lhs}) = ({rhs})"),
+                BinOp::Lt => format!("({lhs}) < ({rhs})"),
+                BinOp::Le => format!("({lhs}) <= ({rhs})"),
+                BinOp::Gt => format!("({lhs}) > ({rhs})"),
+                BinOp::Ge => format!("({lhs}) >= ({rhs})"),
+            }
+        }
+        Expr::Call { name, args } => {
+            let args = args
+                .iter()
+                .map(|arg| build_tma_sql_expr(metrics, events, constants, arg, marker))
+                .collect::<Vec<_>>();
+            match name.to_ascii_lowercase().as_str() {
+                "min" if args.len() == 2 => format!("MIN({}, {})", args[0], args[1]),
+                "max" if args.len() == 2 => format!("MAX({}, {})", args[0], args[1]),
+                "abs" if args.len() == 1 => format!("ABS({})", args[0]),
+                "if" if args.len() == 3 => format!(
+                    "CASE WHEN ({}) <> 0 THEN ({}) ELSE ({}) END",
+                    args[0], args[1], args[2]
+                ),
+                _ => "NULL".to_owned(),
             }
         }
         Expr::Num(number) => number.to_string(),

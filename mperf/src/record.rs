@@ -14,8 +14,11 @@ use pmu::{Counter, Process, Record};
 const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 use crate::{
-    counter_selection::get_pmu_counters, event_dispatcher::EventDispatcher,
-    postprocess::perform_postprocessing, utils::counter_to_event_ty, Scenario,
+    counter_selection::{get_pmu_counters, get_tma_counter_groups},
+    event_dispatcher::EventDispatcher,
+    postprocess::perform_postprocessing,
+    utils::counter_to_event_ty,
+    Scenario,
 };
 
 #[cfg(target_os = "macos")]
@@ -426,10 +429,9 @@ fn create_shmem_pipe(
                     for stack in event.callstack.iter_mut() {
                         if let CallFrame::Location(loc) = stack {
                             loc.function_name =
-                                strings.get(&loc.function_name).cloned().unwrap_or_default()
-                                    as u128;
+                                strings.get(&loc.function_name).cloned().unwrap_or_default();
                             loc.file_name =
-                                strings.get(&loc.file_name).cloned().unwrap_or_default() as u128;
+                                strings.get(&loc.file_name).cloned().unwrap_or_default();
                         }
                     }
 
@@ -445,12 +447,21 @@ fn create_shmem_pipe(
 fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
     let scenario = pmu::host_tma_scenario().context("TMA is not supported on this CPU")?;
     let process = Process::new(command, &[])?;
-    let counters = get_pmu_counters(Scenario::TMA);
+    let counter_groups = get_tma_counter_groups(&scenario)?;
+    // Keep group boundaries in the acquisition order. The perf driver creates
+    // a fresh group whenever it sees the repeated fixed-counter pair.
+    let counters = counter_groups.iter().flatten().cloned().collect::<Vec<_>>();
+    let metadata_counters = get_pmu_counters(Scenario::TMA);
 
-    let mut driver = pmu::SamplingDriverBuilder::new()
+    let builder = pmu::SamplingDriverBuilder::new()
         .counters(&counters)
-        .process(&process)
-        .build()?;
+        .process(&process);
+    let builder = if scenario.precise_attribution {
+        builder.precise_ip()
+    } else {
+        builder
+    };
+    let mut driver = builder.build()?;
     let recorded_pid = process.pid();
     if cfg!(target_os = "macos") {
         publish_process_maps(dispatcher.clone(), recorded_pid);
@@ -503,10 +514,12 @@ fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scena
 
     Ok(ScenarioInfo::TMA(mperf_data::TMAInfo {
         pid: recorded_pid,
-        counters: counters
+        counters: metadata_counters
             .iter()
             .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
             .collect(),
+        groups: scenario.groups,
+        precise_attribution: scenario.precise_attribution,
         metrics: scenario.metrics,
         constants: scenario.constants,
         ui: scenario.ui,

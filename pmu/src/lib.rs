@@ -39,6 +39,11 @@ pub fn host_tma_scenario() -> Option<pmu_data::TmaScenario> {
     cpu_family::host_tma_scenario()
 }
 
+/// Maximum number of events in one coherent group on the host PMU, when known.
+pub fn host_max_counters() -> Option<usize> {
+    cpu_family::host_max_counters()
+}
+
 /// The core clusters present on the host, on a heterogeneous (big.LITTLE)
 /// system. Returns an empty vector on homogeneous systems (a single cluster),
 /// where per-core attribution is meaningless.

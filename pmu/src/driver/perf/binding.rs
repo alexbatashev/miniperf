@@ -62,6 +62,35 @@ pub fn grouped(
     attrs: &mut [perf_event_attr],
     pid: Option<i32>,
 ) -> Result<Vec<NativeCounterHandle>, Error> {
+    // TMA passes one complete group after another, each beginning with cycles.
+    // Do not flatten these into the historical arbitrary chunks: doing so
+    // breaks the common denominator that makes a Top-down ratio meaningful.
+    let boundaries = counters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, counter)| (*counter == Counter::Cycles).then_some(index))
+        .collect::<Vec<_>>();
+    if boundaries.len() > 1 {
+        let mut handles = Vec::new();
+        for (position, start) in boundaries.iter().enumerate() {
+            let end = boundaries
+                .get(position + 1)
+                .copied()
+                .unwrap_or(counters.len());
+            if *start == end || counters[*start] != Counter::Cycles {
+                return Err(Error::InvalidConfiguration(
+                    "invalid coherent sampling group".to_owned(),
+                ));
+            }
+            handles.extend(grouped_all(
+                &counters[*start..end],
+                &mut attrs[*start..end],
+                pid,
+            )?);
+        }
+        return Ok(handles);
+    }
+
     let cpu_family = cpu_family::get_host_cpu_family();
     let info = cpu_family::find_cpu_family(cpu_family);
 

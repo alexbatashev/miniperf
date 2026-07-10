@@ -6,7 +6,17 @@ pub fn scenario_ui(record: &RecordInfo) -> ScenarioUi {
         Scenario::Snapshot => snapshot_ui(),
         Scenario::Roofline => roofline_ui(),
         Scenario::TMA => match &record.scenario_info {
-            ScenarioInfo::TMA(tma) => tma.ui.clone().unwrap_or_else(|| tma_fallback_ui()),
+            ScenarioInfo::TMA(tma) => {
+                let mut ui = tma.ui.clone().unwrap_or_else(tma_fallback_ui);
+                // Ordinary interrupt samples identify where the interrupt was
+                // taken, not necessarily where a non-precise TMA event was
+                // incurred. Hide per-function ratio tables in that case.
+                if !tma.precise_attribution {
+                    ui.tabs
+                        .retain(|tab| !matches!(tab, TabSpec::MetricsTable(_)));
+                }
+                ui
+            }
             _ => snapshot_ui(),
         },
     }

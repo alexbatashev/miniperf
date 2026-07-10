@@ -66,10 +66,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut scenarios = vec![];
         for scenario in &data.scenarios.unwrap_or_default() {
             let name = scenario.name.clone();
+            let precise_attribution = scenario.precise_attribution;
             let events = scenario
                 .events
                 .iter()
                 .map(|event| quote! { #event.to_string() });
+            let groups = scenario.groups.iter().map(|group| {
+                let name = group.name.clone();
+                let events = group.events.iter().map(|event| quote! { #event.to_string() });
+                quote! { pmu_data::TmaGroup { name: #name.to_string(), events: vec![#(#events),*] } }
+            });
             let constants = scenario.constants.iter().map(|constant| {
                 let name = constant.name.clone();
                 let value = constant.value;
@@ -81,11 +87,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let name = metric.name.clone();
                 let desc = metric.desc.clone();
                 let formula = metric.formula.clone();
+                let group = metric
+                    .group
+                    .as_ref()
+                    .map(|group| quote! { Some(#group.to_string()) })
+                    .unwrap_or_else(|| quote! { None });
                 quote! {
                     pmu_data::TmaMetric {
                         name: #name.to_string(),
                         desc: #desc.to_string(),
                         formula: #formula.to_string(),
+                        group: #group,
                     }
                 }
             });
@@ -98,6 +110,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 scenarios.insert(#name.to_string(), pmu_data::TmaScenario {
                     name: #name.to_string(),
                     events: vec![#(#events),*],
+                    groups: vec![#(#groups),*],
+                    precise_attribution: #precise_attribution,
                     constants: vec![#(#constants),*],
                     metrics: vec![#(#scenario_metrics),*],
                     ui: #ui,

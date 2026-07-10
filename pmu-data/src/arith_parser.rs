@@ -16,6 +16,13 @@ pub enum Expr {
     Constant(String),
     /// A numeric literal.
     Num(f64),
+    /// Function call used by vendor metric JSON (`min`, `max`, `abs`, `if`).
+    Call {
+        /// Function identifier.
+        name: String,
+        /// Positional arguments.
+        args: Vec<Expr>,
+    },
 }
 
 /// Arithmetic binary operator.
@@ -29,6 +36,16 @@ pub enum BinOp {
     Mul,
     /// Division.
     Div,
+    /// Equality comparison.
+    Eq,
+    /// Less-than comparison.
+    Lt,
+    /// Less-than-or-equal comparison.
+    Le,
+    /// Greater-than comparison.
+    Gt,
+    /// Greater-than-or-equal comparison.
+    Ge,
 }
 
 /// Parses a valid TMA arithmetic formula.
@@ -37,9 +54,13 @@ pub enum BinOp {
 ///
 /// Panics when `expression` is not a valid formula.
 pub fn parse_expr(expression: &str) -> Expr {
-    Parser::new(expression)
-        .parse()
+    try_parse_expr(expression)
         .unwrap_or_else(|error| panic!("invalid TMA formula '{expression}': {error}"))
+}
+
+/// Parses a TMA formula without panicking, suitable for imported metric data.
+pub fn try_parse_expr(expression: &str) -> Result<Expr, String> {
+    Parser::new(expression).parse()
 }
 
 struct Parser<'a> {
@@ -53,12 +74,41 @@ impl<'a> Parser<'a> {
     }
 
     fn parse(mut self) -> Result<Expr, String> {
-        let expression = self.sum()?;
+        let expression = self.comparison()?;
         self.whitespace();
         if let Some(character) = self.peek() {
             return Err(format!("unexpected '{character}' at byte {}", self.offset));
         }
         Ok(expression)
+    }
+
+    fn comparison(&mut self) -> Result<Expr, String> {
+        let lhs = self.sum()?;
+        self.whitespace();
+        let op = if self.input[self.offset..].starts_with(">=") {
+            self.offset += 2;
+            Some(BinOp::Ge)
+        } else if self.input[self.offset..].starts_with("<=") {
+            self.offset += 2;
+            Some(BinOp::Le)
+        } else if self.input[self.offset..].starts_with("==") {
+            self.offset += 2;
+            Some(BinOp::Eq)
+        } else if self.consume('>') {
+            Some(BinOp::Gt)
+        } else if self.consume('<') {
+            Some(BinOp::Lt)
+        } else {
+            None
+        };
+        match op {
+            Some(op) => Ok(Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(self.sum()?),
+            }),
+            None => Ok(lhs),
+        }
     }
 
     fn sum(&mut self) -> Result<Expr, String> {
@@ -118,7 +168,29 @@ impl<'a> Parser<'a> {
         if character.is_ascii_digit() || character == '.' {
             return self.number().map(Expr::Num);
         }
-        self.identifier().map(Expr::Variable)
+        let identifier = self.identifier()?;
+        self.whitespace();
+        if !self.consume('(') {
+            return Ok(Expr::Variable(identifier));
+        }
+        let mut args = Vec::new();
+        self.whitespace();
+        if !self.consume(')') {
+            loop {
+                args.push(self.comparison()?);
+                self.whitespace();
+                if self.consume(')') {
+                    break;
+                }
+                if !self.consume(',') {
+                    return Err(format!("expected ',' or ')' at byte {}", self.offset));
+                }
+            }
+        }
+        Ok(Expr::Call {
+            name: identifier,
+            args,
+        })
     }
 
     fn identifier(&mut self) -> Result<String, String> {
@@ -195,5 +267,34 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn parses_vendor_functions() {
+        assert_eq!(
+            try_parse_expr("max(0, abs(a - b))").unwrap(),
+            Expr::Call {
+                name: "max".to_owned(),
+                args: vec![
+                    Expr::Num(0.0),
+                    Expr::Call {
+                        name: "abs".to_owned(),
+                        args: vec![Expr::Binary {
+                            op: BinOp::Sub,
+                            lhs: Box::new(Expr::Variable("a".to_owned())),
+                            rhs: Box::new(Expr::Variable("b".to_owned()))
+                        }]
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn parses_conditional_comparison() {
+        assert!(matches!(
+            try_parse_expr("if(a >= b, 1, 0)").unwrap(),
+            Expr::Call { name, args } if name == "if" && matches!(args[0], Expr::Binary { op: BinOp::Ge, .. })
+        ));
     }
 }

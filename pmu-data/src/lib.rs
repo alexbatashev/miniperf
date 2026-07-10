@@ -108,6 +108,15 @@ pub struct TmaScenario {
     pub name: String,
     /// PMU event names that must be sampled.
     pub events: Vec<String>,
+    /// Counter groups which must be scheduled together.  A metric may only
+    /// use events from its group, so each result has one time-enabled/running
+    /// domain instead of mixing independently multiplexed counters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<TmaGroup>,
+    /// Whether this methodology has a precise (PEBS/SPE) sampling event that
+    /// makes function-level ratios meaningful.
+    #[serde(default)]
+    pub precise_attribution: bool,
     /// Named processor constants referenced by metric formulas.
     pub constants: Vec<TmaConstant>,
     /// Hierarchical metrics calculated by the scenario.
@@ -126,6 +135,21 @@ pub struct TmaMetric {
     pub desc: String,
     /// Formula referencing events, constants, or other TMA metrics.
     pub formula: String,
+    /// Name of the coherent counter group used to evaluate this metric.
+    /// Missing is accepted for legacy scenario files and is inferred from the
+    /// formula when possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// A set of events that must be read as one perf group.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaGroup {
+    /// Stable group name referenced by [`TmaMetric::group`].
+    pub name: String,
+    /// Events in the group. `cycles` and `instructions` must be listed when a
+    /// formula uses them; they are intentionally not injected implicitly.
+    pub events: Vec<String>,
 }
 
 /// A named integer constant referenced by a TMA formula.

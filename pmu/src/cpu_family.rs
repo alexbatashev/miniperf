@@ -33,6 +33,74 @@ pub fn host_tma_scenario() -> Option<TmaScenario> {
     find_cpu_family(get_host_cpu_family())
         .and_then(|family| family.scenarios.get("tma"))
         .cloned()
+        .or_else(|| Some(architectural_tma_fallback()))
+}
+
+/// Conservative level-one fallback for CPUs without a vendor TMA definition.
+/// It uses only architectural perf events and labels its estimates accordingly.
+fn architectural_tma_fallback() -> TmaScenario {
+    TmaScenario {
+        name: "tma".to_owned(),
+        events: vec![
+            "cycles".to_owned(),
+            "instructions".to_owned(),
+            "stalled_cycles_frontend".to_owned(),
+            "stalled_cycles_backend".to_owned(),
+        ],
+        groups: vec![
+            pmu_data::TmaGroup {
+                name: "retiring".to_owned(),
+                events: vec!["cycles".to_owned(), "instructions".to_owned()],
+            },
+            pmu_data::TmaGroup {
+                name: "fe_bound".to_owned(),
+                events: vec![
+                    "cycles".to_owned(),
+                    "instructions".to_owned(),
+                    "stalled_cycles_frontend".to_owned(),
+                ],
+            },
+            pmu_data::TmaGroup {
+                name: "be_bound".to_owned(),
+                events: vec![
+                    "cycles".to_owned(),
+                    "instructions".to_owned(),
+                    "stalled_cycles_backend".to_owned(),
+                ],
+            },
+        ],
+        precise_attribution: false,
+        constants: vec![pmu_data::TmaConstant {
+            name: "assumed_retire_width".to_owned(),
+            value: 4,
+        }],
+        metrics: vec![
+            pmu_data::TmaMetric {
+                name: "retiring".to_owned(),
+                desc: "Estimated retiring fraction (architectural fallback)".to_owned(),
+                formula: "instructions / ($assumed_retire_width * cycles)".to_owned(),
+                group: Some("retiring".to_owned()),
+            },
+            pmu_data::TmaMetric {
+                name: "fe_bound".to_owned(),
+                desc: "Estimated frontend-bound fraction (architectural fallback)".to_owned(),
+                formula: "stalled_cycles_frontend / cycles".to_owned(),
+                group: Some("fe_bound".to_owned()),
+            },
+            pmu_data::TmaMetric {
+                name: "be_bound".to_owned(),
+                desc: "Estimated backend-bound fraction (architectural fallback)".to_owned(),
+                formula: "stalled_cycles_backend / cycles".to_owned(),
+                group: Some("be_bound".to_owned()),
+            },
+        ],
+        ui: None,
+    }
+}
+
+/// Maximum number of events the host PMU can schedule in one coherent group.
+pub fn host_max_counters() -> Option<usize> {
+    find_cpu_family(get_host_cpu_family()).and_then(|family| family.max_counters)
 }
 
 #[cfg(target_arch = "x86_64")]

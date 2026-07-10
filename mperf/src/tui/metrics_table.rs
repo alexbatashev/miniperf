@@ -450,7 +450,6 @@ impl MetricsTableTab {
                         let request_id = state.next_assembly_request_id();
                         drop(state);
                         this.request_assembly(func_name, request_id);
-                        return;
                     } else {
                         state.assembly_error =
                             Some("Unable to open assembly view for the selected row".to_string());
