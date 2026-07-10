@@ -26,8 +26,8 @@ use crate::{Counter, Error, Record};
 pub use events::list_supported_counters;
 
 use super::{
-    CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver, SamplingCallback,
-    SamplingDriver,
+    CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver, MeasurementQuality,
+    SamplingCallback, SamplingDriver,
 };
 
 /// Counting driver is used for simple collection of system's performance counters values. On Linux,
@@ -293,6 +293,11 @@ impl CountingDriver for PerfCountingDriver {
                 value: CounterValue {
                     value: reported_value,
                     scaling: scaling_factor,
+                    quality: if handle.core.is_none() && scaling_factor > 1.0 {
+                        MeasurementQuality::Scaled
+                    } else {
+                        MeasurementQuality::Exact
+                    },
                 },
             });
         }

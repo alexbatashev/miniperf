@@ -1,7 +1,7 @@
 use anyhow::Result;
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use num_format::{Locale, ToFormattedString};
-use pmu::{Counter, CounterValue, Process};
+use pmu::{Counter, CounterValue, MeasurementQuality, Process};
 
 /// PMU (hardware) counters, shown per-core on heterogeneous systems.
 fn pmu_counters() -> Vec<Counter> {
@@ -27,20 +27,44 @@ fn software_counters() -> Vec<Counter> {
     ]
 }
 
-pub fn do_stat(command: Vec<String>) -> Result<()> {
-    let process = Process::new(&command, &[])?;
+pub fn do_stat(pid: Option<u32>, command: Vec<String>) -> Result<()> {
+    if pid.is_none() && command.is_empty() {
+        anyhow::bail!(
+            "stat requires a command, or --pid with a command used as the measurement duration"
+        );
+    }
+
+    let process = if pid.is_none() {
+        Some(Process::new(&command, &[])?)
+    } else if command.is_empty() {
+        None
+    } else {
+        Some(Process::new(&command, &[])?)
+    };
 
     let mut counters = pmu_counters();
     counters.extend(software_counters());
 
-    let mut driver = pmu::CountingDriverBuilder::new()
+    let mut builder = pmu::CountingDriverBuilder::new()
         .counters(&counters)
-        .process(Some(&process))
-        .build()?;
+        .process(process.as_ref());
+
+    if let Some(pid) = pid {
+        builder = builder.pid(Some(pid as i32));
+    }
+
+    let mut driver = builder.build()?;
 
     driver.reset()?;
-    process.cont();
-    process.wait()?;
+    driver.start()?;
+    if let Some(process) = &process {
+        process.cont();
+        process.wait()?;
+    } else if let Some(pid) = pid {
+        while unsafe { libc::kill(pid as i32, 0) } == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
     driver.stop()?;
 
     let result = driver.counters()?;
@@ -50,7 +74,11 @@ pub fn do_stat(command: Vec<String>) -> Result<()> {
 
 Performance counter stats for '{}':
 ",
-        command.join(" ")
+        if let Some(pid) = pid {
+            format!("pid {pid}")
+        } else {
+            command.join(" ")
+        }
     );
 
     let cores = result.cores();
@@ -85,7 +113,14 @@ fn render_table(counters: &[Counter], get: impl Fn(&Counter) -> Option<CounterVa
     let instructions = get(&Counter::Instructions).map(|v| v.value);
 
     let mut table = Table::new();
-    table.set_header(vec!["Counter", "Value", "Info", "Scaling", "Description"]);
+    table.set_header(vec![
+        "Counter",
+        "Value",
+        "Info",
+        "Scaling",
+        "Quality",
+        "Description",
+    ]);
 
     for cntr in counters {
         let Some(value) = get(cntr) else {
@@ -100,6 +135,11 @@ fn render_table(counters: &[Counter], get: impl Fn(&Counter) -> Option<CounterVa
                 .set_alignment(CellAlignment::Right),
             info,
             Cell::new(format!("{:.2}", value.scaling)).set_alignment(CellAlignment::Right),
+            Cell::new(match value.quality {
+                MeasurementQuality::Exact => "exact",
+                MeasurementQuality::Scaled => "scaled",
+                MeasurementQuality::Estimated => "estimated",
+            }),
             Cell::new(cntr.description()),
         ]);
     }

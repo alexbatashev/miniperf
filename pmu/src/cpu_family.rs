@@ -322,33 +322,84 @@ pub fn host_core_pmus() -> Vec<CorePmu> {
 /// recording in profile metadata. On heterogeneous systems the model lists each
 /// distinct core cluster, e.g. `"ARM Cortex-A720 + ARM Cortex-A520"`.
 pub fn host_cpu_description() -> (String, String) {
-    let cores = host_core_pmus();
+    #[cfg(target_os = "macos")]
+    {
+        let model = macos_sysctl_string("machdep.cpu.brand_string")
+            .or_else(|| macos_sysctl_string("hw.model"))
+            .unwrap_or_else(|| "Unknown".to_string());
+        return ("Apple".to_string(), model);
+    }
 
-    if cores.len() > 1 {
-        let mut names: Vec<String> = Vec::new();
-        let mut vendor: Option<String> = None;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let cores = host_core_pmus();
 
-        for core in &cores {
-            if let Some(family) = find_cpu_family(core.family_id) {
-                if !names.contains(&family.name) {
-                    names.push(family.name.clone());
-                    vendor.get_or_insert_with(|| family.vendor.clone());
+        if cores.len() > 1 {
+            let mut names: Vec<String> = Vec::new();
+            let mut vendor: Option<String> = None;
+
+            for core in &cores {
+                if let Some(family) = find_cpu_family(core.family_id) {
+                    if !names.contains(&family.name) {
+                        names.push(family.name.clone());
+                        vendor.get_or_insert_with(|| family.vendor.clone());
+                    }
                 }
+            }
+
+            if !names.is_empty() {
+                return (
+                    vendor.unwrap_or_else(|| "Unknown".to_string()),
+                    names.join(" + "),
+                );
             }
         }
 
-        if !names.is_empty() {
-            return (
-                vendor.unwrap_or_else(|| "Unknown".to_string()),
-                names.join(" + "),
-            );
+        match find_cpu_family(get_host_cpu_family()) {
+            Some(family) => (family.vendor.clone(), family.name.clone()),
+            None => ("Unknown".to_string(), "Unknown".to_string()),
         }
     }
+}
 
-    match find_cpu_family(get_host_cpu_family()) {
-        Some(family) => (family.vendor.clone(), family.name.clone()),
-        None => ("Unknown".to_string(), "Unknown".to_string()),
+#[cfg(target_os = "macos")]
+fn macos_sysctl_string(name: &str) -> Option<String> {
+    use std::ffi::CString;
+
+    let name = CString::new(name).ok()?;
+    let mut len = 0_usize;
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || len == 0
+    {
+        return None;
     }
+
+    let mut value = vec![0_u8; len];
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    value.truncate(len);
+    if value.last() == Some(&0) {
+        value.pop();
+    }
+    String::from_utf8(value).ok()
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -376,5 +427,17 @@ mod aarch64_tests {
         assert_eq!(first_cpu_in_mask("7"), Some(7));
         assert_eq!(first_cpu_in_mask("3-3\n"), Some(3));
         assert_eq!(first_cpu_in_mask(""), None);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::host_cpu_description;
+
+    #[test]
+    fn reports_apple_cpu_description() {
+        let (vendor, model) = host_cpu_description();
+        assert_eq!(vendor, "Apple");
+        assert_ne!(model, "Unknown");
     }
 }

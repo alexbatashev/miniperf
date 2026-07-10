@@ -8,7 +8,7 @@ mod kperf;
 use perf::{PerfCountingDriver, PerfSamplingDriver};
 
 #[cfg(target_os = "macos")]
-pub use kperf::{list_software_counters, Driver};
+use kperf::{KPerfCountingDriver, KPerfSamplingDriver};
 
 use itertools::chain;
 use smallvec::SmallVec;
@@ -28,6 +28,14 @@ pub enum DriverKind {
 pub struct CounterValue {
     pub value: u64,
     pub scaling: f64,
+    pub quality: MeasurementQuality,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementQuality {
+    Exact,
+    Scaled,
+    Estimated,
 }
 
 /// Counting driver is used for simple collection of system's performance counters values. On Linux,
@@ -146,6 +154,14 @@ pub fn list_supported_counters(driver: DriverKind) -> Vec<Counter> {
         }
     }
 
+    cfg_if::cfg_if! {
+        if #[cfg(target_os="macos")] {
+            if driver == DriverKind::Default || driver == DriverKind::KPerf {
+                return kperf::list_supported_counters();
+            }
+        }
+    }
+
     vec![]
 }
 
@@ -168,11 +184,20 @@ impl CountingDriverBuilder {
         self
     }
 
+    pub fn pid(mut self, pid: Option<i32>) -> Self {
+        self.pid = pid;
+        self
+    }
+
     pub fn build(self) -> Result<Box<dyn CountingDriver>, Error> {
         cfg_if::cfg_if! {
             if #[cfg(target_os="linux")] {
                 if self.kind == DriverKind::Default || self.kind == DriverKind::Perf {
                     return Ok(Box::new(PerfCountingDriver::new(self.counters, self.pid)?));
+                }
+            } else if #[cfg(target_os="macos")] {
+                if self.kind == DriverKind::Default || self.kind == DriverKind::KPerf {
+                    return Ok(Box::new(KPerfCountingDriver::new(self.counters, self.pid)?));
                 }
             }
         }
@@ -213,6 +238,11 @@ impl SamplingDriverBuilder {
         self
     }
 
+    pub fn pid(mut self, pid: i32) -> Self {
+        self.pid = Some(pid);
+        self
+    }
+
     pub fn sample_freq(mut self, sample_freq: u64) -> Self {
         self.sample_freq = sample_freq;
         self
@@ -228,6 +258,10 @@ impl SamplingDriverBuilder {
             if #[cfg(target_os="linux")] {
                 if self.kind == DriverKind::Default || self.kind == DriverKind::Perf {
                     return Ok(Box::new(PerfSamplingDriver::new(&self.counters, self.sample_freq, self.pid, self.prefer_raw_events)?));
+                }
+            } else if #[cfg(target_os="macos")] {
+                if self.kind == DriverKind::Default || self.kind == DriverKind::KPerf {
+                    return Ok(Box::new(KPerfSamplingDriver::new(&self.counters, self.sample_freq, self.pid)?));
                 }
             }
         }
@@ -254,7 +288,25 @@ impl CounterResult {
         let value = matching.iter().map(|e| e.value.value).sum();
         let scaling = matching.iter().map(|e| e.value.scaling).sum::<f64>() / matching.len() as f64;
 
-        Some(CounterValue { value, scaling })
+        let quality = if matching
+            .iter()
+            .any(|entry| entry.value.quality == MeasurementQuality::Estimated)
+        {
+            MeasurementQuality::Estimated
+        } else if matching
+            .iter()
+            .any(|entry| entry.value.quality == MeasurementQuality::Scaled)
+        {
+            MeasurementQuality::Scaled
+        } else {
+            MeasurementQuality::Exact
+        };
+
+        Some(CounterValue {
+            value,
+            scaling,
+            quality,
+        })
     }
 
     /// Value of a counter on one specific core.

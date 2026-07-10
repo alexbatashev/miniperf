@@ -189,7 +189,10 @@ async fn process_pmu_counters(
             .collect::<SmallVec<[_; 32]>>()
             .join(";");
 
-        if evt.ty == EventType::PmuCycles {
+        // The first KPC observation in each multiplex epoch is a baseline,
+        // represented as a zero delta. Keep it available to correlation/DB
+        // processing, but do not emit meaningless zero-weight flamegraph rows.
+        if evt.ty == EventType::PmuCycles && evt.value > 0 && !func_names.is_empty() {
             *flamegraph_cycles.entry(func_names.clone()).or_default() += evt.value;
             if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
                 *per_core_cycles
@@ -199,7 +202,7 @@ async fn process_pmu_counters(
                     .entry(func_names)
                     .or_default() += evt.value;
             }
-        } else if evt.ty == EventType::PmuInstructions {
+        } else if evt.ty == EventType::PmuInstructions && evt.value > 0 && !func_names.is_empty() {
             *flamegraph_instructions
                 .entry(func_names.clone())
                 .or_default() += evt.value;
@@ -220,61 +223,7 @@ async fn process_pmu_counters(
                 .unwrap_or_default()
         {
             if !counters.is_empty() {
-                let mut keys = vec![];
-                let mut values = vec![];
-                for (k, v) in counters.iter() {
-                    if k == "pmu_unknown" {
-                        continue;
-                    }
-                    keys.push(k.clone());
-                    values.push(v.to_string());
-                }
-
-                let lead_event = lead_event.as_ref().unwrap();
-
-                connection.execute(format!(
-                    "
-                        INSERT INTO pmu_counters (
-                            unique_id,
-                            process_id,
-                            thread_id,
-                            time_enabled,
-                            time_running,
-                            confidence,
-                            ip,
-                            call_stack,
-                            {}
-                        )
-
-                        VALUES (
-                          {},
-                          {},
-                          {},
-                          {},
-                          {},
-                          {},
-                          {},
-                          \"[{}]\",
-                          {}
-                        );
-                    ",
-                    keys.join(", "),
-                    lead_event.unique_id,
-                    lead_event.process_id,
-                    lead_event.thread_id,
-                    lead_event.time_enabled,
-                    lead_event.time_running,
-                    lead_event.time_running as f64 / lead_event.time_enabled as f64,
-                    lead_event.callstack.first().unwrap().as_ip(),
-                    lead_event
-                        .callstack
-                        .iter()
-                        .map(|f| f.as_ip().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    values.join(", "),
-                ))?;
-
+                insert_counter_group(connection, lead_event.as_ref().unwrap(), &counters)?;
                 counters.clear();
             }
 
@@ -310,6 +259,12 @@ async fn process_pmu_counters(
         counters.insert(format!("{}", evt.ty), evt.value);
     }
 
+    if let Some(lead_event) = &lead_event {
+        if !counters.is_empty() {
+            insert_counter_group(connection, lead_event, &counters)?;
+        }
+    }
+
     write_flamegraph(res_dir, "flamegraph_cycles", flamegraph_cycles).await?;
     write_flamegraph(res_dir, "flamegraph_instructions", flamegraph_instructions).await?;
 
@@ -328,6 +283,117 @@ async fn process_pmu_counters(
     }
 
     Ok(())
+}
+
+fn insert_counter_group(
+    connection: &sqlite::Connection,
+    lead_event: &Event,
+    counters: &HashMap<String, u64>,
+) -> Result<()> {
+    if !counter_group_has_profile_data(lead_event, counters) {
+        return Ok(());
+    }
+
+    let mut keys = vec![];
+    let mut values = vec![];
+    for (key, value) in counters {
+        if key == "pmu_unknown" {
+            continue;
+        }
+        keys.push(key.clone());
+        values.push(value.to_string());
+    }
+    if keys.is_empty() {
+        return Ok(());
+    }
+
+    let confidence = if lead_event.time_enabled > 0 {
+        lead_event.time_running as f64 / lead_event.time_enabled as f64
+    } else {
+        0.0
+    };
+    connection.execute(format!(
+        "
+            INSERT INTO pmu_counters (
+                unique_id,
+                process_id,
+                thread_id,
+                time_enabled,
+                time_running,
+                confidence,
+                ip,
+                call_stack,
+                {}
+            )
+            VALUES ({}, {}, {}, {}, {}, {}, {}, \"[{}]\", {});
+        ",
+        keys.join(", "),
+        lead_event.unique_id,
+        lead_event.process_id,
+        lead_event.thread_id,
+        lead_event.time_enabled,
+        lead_event.time_running,
+        confidence,
+        lead_event.callstack.first().map(|f| f.as_ip()).unwrap_or(0),
+        lead_event
+            .callstack
+            .iter()
+            .map(|frame| frame.as_ip().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        values.join(", "),
+    ))?;
+    Ok(())
+}
+
+fn counter_group_has_profile_data(lead_event: &Event, counters: &HashMap<String, u64>) -> bool {
+    !lead_event.callstack.is_empty() && counters.values().any(|value| *value != 0)
+}
+
+#[cfg(test)]
+mod counter_group_tests {
+    use super::counter_group_has_profile_data;
+    use mperf_data::{CallFrame, Event, EventType};
+    use smallvec::SmallVec;
+    use std::collections::HashMap;
+
+    fn event(callstack: SmallVec<[CallFrame; 32]>) -> Event {
+        Event {
+            unique_id: 1,
+            correlation_id: 1,
+            parent_id: 0,
+            ty: EventType::PmuCycles,
+            thread_id: 1,
+            process_id: 1,
+            cpu: 0,
+            time_enabled: 1,
+            time_running: 1,
+            value: 1,
+            timestamp: 1,
+            callstack,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_stacks_and_all_zero_groups() {
+        let mut counters = HashMap::from([("pmu_cycles".to_string(), 1)]);
+        assert!(!counter_group_has_profile_data(
+            &event(SmallVec::new()),
+            &counters
+        ));
+
+        counters.insert("pmu_cycles".to_string(), 0);
+        assert!(!counter_group_has_profile_data(
+            &event(SmallVec::from_slice(&[CallFrame::IP(1)])),
+            &counters
+        ));
+
+        counters.insert("pmu_cycles".to_string(), 1);
+        assert!(counter_group_has_profile_data(
+            &event(SmallVec::from_slice(&[CallFrame::IP(1)])),
+            &counters
+        ));
+    }
 }
 
 /// Parse a sysfs cpumask list such as `"0,5-11"` into inclusive `(start, end)`
