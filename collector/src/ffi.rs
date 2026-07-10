@@ -94,6 +94,8 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
         value: 0,
         timestamp: handle.timestamp,
         callstack: smallvec![start_frame],
+        user_regs: None,
+        user_stack: Vec::new(),
     };
 
     send_event(start_event).expect("failed to send start event");
@@ -135,6 +137,8 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         value: 0,
         timestamp,
         callstack: smallvec![],
+        user_regs: None,
+        user_stack: Vec::new(),
     };
 
     send_event(event).expect("failed to send loop end event");
@@ -170,6 +174,8 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
             value,
             timestamp,
             callstack: smallvec![],
+            user_regs: None,
+            user_stack: Vec::new(),
         };
 
         send_event(event).expect("failed to send loop end event");

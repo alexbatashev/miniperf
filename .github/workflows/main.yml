@@ -1,24 +1,126 @@
-name: Main workflow
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  quality:
+    name: ${{ matrix.task }} (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-x86_64
+            runner: ubuntu-24.04
+            task: build
+            command: cargo build --workspace --all-targets
+          - platform: ubuntu-x86_64
+            runner: ubuntu-24.04
+            task: test
+            command: cargo test --workspace --all-targets
+          - platform: ubuntu-x86_64
+            runner: ubuntu-24.04
+            task: clippy
+            command: cargo clippy --workspace --all-targets -- -D warnings
+          - platform: ubuntu-x86_64
+            runner: ubuntu-24.04
+            task: fmt
+            command: cargo fmt --all -- --check
+          - platform: ubuntu-x86_64
+            runner: ubuntu-24.04
+            task: pmu-features
+            command: cargo check -p miniperf-pmu --no-default-features && cargo clippy -p miniperf-pmu --all-features --all-targets -- -D warnings
+          - platform: ubuntu-x86_64
+            runner: ubuntu-24.04
+            task: pmu-docs
+            command: RUSTDOCFLAGS="-D warnings" cargo doc -p miniperf-pmu -p miniperf-pmu-data --all-features --no-deps
+          - platform: ubuntu-aarch64
+            runner: ubuntu-24.04-arm
+            task: build
+            command: cargo build --workspace --all-targets
+          - platform: ubuntu-aarch64
+            runner: ubuntu-24.04-arm
+            task: test
+            command: cargo test --workspace --all-targets
+          - platform: ubuntu-aarch64
+            runner: ubuntu-24.04-arm
+            task: clippy
+            command: cargo clippy --workspace --all-targets -- -D warnings
+          - platform: ubuntu-aarch64
+            runner: ubuntu-24.04-arm
+            task: fmt
+            command: cargo fmt --all -- --check
+          - platform: macos-14
+            runner: macos-14
+            task: build
+            command: cargo build --workspace --all-targets
+          - platform: macos-14
+            runner: macos-14
+            task: test
+            command: cargo test --workspace --all-targets
+          - platform: macos-14
+            runner: macos-14
+            task: clippy
+            command: cargo clippy --workspace --all-targets -- -D warnings
+          - platform: macos-14
+            runner: macos-14
+            task: fmt
+            command: cargo fmt --all -- --check
 
-    runs-on: ubuntu-latest
-
+    runs-on: ${{ matrix.runner }}
     steps:
-    - uses: actions/checkout@v4
-    - name: Install deps
-      run: sudo apt update && sudo apt install -yqq capnproto
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Run ${{ matrix.task }}
+        run: ${{ matrix.command }}
+
+  perf-integration:
+    name: Privileged Linux perf integration (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            runner: ubuntu-24.04
+          - platform: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Allow access to performance counters
+        run: sudo sysctl -w kernel.perf_event_paranoid=-1
+      - name: Record a CPU-bound workload
+        run: |
+          cc -O2 -g -fno-omit-frame-pointer truth/fixtures/duty_split.c -o integration-workload
+          if ! cargo run -p mperf -- record --scenario snapshot --output-directory integration-results -- "$PWD/integration-workload" 1 >integration-record.log 2>&1; then
+            tail -n 100 integration-record.log
+            exit 1
+          fi
+          tail -n 50 integration-record.log
+      - name: Assert that samples were recorded
+        run: |
+          python3 -c 'import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); count = db.execute("SELECT COUNT(*) FROM pmu_counters").fetchone()[0]; print(f"recorded sample groups: {count}"); sys.exit(count == 0)' integration-results/perf.db
+      # The ignored `truth/tests/profile.rs` suite validates hardware PMU
+      # instruction attribution and must run on controlled/self-hosted hardware.
+      # GitHub-hosted VMs expose perf_event inconsistently and can return zero
+      # hardware counts even when software-event sampling succeeds.

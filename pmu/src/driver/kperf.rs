@@ -930,11 +930,7 @@ impl KPerfCountingDriver {
             let _ = handle.join();
         }
 
-        let fallback = self
-            .taskinfo_latest
-            .lock()
-            .ok()
-            .and_then(|latest| latest.clone());
+        let fallback = self.taskinfo_latest.lock().ok().and_then(|latest| *latest);
         let Some(after) = self.after.as_mut() else {
             return;
         };
@@ -1091,6 +1087,13 @@ impl KPerfSamplingDriver {
 }
 
 impl SamplingDriver for KPerfSamplingDriver {
+    fn counters(&self) -> Vec<Counter> {
+        self.handles
+            .iter()
+            .map(|handle| handle.counter.clone())
+            .collect()
+    }
+
     fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
         setup_kdebug_buffer().map_err(|_| Error::EnableFailed)?;
 
@@ -1160,11 +1163,13 @@ impl SamplingDriver for KPerfSamplingDriver {
                             }
                             handle_kdebug_record(
                                 rec,
-                                &handles,
-                                kpc_count,
-                                pid_filter,
-                                program_epoch,
-                                programs.len().max(1) as u64,
+                                KdebugDecodeConfig {
+                                    handles: &handles,
+                                    kpc_count,
+                                    forced_pid: pid_filter,
+                                    program_epoch,
+                                    time_enabled_multiplier: programs.len().max(1) as u64,
+                                },
                                 &mut state,
                                 &callback,
                             );
@@ -1500,11 +1505,13 @@ fn rotate_sampling_program(
                 for rec in records.into_iter().take(count) {
                     handle_kdebug_record(
                         rec,
-                        handles,
-                        *kpc_count,
-                        pid_filter,
-                        *program_epoch,
-                        programs.len() as u64,
+                        KdebugDecodeConfig {
+                            handles,
+                            kpc_count: *kpc_count,
+                            forced_pid: pid_filter,
+                            program_epoch: *program_epoch,
+                            time_enabled_multiplier: programs.len() as u64,
+                        },
                         state,
                         callback,
                     );
@@ -1859,7 +1866,7 @@ fn sysctl_kdebug_set(op: c_int, value: c_int) -> Result<(), std::io::Error> {
 
 fn read_kdebug_records(records: &mut [KdBuf]) -> Result<usize, std::io::Error> {
     let mut mib = [CTL_KERN, KERN_KDEBUG, KERN_KDREADTR];
-    let mut size = records.len() * size_of::<KdBuf>();
+    let mut size = size_of_val(records);
     let rc = unsafe {
         libc::sysctl(
             mib.as_mut_ptr(),
@@ -1877,13 +1884,18 @@ fn read_kdebug_records(records: &mut [KdBuf]) -> Result<usize, std::io::Error> {
     }
 }
 
-fn handle_kdebug_record(
-    rec: KdBuf,
-    handles: &[NativeCounterHandle],
+#[derive(Clone, Copy)]
+struct KdebugDecodeConfig<'a> {
+    handles: &'a [NativeCounterHandle],
     kpc_count: usize,
     forced_pid: Option<u32>,
     program_epoch: u64,
     time_enabled_multiplier: u64,
+}
+
+fn handle_kdebug_record(
+    rec: KdBuf,
+    config: KdebugDecodeConfig<'_>,
     state: &mut KdebugDecodeState,
     callback: &Arc<dyn SamplingCallback>,
 ) {
@@ -1898,9 +1910,9 @@ fn handle_kdebug_record(
                     tid: rec.arg5 as u32,
                     trace_tid: rec.arg5,
                     cpu: rec.cpuid,
-                    kpc_values: Vec::with_capacity(kpc_count),
+                    kpc_values: Vec::with_capacity(config.kpc_count),
                     callstack: SmallVec::new(),
-                    forced_pid,
+                    forced_pid: config.forced_pid,
                 },
             );
         }
@@ -1917,15 +1929,15 @@ fn handle_kdebug_record(
                         cpu: rec.cpuid,
                         kpc_values: Vec::new(),
                         callstack: SmallVec::new(),
-                        forced_pid,
+                        forced_pid: config.forced_pid,
                     });
             sample.callstack = take_pending_stack(state, &sample);
             finish_pending_sample(
                 sample,
                 rec.arg2,
-                handles,
-                program_epoch,
-                time_enabled_multiplier,
+                config.handles,
+                config.program_epoch,
+                config.time_enabled_multiplier,
                 state,
                 callback,
             );
@@ -1938,9 +1950,9 @@ fn handle_kdebug_record(
                 tid: rec.arg2 as u32,
                 trace_tid: rec.arg5,
                 cpu: rec.cpuid,
-                kpc_values: Vec::with_capacity(kpc_count),
+                kpc_values: Vec::with_capacity(config.kpc_count),
                 callstack: SmallVec::new(),
-                forced_pid,
+                forced_pid: config.forced_pid,
             });
             sample.pid = rec.arg1 as u32;
             sample.tid = rec.arg2 as u32;
@@ -1980,7 +1992,7 @@ fn handle_kdebug_record(
                 }
 
                 for value in [rec.arg1, rec.arg2, rec.arg3, rec.arg4] {
-                    if sample.kpc_values.len() >= kpc_count {
+                    if sample.kpc_values.len() >= config.kpc_count {
                         break;
                     }
                     sample.kpc_values.push(value);
@@ -2147,7 +2159,9 @@ fn emit_pending_sample(
             time_running: time_delta,
             counter: handle.counter.clone(),
             value: value_delta,
-            callstack: callstack.clone(),
+            callstack: callstack.iter().copied().collect(),
+            user_regs: None,
+            user_stack: Vec::new(),
         }));
     }
 }
@@ -2314,11 +2328,13 @@ mod tests {
         ] {
             handle_kdebug_record(
                 rec,
-                &handles,
-                1,
-                Some(pid as u32),
-                0,
-                1,
+                KdebugDecodeConfig {
+                    handles: &handles,
+                    kpc_count: 1,
+                    forced_pid: Some(pid as u32),
+                    program_epoch: 0,
+                    time_enabled_multiplier: 1,
+                },
                 &mut state,
                 &callback,
             );
@@ -2340,11 +2356,13 @@ mod tests {
         ] {
             handle_kdebug_record(
                 rec,
-                &handles,
-                1,
-                Some(pid as u32),
-                0,
-                1,
+                KdebugDecodeConfig {
+                    handles: &handles,
+                    kpc_count: 1,
+                    forced_pid: Some(pid as u32),
+                    program_epoch: 0,
+                    time_enabled_multiplier: 1,
+                },
                 &mut state,
                 &callback,
             );
@@ -2380,7 +2398,18 @@ mod tests {
             record(PERF_STK_UDATA, tid, [0x10, 0, 0, 0]),
             record(PERF_SAMPLE | DBG_FUNC_END, tid, [0, 0, 0, 0]),
         ] {
-            handle_kdebug_record(rec, &handles, 1, Some(7), 0, 1, &mut state, &callback);
+            handle_kdebug_record(
+                rec,
+                KdebugDecodeConfig {
+                    handles: &handles,
+                    kpc_count: 1,
+                    forced_pid: Some(7),
+                    program_epoch: 0,
+                    time_enabled_multiplier: 1,
+                },
+                &mut state,
+                &callback,
+            );
         }
 
         assert!(emitted.lock().unwrap().is_empty());
@@ -2430,7 +2459,18 @@ mod tests {
                 ),
                 record(PERF_SAMPLE | DBG_FUNC_END, tid, [0, 0, 0, 0]),
             ] {
-                handle_kdebug_record(rec, &handles, 1, Some(7), epoch, 1, &mut state, &callback);
+                handle_kdebug_record(
+                    rec,
+                    KdebugDecodeConfig {
+                        handles: &handles,
+                        kpc_count: 1,
+                        forced_pid: Some(7),
+                        program_epoch: epoch,
+                        time_enabled_multiplier: 1,
+                    },
+                    &mut state,
+                    &callback,
+                );
             }
         }
 

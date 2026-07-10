@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use mperf_data::RecordInfo;
 use num_format::Locale;
@@ -7,7 +10,7 @@ use parking_lot::{Mutex, RwLock};
 use ratatui::{
     layout::{Constraint, Layout},
     style::{Style, Stylize},
-    widgets::{Block, Row, Table, Widget},
+    widgets::{Block, Paragraph, Row, Table, Widget, Wrap},
 };
 use sqlite::Connection;
 
@@ -16,6 +19,9 @@ pub struct SummaryTab {
     record_info: RecordInfo,
     connection: Arc<Mutex<Connection>>,
     stat: Arc<RwLock<Stat>>,
+    load_started: Arc<AtomicBool>,
+    load_complete: Arc<AtomicBool>,
+    load_error: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -36,15 +42,19 @@ impl SummaryTab {
             record_info,
             connection,
             stat: Arc::new(RwLock::new(Stat::default())),
+            load_started: Arc::new(AtomicBool::new(false)),
+            load_complete: Arc::new(AtomicBool::new(false)),
+            load_error: Arc::new(RwLock::new(None)),
         }
     }
 
     pub fn run(&self) {
+        if self
+            .load_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            let stat = self.stat.read();
-            if stat.cycles != 0 {
-                return;
-            }
+            return;
         }
         let this = self.clone();
         tokio::spawn(this.fetch_data());
@@ -52,7 +62,10 @@ impl SummaryTab {
 
     async fn fetch_data(self) {
         let conn = self.connection.lock();
-        let mut row = conn
+        let result: Result<Stat, String> = (|| {
+            use sqlite::State;
+
+            let mut statement = conn
             .prepare(
                 "SELECT
             SUM(pmu_cycles) as pmu_cycles,
@@ -67,22 +80,40 @@ impl SummaryTab {
             FROM pmu_counters;
         ",
             )
-            .unwrap()
-            .into_iter();
+            .map_err(|error| error.to_string())?;
 
-        let row = row.next().unwrap().unwrap();
+            if statement.next().map_err(|error| error.to_string())? != State::Row {
+                return Err("summary query returned no rows".to_string());
+            }
 
-        let mut stat = self.stat.write();
-        *stat = Stat {
-            cycles: row.read::<i64, _>("pmu_cycles") as u64,
-            instructions: row.read::<i64, _>("pmu_instructions") as u64,
-            branch_instructions: row.read::<i64, _>("pmu_branch_instructions") as u64,
-            branch_misses: row.read::<i64, _>("pmu_branch_misses") as u64,
-            cache_references: row.read::<i64, _>("pmu_llc_references") as u64,
-            cache_misses: row.read::<i64, _>("pmu_llc_misses") as u64,
-            stalled_cycles_frontend: row.read::<i64, _>("pmu_stalled_cycles_frontend") as u64,
-            stalled_cycles_backend: row.read::<i64, _>("pmu_stalled_cycles_backend") as u64,
-        };
+            let read = |name| {
+                statement
+                    .read::<Option<i64>, _>(name)
+                    .map(|value| value.unwrap_or_default() as u64)
+                    .map_err(|error| error.to_string())
+            };
+            Ok(Stat {
+                cycles: read("pmu_cycles")?,
+                instructions: read("pmu_instructions")?,
+                branch_instructions: read("pmu_branch_instructions")?,
+                branch_misses: read("pmu_branch_misses")?,
+                cache_references: read("pmu_llc_references")?,
+                cache_misses: read("pmu_llc_misses")?,
+                stalled_cycles_frontend: read("pmu_stalled_cycles_frontend")?,
+                stalled_cycles_backend: read("pmu_stalled_cycles_backend")?,
+            })
+        })();
+        drop(conn);
+
+        match result {
+            Ok(stat) => {
+                *self.stat.write() = stat;
+                self.load_complete.store(true, Ordering::Release);
+            }
+            Err(error) => {
+                *self.load_error.write() = Some(format!("Could not load summary data:\n\n{error}"));
+            }
+        }
     }
 }
 
@@ -91,6 +122,14 @@ impl Widget for SummaryTab {
     where
         Self: Sized,
     {
+        if let Some(error) = self.load_error.read().clone() {
+            Paragraph::new(error)
+                .block(Block::bordered().title("Summary error"))
+                .wrap(Wrap { trim: true })
+                .render(area, buf);
+            return;
+        }
+
         let horizontal = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]);
         let [summary_area, _right_area] = horizontal.areas(area);
 
@@ -112,13 +151,17 @@ impl Widget for SummaryTab {
         {
             let stat = self.stat.read();
 
-            if stat.cycles == 0 {
+            if !self.load_complete.load(Ordering::Acquire) {
                 let counter = 0;
                 let pb = ratatui::widgets::Gauge::default()
                     .block(Block::bordered().title("Loading data..."))
                     .gauge_style(Style::new().white().on_black().italic())
                     .percent(counter);
                 pb.render(stat_table_area, buf);
+            } else if stat.cycles == 0 {
+                Paragraph::new("No counter samples were found in this recording.")
+                    .wrap(Wrap { trim: true })
+                    .render(stat_table_area, buf);
             } else {
                 let rows = [
                     Row::new([

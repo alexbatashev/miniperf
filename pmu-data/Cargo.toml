@@ -1,7 +1,22 @@
 [package]
-name = "pmu-data"
+name = "miniperf-pmu-data"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
+description = "Serializable CPU PMU event-table schema used by miniperf"
+license = "Apache-2.0"
+repository = "https://github.com/alexbatashev/miniperf"
+homepage = "https://github.com/alexbatashev/miniperf"
+readme = "README.md"
+keywords = ["performance", "profiling", "pmu", "schema"]
+categories = ["development-tools::profiling", "data-structures"]
+include = ["src/**", "README.md", "CHANGELOG.md"]
+
+[lib]
+name = "pmu_data"
 
 [dependencies]
 serde = { version = "1.0.217", features = ["derive"] }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]

@@ -147,13 +147,8 @@ impl EventDispatcher {
     }
 
     pub fn publish_event_sync(&self, evt: Event) {
-        let pid = evt.process_id;
         if let Err(err) = self.events_tx.blocking_send(evt) {
             eprintln!("lost event: {:?}", err);
-        }
-
-        if pid == 0 {
-            return;
         }
     }
 
@@ -170,13 +165,8 @@ impl EventDispatcher {
     }
 
     pub async fn publish_event(&self, evt: Event) {
-        let pid = evt.process_id;
         if let Err(err) = self.events_tx.send(evt).await {
             eprintln!("lost event: {:?}", err);
-        }
-
-        if pid == 0 {
-            return;
         }
     }
 }

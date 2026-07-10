@@ -31,14 +31,18 @@ pub fn direct(
         };
 
         if new_fd < 0 {
-            return Err(Error::CounterCreationFail);
+            close_handles(&handles);
+            return Err(Error::perf_event_open(cntr, None));
         }
 
         let mut id: u64 = 0;
 
         let result = unsafe { sys::ioctls::ID(new_fd, &mut id) };
         if result < 0 {
-            return Err(Error::CounterCreationFail);
+            let error = Error::perf_ioctl("ID", cntr);
+            unsafe { libc::close(new_fd) };
+            close_handles(&handles);
+            return Err(error);
         }
 
         handles.push(NativeCounterHandle {
@@ -63,12 +67,9 @@ pub fn grouped(
 
     let leader = info.and_then(|info| info.leader_event.clone());
 
-    let leader_cntr = counters.iter().find(|cntr| {
-        leader.is_some()
-            && match cntr {
-                Counter::Custom(name) => name == leader.as_ref().unwrap(),
-                _ => false,
-            }
+    let leader_cntr = counters.iter().find(|cntr| match (cntr, leader.as_ref()) {
+        (Counter::Custom(name), Some(leader)) => name == leader,
+        _ => false,
     });
 
     let max_counters_in_group = info.and_then(|info| info.max_counters).unwrap_or_else(|| {
@@ -83,15 +84,21 @@ pub fn grouped(
         .find(|(cntr, _)| **cntr == Counter::Cycles)
         .map(|(_, attrs)| attrs)
         .cloned()
-        .expect("Cycles are required for correct sampling");
+        .ok_or_else(|| {
+            Error::InvalidConfiguration("cycles are required for hardware sampling".to_owned())
+        })?;
     let mut instr_attrs = zip(counters, attrs.iter())
         .find(|(cntr, _)| **cntr == Counter::Instructions)
         .map(|(_, attrs)| attrs)
         .cloned()
-        .expect("Instructions are required for correct sampling");
+        .ok_or_else(|| {
+            Error::InvalidConfiguration(
+                "instructions are required for hardware sampling".to_owned(),
+            )
+        })?;
 
     let leader_attrs = zip(counters, attrs.iter())
-        .find(|(cntr, _)| leader.is_some() && cntr == leader_cntr.as_ref().unwrap())
+        .find(|(cntr, _)| leader_cntr == Some(*cntr))
         .map(|(_, attrs)| attrs)
         .cloned();
 
@@ -105,11 +112,7 @@ pub fn grouped(
             **cntr != Counter::Cycles
                 && **cntr != Counter::Instructions
                 && !cntr.is_software()
-                && if leader.is_some() {
-                    cntr != leader_cntr.as_ref().unwrap()
-                } else {
-                    true
-                }
+                && leader_cntr != Some(*cntr)
         })
         .chunks(max_counters_in_group);
 
@@ -117,14 +120,15 @@ pub fn grouped(
 
     for chunk in chunks.into_iter() {
         let cycles_leader_fd = if leader.is_some() {
-            let leader_fd = unsafe {
-                sys::perf_event_open(&mut leader_attrs.unwrap(), pid.unwrap_or(0), -1, -1, 0)
-            };
-            handles.push(get_native_handle(
-                leader_fd,
-                leader_cntr.unwrap().clone(),
-                true,
-            )?);
+            let mut leader_attr = leader_attrs.ok_or_else(|| {
+                Error::InvalidConfiguration("configured sampling leader is missing".to_owned())
+            })?;
+            let leader_counter = leader_cntr.ok_or_else(|| {
+                Error::InvalidConfiguration("configured sampling leader is missing".to_owned())
+            })?;
+            let leader_fd =
+                unsafe { sys::perf_event_open(&mut leader_attr, pid.unwrap_or(0), -1, -1, 0) };
+            push_handle(&mut handles, leader_fd, leader_counter.clone(), true)?;
             leader_fd
         } else {
             -1
@@ -140,43 +144,116 @@ pub fn grouped(
             cycles_fd
         };
 
-        handles.push(get_native_handle(
-            cycles_fd,
-            Counter::Cycles,
-            leader.is_none(),
-        )?);
+        push_handle(&mut handles, cycles_fd, Counter::Cycles, leader.is_none())?;
 
         let instr_fd =
             unsafe { sys::perf_event_open(&mut instr_attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
 
-        handles.push(get_native_handle(instr_fd, Counter::Instructions, false)?);
+        push_handle(&mut handles, instr_fd, Counter::Instructions, false)?;
 
         for (cntr, attrs) in chunk {
             let new_fd =
                 unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
-            handles.push(get_native_handle(new_fd, cntr.clone(), false)?);
+            push_handle(&mut handles, new_fd, cntr.clone(), false)?;
         }
 
         for (cntr, attrs) in &mut sw_counters {
             let new_fd =
                 unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
-            handles.push(get_native_handle(new_fd, cntr.clone(), false)?);
+            push_handle(&mut handles, new_fd, cntr.clone(), false)?;
         }
     }
 
     Ok(handles)
 }
 
+/// Build a single software-event sampling group used when the hardware PMU is
+/// unavailable. `cpu-clock` is the group leader and therefore owns the mmap
+/// ring buffer that carries samples and grouped counter reads.
+pub fn grouped_software(
+    counters: &[Counter],
+    attrs: &mut [perf_event_attr],
+    pid: Option<i32>,
+) -> Result<Vec<NativeCounterHandle>, Error> {
+    let Some(leader_index) = counters
+        .iter()
+        .position(|counter| *counter == Counter::CpuClock)
+    else {
+        return Err(Error::InvalidConfiguration(
+            "software sampling fallback requires cpu_clock".to_owned(),
+        ));
+    };
+
+    let mut handles = Vec::with_capacity(counters.len());
+    let leader_fd =
+        unsafe { sys::perf_event_open(&mut attrs[leader_index], pid.unwrap_or(0), -1, -1, 0) };
+    push_handle(&mut handles, leader_fd, Counter::CpuClock, true)?;
+
+    for (index, (counter, attr)) in zip(counters, attrs).enumerate() {
+        if index == leader_index {
+            continue;
+        }
+        let fd = unsafe { sys::perf_event_open(attr, pid.unwrap_or(0), -1, leader_fd, 0) };
+        push_handle(&mut handles, fd, counter.clone(), false)?;
+    }
+
+    Ok(handles)
+}
+
+/// Open one coherent group containing every requested self-monitoring event.
+/// The first event is the leader and owns the sampling mmap buffer.
+pub fn grouped_all(
+    counters: &[Counter],
+    attrs: &mut [perf_event_attr],
+    pid: Option<i32>,
+) -> Result<Vec<NativeCounterHandle>, Error> {
+    if counters.is_empty() || counters.len() != attrs.len() {
+        return Err(Error::InvalidConfiguration(
+            "a sampling group requires matching non-empty counters and attributes".to_owned(),
+        ));
+    }
+
+    let mut handles = Vec::with_capacity(counters.len());
+    let leader_fd = unsafe { sys::perf_event_open(&mut attrs[0], pid.unwrap_or(0), -1, -1, 0) };
+    push_handle(&mut handles, leader_fd, counters[0].clone(), true)?;
+    for (counter, attr) in zip(&counters[1..], &mut attrs[1..]) {
+        let fd = unsafe { sys::perf_event_open(attr, pid.unwrap_or(0), -1, leader_fd, 0) };
+        push_handle(&mut handles, fd, counter.clone(), false)?;
+    }
+    Ok(handles)
+}
+
+fn push_handle(
+    handles: &mut Vec<NativeCounterHandle>,
+    fd: i32,
+    counter: Counter,
+    leader: bool,
+) -> Result<(), Error> {
+    match get_native_handle(fd, counter, leader) {
+        Ok(handle) => {
+            handles.push(handle);
+            Ok(())
+        }
+        Err(error) => {
+            close_handles(handles);
+            handles.clear();
+            Err(error)
+        }
+    }
+}
+
 fn get_native_handle(fd: i32, cntr: Counter, leader: bool) -> Result<NativeCounterHandle, Error> {
     if fd < 0 {
-        return Err(Error::CounterCreationFail);
+        return Err(Error::perf_event_open(&cntr, None));
     }
 
     let mut id: u64 = 0;
 
     let result = unsafe { sys::ioctls::ID(fd, &mut id) };
     if result < 0 {
-        return Err(Error::CounterCreationFail);
+        let error = Error::perf_ioctl("ID", &cntr);
+        unsafe { libc::close(fd) };
+        return Err(error);
     }
 
     Ok(NativeCounterHandle {
@@ -186,4 +263,10 @@ fn get_native_handle(fd: i32, cntr: Counter, leader: bool) -> Result<NativeCount
         fd,
         leader,
     })
+}
+
+fn close_handles(handles: &[NativeCounterHandle]) {
+    for handle in handles {
+        unsafe { libc::close(handle.fd) };
+    }
 }

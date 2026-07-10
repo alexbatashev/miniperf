@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = [ "collector", "mperf", "mperf-data", "pmu", "pmu-data"]
+members = [
+    "collector",
+    "mperf",
+    "mperf-data",
+    "pmu",
+    "pmu-data",
+    "shmem",
+    "symbolize",
+    "truth",
+    "utils/event-import",
+]
 
 [profile.dev.package]
 insta.opt-level = 3

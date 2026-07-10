@@ -1,0 +1,29 @@
+{
+  "events": {
+    "CPU_CYCLES": {
+      "code": "0x0011",
+      "title": "Processor cycles",
+      "description": "Counts processor cycles.",
+      "common": true,
+      "accesses": ["PMU", "ETE"],
+      "architectural": true,
+      "impdef": false
+    },
+    "INST_RETIRED": {
+      "code": "0x0008",
+      "title": "Instructions retired",
+      "accesses": ["PMU"]
+    },
+    "BR_RETIRED": {
+      "code": "0x0021",
+      "title": "Branches retired",
+      "description": "Counts architecturally executed branches.",
+      "accesses": ["PMU"]
+    },
+    "ETE_ONLY": {
+      "code": "0x4000",
+      "title": "Trace-only event",
+      "accesses": ["ETE"]
+    }
+  }
+}

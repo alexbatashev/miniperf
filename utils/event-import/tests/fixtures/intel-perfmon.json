@@ -1,0 +1,14 @@
+[
+  {
+    "EventName": "INST_RETIRED.ANY",
+    "EventCode": "0xc0",
+    "UMask": "0x01",
+    "BriefDescription": "Instructions retired."
+  },
+  {
+    "EventName": "CPU_CLK_UNHALTED.THREAD_P",
+    "EventCode": "0x3c",
+    "UMask": "0x00",
+    "PublicDescription": "Core cycles while the thread is not halted."
+  }
+]

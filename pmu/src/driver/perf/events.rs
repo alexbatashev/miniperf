@@ -32,6 +32,21 @@ pub fn list_supported_counters() -> Vec<Counter> {
     counters
 }
 
+fn resolve_custom_for_family(name: &str, family_id: &str) -> Option<Counter> {
+    let family = cpu_family::find_cpu_family(family_id)?;
+    let event = family.events.get(name).or_else(|| {
+        family
+            .events
+            .values()
+            .find(|event| event.name.eq_ignore_ascii_case(name))
+    })?;
+    Some(Counter::Internal {
+        name: event.name.clone(),
+        desc: event.desc.clone(),
+        code: event.code,
+    })
+}
+
 /// Resolve a logical counter into the concrete event for a *specific* CPU
 /// family, without assuming it is the host family. Used to open the same
 /// logical counter on every cluster's PMU for faithful per-core counting.
@@ -40,6 +55,7 @@ pub fn list_supported_counters() -> Vec<Counter> {
 /// not implement (e.g. an A720-only microarchitectural event has no meaning on
 /// the A520 cluster), so callers simply skip it there instead of counting a
 /// differently-numbered event.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub fn resolve_counter_for_family(
     counter: &Counter,
     family_id: &str,
@@ -51,14 +67,7 @@ pub fn resolve_counter_for_family(
         // Software counters are not PMU-specific.
         c if c.is_software() => Some(c.clone()),
 
-        Counter::Custom(name) => {
-            let evt = info.events.get(name)?;
-            Some(Counter::Internal {
-                name: evt.name.clone(),
-                desc: evt.desc.clone(),
-                code: evt.code,
-            })
-        }
+        Counter::Custom(name) => resolve_custom_for_family(name, family_id),
 
         // Already a concrete raw event: assume the caller knows it is valid for
         // this family (it originates from this family's event table).
@@ -97,40 +106,29 @@ pub fn resolve_counter_for_family(
     }
 }
 
-pub fn process_counter(counter: &Counter, prefer_raw_counters: bool) -> Counter {
+pub fn process_counter(
+    counter: &Counter,
+    prefer_raw_counters: bool,
+) -> Result<Counter, crate::Error> {
     if let Counter::Custom(name) = counter {
         let cpu_family = cpu_family::get_host_cpu_family();
-        let info = cpu_family::find_cpu_family(cpu_family);
-        if info.is_none() {
-            panic!("Unsupported CPU family '{}'", cpu_family);
-        }
-
-        let info = info.unwrap();
-
-        let counter = info.events.get(name);
-
-        if counter.is_none() {
-            panic!(
-                "Unsupported counter '{}' for CPU family '{}'",
-                name, cpu_family
-            );
-        }
-
-        let counter = counter.unwrap();
-
-        return Counter::Internal {
-            name: counter.name.clone(),
-            desc: counter.desc.clone(),
-            code: counter.code,
-        };
+        cpu_family::find_cpu_family(cpu_family).ok_or_else(|| {
+            crate::Error::UnsupportedCounter {
+                counter: name.clone(),
+                family: cpu_family.to_owned(),
+            }
+        })?;
+        return resolve_custom_for_family(name, cpu_family).ok_or_else(|| {
+            crate::Error::UnsupportedCounter {
+                counter: name.clone(),
+                family: cpu_family.to_owned(),
+            }
+        });
     } else if prefer_raw_counters {
         let cpu_family = cpu_family::get_host_cpu_family();
-        let info = cpu_family::find_cpu_family(cpu_family);
-        if info.is_none() {
-            return counter.clone();
-        }
-
-        let info = info.unwrap();
+        let Some(info) = cpu_family::find_cpu_family(cpu_family) else {
+            return Ok(counter.clone());
+        };
 
         let alias_name = match counter {
             Counter::Cycles => "cycles",
@@ -141,29 +139,37 @@ pub fn process_counter(counter: &Counter, prefer_raw_counters: bool) -> Counter 
             Counter::BranchInstructions => "branches",
             Counter::StalledCyclesBackend => "stalled_cycles_backend",
             Counter::StalledCyclesFrontend => "stalled_cycles_frontend",
-            _ => return counter.clone(),
+            _ => return Ok(counter.clone()),
         };
 
-        let alias = info.aliases.get(alias_name);
+        let Some(alias) = info.aliases.get(alias_name) else {
+            return Ok(counter.clone());
+        };
+        let Some(new_counter) = info.events.get(alias) else {
+            return Ok(counter.clone());
+        };
 
-        if alias.is_none() {
-            return counter.clone();
-        }
-
-        let new_counter = info.events.get(alias.unwrap());
-
-        if new_counter.is_none() {
-            return counter.clone();
-        }
-
-        let new_counter = new_counter.unwrap();
-
-        return Counter::Internal {
+        return Ok(Counter::Internal {
             name: new_counter.name.clone(),
             desc: new_counter.desc.clone(),
             code: new_counter.code,
-        };
+        });
     }
 
-    counter.clone()
+    Ok(counter.clone())
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_tiger_lake_custom_event_case_insensitively() {
+        let counter = resolve_custom_for_family("l1d.replacement", pmu_data::INTEL_TIGERLAKE)
+            .expect("Tiger Lake event must resolve");
+        assert!(matches!(
+            counter,
+            Counter::Internal { ref name, code: 0x151, .. } if name == "L1D.REPLACEMENT"
+        ));
+    }
 }

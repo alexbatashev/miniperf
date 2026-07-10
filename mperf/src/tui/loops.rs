@@ -4,7 +4,7 @@ use parking_lot::{Mutex, RwLock};
 use ratatui::{
     layout::Constraint,
     style::{Style, Stylize},
-    widgets::{Block, Cell, Row, Table, Widget},
+    widgets::{Block, Cell, Paragraph, Row, Table, Widget, Wrap},
 };
 use sqlite::Connection;
 
@@ -13,6 +13,7 @@ pub struct LoopsTab {
     hotspots: Arc<RwLock<Vec<Loop>>>,
     is_running: Arc<RwLock<bool>>,
     connection: Arc<Mutex<Connection>>,
+    load_error: Arc<RwLock<Option<String>>>,
 }
 
 #[allow(dead_code)]
@@ -39,6 +40,14 @@ impl Widget for LoopsTab {
     where
         Self: Sized,
     {
+        if let Some(error) = self.load_error.read().clone() {
+            Paragraph::new(error)
+                .block(Block::bordered().title("Roofline error"))
+                .wrap(Wrap { trim: true })
+                .render(area, buf);
+            return;
+        }
+
         let hotspots = self.hotspots.read();
 
         if hotspots.is_empty() {
@@ -106,6 +115,7 @@ impl LoopsTab {
             hotspots: Arc::new(RwLock::new(Vec::new())),
             is_running: Arc::new(RwLock::new(false)),
             connection,
+            load_error: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -123,59 +133,58 @@ impl LoopsTab {
 
     async fn fetch_data(self) {
         let conn = self.connection.lock();
-        let rows = conn
+        let result: Result<Vec<Loop>, String> = conn
             .prepare("SELECT * FROM roofline;")
-            .unwrap()
-            .into_iter()
-            .map(|row| -> Loop {
-                let row = row.unwrap();
-                Loop {
-                    function_name: row.read::<&str, _>("function_name").to_string(),
-                    file_name: row.read::<&str, _>("file_name").to_string(),
-                    line: row.read::<i64, _>("line") as u32,
+            .map_err(|error| error.to_string())
+            .and_then(|statement| {
+                statement
+                    .into_iter()
+                    .map(|row| -> Result<Loop, String> {
+                        let row = row.map_err(|error| error.to_string())?;
+                        let float = |column| {
+                            row.try_read::<Option<f64>, _>(column)
+                                .map(|value| value.unwrap_or_default())
+                                .map_err(|error| error.to_string())
+                        };
+                        Ok(Loop {
+                            function_name: row
+                                .try_read::<&str, _>("function_name")
+                                .map_err(|error| error.to_string())?
+                                .to_string(),
+                            file_name: row
+                                .try_read::<&str, _>("file_name")
+                                .map_err(|error| error.to_string())?
+                                .to_string(),
+                            line: row
+                                .try_read::<i64, _>("line")
+                                .map_err(|error| error.to_string())?
+                                as u32,
+                            sint_ops: float("scalar_int_ops")? / 1_000_000_000.0,
+                            sint_ai: float("scalar_int_ai")?,
+                            sfp_ops: float("scalar_float_ops")? / 1_000_000_000.0,
+                            sfp_ai: float("scalar_float_ai")?,
+                            sdp_ops: float("scalar_double_ops")? / 1_000_000_000.0,
+                            sdp_ai: float("scalar_double_ai")?,
+                            vint_ops: float("vector_int_ops")? / 1_000_000_000.0,
+                            vint_ai: float("vector_int_ai")?,
+                            vfp_ops: float("vector_float_ops")? / 1_000_000_000.0,
+                            vfp_ai: float("vector_float_ai")?,
+                            vdp_ops: float("vector_double_ops")? / 1_000_000_000.0,
+                            vdp_ai: float("vector_double_ai")?,
+                        })
+                    })
+                    .collect()
+            });
+        drop(conn);
 
-                    sint_ops: row.try_read::<f64, _>("scalar_int_ops").unwrap_or_default()
-                        / 1_000_000_000.0,
-                    sint_ai: row.try_read::<f64, _>("scalar_int_ai").unwrap_or_default(),
-
-                    sfp_ops: row
-                        .try_read::<f64, _>("scalar_float_ops")
-                        .unwrap_or_default()
-                        / 1_000_000_000.0,
-                    sfp_ai: row
-                        .try_read::<f64, _>("scalar_float_ai")
-                        .unwrap_or_default(),
-
-                    sdp_ops: row
-                        .try_read::<f64, _>("scalar_double_ops")
-                        .unwrap_or_default()
-                        / 1_000_000_000.0,
-                    sdp_ai: row
-                        .try_read::<f64, _>("scalar_double_ai")
-                        .unwrap_or_default(),
-
-                    vint_ops: row.try_read::<f64, _>("vector_int_ops").unwrap_or_default()
-                        / 1_000_000_000.0,
-                    vint_ai: row.try_read::<f64, _>("vector_int_ai").unwrap_or_default(),
-
-                    vfp_ops: row
-                        .try_read::<f64, _>("vector_float_ops")
-                        .unwrap_or_default()
-                        / 1_000_000_000.0,
-                    vfp_ai: row
-                        .try_read::<f64, _>("vector_float_ai")
-                        .unwrap_or_default(),
-
-                    vdp_ops: row
-                        .try_read::<f64, _>("vector_double_ops")
-                        .unwrap_or_default()
-                        / 1_000_000_000.0,
-                    vdp_ai: row
-                        .try_read::<f64, _>("vector_double_ai")
-                        .unwrap_or_default(),
-                }
-            })
-            .collect();
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                *self.load_error.write() =
+                    Some(format!("Could not load roofline data:\n\n{error}"));
+                return;
+            }
+        };
 
         let mut hotspots = self.hotspots.write();
         *hotspots = rows;

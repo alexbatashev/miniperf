@@ -20,7 +20,17 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH")?;
 
-        if arch != data.arch {
+        let native_events = std::env::var_os("CARGO_FEATURE_EVENTS_NATIVE").is_some();
+        let arch_feature = match data.arch.as_str() {
+            "x86_64" => "CARGO_FEATURE_EVENTS_X86_64",
+            "aarch64" => "CARGO_FEATURE_EVENTS_AARCH64",
+            "riscv64" | "riscv64gc" => "CARGO_FEATURE_EVENTS_RISCV64",
+            _ => continue,
+        };
+        let selected =
+            (native_events && arch == data.arch) || std::env::var_os(arch_feature).is_some();
+
+        if !selected {
             continue;
         }
 
@@ -60,6 +70,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             .leader_event
             .map(|l| quote! {Some(#l.to_string())})
             .unwrap_or(quote! { None });
+        let metrics = data.metrics.into_iter().map(|metric| {
+            let metric_name = metric.name;
+            let desc = metric.desc;
+            let expression = metric.expression.0;
+            let unit = metric
+                .unit
+                .map(|unit| quote! { Some(#unit.to_string()) })
+                .unwrap_or(quote! { None });
+            quote! {
+                Metric {
+                    name: #metric_name.to_string(),
+                    desc: #desc.to_string(),
+                    expression: pmu_data::MetricExpression(#expression.to_string()),
+                    unit: #unit,
+                }
+            }
+        });
 
         families.push(quote! {
             let mut events = HashMap::new();
@@ -78,6 +105,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 max_counters: #max_counters,
                 events,
                 aliases,
+                metrics: vec![#(#metrics),*],
             };
 
             families.insert(#family_id.to_string(), family);
@@ -90,6 +118,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         fn create_known_counters_map() -> HashMap<String, CPUFamily> {
+            #[allow(unused_mut)]
             let mut families = HashMap::new();
 
             #(#families)*

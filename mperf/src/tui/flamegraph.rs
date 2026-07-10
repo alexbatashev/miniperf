@@ -1,6 +1,12 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use crossterm::event::KeyCode;
 use flamelens::app::FlameGraphInput;
@@ -17,7 +23,6 @@ use ratatui::widgets::block::Position;
 use ratatui::widgets::StatefulWidget;
 use ratatui::widgets::Widget;
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
-use tokio::{fs::File, io::AsyncReadExt};
 
 #[derive(Clone)]
 pub struct FlamegraphTab {
@@ -26,6 +31,8 @@ pub struct FlamegraphTab {
     cycles: Arc<RwLock<Option<FlameGraph>>>,
     instructions: Arc<RwLock<Option<FlameGraph>>>,
     state: Arc<Mutex<FlamelensWidgetState>>,
+    load_started: Arc<AtomicBool>,
+    load_error: Arc<RwLock<Option<String>>>,
     show_instructions: bool,
 }
 
@@ -37,65 +44,63 @@ impl FlamegraphTab {
             cycles: Arc::new(RwLock::new(None)),
             instructions: Arc::new(RwLock::new(None)),
             state: Arc::new(Mutex::new(FlamelensWidgetState::default())),
+            load_started: Arc::new(AtomicBool::new(false)),
+            load_error: Arc::new(RwLock::new(None)),
             show_instructions: false,
         }
     }
 
     pub fn handle_event(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Char('m') => {
-                let mut app = self.app.lock();
-                if app.is_none() {
-                    return;
-                }
-
-                self.show_instructions = !self.show_instructions;
-
-                if self.show_instructions {
-                    let fg = self.instructions.read().clone().unwrap();
-                    *app = Some(flamelens::app::App::with_flamegraph("Instructions", fg));
-                } else {
-                    let fg = self.cycles.read().clone().unwrap();
-                    *app = Some(flamelens::app::App::with_flamegraph("Cycles", fg));
-                }
+        if let KeyCode::Char('m') = code {
+            let mut app = self.app.lock();
+            if app.is_none() {
+                return;
             }
-            _ => {}
+
+            self.show_instructions = !self.show_instructions;
+
+            if self.show_instructions {
+                if let Some(fg) = self.instructions.read().clone() {
+                    *app = Some(flamelens::app::App::with_flamegraph("Instructions", fg));
+                }
+            } else if let Some(fg) = self.cycles.read().clone() {
+                *app = Some(flamelens::app::App::with_flamegraph("Cycles", fg));
+            }
         }
     }
 
     pub fn run(&self) {
+        if self
+            .load_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
-            let cycles = self.cycles.read();
-            if cycles.is_some() {
-                return;
-            }
+            return;
         }
         let this = self.clone();
         tokio::spawn(this.fetch_data());
     }
 
     async fn fetch_data(self) {
-        let mut file = File::open(self.res_dir.join("flamegraph_cycles.folded"))
-            .await
-            .expect("");
-        let mut cycles = String::new();
-        file.read_to_string(&mut cycles).await.expect("");
+        let result = async {
+            let cycles = read_flamegraph(&self.res_dir.join("flamegraph_cycles.folded")).await?;
+            let instructions =
+                read_flamegraph(&self.res_dir.join("flamegraph_instructions.folded")).await?;
+            Ok::<_, String>((cycles, instructions))
+        }
+        .await;
 
-        let cycles = FlameGraph::from_string(cycles, false);
-
-        *self.cycles.write() = Some(cycles.clone());
-
-        *self.app.lock() = Some(flamelens::app::App::with_flamegraph("Cycles", cycles));
-
-        let mut file = File::open(self.res_dir.join("flamegraph_instructions.folded"))
-            .await
-            .expect("");
-        let mut instructions = String::new();
-        file.read_to_string(&mut instructions).await.expect("");
-
-        let instructions = FlameGraph::from_string(instructions, false);
-
-        *self.instructions.write() = Some(instructions);
+        match result {
+            Ok((cycles, instructions)) => {
+                *self.cycles.write() = Some(cycles.clone());
+                *self.instructions.write() = Some(instructions);
+                *self.app.lock() = Some(flamelens::app::App::with_flamegraph("Cycles", cycles));
+            }
+            Err(error) => {
+                *self.load_error.write() =
+                    Some(format!("Could not load flamegraph data:\n\n{error}"));
+            }
+        }
     }
 }
 
@@ -104,15 +109,73 @@ impl Widget for FlamegraphTab {
     where
         Self: Sized,
     {
-        let mut app = self.app.lock();
-        if app.is_none() {
+        if let Some(error) = self.load_error.read().clone() {
+            Paragraph::new(error)
+                .block(Block::bordered().title("Flamegraph error"))
+                .wrap(Wrap { trim: true })
+                .render(area, buf);
             return;
         }
 
+        let mut app = self.app.lock();
+        let Some(app) = app.as_mut() else {
+            return;
+        };
+
         let mut state = self.state.lock();
 
-        let flamelens_widget = FlamelensWidget::new(app.as_mut().unwrap());
+        let flamelens_widget = FlamelensWidget::new(app);
         StatefulWidget::render(flamelens_widget, area, buf, &mut *state);
+    }
+}
+
+async fn read_flamegraph(path: &Path) -> Result<FlameGraph, String> {
+    let data = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    parse_flamegraph(data).map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+fn parse_flamegraph(data: String) -> Result<FlameGraph, String> {
+    let mut sample_count = 0usize;
+    for (index, line) in data.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let valid = line
+            .rsplit_once(' ')
+            .is_some_and(|(stack, count)| !stack.is_empty() && count.parse::<u64>().is_ok());
+        if !valid {
+            return Err(format!("malformed folded stack on line {}", index + 1));
+        }
+        sample_count += 1;
+    }
+    if sample_count == 0 {
+        return Err("no valid folded stack samples found".to_string());
+    }
+    Ok(FlameGraph::from_string(data, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_flamegraph;
+
+    #[test]
+    fn rejects_empty_or_corrupt_folded_stacks() {
+        for data in [
+            "",
+            "# only a comment\n",
+            "main not-a-count\n",
+            "main 1\ncorrupt\n",
+        ] {
+            assert!(parse_flamegraph(data.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_folded_stack_samples() {
+        assert!(parse_flamegraph("main;work 42\n".to_string()).is_ok());
     }
 }
 
@@ -346,7 +409,9 @@ impl<'a> FlamelensWidget<'a> {
 
         let mut has_more_rows_to_render = false;
         for child in &stack.children {
-            let child_stack = self.app.flamegraph().get_stack(child).unwrap();
+            let Some(child_stack) = self.app.flamegraph().get_stack(child) else {
+                continue;
+            };
             let child_x_budget = if let Some(zoomed_child_id) = zoomed_child {
                 // Zoomer takes all
                 if zoomed_child_id == *child {
@@ -373,7 +438,7 @@ impl<'a> FlamelensWidget<'a> {
         has_more_rows_to_render
     }
 
-    fn get_ordered_stacks_table(&self) -> Table {
+    fn get_ordered_stacks_table(&self) -> Table<'_> {
         let add_sorted_indicator = |label: &str, sort_column: SortColumn| {
             let suffix = if sort_column == self.app.flamegraph().ordered_stacks.sorted_column {
                 " [▼]"
@@ -470,7 +535,7 @@ impl<'a> FlamelensWidget<'a> {
         width: u16,
         style: Style,
         re: &Option<&regex::Regex>,
-    ) -> Line {
+    ) -> Line<'_> {
         let short_name = self.app.flamegraph().get_stack_short_name_from_info(stack);
 
         // Empty space separator at the beginning
@@ -547,14 +612,14 @@ impl<'a> FlamelensWidget<'a> {
         }
     }
 
-    fn get_view_kind_indicator(&self) -> Line {
+    fn get_view_kind_indicator(&self) -> Line<'_> {
         let mut header_bottom_title_spans = vec![Span::from(" ")];
 
         fn _get_view_kind_span(
             label: &str,
             view_kind: ViewKind,
             current_view_kind: ViewKind,
-        ) -> Span {
+        ) -> Span<'_> {
             let (content, style) = if view_kind == current_view_kind {
                 (format!("[{}]", label), Style::default().bold().yellow())
             } else {
@@ -578,7 +643,7 @@ impl<'a> FlamelensWidget<'a> {
         Line::from(header_bottom_title_spans)
     }
 
-    fn get_header_text(&self, _width: u16) -> Line {
+    fn get_header_text(&self, _width: u16) -> Line<'_> {
         let header_text = match &self.app.flamegraph_input {
             FlameGraphInput::File(path) => path.to_string(),
             FlameGraphInput::Pid(pid, info) => {
@@ -592,7 +657,7 @@ impl<'a> FlamelensWidget<'a> {
         Line::from(header_text).style(Style::default().bold())
     }
 
-    fn get_status_text(&self, width: u16) -> Vec<(&'static str, Line)> {
+    fn get_status_text(&self, width: u16) -> Vec<(&'static str, Line<'_>)> {
         if self.app.input_buffer.is_some() {
             self.get_status_text_buffer()
         } else {
@@ -600,10 +665,15 @@ impl<'a> FlamelensWidget<'a> {
         }
     }
 
-    fn get_status_text_buffer(&self) -> Vec<(&'static str, Line)> {
-        let input_buffer = self.app.input_buffer.as_ref().unwrap();
-        let status_text = format!("{}{}", SEARCH_PREFIX, input_buffer.buffer);
-        vec![("Search", Line::from(status_text))]
+    fn get_status_text_buffer(&self) -> Vec<(&'static str, Line<'_>)> {
+        self.app
+            .input_buffer
+            .as_ref()
+            .map(|input_buffer| {
+                let status_text = format!("{}{}", SEARCH_PREFIX, input_buffer.buffer);
+                vec![("Search", Line::from(status_text))]
+            })
+            .unwrap_or_default()
     }
 
     fn get_cursor_position(&self, status_area: Rect) -> Option<(u16, u16)> {
@@ -615,7 +685,7 @@ impl<'a> FlamelensWidget<'a> {
         })
     }
 
-    fn get_status_text_command(&self, width: u16) -> Vec<(&'static str, Line)> {
+    fn get_status_text_command(&self, width: u16) -> Vec<(&'static str, Line<'_>)> {
         let stack = self
             .app
             .flamegraph()
@@ -624,13 +694,13 @@ impl<'a> FlamelensWidget<'a> {
         let mut lines = vec![];
         match stack {
             Some(stack) => {
-                let zoom_total_count = self.app.flamegraph_state().zoom.as_ref().map(|zoom| {
-                    self.app
-                        .flamegraph()
-                        .get_stack(&zoom.stack_id)
-                        .unwrap()
-                        .total_count
-                });
+                let zoom_total_count = self
+                    .app
+                    .flamegraph_state()
+                    .zoom
+                    .as_ref()
+                    .and_then(|zoom| self.app.flamegraph().get_stack(&zoom.stack_id))
+                    .map(|stack| stack.total_count);
                 if let Some(p) = &self.app.flamegraph_state().search_pattern {
                     if let (true, Some(hit_coverage_count)) =
                         (p.is_manual, self.app.flamegraph().hit_coverage_count())

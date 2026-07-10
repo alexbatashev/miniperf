@@ -1,9 +1,16 @@
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::{anyhow, Result};
 
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "the objdump backend is Linux-only")
+)]
 pub struct DisassembleRequest {
     pub module_path: PathBuf,
     pub load_bias: i64,

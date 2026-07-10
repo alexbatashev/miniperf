@@ -61,7 +61,98 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
         }
     }
 
+    persist_derived_metrics(&connection)?;
+
     Ok(())
+}
+
+fn persist_derived_metrics(connection: &sqlite::Connection) -> Result<()> {
+    persist_metric_definitions(connection, &pmu::host_metrics())
+}
+
+fn persist_metric_definitions(
+    connection: &sqlite::Connection,
+    metrics: &[pmu::Metric],
+) -> Result<()> {
+    use sqlite::State;
+
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS derived_metrics (
+            name TEXT PRIMARY KEY,
+            value REAL NOT NULL,
+            unit TEXT,
+            expression TEXT NOT NULL
+        );",
+    )?;
+
+    for metric in metrics {
+        let Ok(event_names) = metric.expression.event_names() else {
+            continue;
+        };
+        let mut values = HashMap::new();
+        let mut applicable = true;
+        for event_name in event_names {
+            let Some(column) = metric_event_column(&event_name) else {
+                applicable = false;
+                break;
+            };
+            let mut statement = match connection.prepare(format!(
+                "SELECT SUM({column}) AS metric_value FROM pmu_counters"
+            )) {
+                Ok(statement) => statement,
+                Err(_) => {
+                    applicable = false;
+                    break;
+                }
+            };
+            if statement.next()? != State::Row {
+                applicable = false;
+                break;
+            }
+            let value = statement.read::<Option<i64>, _>("metric_value")?;
+            values.insert(event_name, value.unwrap_or(0) as f64);
+        }
+        if !applicable {
+            continue;
+        }
+        let Ok(value) = metric.expression.evaluate(&values) else {
+            continue;
+        };
+        let mut insert = connection.prepare(
+            "INSERT OR REPLACE INTO derived_metrics (name, value, unit, expression)
+             VALUES (?, ?, ?, ?)",
+        )?;
+        insert.bind((1, metric.name.as_str()))?;
+        insert.bind((2, value))?;
+        insert.bind((3, metric.unit.as_deref()))?;
+        insert.bind((4, metric.expression.0.as_str()))?;
+        insert.next()?;
+    }
+    Ok(())
+}
+
+fn metric_event_column(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("cycles") {
+        Some("pmu_cycles")
+    } else if name.eq_ignore_ascii_case("instructions") {
+        Some("pmu_instructions")
+    } else if name.eq_ignore_ascii_case("branches") {
+        Some("pmu_branch_instructions")
+    } else if name.eq_ignore_ascii_case("branch_misses") {
+        Some("pmu_branch_misses")
+    } else if name.eq_ignore_ascii_case("llc_references")
+        || name.eq_ignore_ascii_case("cache_references")
+    {
+        Some("pmu_llc_references")
+    } else if name.eq_ignore_ascii_case("llc_misses") || name.eq_ignore_ascii_case("cache_misses") {
+        Some("pmu_llc_misses")
+    } else if name.eq_ignore_ascii_case("stalled_cycles_frontend") {
+        Some("pmu_stalled_cycles_frontend")
+    } else if name.eq_ignore_ascii_case("stalled_cycles_backend") {
+        Some("pmu_stalled_cycles_backend")
+    } else {
+        None
+    }
 }
 
 async fn process_strings(connection: &sqlite::Connection, res_dir: &Path) -> Result<()> {
@@ -129,6 +220,11 @@ async fn process_pmu_counters(
     let proc_map: Vec<ProcMapEntry> = serde_json::from_reader(proc_map_file)?;
 
     let resolved_pm = utils::resolve_proc_maps(&proc_map);
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let mut post_hoc_unwinder = crate::unwind::PostHocUnwinder::new(&proc_map);
 
     let data_stream = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
 
@@ -161,7 +257,21 @@ async fn process_pmu_counters(
     let mut per_core_instructions = HashMap::<String, (String, HashMap<String, u64>)>::new();
 
     while (cursor.position() as usize) < map.len() {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let mut evt = Event::read_binary(&mut cursor).expect("Failed to decode event");
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
         let evt = Event::read_binary(&mut cursor).expect("Failed to decode event");
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        post_hoc_unwinder.unwind_event(&mut evt);
 
         pb.update_to(cursor.position() as usize)?;
 
@@ -169,21 +279,28 @@ async fn process_pmu_counters(
             continue;
         }
 
-        let pm = resolved_pm.get(&evt.process_id);
-
-        if pm.is_none() {
+        if !resolved_pm.has_process(evt.process_id) {
             continue;
         }
-        let pm = pm.unwrap();
 
         let func_names = evt
             .callstack
             .iter()
             .rev()
-            .map(|frame| match frame {
-                CallFrame::Location(_) => unreachable!(),
+            .flat_map(|frame| match frame {
+                CallFrame::Location(_) => vec!["[instrumented]".to_owned()],
                 CallFrame::IP(ip) => {
-                    utils::find_sym_name(pm, *ip as usize).unwrap_or("[unknown]".to_string())
+                    let mut frames = utils::find_frames(&resolved_pm, evt.process_id, *ip as usize)
+                        .into_iter()
+                        .map(|frame| frame.function)
+                        .collect::<Vec<_>>();
+                    // Resolver frames are inner-to-outer, but this iterator is
+                    // constructing the root-to-leaf folded representation.
+                    frames.reverse();
+                    if frames.is_empty() {
+                        frames.push("[unknown]".to_owned());
+                    }
+                    frames
                 }
             })
             .collect::<SmallVec<[_; 32]>>()
@@ -240,11 +357,14 @@ async fn process_pmu_counters(
                         known_ips.insert(ip);
 
                         proc_map_stmt.reset()?;
-                        let sym_name = utils::find_sym_name(pm, ip as usize)
-                            .unwrap_or("[unknown]".to_string());
-                        let (file, line) = utils::find_location(pm, ip as usize)
-                            .unwrap_or(("unknown".to_string(), 0));
-                        let module_path = utils::find_module_path(pm, ip as usize);
+                        let sym_name =
+                            utils::find_sym_name(&resolved_pm, evt.process_id, ip as usize)
+                                .unwrap_or("[unknown]".to_string());
+                        let (file, line) =
+                            utils::find_location(&resolved_pm, evt.process_id, ip as usize)
+                                .unwrap_or(("unknown".to_string(), 0));
+                        let module_path =
+                            utils::find_module_path(&resolved_pm, evt.process_id, ip as usize);
                         proc_map_stmt.bind((1, ip as i64))?;
                         proc_map_stmt.bind((2, sym_name.as_str()))?;
                         proc_map_stmt.bind((3, file.as_str()))?;
@@ -371,6 +491,8 @@ mod counter_group_tests {
             value: 1,
             timestamp: 1,
             callstack,
+            user_regs: None,
+            user_stack: Vec::new(),
         }
     }
 
@@ -428,17 +550,13 @@ fn cluster_of(clusters: &[ClusterRanges], cpu: u32) -> Option<(String, String)> 
         .map(|(family_id, name, _)| (family_id.clone(), name.clone()))
 }
 
-/// Write a folded stack collapse map to `<stem>.folded` and `<stem>.svg`.
+/// Write a folded stack collapse map to `<stem>.folded` and, when the map is
+/// non-empty, render it to `<stem>.svg`.
 async fn write_flamegraph(res_dir: &Path, stem: &str, map: HashMap<String, u64>) -> Result<()> {
     let lines = map
         .into_iter()
         .map(|(key, value)| format!("{} {}", key, value))
         .collect::<Vec<_>>();
-
-    let mut options = inferno::flamegraph::Options::default();
-    options.reverse_stack_order = false;
-    let svg = std::fs::File::create(res_dir.join(format!("{stem}.svg")))?;
-    inferno::flamegraph::from_lines(&mut options, lines.iter().map(|s| s.as_str()), &svg)?;
 
     let mut folded = File::create(res_dir.join(format!("{stem}.folded"))).await?;
     for line in &lines {
@@ -446,7 +564,41 @@ async fn write_flamegraph(res_dir: &Path, stem: &str, map: HashMap<String, u64>)
         folded.write_all(b"\n").await?;
     }
 
+    // Some counters can legitimately have no positive samples (in particular
+    // for short-lived processes or unavailable hardware events). Inferno treats
+    // an empty input as an error, but that must not invalidate the recording or
+    // prevent other counters from being persisted.
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    let mut options = inferno::flamegraph::Options::default();
+    options.reverse_stack_order = false;
+    let svg = std::fs::File::create(res_dir.join(format!("{stem}.svg")))?;
+    inferno::flamegraph::from_lines(&mut options, lines.iter().map(|s| s.as_str()), &svg)?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod flamegraph_output_tests {
+    use super::write_flamegraph;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn empty_flamegraph_does_not_fail_postprocessing() {
+        let dir =
+            std::env::temp_dir().join(format!("mperf-empty-flamegraph-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&dir).unwrap();
+
+        write_flamegraph(&dir, "empty", HashMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(dir.join("empty.folded")).unwrap(), b"");
+        assert!(!dir.join("empty.svg").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 async fn process_disassembly(
@@ -765,7 +917,7 @@ async fn process_roofline_events(
 ) -> Result<()> {
     let (baseline_pid, instr_pid) = match info {
         ScenarioInfo::Roofline(roofline) => (roofline.perf_pid, roofline.inst_pid),
-        _ => unimplemented!(),
+        _ => anyhow::bail!("roofline postprocessing requires roofline scenario metadata"),
     };
 
     connection.execute(
@@ -850,14 +1002,16 @@ async fn process_roofline_events(
 
         match evt.ty {
             EventType::RooflineLoopStart => {
-                let mut loop_info = LoopInfo::default();
-                loop_info.id = evt.unique_id;
-                loop_info.pid = evt.process_id;
-                loop_info.tid = evt.thread_id;
-                loop_info.file_name = evt.callstack[0].as_loc().file_name;
-                loop_info.func_name = evt.callstack[0].as_loc().function_name;
-                loop_info.line = evt.callstack[0].as_loc().line;
-                loop_info.start = evt.timestamp;
+                let loop_info = LoopInfo {
+                    id: evt.unique_id,
+                    pid: evt.process_id,
+                    tid: evt.thread_id,
+                    file_name: evt.callstack[0].as_loc().file_name,
+                    func_name: evt.callstack[0].as_loc().function_name,
+                    line: evt.callstack[0].as_loc().line,
+                    start: evt.timestamp,
+                    ..LoopInfo::default()
+                };
                 loops.insert(evt.unique_id, loop_info);
             }
             EventType::RooflineLoopEnd => {
@@ -1053,4 +1207,45 @@ LEFT JOIN strings s_file ON runs.file_name = s_file.id
 LEFT JOIN strings s_func ON runs.function_name = s_func.id;
     ").expect("failed to create a view");
     Ok(())
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use pmu::MetricExpression;
+    use sqlite::State;
+
+    #[test]
+    fn persists_applicable_derived_metric() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE pmu_counters (
+                    pmu_cycles INTEGER,
+                    pmu_instructions INTEGER
+                );
+                INSERT INTO pmu_counters VALUES (100, 175);
+                INSERT INTO pmu_counters VALUES (300, 625);",
+            )
+            .unwrap();
+        let metric = pmu::Metric {
+            name: "IPC".to_owned(),
+            desc: "Instructions per cycle".to_owned(),
+            expression: MetricExpression("instructions / cycles".to_owned()),
+            unit: Some("insn/cycle".to_owned()),
+        };
+        persist_metric_definitions(&connection, &[metric]).unwrap();
+
+        let mut statement = connection
+            .prepare("SELECT name, value, unit, expression FROM derived_metrics")
+            .unwrap();
+        assert_eq!(statement.next().unwrap(), State::Row);
+        assert_eq!(statement.read::<String, _>("name").unwrap(), "IPC");
+        assert_eq!(statement.read::<f64, _>("value").unwrap(), 2.0);
+        assert_eq!(statement.read::<String, _>("unit").unwrap(), "insn/cycle");
+        assert_eq!(
+            statement.read::<String, _>("expression").unwrap(),
+            "instructions / cycles"
+        );
+    }
 }

@@ -1,7 +1,9 @@
-use anyhow::Result;
+use std::collections::HashMap;
+
+use anyhow::{anyhow, Result};
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use num_format::{Locale, ToFormattedString};
-use pmu::{Counter, CounterValue, MeasurementQuality, Process};
+use pmu::{Counter, CounterValue, Metric, Process};
 
 /// PMU (hardware) counters, shown per-core on heterogeneous systems.
 fn pmu_counters() -> Vec<Counter> {
@@ -27,33 +29,60 @@ fn software_counters() -> Vec<Counter> {
     ]
 }
 
-pub fn do_stat(pid: Option<u32>, command: Vec<String>) -> Result<()> {
+pub fn do_stat(pid: Option<u32>, command: Vec<String>, event_names: Vec<String>) -> Result<()> {
     if pid.is_none() && command.is_empty() {
         anyhow::bail!(
             "stat requires a command, or --pid with a command used as the measurement duration"
         );
     }
 
-    let process = if pid.is_none() {
+    let process = if pid.is_none() || !command.is_empty() {
         Some(Process::new(&command, &[])?)
-    } else if command.is_empty() {
-        None
     } else {
-        Some(Process::new(&command, &[])?)
+        None
     };
 
-    let mut counters = pmu_counters();
-    counters.extend(software_counters());
-
-    let mut builder = pmu::CountingDriverBuilder::new()
-        .counters(&counters)
-        .process(process.as_ref());
-
-    if let Some(pid) = pid {
-        builder = builder.pid(Some(pid as i32));
+    let capabilities = pmu::capabilities();
+    if !capabilities.hardware_counters {
+        eprintln!("notice: no hardware PMU detected (VM/container or permissions); hardware counters may be unavailable");
     }
 
-    let mut driver = builder.build()?;
+    let supported = pmu::list_supported_counters(pmu::DriverKind::Default);
+    let host_metrics = pmu::host_metrics();
+    let (mut counters, metrics) = if event_names.is_empty() {
+        let mut defaults = pmu_counters();
+        defaults.extend(software_counters());
+        let applicable = applicable_metrics(&host_metrics, &defaults);
+        (defaults, applicable)
+    } else {
+        requested_counters_and_metrics(&event_names, &supported, &host_metrics)?
+    };
+
+    let mut driver = loop {
+        match pmu::CountingDriverBuilder::new()
+            .counters(&counters)
+            .process(process.as_ref())
+            .pid(pid.map(|pid| pid as i32))
+            .build()
+        {
+            Ok(driver) => break driver,
+            Err(error) if error.is_event_unsupported() => {
+                let unsupported = error.counter_name().unwrap_or_default();
+                let Some(index) = counters
+                    .iter()
+                    .position(|counter| counter.name() == unsupported)
+                else {
+                    return Err(error.into());
+                };
+                eprintln!("notice: {unsupported} is not supported by this PMU; omitting it");
+                counters.remove(index);
+                if counters.is_empty() {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
 
     driver.reset()?;
     driver.start()?;
@@ -69,37 +98,44 @@ pub fn do_stat(pid: Option<u32>, command: Vec<String>) -> Result<()> {
 
     let result = driver.counters()?;
 
+    let selected_pmu: Vec<Counter> = counters
+        .iter()
+        .filter(|counter| !counter.is_software())
+        .cloned()
+        .collect();
+    let selected_software: Vec<Counter> = counters
+        .iter()
+        .filter(|counter| counter.is_software())
+        .cloned()
+        .collect();
+
     println!(
         "
 
 Performance counter stats for '{}':
 ",
-        if let Some(pid) = pid {
-            format!("pid {pid}")
-        } else {
-            command.join(" ")
-        }
+        pid.map_or_else(|| command.join(" "), |pid| format!("pid {pid}"))
     );
 
     let cores = result.cores();
 
     if cores.is_empty() {
         // Homogeneous system: a single table with everything, as before.
-        let all = [pmu_counters(), software_counters()].concat();
-        let table = render_table(&all, |c| result.get(c.clone()));
+        let table = render_table(&counters, &metrics, |c| result.get(c.clone()));
         println!("{table}");
     } else {
         // Heterogeneous system: one table per core cluster, then a faithful
         // total summed across all clusters.
         for core in &cores {
-            let table = render_table(&pmu_counters(), |c| {
+            let core_metrics = applicable_metrics(&metrics, &selected_pmu);
+            let table = render_table(&selected_pmu, &core_metrics, |c| {
                 result.get_for(&Some(core.clone()), c.clone())
             });
             println!("{} (cpus {})\n{table}\n", core.name, core.cpus);
         }
 
-        let all = [pmu_counters(), software_counters()].concat();
-        let table = render_table(&all, |c| result.get(c.clone()));
+        let all = [selected_pmu, selected_software].concat();
+        let table = render_table(&all, &metrics, |c| result.get(c.clone()));
         println!("Total \u{2014} all cores (faithful sum)\n{table}");
     }
 
@@ -108,19 +144,16 @@ Performance counter stats for '{}':
 
 /// Render one counter table for a given scope. `get` returns the counter value
 /// within that scope (a single core, or the aggregate total).
-fn render_table(counters: &[Counter], get: impl Fn(&Counter) -> Option<CounterValue>) -> Table {
+fn render_table(
+    counters: &[Counter],
+    metrics: &[Metric],
+    get: impl Fn(&Counter) -> Option<CounterValue>,
+) -> Table {
     let cycles = get(&Counter::Cycles).map(|v| v.value);
     let instructions = get(&Counter::Instructions).map(|v| v.value);
 
     let mut table = Table::new();
-    table.set_header(vec![
-        "Counter",
-        "Value",
-        "Info",
-        "Scaling",
-        "Quality",
-        "Description",
-    ]);
+    table.set_header(vec!["Counter", "Value", "Info", "Scaling", "Description"]);
 
     for cntr in counters {
         let Some(value) = get(cntr) else {
@@ -135,16 +168,99 @@ fn render_table(counters: &[Counter], get: impl Fn(&Counter) -> Option<CounterVa
                 .set_alignment(CellAlignment::Right),
             info,
             Cell::new(format!("{:.2}", value.scaling)).set_alignment(CellAlignment::Right),
-            Cell::new(match value.quality {
-                MeasurementQuality::Exact => "exact",
-                MeasurementQuality::Scaled => "scaled",
-                MeasurementQuality::Estimated => "estimated",
-            }),
             Cell::new(cntr.description()),
         ]);
     }
 
+    let values: HashMap<String, f64> = counters
+        .iter()
+        .filter_map(|counter| {
+            get(counter).map(|value| (counter.name().to_owned(), value.value as f64))
+        })
+        .collect();
+    for metric in metrics {
+        let Ok(value) = metric.expression.evaluate(&values) else {
+            continue;
+        };
+        let rendered = metric.unit.as_deref().map_or_else(
+            || format!("{value:.3}"),
+            |unit| format!("{value:.3} {unit}"),
+        );
+        table.add_row(vec![
+            Cell::new(&metric.name),
+            Cell::new(rendered).set_alignment(CellAlignment::Right),
+            Cell::new("derived"),
+            Cell::new("-"),
+            Cell::new(&metric.desc),
+        ]);
+    }
+
     table
+}
+
+fn requested_counters_and_metrics(
+    names: &[String],
+    supported: &[Counter],
+    host_metrics: &[Metric],
+) -> Result<(Vec<Counter>, Vec<Metric>)> {
+    let mut counters = Vec::new();
+    let mut metrics = Vec::new();
+    for name in names {
+        if let Some(counter) = find_counter(supported, name) {
+            push_counter(&mut counters, counter.clone());
+            continue;
+        }
+        let Some(metric) = host_metrics
+            .iter()
+            .find(|metric| metric.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(anyhow!(
+                "unknown event or metric '{name}'; run `mperf list` to see supported names"
+            ));
+        };
+        for event_name in metric.expression.event_names().map_err(|error| {
+            anyhow!(
+                "metric '{}' has an invalid expression: {error}",
+                metric.name
+            )
+        })? {
+            let counter = find_counter(supported, &event_name).ok_or_else(|| {
+                anyhow!(
+                    "metric '{}' requires unavailable event '{event_name}'",
+                    metric.name
+                )
+            })?;
+            push_counter(&mut counters, counter.clone());
+        }
+        metrics.push(metric.clone());
+    }
+    Ok((counters, metrics))
+}
+
+fn applicable_metrics(metrics: &[Metric], counters: &[Counter]) -> Vec<Metric> {
+    metrics
+        .iter()
+        .filter(|metric| {
+            metric.expression.event_names().is_ok_and(|names| {
+                names
+                    .iter()
+                    .all(|name| find_counter(counters, name).is_some())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn find_counter<'a>(counters: &'a [Counter], name: &str) -> Option<&'a Counter> {
+    counters
+        .iter()
+        .find(|counter| counter.name().eq_ignore_ascii_case(name))
+}
+
+fn push_counter(counters: &mut Vec<Counter>, counter: Counter) {
+    if find_counter(counters, counter.name()).is_none() {
+        counters.push(counter);
+    }
 }
 
 /// Compute the derived "Info" cell (IPC, MPKI, stall %) for a counter, relative
@@ -198,5 +314,38 @@ fn info_cell(
             cell
         }
         _ => Cell::new(""),
+    }
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use pmu::MetricExpression;
+
+    fn ipc() -> Metric {
+        Metric {
+            name: "IPC".to_owned(),
+            desc: "Instructions per cycle".to_owned(),
+            expression: MetricExpression("instructions / cycles".to_owned()),
+            unit: Some("insn/cycle".to_owned()),
+        }
+    }
+
+    #[test]
+    fn requested_metric_expands_required_counters() {
+        let supported = vec![Counter::Cycles, Counter::Instructions];
+        let (counters, metrics) =
+            requested_counters_and_metrics(&["IPC".to_owned()], &supported, &[ipc()]).unwrap();
+        assert_eq!(counters, supported);
+        assert_eq!(metrics, vec![ipc()]);
+    }
+
+    #[test]
+    fn applicable_metric_requires_every_event() {
+        assert!(applicable_metrics(&[ipc()], &[Counter::Cycles]).is_empty());
+        assert_eq!(
+            applicable_metrics(&[ipc()], &[Counter::Cycles, Counter::Instructions]),
+            vec![ipc()]
+        );
     }
 }

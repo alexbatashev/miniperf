@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use lazy_static::lazy_static;
-use pmu_data::EventDesc;
+use pmu_data::{EventDesc, Metric};
 
 #[allow(dead_code)]
 pub struct CPUFamily {
@@ -12,6 +12,7 @@ pub struct CPUFamily {
     pub leader_event: Option<String>,
     pub events: HashMap<String, EventDesc>,
     pub aliases: HashMap<String, String>,
+    pub metrics: Vec<Metric>,
 }
 
 include!(concat!(env!("OUT_DIR"), "/events.rs"));
@@ -20,14 +21,23 @@ pub fn find_cpu_family(id: &str) -> Option<&CPUFamily> {
     CPU_FAMILIES.get(id)
 }
 
+/// Returns derived PMU metrics defined for the detected host family.
+pub fn host_metrics() -> Vec<Metric> {
+    find_cpu_family(get_host_cpu_family())
+        .map(|family| family.metrics.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(target_arch = "x86_64")]
 pub fn get_host_cpu_family() -> &'static str {
     const EAX_VENDOR_INFO: u32 = 0x1;
 
-    let result = unsafe { core::arch::x86_64::__cpuid(EAX_VENDOR_INFO) };
+    let result = core::arch::x86_64::__cpuid(EAX_VENDOR_INFO);
+    x86_family_from_signature(result.eax)
+}
 
-    let eax = result.eax;
-
+#[cfg(target_arch = "x86_64")]
+fn x86_family_from_signature(eax: u32) -> &'static str {
     let model = (eax >> 4) & 0xf;
     let family = (eax >> 8) & 0xf;
     let extended_model = (eax >> 16) & 0xf;
@@ -89,12 +99,65 @@ pub fn get_host_cpu_family() -> &'static str {
     "unknown"
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_tests {
+    use super::*;
+
+    fn signature(family: u32, model: u32, extended_model: u32, extended_family: u32) -> u32 {
+        (model << 4) | (family << 8) | (extended_model << 16) | (extended_family << 20)
+    }
+
+    #[test]
+    fn maps_both_tiger_lake_models() {
+        assert_eq!(
+            x86_family_from_signature(signature(6, 0xc, 8, 0)),
+            pmu_data::INTEL_TIGERLAKE
+        );
+        assert_eq!(
+            x86_family_from_signature(signature(6, 0xd, 8, 0)),
+            pmu_data::INTEL_TIGERLAKE
+        );
+    }
+
+    #[test]
+    fn tiger_lake_event_table_is_loaded() {
+        let family = find_cpu_family(pmu_data::INTEL_TIGERLAKE).unwrap();
+        assert_eq!(family.name, "Intel Tiger Lake");
+        assert_eq!(family.events.len(), 231);
+        assert_eq!(
+            family.aliases.get("cycles").unwrap(),
+            "CPU_CLK_UNHALTED.THREAD_P"
+        );
+        assert_eq!(family.events.get("L1D.REPLACEMENT").unwrap().code, 0x151);
+        let ipc = family
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "IPC")
+            .unwrap();
+        assert_eq!(ipc.expression.0, "instructions / cycles");
+        assert_eq!(
+            ipc.expression
+                .evaluate(&HashMap::from([
+                    ("instructions".to_owned(), 2_000.0),
+                    ("cycles".to_owned(), 1_000.0),
+                ]))
+                .unwrap(),
+            2.0
+        );
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 pub fn get_host_cpu_family() -> &'static str {
     use proc_getter::cpuinfo::cpuinfo;
 
-    let info = cpuinfo().expect("/proc/cpuinfo is inaccessible");
-    let marchid = info[0].get("marchid");
+    let Ok(info) = cpuinfo() else {
+        return "unknown";
+    };
+    let Some(first_cpu) = info.first() else {
+        return "unknown";
+    };
+    let marchid = first_cpu.get("marchid");
 
     match marchid {
         Some(marchid) => {
@@ -114,7 +177,7 @@ pub fn get_host_cpu_family() -> &'static str {
 /// `implementer` is MIDR_EL1[31:24] and `part` is MIDR_EL1[15:4]. Variant and
 /// revision are intentionally ignored, matching the way Linux perf keys its
 /// pmu-events map.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", any(target_os = "linux", test)))]
 fn aarch64_family(implementer: u32, part: u32) -> &'static str {
     // 0x41 == 'A', the Arm Limited implementer code.
     const ARM: u32 = 0x41;
@@ -257,6 +320,7 @@ pub fn host_pmu_type() -> Option<u32> {
 #[derive(Clone, Debug)]
 pub struct CorePmu {
     /// Dynamic `perf_event` PMU `type` id read from sysfs.
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub pmu_type: u32,
     /// Known family id (e.g. `"cortex_a720"`), or `"unknown"` for a cluster we
     /// have no event data for.
@@ -327,7 +391,7 @@ pub fn host_cpu_description() -> (String, String) {
         let model = macos_sysctl_string("machdep.cpu.brand_string")
             .or_else(|| macos_sysctl_string("hw.model"))
             .unwrap_or_else(|| "Unknown".to_string());
-        return ("Apple".to_string(), model);
+        ("Apple".to_string(), model)
     }
 
     #[cfg(not(target_os = "macos"))]

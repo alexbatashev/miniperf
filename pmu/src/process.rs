@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::ffi::CString;
 
 #[derive(Debug)]
+/// A child process suspended before `execve` so counters can be attached.
 pub struct Process {
     pid: i32,
     #[cfg(not(target_os = "macos"))]
@@ -15,10 +16,11 @@ pub struct Process {
 }
 
 impl Process {
+    /// Creates a child process suspended until [`Process::cont`] is called.
     pub fn new(args: &[String], env: &[(String, String)]) -> Result<Self, std::io::Error> {
         #[cfg(target_os = "macos")]
         {
-            return Self::new_macos_suspended(args, env);
+            Self::new_macos_suspended(args, env)
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -150,10 +152,12 @@ impl Process {
         })
     }
 
+    /// Returns the child process identifier.
     pub fn pid(&self) -> i32 {
         self.pid
     }
 
+    /// Releases the child to execute its configured command.
     pub fn cont(&self) {
         #[cfg(target_os = "macos")]
         unsafe {

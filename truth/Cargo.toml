@@ -1,0 +1,8 @@
+[package]
+name = "truth"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+[dependencies]
+sqlite = "0.37.0"

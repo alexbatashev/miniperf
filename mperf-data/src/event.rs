@@ -58,6 +58,13 @@ pub enum CallFrame {
 }
 
 #[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
+pub struct UserRegs {
+    pub abi: u64,
+    pub mask: u64,
+    pub values: Vec<u64>,
+}
+
+#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub unique_id: u128,
     pub correlation_id: u128,
@@ -74,6 +81,9 @@ pub struct Event {
     pub value: u64,
     pub timestamp: u64,
     pub callstack: SmallVec<[CallFrame; 32]>,
+    /// Raw state used for offline DWARF unwinding. Empty for instrumentation events.
+    pub user_regs: Option<UserRegs>,
+    pub user_stack: Vec<u8>,
 }
 
 #[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
@@ -184,7 +194,7 @@ impl CallFrame {
     }
     pub fn as_loc(&self) -> Location {
         match self {
-            CallFrame::Location(loc) => loc.clone(),
+            CallFrame::Location(loc) => *loc,
             CallFrame::IP(_) => unreachable!(),
         }
     }
