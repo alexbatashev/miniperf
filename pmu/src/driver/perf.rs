@@ -91,9 +91,10 @@ impl PerfCountingDriver {
             attr.set_inherit(1);
             attr.set_exclusive(0);
             attr.sample_type = PERF_SAMPLE_IDENTIFIER as u64;
-            if pid.is_some() {
-                attr.set_enable_on_exec(1);
-            }
+            // CountingDriver::start enables the event immediately before the
+            // fork-gated child is released. Do not also request enable-on-exec:
+            // on some kernels that transition resets a pre-enabled attached
+            // event and leaves a short, partial measurement.
         }
 
         let native_handles = binding::direct(&counters, &mut attrs, pid)?;
@@ -116,9 +117,7 @@ impl PerfCountingDriver {
             attr.set_inherit(1);
             attr.set_exclusive(0);
             attr.sample_type = PERF_SAMPLE_IDENTIFIER as u64;
-            if pid.is_some() {
-                attr.set_enable_on_exec(1);
-            }
+            // See the single-PMU path above: start() owns the enable edge.
         };
 
         let open = |counter: &Counter, attr: &mut perf_event_attr| -> Result<(i32, u64), Error> {
@@ -484,12 +483,16 @@ fn apply_sampling_flags(
     unwind_mode: UnwindMode,
     stack_dump_size: u32,
     enable_on_exec: bool,
+    precise_ip: bool,
 ) {
     attr.set_exclude_kernel(1);
     attr.set_exclude_user(0);
     attr.set_exclusive(0);
     attr.set_inherit(0);
     attr.set_enable_on_exec(enable_on_exec.into());
+    if precise_ip {
+        attr.set_precise_ip(2);
+    }
 
     attr.sample_freq = sample_freq;
     attr.set_freq(1);
@@ -527,6 +530,7 @@ impl PerfSamplingDriver {
         prefer_raw_events: bool,
         unwind_mode: UnwindMode,
         stack_dump_size: u32,
+        precise_ip: bool,
     ) -> Result<PerfSamplingDriver, Error> {
         // On a heterogeneous (big.LITTLE) host, open a sampling group on each
         // cluster's PMU so the profile captures execution wherever the task
@@ -541,6 +545,7 @@ impl PerfSamplingDriver {
                 &core_pmus,
                 unwind_mode,
                 stack_dump_size,
+                precise_ip,
             );
         }
 
@@ -553,6 +558,7 @@ impl PerfSamplingDriver {
                 unwind_mode,
                 stack_dump_size,
                 pid.is_some(),
+                precise_ip,
             );
         }
 
@@ -584,6 +590,7 @@ impl PerfSamplingDriver {
         core_pmus: &[crate::cpu_family::CorePmu],
         unwind_mode: UnwindMode,
         stack_dump_size: u32,
+        precise_ip: bool,
     ) -> Result<PerfSamplingDriver, Error> {
         let mut native_handles: Vec<NativeCounterHandle> = Vec::new();
 
@@ -602,6 +609,7 @@ impl PerfSamplingDriver {
                         unwind_mode,
                         stack_dump_size,
                         pid.is_some(),
+                        precise_ip,
                     );
                     Ok(attr)
                 })

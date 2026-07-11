@@ -209,6 +209,7 @@ pub struct SamplingDriverBuilder {
     kind: DriverKind,
     unwind_mode: UnwindMode,
     stack_dump_size: u32,
+    precise_ip: bool,
 }
 
 impl<F: Fn(Record) + Send + Sync> SamplingCallback for F {
@@ -258,7 +259,12 @@ impl CountingDriverBuilder {
 
     /// Attaches counting to an already-running process.
     pub fn pid(mut self, pid: Option<i32>) -> Self {
-        self.pid = pid;
+        // `process()` supplies a suspended child PID. Callers commonly chain
+        // `.pid(optional_pid)` afterwards; an absent optional attachment must
+        // not silently replace that child with PID 0 (the profiler itself).
+        if pid.is_some() {
+            self.pid = pid;
+        }
         self
     }
 
@@ -299,6 +305,7 @@ impl SamplingDriverBuilder {
             kind: DriverKind::Default,
             unwind_mode: UnwindMode::Dwarf,
             stack_dump_size: 8 * 1024,
+            precise_ip: false,
         }
     }
 
@@ -349,6 +356,13 @@ impl SamplingDriverBuilder {
         self
     }
 
+    /// Requests PEBS/SPE-quality instruction pointers for supported events.
+    /// Opening the event remains the kernel's authoritative capability check.
+    pub fn precise_ip(mut self) -> Self {
+        self.precise_ip = true;
+        self
+    }
+
     /// Prefers raw CPU-family event encodings over generic perf aliases.
     pub fn prefer_raw_events(mut self) -> Self {
         self.prefer_raw_events = true;
@@ -370,6 +384,7 @@ impl SamplingDriverBuilder {
                             self.prefer_raw_events,
                             unwind_mode,
                             self.stack_dump_size,
+                            self.precise_ip,
                         ),
                     )?;
                     return Ok(Box::new(driver));

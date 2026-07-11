@@ -1,4 +1,5 @@
 use clap::ValueEnum;
+use pmu_data::{ScenarioUi, TmaConstant, TmaGroup, TmaMetric};
 use serde::{Deserialize, Serialize};
 
 mod event;
@@ -18,25 +19,42 @@ pub const CURRENT_FORMAT_VERSION: u32 = 2;
 pub enum Scenario {
     Snapshot,
     Roofline,
+    TMA,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotInfo {
     pub pid: i32,
-    pub counters: Vec<EventType>,
+    pub counters: Vec<(EventType, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RooflineInfo {
     pub perf_pid: i32,
-    pub counters: Vec<EventType>,
+    pub counters: Vec<(EventType, String)>,
     pub inst_pid: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TMAInfo {
+    pub pid: i32,
+    pub counters: Vec<(EventType, String)>,
+    #[serde(default)]
+    pub groups: Vec<TmaGroup>,
+    /// True only when the recording used a precise PMU sampling source.
+    #[serde(default)]
+    pub precise_attribution: bool,
+    pub metrics: Vec<TmaMetric>,
+    pub constants: Vec<TmaConstant>,
+    #[serde(default)]
+    pub ui: Option<ScenarioUi>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ScenarioInfo {
     Snapshot(SnapshotInfo),
     Roofline(RooflineInfo),
+    TMA(TMAInfo),
 }
 
 /// A cluster of cores on a heterogeneous (big.LITTLE) system, used to attribute
@@ -101,6 +119,7 @@ impl Scenario {
         match self {
             Scenario::Snapshot => "Snapshot",
             Scenario::Roofline => "Roofline",
+            Scenario::TMA => "Top-Down",
         }
     }
 }

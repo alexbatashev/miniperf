@@ -356,6 +356,7 @@ dependencies = [
  "parking_lot",
  "shmem",
  "smallvec",
+ "uuid",
 ]
 
 [[package]]
@@ -1198,6 +1199,7 @@ dependencies = [
  "miniperf-symbolize",
  "perf-event-open-sys2",
  "prettyplease",
+ "proc-macro2",
  "proc_getter",
  "quote",
  "serde",
@@ -1278,6 +1280,7 @@ dependencies = [
  "libc",
  "memmap2",
  "miniperf-pmu",
+ "miniperf-pmu-data",
  "miniperf-symbolize",
  "mperf-data",
  "num-format",
@@ -1306,6 +1309,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "clap",
+ "miniperf-pmu-data",
  "serde",
  "serde_json",
  "shmem",

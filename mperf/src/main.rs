@@ -42,6 +42,12 @@ enum Commands {
         /// Comma-separated event names (use `mperf list` to discover them).
         #[arg(short = 'e', long = "event", value_delimiter = ',')]
         events: Vec<String>,
+        /// Render the host Top-down methodology instead of the flat stat table.
+        #[arg(long)]
+        topdown: bool,
+        /// Maximum Top-down tree level to display (default: 1).
+        #[arg(short = 'l', long, default_value_t = 1)]
+        level: u8,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -71,8 +77,10 @@ async fn main() -> Result<()> {
         Commands::Stat {
             pid,
             events,
+            topdown,
+            level,
             command,
-        } => return do_stat(pid, command, events),
+        } => return do_stat(pid, command, events, topdown.then_some(level)),
         Commands::List => {
             let events = pmu::list_supported_counters(pmu::DriverKind::Default);
             for event in events {

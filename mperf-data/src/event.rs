@@ -7,7 +7,7 @@ use smallvec::SmallVec;
 
 #[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
 pub struct IString {
-    pub id: u64,
+    pub id: u128,
     pub value: String,
 }
 
@@ -80,6 +80,7 @@ pub struct Event {
     pub time_running: u64,
     pub value: u64,
     pub timestamp: u64,
+    pub name: u128,
     pub callstack: SmallVec<[CallFrame; 32]>,
     /// Raw state used for offline DWARF unwinding. Empty for instrumentation events.
     pub user_regs: Option<UserRegs>,

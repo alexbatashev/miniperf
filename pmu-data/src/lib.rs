@@ -1,6 +1,9 @@
 #![deny(missing_docs)]
 //! Serializable schema and stable identifiers for CPU PMU event tables.
 
+/// Arithmetic expression parser used by TMA scenario formulas.
+pub mod arith_parser;
+
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{de, Deserialize, Serialize};
@@ -72,6 +75,9 @@ pub struct PlatformDesc {
     /// Derived metrics defined for this PMU.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metrics: Vec<Metric>,
+    /// Top-down analysis scenarios defined for this PMU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scenarios: Option<Vec<TmaScenario>>,
 }
 
 /// Description and raw encoding of one PMU event.
@@ -93,6 +99,195 @@ pub struct Alias {
     pub target: String,
     /// Platform-specific event name present in [`PlatformDesc::events`].
     pub origin: String,
+}
+
+/// A top-down analysis scenario and the counters needed to evaluate it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaScenario {
+    /// Stable scenario name, normally `tma`.
+    pub name: String,
+    /// PMU event names that must be sampled.
+    pub events: Vec<String>,
+    /// Counter groups which must be scheduled together.  A metric may only
+    /// use events from its group, so each result has one time-enabled/running
+    /// domain instead of mixing independently multiplexed counters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<TmaGroup>,
+    /// Whether this methodology has a precise (PEBS/SPE) sampling event that
+    /// makes function-level ratios meaningful.
+    #[serde(default)]
+    pub precise_attribution: bool,
+    /// Named processor constants referenced by metric formulas.
+    pub constants: Vec<TmaConstant>,
+    /// Hierarchical metrics calculated by the scenario.
+    pub metrics: Vec<TmaMetric>,
+    /// Optional TUI layout for presenting this scenario.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<ScenarioUi>,
+}
+
+/// A metric formula belonging to a top-down analysis scenario.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaMetric {
+    /// Stable hierarchical metric name.
+    pub name: String,
+    /// Human-readable metric description.
+    pub desc: String,
+    /// Formula referencing events, constants, or other TMA metrics.
+    pub formula: String,
+    /// Name of the coherent counter group used to evaluate this metric.
+    /// Missing is accepted for legacy scenario files and is inferred from the
+    /// formula when possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+/// A set of events that must be read as one perf group.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaGroup {
+    /// Stable group name referenced by [`TmaMetric::group`].
+    pub name: String,
+    /// Events in the group. `cycles` and `instructions` must be listed when a
+    /// formula uses them; they are intentionally not injected implicitly.
+    pub events: Vec<String>,
+}
+
+/// A named integer constant referenced by a TMA formula.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TmaConstant {
+    /// Constant name without the `$` prefix.
+    pub name: String,
+    /// Constant value.
+    pub value: u32,
+}
+
+/// Declarative TUI layout for a profiling scenario.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScenarioUi {
+    /// Tabs displayed for this scenario, in order.
+    #[serde(default)]
+    pub tabs: Vec<TabSpec>,
+}
+
+/// One tab in a declarative scenario UI.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TabSpec {
+    /// Recording summary.
+    Summary,
+    /// Sample flamegraph.
+    Flamegraph,
+    /// Instrumented loop statistics.
+    Loops,
+    /// Configurable table backed by a SQLite view.
+    MetricsTable(MetricsTableSpec),
+}
+
+/// Configuration for a table backed by a SQLite view.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsTableSpec {
+    /// SQLite view queried by the tab.
+    pub view: String,
+    /// Optional tab title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Whether standard function, share, cycle, instruction, and IPC columns are included.
+    #[serde(default = "default_true")]
+    pub include_default_columns: bool,
+    /// Additional columns read from the view.
+    #[serde(default)]
+    pub columns: Vec<MetricColumnSpec>,
+    /// Default row ordering.
+    #[serde(default)]
+    pub order_by: Option<OrderSpec>,
+    /// Optional maximum number of rows.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Number of leading columns kept visible during horizontal scrolling.
+    #[serde(default)]
+    pub sticky_columns: Option<usize>,
+    /// Column used to identify a function for assembly display.
+    #[serde(default)]
+    pub function_column: Option<String>,
+    /// Whether assembly drill-down is enabled.
+    #[serde(default)]
+    pub enable_assembly: bool,
+}
+
+/// Default ordering for a metrics table.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrderSpec {
+    /// Column name used for ordering.
+    pub column: String,
+    /// Sort direction.
+    #[serde(default)]
+    pub direction: SortDirection,
+}
+
+/// Sort direction for a metrics table.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SortDirection {
+    /// Ascending order.
+    Asc,
+    /// Descending order.
+    #[default]
+    Desc,
+}
+
+/// Description of one configurable metrics-table column.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricColumnSpec {
+    /// SQLite column name.
+    pub key: String,
+    /// Optional display label.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Value formatting style.
+    #[serde(default)]
+    pub format: ValueFormat,
+    /// Optional display width.
+    #[serde(default)]
+    pub width: Option<u16>,
+    /// Whether the column remains visible while scrolling horizontally.
+    #[serde(default)]
+    pub sticky: bool,
+    /// Whether a missing SQLite column may be omitted.
+    #[serde(default)]
+    pub optional: bool,
+}
+
+/// Display formatting for a metrics-table value.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueFormat {
+    /// Infer formatting from the SQLite value.
+    #[default]
+    Auto,
+    /// Display as text.
+    Text,
+    /// Display as an integer.
+    Integer,
+    /// Display as a floating-point value with default precision.
+    Float,
+    /// Display a floating-point value with one decimal place.
+    Float1,
+    /// Display a floating-point value with two decimal places.
+    Float2,
+    /// Display a floating-point value with three decimal places.
+    Float3,
+    /// Display a percentage with default precision.
+    Percent,
+    /// Display a percentage with one decimal place.
+    Percent1,
+    /// Display a percentage with two decimal places.
+    Percent2,
+    /// Display a percentage with three decimal places.
+    Percent3,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

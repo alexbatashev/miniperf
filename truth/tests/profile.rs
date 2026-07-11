@@ -11,6 +11,8 @@ use truth::assert_f6_1_duty_split;
 
 const DUTY_SPLIT_FP: &str = env!("TRUTH_DUTY_SPLIT_FP");
 const DUTY_SPLIT_NO_FP: &str = env!("TRUTH_DUTY_SPLIT_NO_FP");
+const POINTER_CHASE_FP: &str = env!("TRUTH_POINTER_CHASE_FP");
+const BRANCH_HEAVY_FP: &str = env!("TRUTH_BRANCH_HEAVY_FP");
 
 #[test]
 #[ignore = "requires Linux perf_event access; run `cargo build -p mperf && cargo test -p truth --test profile -- --ignored`"]
@@ -48,6 +50,32 @@ fn f3_1_dwarf_resolves_optimized_no_frame_pointer_fixture() {
     cleanup_recording(&results, &log_path, "01-F3.1");
 }
 
+#[test]
+#[ignore = "requires Linux perf_event access; run `cargo build -p mperf && cargo test -p truth --test profile -- --ignored`"]
+fn tma_acceptance_fixtures_have_expected_dominant_paths() {
+    for (fixture, expected) in [
+        (POINTER_CHASE_FP, "be_bound"),
+        (BRANCH_HEAVY_FP, "bad_speculation"),
+    ] {
+        let Some((results, log)) = record_tma_fixture(fixture, "13-TMA") else {
+            return;
+        };
+        let connection = sqlite::open(results.join("perf.db")).expect("13-TMA: open database");
+        let mut statement = connection
+            .prepare("SELECT metric FROM tma_summary WHERE verdict = 'dominant'")
+            .expect("13-TMA: query verdict");
+        assert_eq!(statement.next().expect("13-TMA: read verdict"), State::Row);
+        let dominant = statement
+            .read::<String, _>("metric")
+            .expect("13-TMA: read metric");
+        assert!(
+            dominant == expected || (expected == "be_bound" && dominant.starts_with("be_bound.")),
+            "13-TMA: expected {expected}, got {dominant}"
+        );
+        cleanup_recording(&results, &log, "13-TMA");
+    }
+}
+
 fn record_fixture(fixture: &str, duration: &str, milestone: &str) -> Option<(PathBuf, PathBuf)> {
     if !perf_events_are_available() {
         eprintln!(
@@ -83,6 +111,28 @@ fn record_fixture(fixture: &str, duration: &str, milestone: &str) -> Option<(Pat
         status.success(),
         "{milestone}: mperf failed or exceeded 45 seconds\n{log}"
     );
+    Some((results, log_path))
+}
+
+fn record_tma_fixture(fixture: &str, milestone: &str) -> Option<(PathBuf, PathBuf)> {
+    if !perf_events_are_available() {
+        return None;
+    }
+    let mperf = mperf_binary();
+    let results = unique_results_dir();
+    let log_path = results.with_extension("log");
+    let log = File::create(&log_path).expect("13-TMA: create log");
+    let status = Command::new("timeout")
+        .args(["60s"])
+        .arg(&mperf)
+        .args(["record", "--scenario", "tma", "--output-directory"])
+        .arg(&results)
+        .args(["--", fixture])
+        .stdout(Stdio::from(log.try_clone().expect("13-TMA: clone log")))
+        .stderr(Stdio::from(log))
+        .status()
+        .expect("13-TMA: run mperf");
+    assert!(status.success(), "{milestone}: TMA record failed");
     Some((results, log_path))
 }
 

@@ -55,6 +55,7 @@ serde_json = "1.0.138"
 pmu-data = { package = "miniperf-pmu-data", path = "../pmu-data/", version = "0.1.0" }
 glob = "0.3.2"
 quote = "1.0.38"
+proc-macro2 = "1.0"
 prettyplease = "0.2.29"
 syn = "2.0.96"
 

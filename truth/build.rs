@@ -3,6 +3,8 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=fixtures/duty_split.c");
     println!("cargo:rerun-if-changed=fixtures/known_sleeper.c");
+    println!("cargo:rerun-if-changed=fixtures/pointer_chase.c");
+    println!("cargo:rerun-if-changed=fixtures/branch_heavy.c");
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR"));
     let compiler = env::var_os("CC").unwrap_or_else(|| "cc".into());
@@ -11,6 +13,8 @@ fn main() {
     for (source, name) in [
         ("fixtures/duty_split.c", "duty_split"),
         ("fixtures/known_sleeper.c", "known_sleeper"),
+        ("fixtures/pointer_chase.c", "pointer_chase"),
+        ("fixtures/branch_heavy.c", "branch_heavy"),
     ] {
         for (suffix, frame_pointer_flag) in [
             ("fp", "-fno-omit-frame-pointer"),

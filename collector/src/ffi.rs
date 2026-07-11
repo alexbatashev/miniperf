@@ -76,8 +76,8 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
     let func_name = get_string_id(&handle.info.func_name);
 
     let start_frame = CallFrame::Location(Location {
-        function_name: func_name as u128,
-        file_name: filename as u128,
+        function_name: func_name,
+        file_name: filename,
         line: handle.info.line,
     });
 
@@ -92,6 +92,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_begin(
         time_enabled: 0,
         time_running: 0,
         value: 0,
+        name: 0,
         timestamp: handle.timestamp,
         callstack: smallvec![start_frame],
         user_regs: None,
@@ -135,6 +136,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_end(handle: *mut Lo
         time_enabled: 0,
         time_running: 0,
         value: 0,
+        name: 0,
         timestamp,
         callstack: smallvec![],
         user_regs: None,
@@ -172,6 +174,7 @@ pub unsafe extern "C" fn mperf_roofline_internal_notify_loop_stats(
             time_enabled: 0,
             time_running: 0,
             value,
+            name: 0,
             timestamp,
             callstack: smallvec![],
             user_regs: None,
