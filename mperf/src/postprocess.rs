@@ -195,12 +195,17 @@ async fn process_pmu_counters(
         ScenarioInfo::TMA(t) => &t.counters,
     };
 
+    let default_value = if matches!(info, ScenarioInfo::TMA(_)) {
+        ""
+    } else {
+        " DEFAULT 0"
+    };
     let str_events = events
         .iter()
         // NULL means this event was not a member of the sampled perf group;
         // zero means it was a member but observed no delta.  TMA needs this
         // distinction to keep a formula inside its coherent group.
-        .map(|event| format!("{} INTEGER", get_event_column_name(event)))
+        .map(|event| format!("{} INTEGER{}", get_event_column_name(event), default_value))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -330,30 +335,36 @@ async fn process_pmu_counters(
             .collect::<SmallVec<[_; 32]>>()
             .join(";");
 
-        // The first KPC observation in each multiplex epoch is a baseline,
-        // represented as a zero delta. Keep it available to correlation/DB
-        // processing, but do not emit meaningless zero-weight flamegraph rows.
-        if evt.ty == EventType::PmuCycles && evt.value > 0 && !func_names.is_empty() {
-            *flamegraph_cycles.entry(func_names.clone()).or_default() += evt.value;
-            if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
-                *per_core_cycles
-                    .entry(family_id)
-                    .or_insert_with(|| (name, HashMap::new()))
-                    .1
-                    .entry(func_names)
-                    .or_default() += evt.value;
+        // Frequency sampling makes every delivered overflow one observation.
+        // Do not weight it by the cumulative counter delta: after a lost or
+        // throttled interval that delta spans many seconds and cannot be
+        // attributed to the single IP which happens to arrive next.
+        // Zero is the initial KPC baseline and is not an actual observation.
+        if evt.ty == EventType::PmuCycles && !func_names.is_empty() {
+            if let Some(weight) = flamegraph_sample_weight(evt.value) {
+                *flamegraph_cycles.entry(func_names.clone()).or_default() += weight;
+                if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
+                    *per_core_cycles
+                        .entry(family_id)
+                        .or_insert_with(|| (name, HashMap::new()))
+                        .1
+                        .entry(func_names)
+                        .or_default() += weight;
+                }
             }
-        } else if evt.ty == EventType::PmuInstructions && evt.value > 0 && !func_names.is_empty() {
-            *flamegraph_instructions
-                .entry(func_names.clone())
-                .or_default() += evt.value;
-            if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
-                *per_core_instructions
-                    .entry(family_id)
-                    .or_insert_with(|| (name, HashMap::new()))
-                    .1
-                    .entry(func_names)
-                    .or_default() += evt.value;
+        } else if evt.ty == EventType::PmuInstructions && !func_names.is_empty() {
+            if let Some(weight) = flamegraph_sample_weight(evt.value) {
+                *flamegraph_instructions
+                    .entry(func_names.clone())
+                    .or_default() += weight;
+                if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
+                    *per_core_instructions
+                        .entry(family_id)
+                        .or_insert_with(|| (name, HashMap::new()))
+                        .1
+                        .entry(func_names)
+                        .or_default() += weight;
+                }
             }
         }
 
@@ -428,6 +439,10 @@ async fn process_pmu_counters(
     }
 
     Ok(())
+}
+
+fn flamegraph_sample_weight(counter_delta: u64) -> Option<u64> {
+    (counter_delta != 0).then_some(1)
 }
 
 fn insert_counter_group(
@@ -661,7 +676,7 @@ async fn write_flamegraph(res_dir: &Path, stem: &str, map: HashMap<String, u64>)
 
 #[cfg(test)]
 mod flamegraph_output_tests {
-    use super::write_flamegraph;
+    use super::{flamegraph_sample_weight, write_flamegraph};
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -677,6 +692,13 @@ mod flamegraph_output_tests {
         assert_eq!(std::fs::read(dir.join("empty.folded")).unwrap(), b"");
         assert!(!dir.join("empty.svg").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cumulative_gap_does_not_dominate_flamegraph_weight() {
+        assert_eq!(flamegraph_sample_weight(60_000_000_000), Some(1));
+        assert_eq!(flamegraph_sample_weight(1), Some(1));
+        assert_eq!(flamegraph_sample_weight(0), None);
     }
 }
 

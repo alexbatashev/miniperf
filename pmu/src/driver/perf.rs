@@ -91,10 +91,9 @@ impl PerfCountingDriver {
             attr.set_inherit(1);
             attr.set_exclusive(0);
             attr.sample_type = PERF_SAMPLE_IDENTIFIER as u64;
-            // CountingDriver::start enables the event immediately before the
-            // fork-gated child is released. Do not also request enable-on-exec:
-            // on some kernels that transition resets a pre-enabled attached
-            // event and leaves a short, partial measurement.
+            if pid.is_some() {
+                attr.set_enable_on_exec(1);
+            }
         }
 
         let native_handles = binding::direct(&counters, &mut attrs, pid)?;
@@ -117,7 +116,9 @@ impl PerfCountingDriver {
             attr.set_inherit(1);
             attr.set_exclusive(0);
             attr.sample_type = PERF_SAMPLE_IDENTIFIER as u64;
-            // See the single-PMU path above: start() owns the enable edge.
+            if pid.is_some() {
+                attr.set_enable_on_exec(1);
+            }
         };
 
         let open = |counter: &Counter, attr: &mut perf_event_attr| -> Result<(i32, u64), Error> {

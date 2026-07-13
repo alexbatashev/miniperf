@@ -139,19 +139,26 @@ impl SummaryTab {
                 .ok_or_else(|| "summary query returned no rows".to_string())?
                 .map_err(|error| error.to_string())?;
 
+            let read = |name| {
+                row.try_read::<Option<i64>, _>(name)
+                    .map(|value| value.unwrap_or_default() as u64)
+                    .map_err(|error| error.to_string())
+            };
             Ok(Stat {
-                cycles: row.read::<i64, _>("pmu_cycles") as u64,
-                instructions: row.read::<i64, _>("pmu_instructions") as u64,
+                cycles: read("pmu_cycles")?,
+                instructions: read("pmu_instructions")?,
                 branch_instructions: has_branch
-                    .then(|| row.read::<i64, _>("pmu_branch_instructions") as u64),
-                branch_misses: has_branch.then(|| row.read::<i64, _>("pmu_branch_misses") as u64),
-                cache_references: has_cache
-                    .then(|| row.read::<i64, _>("pmu_llc_references") as u64),
-                cache_misses: has_cache.then(|| row.read::<i64, _>("pmu_llc_misses") as u64),
+                    .then(|| read("pmu_branch_instructions"))
+                    .transpose()?,
+                branch_misses: has_branch.then(|| read("pmu_branch_misses")).transpose()?,
+                cache_references: has_cache.then(|| read("pmu_llc_references")).transpose()?,
+                cache_misses: has_cache.then(|| read("pmu_llc_misses")).transpose()?,
                 stalled_cycles_frontend: has_stalled
-                    .then(|| row.read::<i64, _>("pmu_stalled_cycles_frontend") as u64),
+                    .then(|| read("pmu_stalled_cycles_frontend"))
+                    .transpose()?,
                 stalled_cycles_backend: has_stalled
-                    .then(|| row.read::<i64, _>("pmu_stalled_cycles_backend") as u64),
+                    .then(|| read("pmu_stalled_cycles_backend"))
+                    .transpose()?,
                 initialized: true,
             })
         })();
