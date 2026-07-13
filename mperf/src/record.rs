@@ -242,6 +242,14 @@ fn publish_process_maps(dispatcher: Arc<EventDispatcher>, pid: i32) {
             filename: filename.to_string_lossy().to_string(),
             address: map.start(),
             size: map.size(),
+            // Linux executable mappings normally begin at a non-zero ELF file
+            // offset. Dropping it creates a second, overlapping module with a
+            // bogus load bias alongside PERF_RECORD_MMAP. Which one framehop
+            // sees first then depends on HashMap iteration order, making two
+            // otherwise identical recordings unwind into unrelated functions.
+            #[cfg(target_os = "linux")]
+            offset: map.offset,
+            #[cfg(not(target_os = "linux"))]
             offset: 0,
             pid: pid as u32,
         };
@@ -447,21 +455,21 @@ fn create_shmem_pipe(
 fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
     let scenario = pmu::host_tma_scenario().context("TMA is not supported on this CPU")?;
     let process = Process::new(command, &[])?;
-    let counter_groups = get_tma_counter_groups(&scenario)?;
-    // Keep group boundaries in the acquisition order. The perf driver creates
-    // a fresh group whenever it sees the repeated fixed-counter pair.
-    let counters = counter_groups.iter().flatten().cloned().collect::<Vec<_>>();
-    let metadata_counters = get_pmu_counters(Scenario::TMA);
+    // Validate the formula groups, but do not turn each one into an independent
+    // sampling leader. Multiple cycle leaders multiply the interrupt rate and
+    // severely perturb the workload (especially while capturing DWARF stacks).
+    // The original TMA collector sampled the deduplicated event set once.
+    get_tma_counter_groups(&scenario)?;
+    let counters = get_pmu_counters(Scenario::TMA);
 
-    let builder = pmu::SamplingDriverBuilder::new()
+    // TMA uses the same sampling engine and attribution mode as Snapshot.
+    // Only the counter set differs. The original TMA implementation worked
+    // this way; switching selected scenarios to PEBS changed the meaning and
+    // availability of samples without changing the metric formulas.
+    let mut driver = pmu::SamplingDriverBuilder::new()
         .counters(&counters)
-        .process(&process);
-    let builder = if scenario.precise_attribution {
-        builder.precise_ip()
-    } else {
-        builder
-    };
-    let mut driver = builder.build()?;
+        .process(&process)
+        .build()?;
     let recorded_pid = process.pid();
     if cfg!(target_os = "macos") {
         publish_process_maps(dispatcher.clone(), recorded_pid);
@@ -514,7 +522,7 @@ fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scena
 
     Ok(ScenarioInfo::TMA(mperf_data::TMAInfo {
         pid: recorded_pid,
-        counters: metadata_counters
+        counters: counters
             .iter()
             .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
             .collect(),

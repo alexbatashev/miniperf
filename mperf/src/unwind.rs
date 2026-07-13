@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use framehop::{CacheNative, MayAllocateDuringUnwind, Module, Unwinder, UnwinderNative};
 use framehop_object::ObjectSectionInfo;
@@ -9,8 +9,8 @@ type NativeCache = CacheNative<MayAllocateDuringUnwind>;
 
 /// Per-process module tables and caches used only after recording has completed.
 pub(crate) struct PostHocUnwinder {
-    unwinders: HashMap<u32, NativeUnwinder>,
-    caches: HashMap<u32, NativeCache>,
+    unwinders: BTreeMap<u32, NativeUnwinder>,
+    caches: BTreeMap<u32, NativeCache>,
     last_stack: Option<(u128, smallvec::SmallVec<[CallFrame; 32]>)>,
 }
 
@@ -18,7 +18,11 @@ impl PostHocUnwinder {
     pub(crate) fn new(proc_maps: &[ProcMapEntry]) -> Self {
         // Coalesce the individual executable mappings for one loaded object. framehop
         // needs the object load bias plus a runtime range; both come from ProcMapEntry.
-        let mut ranges = HashMap::<(u32, String, u64), (u64, u64)>::new();
+        // A sorted map makes module insertion reproducible. Correct recordings
+        // should have only one load bias per mapping, but old result sets may
+        // contain conflicting overlapping entries and must not change meaning
+        // randomly from one `mperf show` invocation to the next.
+        let mut ranges = BTreeMap::<(u32, String, u64), (u64, u64)>::new();
         for map in proc_maps {
             if map.filename.is_empty() || map.filename.starts_with('[') || map.size == 0 {
                 continue;
@@ -35,7 +39,7 @@ impl PostHocUnwinder {
                 .or_insert((start, end));
         }
 
-        let mut unwinders = HashMap::<u32, NativeUnwinder>::new();
+        let mut unwinders = BTreeMap::<u32, NativeUnwinder>::new();
         for ((pid, filename, base), (start, end)) in ranges {
             let Ok(bytes) = fs::read(Path::new(&filename)) else {
                 continue;
@@ -54,7 +58,7 @@ impl PostHocUnwinder {
 
         Self {
             unwinders,
-            caches: HashMap::new(),
+            caches: BTreeMap::new(),
             last_stack: None,
         }
     }
