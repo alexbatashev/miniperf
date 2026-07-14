@@ -109,6 +109,55 @@ struct AssemblyRow {
     llc_references: u64,
 }
 
+#[derive(Clone, Copy, Default)]
+struct AssemblyStats {
+    samples: u64,
+    cycles: u64,
+    instructions: u64,
+    branch_misses: u64,
+    branch_instructions: u64,
+    llc_misses: u64,
+    llc_references: u64,
+}
+
+impl AssemblyStats {
+    fn merge(&mut self, other: Self) {
+        self.samples = self.samples.saturating_add(other.samples);
+        self.cycles = self.cycles.saturating_add(other.cycles);
+        self.instructions = self.instructions.saturating_add(other.instructions);
+        self.branch_misses = self.branch_misses.saturating_add(other.branch_misses);
+        self.branch_instructions = self
+            .branch_instructions
+            .saturating_add(other.branch_instructions);
+        self.llc_misses = self.llc_misses.saturating_add(other.llc_misses);
+        self.llc_references = self.llc_references.saturating_add(other.llc_references);
+    }
+}
+
+fn assembly_row(
+    address: u64,
+    instruction: String,
+    stats: AssemblyStats,
+    total_samples: u64,
+) -> AssemblyRow {
+    AssemblyRow {
+        address,
+        instruction,
+        samples: stats.samples,
+        share: if total_samples > 0 {
+            stats.samples as f64 / total_samples as f64
+        } else {
+            0.0
+        },
+        cycles: stats.cycles,
+        instructions: stats.instructions,
+        branch_misses: stats.branch_misses,
+        branch_instructions: stats.branch_instructions,
+        llc_misses: stats.llc_misses,
+        llc_references: stats.llc_references,
+    }
+}
+
 #[derive(Clone)]
 struct AssemblyViewState {
     func_name: String,
@@ -514,7 +563,6 @@ impl MetricsTableTab {
             let mut stats_map = HashMap::new();
             let mut ordered_addresses = Vec::new();
             let mut total_samples = 0u64;
-            let mut max_samples = 0u64;
 
             while let State::Row = stats_stmt.next().map_err(|err| err.to_string())? {
                 let address = stats_stmt
@@ -545,7 +593,7 @@ impl MetricsTableTab {
 
                 stats_map.insert(
                     address,
-                    (
+                    AssemblyStats {
                         samples,
                         cycles,
                         instructions,
@@ -553,57 +601,119 @@ impl MetricsTableTab {
                         branch_instructions,
                         llc_misses,
                         llc_references,
-                    ),
+                    },
                 );
                 ordered_addresses.push(address);
 
-                total_samples += samples;
-                max_samples = max_samples.max(samples);
+                total_samples = total_samples.saturating_add(samples);
             }
 
             if ordered_addresses.is_empty() {
                 return Err("No assembly information found for the selected function".to_string());
             }
 
-            let disassembler =
-                crate::disassembly::default_disassembler().map_err(|err| err.to_string())?;
-            let disassembly = disassembler
-                .disassemble(&crate::disassembly::DisassembleRequest {
-                    module_path: module_path.clone().into(),
-                    load_bias: 0,
-                })
+            // PMU instruction pointers are not guaranteed to equal the first byte of an
+            // instruction. Attribute each one to the closest preceding persisted instruction,
+            // bounded by the maximum x86 instruction length so gaps between selected symbols do
+            // not absorb unrelated samples.
+            const MAX_INSTRUCTION_BYTES: u64 = 15;
+            let mut instruction_stmt = conn
+                .prepare(
+                    "SELECT runtime_address, symbol FROM assembly_lines
+                     WHERE module_path = ? AND runtime_address BETWEEN ? AND ?
+                       AND symbol IS NOT NULL
+                     ORDER BY runtime_address DESC LIMIT 1;",
+                )
+                .map_err(|err| err.to_string())?;
+            let mut attributed_stats = HashMap::<u64, AssemblyStats>::new();
+            let mut owner_symbols = Vec::new();
+            let mut unattributed = Vec::new();
+            for address in ordered_addresses {
+                instruction_stmt.reset().map_err(|err| err.to_string())?;
+                instruction_stmt
+                    .bind((1, module_path.as_str()))
+                    .map_err(|err| err.to_string())?;
+                instruction_stmt
+                    .bind((2, address.saturating_sub(MAX_INSTRUCTION_BYTES) as i64))
+                    .map_err(|err| err.to_string())?;
+                instruction_stmt
+                    .bind((3, address as i64))
+                    .map_err(|err| err.to_string())?;
+
+                let stats = stats_map[&address];
+                match instruction_stmt.next().map_err(|err| err.to_string())? {
+                    State::Row => {
+                        let instruction_address = instruction_stmt
+                            .read::<i64, _>("runtime_address")
+                            .map_err(|err| err.to_string())?
+                            as u64;
+                        let owner = instruction_stmt
+                            .read::<String, _>("symbol")
+                            .map_err(|err| err.to_string())?;
+                        attributed_stats
+                            .entry(instruction_address)
+                            .or_default()
+                            .merge(stats);
+                        owner_symbols.push(owner);
+                    }
+                    State::Done => unattributed.push((address, stats)),
+                }
+            }
+            owner_symbols.sort_unstable();
+            owner_symbols.dedup();
+
+            let mut lines_stmt = conn
+                .prepare(
+                    "SELECT runtime_address, instruction FROM assembly_lines
+                     WHERE module_path = ? AND symbol = ? ORDER BY runtime_address;",
+                )
                 .map_err(|err| err.to_string())?;
 
-            let symbol = disassembly
-                .iter()
-                .find_map(|line| line.symbol.clone())
-                .unwrap_or_default();
+            let mut rows = Vec::new();
+            for owner in &owner_symbols {
+                lines_stmt.reset().map_err(|err| err.to_string())?;
+                lines_stmt
+                    .bind((1, module_path.as_str()))
+                    .map_err(|err| err.to_string())?;
+                lines_stmt
+                    .bind((2, owner.as_str()))
+                    .map_err(|err| err.to_string())?;
+                while let State::Row = lines_stmt.next().map_err(|err| err.to_string())? {
+                    let address = lines_stmt
+                        .read::<i64, _>("runtime_address")
+                        .map_err(|err| err.to_string())? as u64;
+                    let instruction = lines_stmt
+                        .read::<String, _>("instruction")
+                        .map_err(|err| err.to_string())?;
+                    let stats = attributed_stats.get(&address).copied().unwrap_or_default();
+                    rows.push(assembly_row(address, instruction, stats, total_samples));
+                }
+            }
 
-            let rows = disassembly
-                .into_iter()
-                .map(|inst| {
-                    let stats = stats_map
-                        .get(&inst.rel_address)
-                        .cloned()
-                        .unwrap_or((0, 0, 0, 0, 0, 0, 0));
-                    AssemblyRow {
-                        address: inst.rel_address,
-                        instruction: inst.instruction,
-                        samples: stats.0,
-                        share: if total_samples > 0 {
-                            stats.0 as f64 / total_samples as f64
-                        } else {
-                            0.0
-                        },
-                        cycles: stats.1,
-                        instructions: stats.2,
-                        branch_misses: stats.3,
-                        branch_instructions: stats.4,
-                        llc_misses: stats.5,
-                        llc_references: stats.6,
-                    }
-                })
-                .collect();
+            // Old or partially postprocessed recordings may not contain the selected machine
+            // symbol. Keep their metrics visible and make the missing instruction explicit.
+            rows.extend(unattributed.into_iter().map(|(address, stats)| {
+                assembly_row(
+                    address,
+                    "<persisted instruction unavailable>".to_string(),
+                    stats,
+                    total_samples,
+                )
+            }));
+            rows.sort_unstable_by_key(|row| row.address);
+
+            if rows.is_empty() {
+                return Err(
+                    "Persisted assembly is not available for the selected function".to_string(),
+                );
+            }
+
+            let max_samples = rows.iter().map(|row| row.samples).max().unwrap_or(0);
+            let symbol = match owner_symbols.as_slice() {
+                [] => "[instructions unavailable]".to_string(),
+                [owner] => owner.clone(),
+                owners => format!("{} machine symbols", owners.len()),
+            };
 
             Ok(AssemblyViewState {
                 func_name: func_name.clone(),
@@ -1322,5 +1432,68 @@ mod tests {
             "SELECT * FROM hotspots ORDER BY total DESC LIMIT 50"
         );
         assert!(config.columns.len() > 5);
+    }
+
+    #[tokio::test]
+    async fn assembly_view_attributes_samples_and_keeps_unavailable_metrics() {
+        let connection = Connection::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE pmu_counters (ip INTEGER, pmu_cycles INTEGER);
+                 CREATE TABLE proc_map (ip INTEGER, module_path TEXT, func_name TEXT);
+                 CREATE TABLE assembly_address_stats (
+                    module_path TEXT, func_name TEXT, address INTEGER, samples INTEGER,
+                    cycles INTEGER, instructions INTEGER, branch_misses INTEGER,
+                    branch_instructions INTEGER, llc_misses INTEGER, llc_references INTEGER
+                 );
+                 CREATE TABLE assembly_lines (
+                    module_path TEXT, symbol TEXT, rel_address INTEGER,
+                    runtime_address INTEGER, instruction TEXT
+                 );
+                 INSERT INTO pmu_counters VALUES (4099, 10);
+                 INSERT INTO proc_map VALUES (4099, '/tmp/test', 'logical');
+                 INSERT INTO assembly_address_stats VALUES
+                    ('/tmp/test', 'logical', 4099, 2, 20, 40, 1, 4, 2, 8),
+                    ('/tmp/test', 'logical', 4100, 3, 30, 60, 2, 6, 3, 12),
+                    ('/tmp/test', 'logical', 8192, 7, 70, 140, 3, 8, 4, 16),
+                    ('/tmp/test', 'logical', 12288, 11, 110, 220, 5, 10, 6, 24);
+                 INSERT INTO assembly_lines VALUES
+                    ('/tmp/test', 'machine_a', 4096, 4096, 'mov %rax,%rbx'),
+                    ('/tmp/test', 'machine_a', 4101, 4101, 'ret'),
+                    ('/tmp/test', 'machine_b', 8192, 8192, 'add %rax,%rbx');",
+            )
+            .unwrap();
+        let spec = MetricsTableSpec {
+            view: "hotspots".to_string(),
+            title: None,
+            include_default_columns: false,
+            columns: Vec::new(),
+            order_by: None,
+            limit: None,
+            sticky_columns: None,
+            function_column: Some("func_name".to_string()),
+            enable_assembly: true,
+        };
+        let tab = MetricsTableTab::new(spec, Arc::new(Mutex::new(connection)));
+
+        tab.clone().fetch_assembly("logical".to_string(), 0).await;
+
+        let state = tab.state.lock();
+        assert!(state.assembly_error.is_none());
+        let view = state.assembly.as_ref().unwrap();
+        assert_eq!(view.symbol, "2 machine symbols");
+        let first = view.rows.iter().find(|row| row.address == 4096).unwrap();
+        assert_eq!(first.samples, 5);
+        assert_eq!(first.cycles, 50);
+        assert_eq!(first.instructions, 100);
+        let second = view.rows.iter().find(|row| row.address == 8192).unwrap();
+        assert_eq!(second.samples, 7);
+        let unavailable = view.rows.iter().find(|row| row.address == 12288).unwrap();
+        assert_eq!(unavailable.samples, 11);
+        assert_eq!(
+            unavailable.instruction,
+            "<persisted instruction unavailable>"
+        );
+        assert_eq!(view.max_samples, 11);
     }
 }
