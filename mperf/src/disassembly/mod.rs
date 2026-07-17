@@ -24,6 +24,7 @@ pub struct DisassembleTarget {
     /// Stable, demangled owner stored for every emitted instruction.
     pub owner_symbol: String,
     pub start_address: u64,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub end_address: u64,
 }
 

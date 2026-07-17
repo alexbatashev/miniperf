@@ -1488,10 +1488,7 @@ mod optimized_postprocessing_tests {
         let symbol = object
             .symbols()
             .find(|symbol| {
-                symbol.kind() == SymbolKind::Text
-                    && symbol.address() != 0
-                    && symbol.size() > 2
-                    && symbol.name().is_ok()
+                symbol.kind() == SymbolKind::Text && symbol.address() != 0 && symbol.name().is_ok()
             })
             .unwrap();
         let sampled_address = symbol.address() + 1;
