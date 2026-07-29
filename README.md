@@ -159,6 +159,29 @@ mperf show <output_directory>
 
 This will display detailed analysis based on the recorded profile.
 
+### Querying Results
+
+Recorded performance data can also be explored non-interactively with read-only
+SQLite queries:
+
+```sh
+mperf query ./results \
+  'SELECT func_name, total, cycles, instructions, ipc
+   FROM hotspots ORDER BY total DESC LIMIT 20'
+
+mperf query --format json ./results \
+  'SELECT metric, value, verdict FROM tma_summary ORDER BY value DESC'
+```
+
+Queries run directly against `perf.db` using a query-only connection. `SELECT`,
+CTEs, aggregation, joins, window functions, `EXPLAIN`, and read-only `PRAGMA`
+statements are supported; writes and multiple statements are rejected. Output
+is capped at 50 rows by default and can be raised with `--max-rows` up to 10,000.
+
+Run `mperf query help` for the complete guide, including available tables and
+views, schema discovery, formula inspection, Roofline and TMA examples, JSON
+output, SQL files, and stdin usage.
+
 ## Platform-Specific Notes
 
 ### Intel Tiger Lake

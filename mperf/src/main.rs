@@ -4,6 +4,7 @@ mod event_dispatcher;
 mod events_export;
 mod postprocess;
 mod processing;
+mod query;
 mod record;
 mod stat;
 mod tui;
@@ -24,6 +25,7 @@ use clap::{Parser, Subcommand};
 
 use events_export::do_events_export;
 use mperf_data::Scenario;
+use query::{do_query, QueryFormat};
 use record::do_record;
 use stat::do_stat;
 
@@ -66,6 +68,22 @@ enum Commands {
     },
     EventsExport {
         result_directory: String,
+    },
+    /// Run one read-only SQLite query against recorded performance data.
+    Query {
+        /// Result directory followed by one quoted SQL statement. Use
+        /// `mperf query help` for the complete guide.
+        #[arg(value_names = ["RESULT_DIRECTORY", "SQL"], num_args = 0..=2)]
+        arguments: Vec<String>,
+        /// Output format.
+        #[arg(short, long, value_enum, default_value_t = QueryFormat::Text)]
+        format: QueryFormat,
+        /// Read SQL from a file instead of the command line. Use `-` for stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<String>,
+        /// Maximum rows emitted, independent of any SQL LIMIT.
+        #[arg(long, default_value_t = 50, value_parser = query::parse_max_rows)]
+        max_rows: usize,
     },
 }
 
@@ -113,6 +131,14 @@ async fn main() -> Result<()> {
         Commands::EventsExport { result_directory } => {
             let path = Path::new(&result_directory);
             do_events_export(path);
+        }
+        Commands::Query {
+            arguments,
+            format,
+            file,
+            max_rows,
+        } => {
+            return do_query(arguments, file, format, max_rows);
         }
     }
 
