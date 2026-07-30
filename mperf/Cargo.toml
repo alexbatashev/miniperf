@@ -33,10 +33,14 @@ kdam = "0.6.2"
 flamelens = "0.3.1"
 inferno = "0.12.2"
 regex = "1.11.1"
+rayon = "1.12.0"
 which = "6.0.1"
 addr2line = "0.24.2"
 object = "0.36.7"
 symbolize = { package = "miniperf-symbolize", path = "../symbolize" }
+
+[build-dependencies]
+cc = "1.2.54"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 framehop = { version = "0.16.0", default-features = false, features = ["std"] }

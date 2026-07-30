@@ -1,22 +1,17 @@
 use anyhow::{Context, Result};
-use mperf_data::{
-    CallFrame, Event, IPCMessage, ProcMapEntry, RecordInfo, RooflineInfo, ScenarioInfo,
-};
-use std::{
-    collections::HashMap,
-    fs::File,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use mperf_data::{CallFrame, Event, ProcMapEntry, RecordInfo, ScenarioInfo};
+use std::{fs::File, path::Path, sync::Arc};
+
+#[cfg(target_os = "macos")]
+use std::{collections::HashMap, path::PathBuf};
 
 use pmu::{Counter, Process, Record};
-
-const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 use crate::{
     counter_selection::{get_pmu_counters, get_tma_counter_groups},
     event_dispatcher::EventDispatcher,
     postprocess::perform_postprocessing,
+    roofline,
     utils::counter_to_event_ty,
     Scenario,
 };
@@ -29,14 +24,37 @@ pub async fn do_record(
     output_directory: &Path,
     pid: Option<u32>,
     command: Vec<String>,
+    roofline_options: roofline::Options,
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
+
+    let cpu_info = if scenario == Scenario::Roofline {
+        println!("Calibrating host Roofline ceilings...");
+        let calibration = roofline::calibrate_host()?;
+        println!(
+            "Host ceilings: {:.2} GFLOP/s FP64, {:.2} GB/s memory ({} Rayon threads)",
+            calibration.fp64_gflops, calibration.memory_gbytes_per_second, calibration.threads
+        );
+        mperf_data::CpuInfo {
+            roofline_calibration: Some(Box::new(calibration)),
+        }
+    } else {
+        mperf_data::CpuInfo::default()
+    };
 
     let (dispatcher, join_handle) = EventDispatcher::new(output_directory);
 
     let info = match scenario {
         Scenario::Snapshot => snapshot(dispatcher.clone(), pid, &command)?,
-        Scenario::Roofline => roofline(dispatcher.clone(), &command).await?,
+        Scenario::Roofline => {
+            roofline::record(
+                &roofline_options,
+                dispatcher.clone(),
+                &command,
+                output_directory,
+            )
+            .await?
+        }
         Scenario::TMA => topdown(dispatcher.clone(), &command)?,
     };
 
@@ -68,6 +86,7 @@ pub async fn do_record(
         cpu_model,
         cpu_vendor,
         cores,
+        cpu_info,
         scenario_info: info,
     };
 
@@ -272,184 +291,6 @@ fn mach_o_text_address(path: &Path) -> Option<u64> {
 #[cfg(target_os = "macos")]
 fn macos_segment_is_executable(size: u64, initial_protection: i32) -> bool {
     size > 0 && initial_protection & VM_PROT_EXECUTE != 0
-}
-
-fn get_exe_dir() -> std::io::Result<PathBuf> {
-    let mut exe_path = std::env::current_exe()?;
-    exe_path.pop();
-    Ok(exe_path)
-}
-
-async fn roofline(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
-    let exe_path = get_exe_dir()?.to_str().unwrap().to_string();
-
-    // FIXME make this platform independent
-    let ld_path = match std::env::var("LD_LIBRARY_PATH") {
-        Ok(path) => format!("{}:{}:{}/../lib", path, exe_path, exe_path),
-        Err(_) => format!("{}:{}/../lib", exe_path, exe_path),
-    };
-
-    println!(
-        "Run 1: collecting performance data for '{}'",
-        command.join(" ")
-    );
-
-    let (pipe_name, task) =
-        create_shmem_pipe(command[0].split("/").last().unwrap(), dispatcher.clone())?;
-
-    let process = Process::new(
-        command,
-        &[
-            ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
-            ("LD_LIBRARY_PATH".to_string(), ld_path.clone()),
-            ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
-        ],
-    )?;
-
-    let counters = get_pmu_counters(Scenario::Roofline);
-
-    let mut driver = pmu::SamplingDriverBuilder::new()
-        .counters(&counters)
-        .process(&process)
-        .build()?;
-
-    let roofline_dispatcher = dispatcher.clone();
-
-    driver.start(Arc::new(move |record| {
-        match record {
-            Record::Sample(sample) => {
-                let unique_id = uuid::Uuid::now_v7().as_u128();
-                let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
-                let name = if let Counter::Custom(name) = &sample.counter {
-                    dispatcher.string_id(name)
-                } else {
-                    0
-                };
-                let event = Event {
-                    unique_id,
-                    correlation_id: sample.event_id,
-                    parent_id: 0,
-                    ty: counter_to_event_ty(&sample.counter),
-                    thread_id: sample.tid,
-                    process_id: sample.pid,
-                    cpu: sample.cpu,
-                    time_enabled: sample.time_enabled,
-                    time_running: sample.time_running,
-                    value: sample.value,
-                    timestamp: sample.time,
-                    name,
-                    callstack,
-                    user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
-                        abi: regs.abi,
-                        mask: regs.mask,
-                        values: regs.values,
-                    }),
-                    user_stack: sample.user_stack,
-                };
-
-                dispatcher.publish_event_sync(event);
-            }
-            Record::ProcAddr(addr) => {
-                let entry = ProcMapEntry {
-                    filename: addr.filename,
-                    address: addr.addr as usize,
-                    size: addr.len as usize,
-                    offset: addr.pgoff as usize,
-                    pid: addr.pid,
-                };
-
-                dispatcher.publish_proc_map_sync(entry);
-            }
-        };
-    }))?;
-
-    process.cont();
-    process.wait()?;
-    driver.stop()?;
-    task.await?;
-
-    let perf_pid = process.pid();
-
-    println!(
-        "Run 2: collecting loop statistics for '{}'",
-        command.join(" ")
-    );
-
-    let (pipe_name, task) =
-        create_shmem_pipe(command[0].split("/").last().unwrap(), roofline_dispatcher)?;
-
-    let process = Process::new(
-        command,
-        &[
-            ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name.clone()),
-            ("LD_LIBRARY_PATH".to_string(), ld_path),
-            ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
-            (
-                "MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED".to_string(),
-                "1".to_string(),
-            ),
-        ],
-    )?;
-
-    process.cont();
-    process.wait()?;
-
-    task.await?;
-
-    let inst_pid = process.pid();
-
-    Ok(ScenarioInfo::Roofline(RooflineInfo {
-        perf_pid,
-        counters: counters
-            .iter()
-            .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
-            .collect(),
-        inst_pid,
-    }))
-}
-
-fn create_shmem_pipe(
-    prefix: &str,
-    roofline_dispatcher: Arc<EventDispatcher>,
-) -> Result<(String, tokio::task::JoinHandle<()>), std::io::Error> {
-    let pipe_name = format!(
-        "/{}{}{}",
-        prefix,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    );
-
-    let rx = shmem::proc_channel::Receiver::<IPCMessage>::new(&pipe_name, SIZE_16MB)?;
-
-    let task = tokio::spawn(async move {
-        let mut strings = HashMap::<u128, u128>::new();
-
-        while let Some(message) = rx.recv().await {
-            match message {
-                IPCMessage::String(string) => {
-                    let id = roofline_dispatcher.string_id_async(&string.value).await;
-                    strings.insert(string.key, id);
-                }
-                IPCMessage::Event(mut event) => {
-                    for stack in event.callstack.iter_mut() {
-                        if let CallFrame::Location(loc) = stack {
-                            loc.function_name =
-                                strings.get(&loc.function_name).cloned().unwrap_or_default();
-                            loc.file_name =
-                                strings.get(&loc.file_name).cloned().unwrap_or_default();
-                        }
-                    }
-
-                    roofline_dispatcher.publish_event(event).await;
-                }
-            }
-        }
-    });
-
-    Ok((pipe_name, task))
 }
 
 fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {

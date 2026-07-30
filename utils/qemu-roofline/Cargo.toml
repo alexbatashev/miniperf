@@ -1,0 +1,8 @@
+[package]
+name = "miniperf-qemu-roofline"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "miniperf_qemu_roofline"
+crate-type = ["cdylib"]
