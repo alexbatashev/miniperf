@@ -203,6 +203,7 @@ fn cpu_affinity() -> Option<String> {
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn format_cpu_list(cpus: &[usize]) -> String {
     let mut ranges = Vec::new();
     let mut start = *cpus.first().unwrap_or(&0);

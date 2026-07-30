@@ -35,10 +35,13 @@ struct Counts {
 }
 
 impl QemuBackend {
-    pub(super) fn new(options: &Options) -> Result<Self> {
-        #[cfg(not(target_os = "linux"))]
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn new(_options: &Options) -> Result<Self> {
         anyhow::bail!("the QEMU roofline backend supports Linux hosts only");
+    }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn new(options: &Options) -> Result<Self> {
         let plugin = options
             .qemu_plugin
             .clone()
@@ -364,6 +367,7 @@ fn parse_counts(input: &str) -> Result<Counts> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn default_plugin_path() -> PathBuf {
     super::executable_directory()
         .unwrap_or_default()
