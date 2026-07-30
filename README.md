@@ -107,10 +107,23 @@ Available Scenarios
 
 - `snapshot`: A basic performance snapshot similar to stat command but in
   sampling mode. Useful for general performance overview.
-- `roofline`: Roofline analysis capture that requires instrumented binaries.
-  This runs collection in two passes:
+- `roofline`: Two-pass Roofline analysis capture:
     1. First to collect PMU (Performance Monitoring Unit) counters
-    2. Second to gather loop statistics
+    2. Second to gather operation and memory statistics
+
+  Choose compiler-instrumented source-loop accounting or binary accounting with
+  plugin-enabled QEMU:
+
+  ```sh
+  cargo build -p mperf -p miniperf-qemu-roofline
+  mperf record -s roofline --roofline-backend qemu \
+    -o roofline-results -- ./kernel-riscv64
+  ```
+
+  Miniperf calibrates FP64 compute and memory-bandwidth ceilings before every
+  recording and stores the raw samples and derived ridge point with the CPU
+  metadata. See the [Roofline tutorial](docs/tutorials/roofline.md) for setup,
+  AVX-512 and RVV examples, backend selection, and result interpretation.
 
 #### Call-stack collection overhead
 
@@ -139,15 +152,6 @@ Postprocessing expands DWARF inline frames and uses the shared
 `.gnu_debuglink`, system and miniperf build-id caches, and
 `/tmp/perf-<pid>.map` JIT symbol files. See [`symbolize/README.md`](symbolize/README.md)
 for lookup order, cache paths, and the explicitly opt-in debuginfod behavior.
-
-#### Building instrumented application
-
-Roofline analysis requires instrumented binaries to work properly. Here's how
-you can use Clang plugin to build your application:
-
-```sh
-clang -O3 source.c -o a.out -g -Xclang -fpass-plugin=$HOME/miniperf/target/clang_plugin/lib/miniperf_plugin.so -L $HOME/miniperf/target/release/ -lcollector
-```
 
 ### Viewing Results
 

@@ -173,7 +173,7 @@ async fn process_strings(connection: &sqlite::Connection, res_dir: &Path) -> Res
             connection.prepare("INSERT INTO strings (id, string) VALUES (?, ?);")?;
         for s in strings {
             statement.reset()?;
-            statement.bind((1, s.id as f64))?;
+            bind_id(&mut statement, 1, s.id)?;
             statement.bind((2, s.value.as_str()))?;
             statement.next()?;
         }
@@ -737,11 +737,11 @@ fn persist_roofline_data(connection: &sqlite::Connection, data: RooflineData) ->
     )?;
     for (run, end) in data.runs {
         run_stmt.reset()?;
-        run_stmt.bind((1, run.id as f64))?;
+        bind_id(&mut run_stmt, 1, run.id)?;
         run_stmt.bind((2, run.pid as i64))?;
         run_stmt.bind((3, run.tid as i64))?;
-        run_stmt.bind((4, run.file_name as f64))?;
-        run_stmt.bind((5, run.func_name as f64))?;
+        bind_id(&mut run_stmt, 4, run.file_name)?;
+        bind_id(&mut run_stmt, 5, run.func_name)?;
         run_stmt.bind((6, run.line as i64))?;
         run_stmt.bind((7, run.start as i64))?;
         run_stmt.bind((8, end as i64))?;
@@ -757,11 +757,11 @@ fn persist_roofline_data(connection: &sqlite::Connection, data: RooflineData) ->
     )?;
     for ops in data.ops {
         ops_stmt.reset()?;
-        ops_stmt.bind((1, ops.id as f64))?;
+        bind_id(&mut ops_stmt, 1, ops.id)?;
         ops_stmt.bind((2, ops.pid as i64))?;
         ops_stmt.bind((3, ops.tid as i64))?;
-        ops_stmt.bind((4, ops.file_name as f64))?;
-        ops_stmt.bind((5, ops.func_name as f64))?;
+        bind_id(&mut ops_stmt, 4, ops.file_name)?;
+        bind_id(&mut ops_stmt, 5, ops.func_name)?;
         ops_stmt.bind((6, ops.line as i64))?;
         for (index, value) in [
             ops.bytes_load,
@@ -820,7 +820,7 @@ fn insert_counter_group(
             .join(", ")
     );
     statement.reset()?;
-    statement.bind((1, lead_event.unique_id as f64))?;
+    bind_id(statement, 1, lead_event.unique_id)?;
     statement.bind((2, lead_event.process_id as i64))?;
     statement.bind((3, lead_event.thread_id as i64))?;
     statement.bind((4, lead_event.time_enabled as i64))?;
@@ -842,6 +842,11 @@ fn insert_counter_group(
     }
     statement.next()?;
     Ok(())
+}
+
+fn bind_id(statement: &mut sqlite::Statement<'_>, index: usize, id: u128) -> sqlite::Result<()> {
+    let bytes = id.to_be_bytes();
+    statement.bind((index, bytes.as_slice()))
 }
 
 /// Persist one-second metric intervals and a machine-readable dominant verdict.
@@ -1447,7 +1452,7 @@ fn remove_load_bias(runtime: u64, load_bias: i64) -> Option<u64> {
 
 #[cfg(test)]
 mod optimized_postprocessing_tests {
-    use super::{populate_assembly_samples, sampled_disassembly_targets, RooflineData};
+    use super::{bind_id, populate_assembly_samples, sampled_disassembly_targets, RooflineData};
     use mperf_data::{CallFrame, Event, EventType, Location, RooflineInfo, ScenarioInfo};
     use object::{Object, ObjectSymbol, SymbolKind};
     use sqlite::State;
@@ -1481,6 +1486,24 @@ mod optimized_postprocessing_tests {
     }
 
     #[test]
+    fn sqlite_ids_preserve_full_u128_precision() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection.execute("CREATE TABLE ids (id BLOB);").unwrap();
+        let mut insert = connection.prepare("INSERT INTO ids VALUES (?);").unwrap();
+        for id in [u128::MAX - 1, u128::MAX] {
+            insert.reset().unwrap();
+            bind_id(&mut insert, 1, id).unwrap();
+            insert.next().unwrap();
+        }
+
+        let mut count = connection
+            .prepare("SELECT COUNT(DISTINCT id) FROM ids;")
+            .unwrap();
+        assert_eq!(count.next().unwrap(), State::Row);
+        assert_eq!(count.read::<i64, _>(0).unwrap(), 2);
+    }
+
+    #[test]
     fn sampled_symbol_selection_avoids_unrelated_object_code() {
         let executable = std::env::current_exe().unwrap();
         let bytes = std::fs::read(&executable).unwrap();
@@ -1503,6 +1526,7 @@ mod optimized_postprocessing_tests {
     #[test]
     fn roofline_events_are_collected_during_the_pmu_pass() {
         let info = ScenarioInfo::Roofline(RooflineInfo {
+            backend: "compiler".to_string(),
             perf_pid: 10,
             counters: Vec::new(),
             inst_pid: 20,

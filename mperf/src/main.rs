@@ -6,6 +6,7 @@ mod postprocess;
 mod processing;
 mod query;
 mod record;
+mod roofline;
 mod stat;
 mod tui;
 #[cfg(all(
@@ -56,6 +57,18 @@ enum Commands {
     Record {
         #[arg(short, long)]
         scenario: Scenario,
+        /// Roofline accounting implementation.
+        #[arg(long, value_enum, default_value_t = roofline::BackendKind::Compiler)]
+        roofline_backend: roofline::BackendKind,
+        /// QEMU user-mode binary; auto-detected from the guest ELF when omitted.
+        #[arg(long)]
+        qemu: Option<PathBuf>,
+        /// QEMU plugin shared library; defaults to the artifact next to mperf.
+        #[arg(long)]
+        qemu_plugin: Option<PathBuf>,
+        /// Extra argument passed to QEMU before the guest executable.
+        #[arg(long, allow_hyphen_values = true)]
+        qemu_arg: Vec<String>,
         #[arg(short, long)]
         output_directory: String,
         #[arg(short, long)]
@@ -107,10 +120,22 @@ async fn main() -> Result<()> {
         }
         Commands::Record {
             scenario,
+            roofline_backend,
+            qemu,
+            qemu_plugin,
+            qemu_arg,
             output_directory,
             pid,
             command,
         } => {
+            let roofline = roofline::Options {
+                backend: roofline_backend,
+                qemu,
+                qemu_plugin,
+                qemu_args: qemu_arg,
+            };
+            roofline.validate_for(scenario)?;
+
             if std::fs::exists(&output_directory)? {
                 return Err(Into::<anyhow::Error>::into(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -122,7 +147,7 @@ async fn main() -> Result<()> {
 
             let output_directory = PathBuf::from_str(&output_directory)?;
 
-            return do_record(scenario, &output_directory, pid, command).await;
+            return do_record(scenario, &output_directory, pid, command, roofline).await;
         }
         Commands::Show { result_directory } => {
             let path = Path::new(&result_directory);

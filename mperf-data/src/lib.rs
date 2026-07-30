@@ -30,9 +30,15 @@ pub struct SnapshotInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RooflineInfo {
+    #[serde(default = "default_roofline_backend")]
+    pub backend: String,
     pub perf_pid: i32,
     pub counters: Vec<(EventType, String)>,
     pub inst_pid: i32,
+}
+
+fn default_roofline_backend() -> String {
+    "compiler".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +75,40 @@ pub struct CoreCluster {
     pub cpus: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CpuInfo {
+    /// Host ceilings measured immediately before a Roofline recording.
+    #[serde(default)]
+    pub roofline_calibration: Option<Box<RooflineCalibration>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RooflineCalibration {
+    /// Number of Rayon workers used by both calibration kernels.
+    pub threads: usize,
+    /// Host CPUs on which the process was allowed to run, when available.
+    #[serde(default)]
+    pub cpu_affinity: Option<String>,
+    /// Samples contributing to each reported median.
+    pub samples: usize,
+    /// Name of the architecture-specific FP64 compute kernel.
+    pub compute_kernel: String,
+    /// Median aggregate FP64 throughput.
+    pub fp64_gflops: f64,
+    /// Individual aggregate FP64 throughput samples.
+    #[serde(default)]
+    pub fp64_gflops_samples: Vec<f64>,
+    /// Median aggregate triad bandwidth.
+    pub memory_gbytes_per_second: f64,
+    /// Individual aggregate triad-bandwidth samples.
+    #[serde(default)]
+    pub memory_gbytes_per_second_samples: Vec<f64>,
+    /// Compute/bandwidth intersection.
+    pub ridge_point_flops_per_byte: f64,
+    /// Bytes in all three buffers used by the memory calibration.
+    pub memory_working_set_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordInfo {
     /// On-disk results format. Missing means the legacy, pre-versioned format.
@@ -81,6 +121,9 @@ pub struct RecordInfo {
     /// Core clusters on a heterogeneous host (empty on homogeneous systems).
     #[serde(default)]
     pub cores: Vec<CoreCluster>,
+    /// Extensible host CPU measurements collected with this recording.
+    #[serde(default)]
+    pub cpu_info: CpuInfo,
     pub scenario_info: ScenarioInfo,
 }
 
@@ -142,6 +185,7 @@ mod tests {
         for version in [None, Some(CURRENT_FORMAT_VERSION)] {
             let info: RecordInfo = serde_json::from_str(&record_info_json(version)).unwrap();
             info.ensure_supported_format().unwrap();
+            assert!(info.cpu_info.roofline_calibration.is_none());
         }
     }
 
@@ -153,5 +197,35 @@ mod tests {
 
         assert!(error.contains("upgrade mperf"));
         assert!(error.contains(&(CURRENT_FORMAT_VERSION + 1).to_string()));
+    }
+
+    #[test]
+    fn round_trips_roofline_calibration_in_cpu_info() {
+        let calibration = RooflineCalibration {
+            threads: 4,
+            cpu_affinity: Some("0-3".to_string()),
+            samples: 5,
+            compute_kernel: "test-fma".to_string(),
+            fp64_gflops: 100.0,
+            fp64_gflops_samples: vec![100.0],
+            memory_gbytes_per_second: 50.0,
+            memory_gbytes_per_second_samples: vec![50.0],
+            ridge_point_flops_per_byte: 2.0,
+            memory_working_set_bytes: 1024,
+        };
+        let cpu_info = CpuInfo {
+            roofline_calibration: Some(Box::new(calibration)),
+        };
+
+        let json = serde_json::to_string(&cpu_info).unwrap();
+        let decoded: CpuInfo = serde_json::from_str(&json).unwrap();
+        let decoded = decoded.roofline_calibration.unwrap();
+
+        assert_eq!(decoded.threads, 4);
+        assert_eq!(decoded.cpu_affinity.as_deref(), Some("0-3"));
+        assert_eq!(decoded.compute_kernel, "test-fma");
+        assert_eq!(decoded.fp64_gflops_samples, vec![100.0]);
+        assert_eq!(decoded.memory_gbytes_per_second_samples, vec![50.0]);
+        assert_eq!(decoded.ridge_point_flops_per_byte, 2.0);
     }
 }

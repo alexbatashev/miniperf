@@ -328,12 +328,29 @@ impl Widget for SummaryTab {
             .unwrap_or(vec!["".to_string()])
             .join(" ");
 
-        let rows = [
-            Row::new(["Scenario", self.record_info.scenario.name()]),
-            Row::new(["Command", command.as_str()]),
-            Row::new(["CPU family", self.record_info.cpu_model.as_str()]),
-            Row::new(["CPU vendor", self.record_info.cpu_vendor.as_str()]),
+        let mut rows = vec![
+            Row::new([
+                "Scenario".to_string(),
+                self.record_info.scenario.name().to_string(),
+            ]),
+            Row::new(["Command".to_string(), command]),
+            Row::new(["CPU family".to_string(), self.record_info.cpu_model.clone()]),
+            Row::new([
+                "CPU vendor".to_string(),
+                self.record_info.cpu_vendor.clone(),
+            ]),
         ];
+        if let Some(calibration) = &self.record_info.cpu_info.roofline_calibration {
+            rows.push(Row::new([
+                "Roof ceilings".to_string(),
+                format!(
+                    "{:.2} GFLOP/s · {:.2} GB/s · {} Rayon threads",
+                    calibration.fp64_gflops,
+                    calibration.memory_gbytes_per_second,
+                    calibration.threads
+                ),
+            ]));
+        }
         let widths = [Constraint::Percentage(20), Constraint::Percentage(80)];
 
         let vertical = Layout::horizontal_margin(
