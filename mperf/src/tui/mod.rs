@@ -8,12 +8,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use config::scenario_ui;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use flamegraph::FlamegraphTab;
 use loops::LoopsTab;
 use metrics_table::MetricsTableTab;
-use mperf_data::{RecordInfo, Scenario};
+use mperf_data::{scenario_ui, RecordInfo, Scenario};
 use parking_lot::{Mutex, RwLock};
 use ratatui::{
     layout::{Constraint, Flex, Layout},
@@ -26,7 +25,6 @@ use summary::SummaryTab;
 use tokio::fs::{self};
 use tokio_stream::StreamExt;
 
-mod config;
 mod flamegraph;
 mod loops;
 mod metrics_table;

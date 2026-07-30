@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 
 mod event;
 mod ipc;
+mod ui;
 
 pub use event::{CallFrame, Event, EventType, IString, Location, ProcMapEntry, UserRegs};
 pub use ipc::{IPCMessage, IPCString};
+pub use ui::scenario_ui;
 
 /// Version of the on-disk results format written by this build.
 ///

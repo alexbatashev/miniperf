@@ -4,6 +4,7 @@ members = [
     "collector",
     "mperf",
     "mperf-data",
+    "mperf-gui",
     "pmu",
     "pmu-data",
     "shmem",

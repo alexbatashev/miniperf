@@ -163,6 +163,23 @@ mperf show <output_directory>
 
 This will display detailed analysis based on the recorded profile.
 
+A GPU-accelerated viewer is also available. It implements recording summaries,
+SQLite-backed hotspot/metric tables, and interactive cycle and instruction
+flamegraphs using the same scenario-specific tab definitions as the TUI:
+
+```sh
+cargo run -p mperf-gui
+# Or open a result directly:
+cargo run -p mperf-gui -- <output_directory>
+```
+
+Without an output directory, the GUI opens the system directory picker. Opened
+results are kept in the collapsible, resizable Projects sidebar for quick access
+on later launches. The GUI uses GPUI and currently supports macOS and Linux. On
+macOS, make sure Xcode and its command-line tools are installed. If Cargo cannot
+locate the active SDK, run the command with
+`SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"`.
+
 ### Querying Results
 
 Recorded performance data can also be explored non-interactively with read-only
