@@ -1,9 +1,14 @@
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result};
 use num_format::{Locale, ToFormattedString};
 use pmu_data::{MetricColumnSpec, MetricsTableSpec, SortDirection, ValueFormat};
 use sqlite::{Connection, Value};
+
+use crate::source::SourceLocation;
 
 #[derive(Debug)]
 pub struct MetricsTableData {
@@ -22,6 +27,8 @@ pub struct MetricsColumn {
 #[derive(Debug)]
 pub struct MetricsRow {
     pub values: Vec<String>,
+    pub function: Option<String>,
+    pub source: Option<SourceLocation>,
 }
 
 #[derive(Clone)]
@@ -53,14 +60,22 @@ fn load(connection: &Connection, spec: &MetricsTableSpec) -> Result<MetricsTable
     let available = available_columns(connection, &spec.view)?;
     let columns = resolved_columns(spec, &available)?;
     let query = build_query(spec, &available);
+    let function_column = spec
+        .function_column
+        .as_deref()
+        .or_else(|| available.contains("func_name").then_some("func_name"));
     let statement = connection
         .prepare(query)
         .with_context(|| format!("failed to query SQLite view `{}`", spec.view))?;
-    let rows = statement
+    let mut rows = statement
         .into_iter()
         .map(|row| {
             let row = row.with_context(|| format!("failed to read SQLite view `{}`", spec.view))?;
             Ok(MetricsRow {
+                function: function_column.and_then(|column| match &row[column] {
+                    Value::String(value) => Some(value.clone()),
+                    _ => None,
+                }),
                 values: columns
                     .iter()
                     .map(|column| {
@@ -68,15 +83,58 @@ fn load(connection: &Connection, spec: &MetricsTableSpec) -> Result<MetricsTable
                         format_value(&value, &column.format)
                     })
                     .collect(),
+                source: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let source_locations = source_locations(connection).unwrap_or_default();
+    for row in &mut rows {
+        row.source = row
+            .function
+            .as_ref()
+            .and_then(|function| source_locations.get(function))
+            .cloned();
+    }
 
     Ok(MetricsTableData {
         columns: columns.iter().map(display_column).collect(),
         rows,
         error: None,
     })
+}
+
+fn source_locations(connection: &Connection) -> Result<HashMap<String, SourceLocation>> {
+    let query = "
+        SELECT proc_map.func_name AS func_name,
+               proc_map.file_name AS file_name,
+               proc_map.line AS line,
+               SUM(pmu_counters.pmu_cycles) AS total_cycles
+        FROM pmu_counters
+        INNER JOIN proc_map ON proc_map.ip = pmu_counters.ip
+        WHERE proc_map.func_name IS NOT NULL
+          AND proc_map.file_name IS NOT NULL
+          AND proc_map.file_name <> ''
+          AND proc_map.line IS NOT NULL
+          AND proc_map.line > 0
+        GROUP BY proc_map.func_name, proc_map.file_name, proc_map.line
+        ORDER BY total_cycles DESC;
+    ";
+    let mut locations = HashMap::new();
+    for row in connection
+        .prepare(query)
+        .context("failed to prepare source-location query")?
+        .into_iter()
+    {
+        let row = row.context("failed to read source-location query")?;
+        let function = row.read::<&str, _>("func_name");
+        locations
+            .entry(function.to_string())
+            .or_insert_with(|| SourceLocation {
+                path: PathBuf::from(row.read::<&str, _>("file_name")),
+                line: row.read::<i64, _>("line").max(1) as usize,
+            });
+    }
+    Ok(locations)
 }
 
 fn available_columns(connection: &Connection, view: &str) -> Result<HashSet<String>> {
@@ -317,5 +375,38 @@ mod tests {
         let connection = sqlite::open(":memory:").unwrap();
         let table = MetricsTableData::load(&connection, &spec());
         assert!(table.error.as_deref().unwrap().contains("does not exist"));
+    }
+
+    #[test]
+    fn associates_hottest_recorded_source_location_with_function() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE hotspots (
+                    func_name TEXT, total REAL, cycles INTEGER,
+                    instructions INTEGER, ipc REAL
+                );
+                INSERT INTO hotspots VALUES ('hot', 1.0, 90, 135, 1.5);
+                CREATE TABLE proc_map (
+                    ip INTEGER, func_name TEXT, file_name TEXT, line INTEGER
+                );
+                CREATE TABLE pmu_counters (ip INTEGER, pmu_cycles INTEGER);
+                INSERT INTO proc_map VALUES (1, 'hot', '/src/hot.rs', 12);
+                INSERT INTO proc_map VALUES (2, 'hot', '/src/hot.rs', 44);
+                INSERT INTO pmu_counters VALUES (1, 10);
+                INSERT INTO pmu_counters VALUES (2, 80);",
+            )
+            .unwrap();
+
+        let table = MetricsTableData::load(&connection, &spec());
+
+        assert_eq!(table.rows[0].function.as_deref(), Some("hot"));
+        assert_eq!(
+            table.rows[0].source,
+            Some(SourceLocation {
+                path: PathBuf::from("/src/hot.rs"),
+                line: 44,
+            })
+        );
     }
 }

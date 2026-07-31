@@ -1,0 +1,7 @@
+# gpui 0.2.2 runs bindgen before mperf-gui's own build can discover the
+# macOS SDK. Point bindgen at the Command Line Tools SDK so ordinary
+# `cargo build/run -p mperf-gui` commands work without exporting SDKROOT.
+# A caller-provided value still wins.
+[env]
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin = { value = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = false }
+BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_darwin = { value = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = false }

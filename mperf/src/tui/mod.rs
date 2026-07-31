@@ -196,7 +196,7 @@ impl Widget for &TabsWidget {
 
 #[derive(Clone)]
 enum Tab {
-    Summary(SummaryTab),
+    Summary(Box<SummaryTab>),
     MetricsTable(MetricsTableTab),
     Loops(LoopsTab),
     Flamegraph(FlamegraphTab),
@@ -264,9 +264,8 @@ impl TabsWidget {
 
         for tab in ui.tabs.iter() {
             match tab {
-                pmu_data::TabSpec::Summary => write_tabs.push(Tab::Summary(SummaryTab::new(
-                    info.clone(),
-                    connection.clone(),
+                pmu_data::TabSpec::Summary => write_tabs.push(Tab::Summary(Box::new(
+                    SummaryTab::new(info.clone(), connection.clone()),
                 ))),
                 pmu_data::TabSpec::Flamegraph => {
                     write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())))
@@ -343,7 +342,7 @@ impl Widget for &Tab {
         Self: Sized,
     {
         match self {
-            Tab::Summary(tab) => tab.clone().render(area, buf),
+            Tab::Summary(tab) => tab.as_ref().clone().render(area, buf),
             Tab::MetricsTable(tab) => tab.clone().render(area, buf),
             Tab::Loops(tab) => tab.clone().render(area, buf),
             Tab::Flamegraph(tab) => tab.clone().render(area, buf),

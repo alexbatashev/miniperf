@@ -1,0 +1,11 @@
+mod bottom_panel;
+mod callers;
+mod chrome;
+mod cpu_heatmap;
+mod flamegraph;
+mod flamescope;
+mod icicle;
+mod metrics_timeline;
+mod sidebar;
+mod source;
+mod stack_timeline;

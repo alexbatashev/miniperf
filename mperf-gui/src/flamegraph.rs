@@ -1,5 +1,8 @@
 use std::{fs, path::Path};
 
+#[cfg(test)]
+use std::collections::HashSet;
+
 use flamelens::flame::{FlameGraph, StackIdentifier, ROOT_ID};
 
 #[derive(Debug)]
@@ -14,6 +17,7 @@ pub struct FlameFrame {
     pub id: StackIdentifier,
     pub name: String,
     pub value: u64,
+    pub self_value: u64,
     pub x: f32,
     pub width: f32,
     pub depth: usize,
@@ -48,11 +52,7 @@ impl FlamegraphData {
     }
 
     pub fn layout(&self, instructions: bool, zoom: StackIdentifier) -> Option<FlameLayout> {
-        let graph = if instructions {
-            self.instructions.as_ref()
-        } else {
-            self.cycles.as_ref()
-        }?;
+        let graph = self.graph(instructions)?;
         let zoom = graph.get_stack(&zoom).map(|_| zoom).unwrap_or(ROOT_ID);
         let root = graph.get_stack(&zoom)?;
         let total = root.total_count;
@@ -72,6 +72,47 @@ impl FlamegraphData {
                 .unwrap_or("all")
                 .to_string(),
         })
+    }
+
+    pub fn hottest_stack_named(
+        &self,
+        instructions: bool,
+        function: &str,
+    ) -> Option<StackIdentifier> {
+        let graph = self.graph(instructions)?;
+        (0..graph.get_num_levels())
+            .filter_map(|level| graph.get_stacks_at_level(level))
+            .flatten()
+            .filter_map(|id| graph.get_stack(id))
+            .filter(|stack| names_match(graph.get_stack_short_name_from_info(stack), function))
+            .max_by_key(|stack| stack.total_count)
+            .map(|stack| stack.id)
+    }
+
+    #[cfg(test)]
+    pub fn descendant_function_names(
+        &self,
+        instructions: bool,
+        stack_id: StackIdentifier,
+    ) -> HashSet<String> {
+        let Some(graph) = self.graph(instructions) else {
+            return HashSet::new();
+        };
+        graph
+            .get_descendants(&stack_id)
+            .into_iter()
+            .filter(|id| *id != ROOT_ID)
+            .filter_map(|id| graph.get_stack_short_name(&id))
+            .map(|name| name.replace("[unknown]", "Unknown"))
+            .collect()
+    }
+
+    fn graph(&self, instructions: bool) -> Option<&FlameGraph> {
+        if instructions {
+            self.instructions.as_ref()
+        } else {
+            self.cycles.as_ref()
+        }
     }
 }
 
@@ -123,6 +164,7 @@ fn flatten(
             .get_stack_short_name_from_info(stack)
             .replace("[unknown]", "Unknown"),
         value: stack.total_count,
+        self_value: stack.self_count,
         x,
         width,
         depth,
@@ -147,6 +189,12 @@ fn flatten(
     }
 }
 
+fn names_match(stack_name: &str, function: &str) -> bool {
+    stack_name == function
+        || stack_name.strip_prefix('_') == Some(function)
+        || function.strip_prefix('_') == Some(stack_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +217,11 @@ mod tests {
             .find(|frame| frame.name == "hot")
             .unwrap();
         assert!((hot.width - 0.75).abs() < f32::EPSILON);
+        assert_eq!(data.hottest_stack_named(false, "hot"), Some(hot.id));
+        assert_eq!(
+            data.descendant_function_names(false, ROOT_ID),
+            HashSet::from(["main".to_string(), "hot".to_string(), "cold".to_string()])
+        );
     }
 
     #[test]

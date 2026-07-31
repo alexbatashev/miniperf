@@ -352,7 +352,11 @@ impl SamplingDriver for PerfSamplingDriver {
         }
 
         let handle = thread::spawn(move || {
-            let mut last_samples_map = HashMap::<(usize, u32, u32, u32, u64), LastSample>::new();
+            // Perf event values are cumulative for the task/event. The CPU in
+            // PERF_SAMPLE_CPU is attribution metadata, not part of the counter
+            // identity; including it here would restart the baseline after
+            // every migration and over-count the first sample on the new CPU.
+            let mut last_samples_map = HashMap::<(usize, u32, u32, u64), LastSample>::new();
 
             loop {
                 for (idx, &mmap) in mmaps.iter().enumerate() {
@@ -385,7 +389,7 @@ impl SamplingDriver for PerfSamplingDriver {
                                         continue;
                                     };
                                     let last_sample = last_samples_map
-                                        .get(&(idx, cpu, pid, tid, value.id))
+                                        .get(&(idx, pid, tid, value.id))
                                         .cloned()
                                         .unwrap_or_default();
 
@@ -397,10 +401,12 @@ impl SamplingDriver for PerfSamplingDriver {
                                         cpu,
                                         core: handle.core.as_ref().map(|c| c.family_id.clone()),
                                         time,
-                                        time_enabled: time_enabled - last_sample.time_enabled,
-                                        time_running: time_running - last_sample.time_running,
+                                        time_enabled: time_enabled
+                                            .saturating_sub(last_sample.time_enabled),
+                                        time_running: time_running
+                                            .saturating_sub(last_sample.time_running),
                                         counter: handle.kind.clone(),
-                                        value: value.value - last_sample.value,
+                                        value: value.value.saturating_sub(last_sample.value),
                                         callstack: callstack.clone(),
                                         // Every grouped counter shares this correlation id and
                                         // call stack. Carry the large raw state once; postprocess
@@ -410,7 +416,7 @@ impl SamplingDriver for PerfSamplingDriver {
                                     });
 
                                     last_samples_map.insert(
-                                        (idx, cpu, pid, tid, value.id),
+                                        (idx, pid, tid, value.id),
                                         LastSample {
                                             time_enabled,
                                             time_running,

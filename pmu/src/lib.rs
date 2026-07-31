@@ -34,6 +34,9 @@ pub use process::Process;
 pub use quick::{top_symbols, SymbolCount};
 pub use quick::{QuickSampler, SampleBatch};
 
+/// Default sampling frequency used by [`SamplingDriverBuilder`].
+pub const DEFAULT_SAMPLE_FREQUENCY_HZ: u64 = 1_000;
+
 /// Returns the top-down analysis scenario for the detected host CPU, if one is defined.
 pub fn host_tma_scenario() -> Option<pmu_data::TmaScenario> {
     cpu_family::host_tma_scenario()

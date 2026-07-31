@@ -299,7 +299,7 @@ impl SamplingDriverBuilder {
     pub fn new() -> Self {
         SamplingDriverBuilder {
             counters: vec![],
-            sample_freq: 1000,
+            sample_freq: crate::DEFAULT_SAMPLE_FREQUENCY_HZ,
             pid: None,
             prefer_raw_events: true,
             kind: DriverKind::Default,

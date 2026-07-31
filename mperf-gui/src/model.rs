@@ -1,23 +1,40 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result};
-use mperf_data::{scenario_ui, RecordInfo};
+use anyhow::{bail, Context, Result};
+use mperf_data::{scenario_ui, RecordInfo, ScenarioInfo};
 use num_format::{Locale, ToFormattedString};
-use pmu_data::TabSpec;
-use sqlite::Connection;
+use pmu_data::{TabSpec, TmaMetric};
+use sqlite::{Connection, Value};
 
-use crate::{flamegraph::FlamegraphData, metrics::MetricsTableData};
+use crate::{flamegraph::FlamegraphData, metrics::MetricsTableData, profile::ProfileData};
 
 #[derive(Debug)]
 pub struct ResultsModel {
     pub result_directory: PathBuf,
     pub record_info: RecordInfo,
     pub summary: SummaryStats,
+    pub tma_summary: Option<TmaSummaryData>,
+    pub profile: ProfileData,
     pub tabs: Vec<GuiTab>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmaSummaryData {
+    pub rows: Vec<TmaSummaryRow>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TmaSummaryRow {
+    pub name: String,
+    pub description: String,
+    pub level: usize,
+    pub value: Option<f64>,
+    pub dominant: bool,
 }
 
 #[derive(Debug)]
@@ -68,6 +85,9 @@ impl ResultsModel {
         let connection = sqlite::open(&database_path)
             .with_context(|| format!("failed to open {}", database_path.display()))?;
         let summary = SummaryStats::load(&connection)?;
+        let tma_summary = TmaSummaryData::for_scenario(&record_info.scenario_info, &connection);
+        let mut profile = ProfileData::load(&connection);
+        profile.logical_cpu_count = record_info.logical_cpu_count;
 
         let tabs = scenario_ui(&record_info)
             .tabs
@@ -79,21 +99,102 @@ impl ResultsModel {
             result_directory,
             record_info,
             summary,
+            tma_summary,
+            profile,
             tabs,
         })
     }
 }
 
-impl GuiTab {
-    pub fn title(&self) -> &str {
-        match self {
-            Self::Summary => "Summary",
-            Self::MetricsTable { title, .. } => title,
-            Self::Loops => "Loops",
-            Self::Flamegraph(_) => "Flamegraph",
-        }
+impl TmaSummaryData {
+    fn for_scenario(scenario: &ScenarioInfo, connection: &Connection) -> Option<Self> {
+        let ScenarioInfo::TMA(info) = scenario else {
+            return None;
+        };
+        Some(Self::load(connection, &info.metrics))
     }
 
+    fn load(connection: &Connection, metrics: &[TmaMetric]) -> Self {
+        match load_persisted_tma_summary(connection) {
+            Ok(persisted) => Self {
+                rows: join_tma_summary(metrics, &persisted),
+                error: None,
+            },
+            Err(error) => Self {
+                rows: join_tma_summary(metrics, &HashMap::new()),
+                error: Some(format!("{error:#}")),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PersistedTmaSummary {
+    value: Option<f64>,
+    dominant: bool,
+}
+
+fn load_persisted_tma_summary(
+    connection: &Connection,
+) -> Result<HashMap<String, PersistedTmaSummary>> {
+    let statement = connection
+        .prepare("SELECT metric, value, verdict FROM tma_summary;")
+        .context("TMA summary is unavailable: failed to query SQLite table `tma_summary`")?;
+    let mut summaries = HashMap::new();
+
+    for row in statement.into_iter() {
+        let row = row.context("failed to read a row from SQLite table `tma_summary`")?;
+        let metric = match &row[0] {
+            Value::String(metric) => metric.clone(),
+            _ => bail!("SQLite table `tma_summary` contains a non-text metric name"),
+        };
+        let value = finite_tma_value(&row[1]);
+        let dominant = matches!(
+            &row[2],
+            Value::String(verdict) if verdict.trim().eq_ignore_ascii_case("dominant")
+        );
+        summaries.insert(metric, PersistedTmaSummary { value, dominant });
+    }
+
+    Ok(summaries)
+}
+
+fn join_tma_summary(
+    metrics: &[TmaMetric],
+    persisted: &HashMap<String, PersistedTmaSummary>,
+) -> Vec<TmaSummaryRow> {
+    metrics
+        .iter()
+        .filter_map(|metric| {
+            let level = tma_hierarchy_level(&metric.name);
+            (1..=3).contains(&level).then(|| {
+                let summary = persisted.get(&metric.name).copied().unwrap_or_default();
+                TmaSummaryRow {
+                    name: metric.name.clone(),
+                    description: metric.desc.clone(),
+                    level,
+                    value: summary.value,
+                    dominant: summary.dominant,
+                }
+            })
+        })
+        .collect()
+}
+
+fn tma_hierarchy_level(name: &str) -> usize {
+    name.bytes().filter(|byte| *byte == b'.').count() + 1
+}
+
+fn finite_tma_value(value: &Value) -> Option<f64> {
+    let value = match value {
+        Value::Integer(value) => *value as f64,
+        Value::Float(value) => *value,
+        _ => return None,
+    };
+    value.is_finite().then_some(value)
+}
+
+impl GuiTab {
     fn load(tab: TabSpec, connection: &Connection, result_directory: &Path) -> Self {
         match tab {
             TabSpec::Summary => Self::Summary,
@@ -296,6 +397,28 @@ fn optional_ratio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mperf_data::{RooflineInfo, SnapshotInfo, TMAInfo};
+
+    fn metric(name: &str, description: &str) -> TmaMetric {
+        TmaMetric {
+            name: name.to_string(),
+            desc: description.to_string(),
+            formula: "0".to_string(),
+            group: None,
+        }
+    }
+
+    fn tma_scenario(metrics: Vec<TmaMetric>) -> ScenarioInfo {
+        ScenarioInfo::TMA(TMAInfo {
+            pid: 1,
+            counters: Vec::new(),
+            groups: Vec::new(),
+            precise_attribution: false,
+            metrics,
+            constants: Vec::new(),
+            ui: None,
+        })
+    }
 
     #[test]
     fn loads_required_and_optional_summary_counters() {
@@ -325,5 +448,92 @@ mod tests {
     fn zero_denominators_render_as_na() {
         assert_eq!(ratio(10, 0, 1.0, ""), "N/A");
         assert_eq!(optional_ratio(Some(10), None, 100.0, "%"), "N/A");
+    }
+
+    #[test]
+    fn tma_summary_preserves_scenario_order_and_hierarchy() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE tma_summary (
+                    metric TEXT PRIMARY KEY,
+                    value REAL,
+                    verdict TEXT
+                );
+                INSERT INTO tma_summary VALUES
+                    ('be_bound.memory_bound', 0.75, 'dominant'),
+                    ('retiring', 0.5, NULL),
+                    ('be_bound', 0.25, NULL),
+                    ('be_bound.memory_bound.dram', NULL, NULL),
+                    ('unknown', 1.0, 'dominant');",
+            )
+            .unwrap();
+        let scenario = tma_scenario(vec![
+            metric("retiring", "Retiring slots"),
+            metric("be_bound", "Backend bound slots"),
+            metric("be_bound.memory_bound", "Memory-bound slots"),
+            metric("be_bound.memory_bound.dram", "DRAM-bound memory accesses"),
+            metric("be_bound.memory_bound.dram.local", "A fourth-level metric"),
+            metric("fe_bound", "Frontend bound slots"),
+        ]);
+
+        let summary = TmaSummaryData::for_scenario(&scenario, &connection).unwrap();
+
+        assert_eq!(summary.error, None);
+        assert_eq!(
+            summary
+                .rows
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "retiring",
+                "be_bound",
+                "be_bound.memory_bound",
+                "be_bound.memory_bound.dram",
+                "fe_bound",
+            ]
+        );
+        assert_eq!(
+            summary.rows.iter().map(|row| row.level).collect::<Vec<_>>(),
+            vec![1, 1, 2, 3, 1]
+        );
+        assert_eq!(summary.rows[0].description, "Retiring slots");
+        assert_eq!(summary.rows[0].value, Some(0.5));
+        assert!(!summary.rows[0].dominant);
+        assert_eq!(summary.rows[2].value, Some(0.75));
+        assert!(summary.rows[2].dominant);
+        assert_eq!(summary.rows[3].value, None);
+        assert_eq!(summary.rows[4].value, None);
+        assert!(!summary.rows[4].dominant);
+        assert_eq!(finite_tma_value(&Value::Float(f64::INFINITY)), None);
+        assert_eq!(finite_tma_value(&Value::Float(f64::NAN)), None);
+    }
+
+    #[test]
+    fn tma_summary_keeps_legacy_errors_and_is_absent_for_other_scenarios() {
+        let connection = sqlite::open(":memory:").unwrap();
+        let scenario = tma_scenario(vec![metric("retiring", "Retiring slots")]);
+
+        let summary = TmaSummaryData::for_scenario(&scenario, &connection).unwrap();
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(summary.rows[0].value, None);
+        assert!(!summary.rows[0].dominant);
+        assert!(summary
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("tma_summary")));
+
+        let snapshot = ScenarioInfo::Snapshot(SnapshotInfo {
+            pid: 1,
+            counters: Vec::new(),
+        });
+        let roofline = ScenarioInfo::Roofline(RooflineInfo {
+            perf_pid: 1,
+            counters: Vec::new(),
+            inst_pid: 2,
+        });
+        assert!(TmaSummaryData::for_scenario(&snapshot, &connection).is_none());
+        assert!(TmaSummaryData::for_scenario(&roofline, &connection).is_none());
     }
 }
