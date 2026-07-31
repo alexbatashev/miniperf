@@ -4,9 +4,11 @@ use serde::{Deserialize, Serialize};
 
 mod event;
 mod ipc;
+mod ui;
 
 pub use event::{CallFrame, Event, EventType, IString, Location, ProcMapEntry, UserRegs};
 pub use ipc::{IPCMessage, IPCString};
+pub use ui::scenario_ui;
 
 /// Version of the on-disk results format written by this build.
 ///
@@ -109,6 +111,29 @@ pub struct RooflineCalibration {
     pub memory_working_set_bytes: u64,
 }
 
+/// How `os_cpu_clock` observations should be interpreted by time-based views.
+///
+/// A counter delta is paired with an explicit wall-time interval. Sampled
+/// occupancy attributes a CPU-time weight to the logical CPU reported at the
+/// sample endpoint: Darwin kperf emits a fixed timer period, while Linux perf
+/// emits a task-clock delta from one authoritative sampling group. Endpoint
+/// attribution is statistical when a task may have migrated within the delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuClockSource {
+    CounterDelta,
+    SampledOccupancy,
+}
+
+impl CpuClockSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CounterDelta => "counter_delta",
+            Self::SampledOccupancy => "sampled_occupancy",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordInfo {
     /// On-disk results format. Missing means the legacy, pre-versioned format.
@@ -118,6 +143,19 @@ pub struct RecordInfo {
     pub command: Option<Vec<String>>,
     pub cpu_model: String,
     pub cpu_vendor: String,
+    /// Requested profiler sampling frequency. Missing on recordings written
+    /// before temporal sample metadata was persisted.
+    #[serde(default)]
+    pub sampling_frequency_hz: Option<u64>,
+    /// Semantics of timestamped CPU-clock observations. Missing on recordings
+    /// created before CPU-lane data was preserved independently.
+    #[serde(default)]
+    pub cpu_clock_source: Option<CpuClockSource>,
+    /// Number of logical CPUs in the source host topology. Current recordings
+    /// use contiguous logical CPU IDs `0..logical_cpu_count`; missing means the
+    /// recording predates topology preservation.
+    #[serde(default)]
+    pub logical_cpu_count: Option<u32>,
     /// Core clusters on a heterogeneous host (empty on homogeneous systems).
     #[serde(default)]
     pub cores: Vec<CoreCluster>,
@@ -186,7 +224,21 @@ mod tests {
             let info: RecordInfo = serde_json::from_str(&record_info_json(version)).unwrap();
             info.ensure_supported_format().unwrap();
             assert!(info.cpu_info.roofline_calibration.is_none());
+            assert_eq!(info.cpu_clock_source, None);
+            assert_eq!(info.logical_cpu_count, None);
         }
+    }
+
+    #[test]
+    fn cpu_clock_source_has_stable_machine_readable_names() {
+        assert_eq!(
+            serde_json::to_string(&CpuClockSource::CounterDelta).unwrap(),
+            "\"counter_delta\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CpuClockSource::SampledOccupancy).unwrap(),
+            "\"sampled_occupancy\""
+        );
     }
 
     #[test]

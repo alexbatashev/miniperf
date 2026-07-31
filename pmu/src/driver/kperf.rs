@@ -41,6 +41,7 @@ const PERF_STK_UHDR: u32 = 0x2502_0018;
 const PERF_STK_UDATA: u32 = 0x2502_0010;
 const PERF_KPC_DATA_THREAD: u32 = kdbg_eventid(DBG_PERF, 6, 8);
 
+const SAMPLE_FLAG_PEND_USER: u64 = 1 << 0;
 const SAMPLE_META_UPEND: u64 = 1 << 1;
 const CALLSTACK_VALID: u64 = 1 << 0;
 const CALLSTACK_HAS_ASYNC: u64 = 1 << 9;
@@ -399,6 +400,7 @@ struct PendingSample {
     kpc_values: Vec<u64>,
     callstack: SmallVec<[u64; 32]>,
     forced_pid: Option<u32>,
+    timer_observation: bool,
 }
 
 struct DeferredSample {
@@ -414,6 +416,7 @@ struct KdebugDecodeState {
     pending_samples: HashMap<u64, PendingSample>,
     deferred_samples: HashMap<u64, VecDeque<DeferredSample>>,
     last_kpc_values: HashMap<(u32, u32, u64, usize), LastKpcValue>,
+    sample_period_ns: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1069,7 +1072,24 @@ impl KPerfSamplingDriver {
         capture_callstacks: bool,
     ) -> Result<Self, Error> {
         let ctx = KPerfContext::new()?;
-        let config = build_kpc_config(&ctx, counters, sample_period_from_freq(sample_freq), true)?;
+        let counters = counters
+            .iter()
+            .filter(|counter| sampling_counter_supported(counter))
+            .cloned()
+            .collect::<Vec<_>>();
+        if counters.is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "none of the requested counters can be sampled by macOS kperf".to_string(),
+            ));
+        }
+        let mut config =
+            build_kpc_config(&ctx, &counters, sample_period_from_freq(sample_freq), true)?;
+        config.handles.retain(sampling_handle_supported);
+        if config.handles.is_empty() {
+            return Err(Error::InvalidConfiguration(
+                "none of the requested counters can be sampled by macOS kperf".to_string(),
+            ));
+        }
 
         Ok(KPerfSamplingDriver {
             ctx,
@@ -1097,14 +1117,12 @@ impl SamplingDriver for KPerfSamplingDriver {
     fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
         setup_kdebug_buffer().map_err(|_| Error::EnableFailed)?;
 
-        let period_ns = 1_000_000_000_u64 / self.sample_freq.max(1);
-        let samplers = SAMPLER_TH_INFO
-            | SAMPLER_PMC_THREAD
-            | if self.capture_callstacks {
-                SAMPLER_USTACK
-            } else {
-                0
-            };
+        let period_ns = (1_000_000_000_u64 / self.sample_freq.max(1)).max(1);
+        let has_kpc_payload = self
+            .programs
+            .first()
+            .is_some_and(|program| program.kpc_count > 0);
+        let samplers = sampling_samplers(has_kpc_payload, self.capture_callstacks);
         if let Err(err) = configure_kperf_timer_sampler(
             &self.ctx,
             self.classes,
@@ -1127,10 +1145,7 @@ impl SamplingDriver for KPerfSamplingDriver {
         let running = self.running.clone();
         let ctx = self.ctx.clone();
         let programs = self.programs.clone();
-        let mut handles = programs
-            .first()
-            .map(|program| program.handles.clone())
-            .unwrap_or_default();
+        let mut handles = initial_sampling_handles(&programs, &self.handles);
         let mut kpc_count = programs
             .first()
             .map(|program| program.kpc_count)
@@ -1138,7 +1153,10 @@ impl SamplingDriver for KPerfSamplingDriver {
         let pid_filter = self.pid.map(|pid| pid as u32);
 
         let handle = thread::spawn(move || {
-            let mut state = KdebugDecodeState::default();
+            let mut state = KdebugDecodeState {
+                sample_period_ns: period_ns,
+                ..Default::default()
+            };
             let mut active_program = 0_usize;
             let mut program_epoch = 0_u64;
             let mut last_switch = Instant::now();
@@ -1202,7 +1220,7 @@ impl SamplingDriver for KPerfSamplingDriver {
                 }
             }
 
-            discard_incomplete_deferred_samples(&mut state);
+            flush_incomplete_deferred_samples(&mut state, &callback);
         });
         self.thread_handle = Some(handle);
 
@@ -1230,6 +1248,38 @@ impl SamplingDriver for KPerfSamplingDriver {
         teardown_kdebug_buffer();
         Ok(())
     }
+}
+
+fn sampling_counter_supported(counter: &Counter) -> bool {
+    !counter.is_software() || matches!(counter, Counter::CpuClock)
+}
+
+fn sampling_handle_supported(handle: &NativeCounterHandle) -> bool {
+    handle.counter == Counter::CpuClock || handle.kpc_index.is_some()
+}
+
+fn sampling_samplers(has_kpc_payload: bool, capture_callstacks: bool) -> u32 {
+    SAMPLER_TH_INFO
+        | if has_kpc_payload {
+            SAMPLER_PMC_THREAD
+        } else {
+            0
+        }
+        | if capture_callstacks {
+            SAMPLER_USTACK
+        } else {
+            0
+        }
+}
+
+fn initial_sampling_handles(
+    programs: &[KpcProgram],
+    configured_handles: &[NativeCounterHandle],
+) -> Vec<NativeCounterHandle> {
+    programs
+        .first()
+        .map(|program| program.handles.clone())
+        .unwrap_or_else(|| configured_handles.to_vec())
 }
 
 struct BuiltConfig {
@@ -1275,6 +1325,18 @@ fn build_kpc_config(
         for handle in &mut program.handles {
             handle.program_index = Some(program_index);
         }
+    }
+    let software_handles = counters
+        .iter()
+        .filter(|counter| counter.is_software())
+        .map(|counter| NativeCounterHandle {
+            counter: counter.clone(),
+            program_index: None,
+            kpc_index: None,
+        })
+        .collect::<Vec<_>>();
+    for program in &mut programs {
+        program.handles.extend(software_handles.iter().cloned());
     }
 
     let mut handles = Vec::new();
@@ -1788,10 +1850,10 @@ fn configure_kperf_timer_sampler(
     user_stack_depth: Option<u32>,
 ) -> Result<(), Error> {
     unsafe {
-        if ctx.kpc.kpc_force_all_ctrs_set(1) != 0 {
-            return Err(Error::PermissionDenied);
-        }
         if classes != 0 {
+            if ctx.kpc.kpc_force_all_ctrs_set(1) != 0 {
+                return Err(Error::PermissionDenied);
+            }
             if ctx.kpc.kpc_set_counting(classes) != 0 {
                 return Err(Error::PermissionDenied);
             }
@@ -1913,6 +1975,7 @@ fn handle_kdebug_record(
                     kpc_values: Vec::with_capacity(config.kpc_count),
                     callstack: SmallVec::new(),
                     forced_pid: config.forced_pid,
+                    timer_observation: rec.arg4 & SAMPLE_FLAG_PEND_USER != 0,
                 },
             );
         }
@@ -1930,6 +1993,7 @@ fn handle_kdebug_record(
                         kpc_values: Vec::new(),
                         callstack: SmallVec::new(),
                         forced_pid: config.forced_pid,
+                        timer_observation: false,
                     });
             sample.callstack = take_pending_stack(state, &sample);
             finish_pending_sample(
@@ -1953,6 +2017,7 @@ fn handle_kdebug_record(
                 kpc_values: Vec::with_capacity(config.kpc_count),
                 callstack: SmallVec::new(),
                 forced_pid: config.forced_pid,
+                timer_observation: false,
             });
             sample.pid = rec.arg1 as u32;
             sample.tid = rec.arg2 as u32;
@@ -2045,7 +2110,10 @@ fn finish_pending_sample(
         }
     }
 
-    if !sample.kpc_values.is_empty() {
+    // Timer groups have SAMPLE_FLAG_PEND_USER. A KPC payload is also
+    // authoritative because the later AST group never samples PMCs.
+    let timer_observation = sample.timer_observation || !sample.kpc_values.is_empty();
+    if timer_observation {
         if sample_meta_flags & SAMPLE_META_UPEND != 0 && sample.callstack.is_empty() {
             state
                 .deferred_samples
@@ -2072,7 +2140,8 @@ fn finish_pending_sample(
 
     // A pended user callstack is logged later by XNU's kperf AST as a second
     // generic sample containing USTACK + TH_INFO but no PMC payload. Join it to
-    // the timer/KPC sample instead of emitting a bogus one-count PMU event.
+    // the timer sample instead of treating the AST delivery as another
+    // CPU-clock observation.
     if sample.callstack.is_empty() {
         return;
     }
@@ -2096,12 +2165,23 @@ fn finish_pending_sample(
     );
 }
 
-fn discard_incomplete_deferred_samples(state: &mut KdebugDecodeState) {
-    // A timer sample marked SAMPLE_META_UPEND has no user IP of its own. If
-    // shutdown wins the race with the AST-side stack group, emitting that
-    // counter delta produces an ip=0/empty-stack row and a blank flamegraph
-    // entry. Treat these tail samples as lost rather than inventing a location.
-    state.deferred_samples.clear();
+fn flush_incomplete_deferred_samples(
+    state: &mut KdebugDecodeState,
+    callback: &Arc<dyn SamplingCallback>,
+) {
+    // PMU values need the deferred stack to produce a useful attributed delta.
+    // CPU-clock is sampled occupancy, though, so the timer hit itself is enough
+    // evidence to keep one period even when shutdown wins the AST race.
+    let deferred_samples = std::mem::take(&mut state.deferred_samples);
+    for deferred in deferred_samples.into_values().flat_map(VecDeque::into_iter) {
+        emit_cpu_clock_observation(
+            &deferred.sample,
+            &deferred.handles,
+            state.sample_period_ns,
+            uuid::Uuid::now_v7().as_u128(),
+            callback,
+        );
+    }
 }
 
 fn emit_pending_sample(
@@ -2112,13 +2192,8 @@ fn emit_pending_sample(
     state: &mut KdebugDecodeState,
     callback: &Arc<dyn SamplingCallback>,
 ) {
-    let callstack = sample.callstack;
-    let ip = callstack.first().copied().unwrap_or_default();
+    let ip = sample.callstack.first().copied().unwrap_or_default();
     let event_id = uuid::Uuid::now_v7().as_u128();
-
-    if sample.kpc_values.is_empty() {
-        return;
-    }
 
     for handle in handles {
         let Some(idx) = handle.kpc_index else {
@@ -2159,11 +2234,51 @@ fn emit_pending_sample(
             time_running: time_delta,
             counter: handle.counter.clone(),
             value: value_delta,
-            callstack: callstack.iter().copied().collect(),
+            callstack: sample.callstack.iter().copied().collect(),
             user_regs: None,
             user_stack: Vec::new(),
         }));
     }
+
+    emit_cpu_clock_observation(&sample, handles, state.sample_period_ns, event_id, callback);
+}
+
+fn emit_cpu_clock_observation(
+    sample: &PendingSample,
+    handles: &[NativeCounterHandle],
+    sample_period_ns: u64,
+    event_id: u128,
+    callback: &Arc<dyn SamplingCallback>,
+) {
+    if sample_period_ns == 0
+        || !handles
+            .iter()
+            .any(|handle| handle.counter == Counter::CpuClock)
+    {
+        return;
+    }
+
+    // The PID-filtered timer only produces an observation while its endpoint
+    // thread is on-CPU. Each hit therefore contributes exactly one configured
+    // period to the CPU that delivered it. Interarrival time is deliberately
+    // irrelevant: back-projecting it would smear occupancy across migration or
+    // scheduled-out gaps and would also lose the first hit.
+    callback.call(Record::Sample(Sample {
+        event_id,
+        ip: sample.callstack.first().copied().unwrap_or_default(),
+        pid: sample.pid,
+        tid: sample.tid,
+        cpu: sample.cpu,
+        core: None,
+        time: sample.time,
+        time_enabled: sample_period_ns,
+        time_running: sample_period_ns,
+        counter: Counter::CpuClock,
+        value: sample_period_ns,
+        callstack: sample.callstack.iter().copied().collect(),
+        user_regs: None,
+        user_stack: Vec::new(),
+    }));
 }
 
 pub fn list_supported_counters() -> Vec<Counter> {
@@ -2250,6 +2365,171 @@ mod tests {
         }]
     }
 
+    fn cpu_clock_handle() -> NativeCounterHandle {
+        NativeCounterHandle {
+            counter: Counter::CpuClock,
+            program_index: None,
+            kpc_index: None,
+        }
+    }
+
+    fn recording_callback() -> (Arc<Mutex<Vec<Record>>>, Arc<dyn SamplingCallback>) {
+        let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
+        let emitted_for_callback = emitted.clone();
+        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+            emitted_for_callback.lock().unwrap().push(record);
+        });
+        (emitted, callback)
+    }
+
+    fn cpu_clock_sample(time: u64, cpu: u32) -> PendingSample {
+        PendingSample {
+            time,
+            pid: 7,
+            tid: 42,
+            trace_tid: 42,
+            cpu,
+            kpc_values: Vec::new(),
+            callstack: SmallVec::from_slice(&[0x10, 0x20]),
+            forced_pid: Some(7),
+            timer_observation: true,
+        }
+    }
+
+    #[test]
+    fn cpu_clock_emits_the_first_timer_hit() {
+        let handles = vec![cpu_clock_handle()];
+        let (emitted, callback) = recording_callback();
+        let mut state = KdebugDecodeState {
+            sample_period_ns: 1_000_000,
+            ..Default::default()
+        };
+
+        emit_pending_sample(
+            cpu_clock_sample(1_000_000, 3),
+            &handles,
+            0,
+            1,
+            &mut state,
+            &callback,
+        );
+
+        let records = emitted.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let Record::Sample(cpu_clock) = &records[0] else {
+            panic!("expected a CPU-clock sample");
+        };
+        assert_eq!(cpu_clock.counter, Counter::CpuClock);
+        assert_eq!(cpu_clock.value, 1_000_000);
+        assert_eq!(cpu_clock.cpu, 3);
+        assert_eq!(cpu_clock.callstack.as_slice(), &[0x10, 0x20]);
+    }
+
+    #[test]
+    fn cpu_clock_attributes_each_period_to_the_endpoint_cpu_across_migration() {
+        let handles = vec![cpu_clock_handle()];
+        let (emitted, callback) = recording_callback();
+        let mut state = KdebugDecodeState {
+            sample_period_ns: 1_000_000,
+            ..Default::default()
+        };
+
+        for sample in [
+            cpu_clock_sample(1_000_000, 3),
+            cpu_clock_sample(500_000_000, 7),
+        ] {
+            emit_pending_sample(sample, &handles, 0, 1, &mut state, &callback);
+        }
+
+        let records = emitted.lock().unwrap();
+        let cpu_clock = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::Sample(sample) if sample.counter == Counter::CpuClock => Some(sample),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cpu_clock.len(), 2);
+        assert_eq!(
+            cpu_clock
+                .iter()
+                .map(|sample| sample.cpu)
+                .collect::<Vec<_>>(),
+            [3, 7]
+        );
+        assert!(cpu_clock.iter().all(|sample| sample.value == 1_000_000));
+    }
+
+    #[test]
+    fn cpu_clock_only_sampling_uses_a_no_payload_timer_path() {
+        assert_eq!(
+            sampling_samplers(false, false),
+            SAMPLER_TH_INFO,
+            "software-only sampling must not request PMC_THREAD"
+        );
+        assert_eq!(
+            sampling_samplers(false, true),
+            SAMPLER_TH_INFO | SAMPLER_USTACK
+        );
+        assert!(!sampling_counter_supported(&Counter::PageFaults));
+        assert!(!sampling_counter_supported(&Counter::ContextSwitches));
+        assert!(!sampling_counter_supported(&Counter::CpuMigrations));
+        assert!(sampling_handle_supported(&cpu_clock_handle()));
+        assert!(!sampling_handle_supported(&NativeCounterHandle {
+            counter: Counter::PageFaults,
+            program_index: None,
+            kpc_index: None,
+        }));
+
+        let configured_handles = vec![cpu_clock_handle()];
+        let handles = initial_sampling_handles(&[], &configured_handles);
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].counter, Counter::CpuClock);
+
+        let (emitted, callback) = recording_callback();
+        let mut state = KdebugDecodeState {
+            sample_period_ns: 2_000_000,
+            ..Default::default()
+        };
+        let tid = 42;
+        let pid = 7;
+        for rec in [
+            record(
+                PERF_SAMPLE | DBG_FUNC_START,
+                tid,
+                [SAMPLER_TH_INFO as u64, 1, 0, SAMPLE_FLAG_PEND_USER],
+            ),
+            record(PERF_TI_DATA, tid, [pid, tid, 0, 0]),
+            record(
+                PERF_SAMPLE | DBG_FUNC_END,
+                tid,
+                [SAMPLER_TH_INFO as u64, 0, 0, 0],
+            ),
+        ] {
+            handle_kdebug_record(
+                rec,
+                KdebugDecodeConfig {
+                    handles: &handles,
+                    kpc_count: 0,
+                    forced_pid: Some(pid as u32),
+                    program_epoch: 0,
+                    time_enabled_multiplier: 1,
+                },
+                &mut state,
+                &callback,
+            );
+        }
+
+        let records = emitted.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let Record::Sample(sample) = &records[0] else {
+            panic!("expected CPU-clock sample");
+        };
+        assert_eq!(sample.counter, Counter::CpuClock);
+        assert_eq!(sample.value, 2_000_000);
+        assert!(sample.callstack.is_empty());
+    }
+
     #[test]
     fn moves_appended_user_stack_fixup_after_sampled_pc() {
         let stack = StackBuilder {
@@ -2297,13 +2577,13 @@ mod tests {
 
     #[test]
     fn joins_pended_user_stack_to_timer_kpc_sample() {
-        let handles = one_counter_handles();
-        let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
-        let emitted_for_callback = emitted.clone();
-        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
-            emitted_for_callback.lock().unwrap().push(record);
-        });
-        let mut state = KdebugDecodeState::default();
+        let mut handles = one_counter_handles();
+        handles.push(cpu_clock_handle());
+        let (emitted, callback) = recording_callback();
+        let mut state = KdebugDecodeState {
+            sample_period_ns: 1_000_000,
+            ..Default::default()
+        };
         let tid = 42;
         let pid = 7;
         state.last_kpc_values.insert(
@@ -2317,7 +2597,11 @@ mod tests {
         // Timer sample: XNU logs TH_INFO + PMC_THREAD, marks the user stack as
         // pended, and ends this generic sample before the AST runs.
         for rec in [
-            record(PERF_SAMPLE | DBG_FUNC_START, tid, [0, 0, 0, 0]),
+            record(
+                PERF_SAMPLE | DBG_FUNC_START,
+                tid,
+                [0, 0, 0, SAMPLE_FLAG_PEND_USER],
+            ),
             record(PERF_TI_DATA, tid, [pid, tid, 0, 0]),
             record(PERF_KPC_DATA_THREAD | DBG_FUNC_START, tid, [1_000, 0, 0, 0]),
             record(
@@ -2369,27 +2653,41 @@ mod tests {
         }
 
         let records = emitted.lock().unwrap();
-        assert_eq!(records.len(), 1);
-        let Record::Sample(sample) = &records[0] else {
-            panic!("expected sample");
-        };
-        assert_eq!(sample.pid, pid as u32);
-        assert_eq!(sample.tid, tid as u32);
-        assert_eq!(sample.cpu, 3);
-        assert_eq!(sample.counter, Counter::Cycles);
-        assert_eq!(sample.callstack.as_slice(), &[0x10, 0x20, 0x30]);
-        assert_eq!(sample.ip, 0x10);
+        assert_eq!(records.len(), 2);
+        for record in records.iter() {
+            let Record::Sample(sample) = record else {
+                panic!("expected sample");
+            };
+            assert_eq!(sample.pid, pid as u32);
+            assert_eq!(sample.tid, tid as u32);
+            assert_eq!(sample.cpu, 3);
+            assert_eq!(sample.callstack.as_slice(), &[0x10, 0x20, 0x30]);
+            assert_eq!(sample.ip, 0x10);
+        }
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record,
+                        Record::Sample(sample) if sample.counter == Counter::CpuClock
+                    )
+                })
+                .count(),
+            1,
+            "the AST stack delivery must not add another CPU-clock period"
+        );
     }
 
     #[test]
     fn does_not_emit_unmatched_stack_only_group_as_hardware_sample() {
-        let handles = one_counter_handles();
-        let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
-        let emitted_for_callback = emitted.clone();
-        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
-            emitted_for_callback.lock().unwrap().push(record);
-        });
-        let mut state = KdebugDecodeState::default();
+        let mut handles = one_counter_handles();
+        handles.push(cpu_clock_handle());
+        let (emitted, callback) = recording_callback();
+        let mut state = KdebugDecodeState {
+            sample_period_ns: 1_000_000,
+            ..Default::default()
+        };
         let tid = 42;
 
         for rec in [
@@ -2416,25 +2714,46 @@ mod tests {
     }
 
     #[test]
-    fn discards_deferred_timer_sample_without_ast_stack_at_shutdown() {
-        let mut state = KdebugDecodeState::default();
+    fn shutdown_preserves_deferred_cpu_clock_but_discards_pmu_delta() {
+        let (emitted, callback) = recording_callback();
+        let mut state = KdebugDecodeState {
+            sample_period_ns: 1_000_000,
+            ..Default::default()
+        };
+        let mut handles = one_counter_handles();
+        handles.push(cpu_clock_handle());
         state.deferred_samples.insert(
             42,
             VecDeque::from([DeferredSample {
                 sample: PendingSample {
+                    time: 5_000_000,
+                    pid: 7,
+                    tid: 42,
                     trace_tid: 42,
+                    cpu: 6,
                     kpc_values: vec![1_000],
+                    timer_observation: true,
                     ..PendingSample::default()
                 },
-                handles: one_counter_handles(),
+                handles,
                 program_epoch: 0,
                 time_enabled_multiplier: 1,
             }]),
         );
 
-        discard_incomplete_deferred_samples(&mut state);
+        flush_incomplete_deferred_samples(&mut state, &callback);
 
         assert!(state.deferred_samples.is_empty());
+        let records = emitted.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let Record::Sample(sample) = &records[0] else {
+            panic!("expected CPU-clock sample");
+        };
+        assert_eq!(sample.counter, Counter::CpuClock);
+        assert_eq!(sample.value, 1_000_000);
+        assert_eq!(sample.cpu, 6);
+        assert_eq!(sample.ip, 0);
+        assert!(sample.callstack.is_empty());
     }
 
     #[test]

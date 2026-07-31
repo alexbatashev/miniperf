@@ -1,6 +1,5 @@
 use std::iter::zip;
 
-use itertools::Itertools;
 use perf_event_open_sys::{self as sys, bindings::perf_event_attr};
 
 use crate::{cpu_family, Counter, Error};
@@ -131,23 +130,16 @@ pub fn grouped(
         .map(|(_, attrs)| attrs)
         .cloned();
 
-    let mut sw_counters = zip(counters, attrs.iter().cloned())
-        .filter(|(cntr, _)| cntr.is_software())
+    let group_plan = sampling_group_plan(counters, leader_cntr, max_counters_in_group);
+    let software_indices = counters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, counter)| counter.is_software().then_some(index))
         .collect::<Vec<_>>();
-
-    // Filter out Cycles, Instructions and group leader (if any)
-    let chunks = zip(counters, attrs.iter_mut())
-        .filter(|(cntr, _)| {
-            **cntr != Counter::Cycles
-                && **cntr != Counter::Instructions
-                && !cntr.is_software()
-                && leader_cntr != Some(*cntr)
-        })
-        .chunks(max_counters_in_group);
 
     let mut handles: Vec<NativeCounterHandle> = vec![];
 
-    for chunk in chunks.into_iter() {
+    for group in group_plan {
         let cycles_leader_fd = if leader.is_some() {
             let mut leader_attr = leader_attrs.ok_or_else(|| {
                 Error::InvalidConfiguration("configured sampling leader is missing".to_owned())
@@ -180,13 +172,20 @@ pub fn grouped(
 
         push_handle(&mut handles, instr_fd, Counter::Instructions, false)?;
 
-        for (cntr, attrs) in chunk {
+        for index in group.hardware_indices {
+            let cntr = &counters[index];
+            let attrs = &mut attrs[index];
             let new_fd =
                 unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
             push_handle(&mut handles, new_fd, cntr.clone(), false)?;
         }
 
-        for (cntr, attrs) in &mut sw_counters {
+        if !group.include_software {
+            continue;
+        }
+        for &index in &software_indices {
+            let cntr = &counters[index];
+            let attrs = &mut attrs[index];
             let new_fd =
                 unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
             push_handle(&mut handles, new_fd, cntr.clone(), false)?;
@@ -194,6 +193,50 @@ pub fn grouped(
     }
 
     Ok(handles)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SamplingGroupPlan {
+    hardware_indices: Vec<usize>,
+    include_software: bool,
+}
+
+/// Split hardware events into sampling groups while assigning software events
+/// to exactly one authoritative stream. Repeating task-clock in every group
+/// duplicates the same cumulative counter and overstates CPU occupancy.
+fn sampling_group_plan(
+    counters: &[Counter],
+    leader_counter: Option<&Counter>,
+    max_counters_in_group: usize,
+) -> Vec<SamplingGroupPlan> {
+    let hardware_indices = counters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, counter)| {
+            (*counter != Counter::Cycles
+                && *counter != Counter::Instructions
+                && !counter.is_software()
+                && leader_counter != Some(counter))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let chunk_size = max_counters_in_group.max(1);
+
+    if hardware_indices.is_empty() {
+        return vec![SamplingGroupPlan {
+            hardware_indices,
+            include_software: true,
+        }];
+    }
+
+    hardware_indices
+        .chunks(chunk_size)
+        .enumerate()
+        .map(|(group_index, indices)| SamplingGroupPlan {
+            hardware_indices: indices.to_vec(),
+            include_software: group_index == 0,
+        })
+        .collect()
 }
 
 /// Build a single software-event sampling group used when the hardware PMU is
@@ -297,5 +340,45 @@ fn get_native_handle(fd: i32, cntr: Counter, leader: bool) -> Result<NativeCount
 fn close_handles(handles: &[NativeCounterHandle]) {
     for handle in handles {
         unsafe { libc::close(handle.fd) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampling_group_plan;
+    use crate::Counter;
+
+    #[test]
+    fn software_counters_have_one_authoritative_hardware_group() {
+        let counters = vec![
+            Counter::Cycles,
+            Counter::Instructions,
+            Counter::LLCReferences,
+            Counter::LLCMisses,
+            Counter::BranchInstructions,
+            Counter::CpuClock,
+            Counter::CpuMigrations,
+        ];
+
+        let plan = sampling_group_plan(&counters, None, 1);
+
+        assert_eq!(plan.len(), 3);
+        assert!(plan[0].include_software);
+        assert!(plan[1..].iter().all(|group| !group.include_software));
+        assert_eq!(
+            plan.iter().filter(|group| group.include_software).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn base_hardware_group_still_owns_software_without_extra_events() {
+        let counters = vec![Counter::Cycles, Counter::Instructions, Counter::CpuClock];
+
+        let plan = sampling_group_plan(&counters, None, 3);
+
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].hardware_indices.is_empty());
+        assert!(plan[0].include_software);
     }
 }

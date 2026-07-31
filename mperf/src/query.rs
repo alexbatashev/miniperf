@@ -464,6 +464,7 @@ DISCOVER THE RECORDING SCHEMA
 COMMON DATASETS
   hotspots              Snapshot/Roofline function-level performance
   pmu_counters           Processed PMU sample groups and recorded counters
+  cpu_observations       Stack-independent logical-CPU activity observations
   derived_metrics        Recording-wide derived values and their formulas
   tma                    TMA function-level metrics
   tma_summary            TMA recording-wide values and dominant verdict

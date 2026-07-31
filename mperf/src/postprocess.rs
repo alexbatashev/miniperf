@@ -8,7 +8,8 @@ use anyhow::Result;
 use kdam::BarExt;
 use memmap2::{Advice, Mmap};
 use mperf_data::{
-    CallFrame, Event, EventType, IString, ProcMapEntry, RecordInfo, Scenario, ScenarioInfo,
+    CallFrame, CpuClockSource, Event, EventType, IString, ProcMapEntry, RecordInfo, Scenario,
+    ScenarioInfo,
 };
 use object::{Object, ObjectSymbol, SymbolKind};
 use smallvec::SmallVec;
@@ -50,18 +51,18 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
 
     match info.scenario {
         Scenario::Snapshot => {
-            process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
+            process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
         }
         Scenario::Roofline => {
-            process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
+            process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
             create_roofline_view(&connection).await?;
         }
         Scenario::TMA => {
-            process_pmu_counters(&connection, &info.scenario_info, res_dir, &mut pb).await?;
+            process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_tma_view(&connection, &info.scenario_info).await?;
         }
@@ -210,6 +211,7 @@ struct CounterLead {
     correlation_id: u128,
     process_id: u32,
     thread_id: u32,
+    cpu: u32,
     time_enabled: u64,
     time_running: u64,
     timestamp: u64,
@@ -342,10 +344,11 @@ impl RooflineData {
 
 async fn process_pmu_counters(
     connection: &sqlite::Connection,
-    info: &ScenarioInfo,
+    record_info: &RecordInfo,
     res_dir: &Path,
     pb: &mut kdam::Bar,
 ) -> Result<()> {
+    let info = &record_info.scenario_info;
     let events = match info {
         ScenarioInfo::Snapshot(s) => &s.counters,
         ScenarioInfo::Roofline(r) => &r.counters,
@@ -384,12 +387,23 @@ async fn process_pmu_counters(
                 unique_id BINARY(128),
                 process_id INTEGER NOT NULL,
                 thread_id INTEGER NOT NULL,
+                cpu INTEGER,
                 time_enabled INTEGER NOT NULL,
                 time_running INTEGER NOT NULL,
                 confidence REAL NOT NULL,
                 timestamp INTEGER NOT NULL,
                 ip INTEGER NOT NULL,
                 call_stack TEXT{}
+            );
+            CREATE TABLE cpu_observations (
+                process_id INTEGER NOT NULL,
+                thread_id INTEGER NOT NULL,
+                cpu INTEGER,
+                timestamp INTEGER NOT NULL,
+                interval_start_ns INTEGER,
+                weight_ns INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                call_stack TEXT NOT NULL
             );
         ",
         event_schema
@@ -445,14 +459,16 @@ async fn process_pmu_counters(
 
     // Core-cluster topology, used to attribute samples per core on
     // heterogeneous (big.LITTLE) systems. Empty on homogeneous hosts.
-    let clusters: Vec<ClusterRanges> = {
-        let data = std::fs::read_to_string(res_dir.join("info.json"))?;
-        let ri: RecordInfo = serde_json::from_str(&data)?;
-        ri.cores
-            .into_iter()
-            .map(|c| (c.family_id, c.name, parse_cpumask(&c.cpus)))
-            .collect()
-    };
+    let clusters: Vec<ClusterRanges> = record_info
+        .cores
+        .iter()
+        .cloned()
+        .map(|c| (c.family_id, c.name, parse_cpumask(&c.cpus)))
+        .collect();
+    let cpu_clock_source = record_info
+        .cpu_clock_source
+        .map(CpuClockSource::as_str)
+        .unwrap_or("legacy_unknown");
 
     let mut flamegraph_cycles = HashMap::<String, u64>::new();
     let mut flamegraph_instructions = HashMap::<String, u64>::new();
@@ -470,15 +486,21 @@ async fn process_pmu_counters(
     } else {
         format!(", {insert_columns}")
     };
-    let placeholders = std::iter::repeat_n("?", 9 + event_columns.len())
+    let placeholders = std::iter::repeat_n("?", 10 + event_columns.len())
         .collect::<Vec<_>>()
         .join(", ");
     let mut counter_stmt = connection.prepare(format!(
         "INSERT INTO pmu_counters (
-            unique_id, process_id, thread_id, time_enabled, time_running,
+            unique_id, process_id, thread_id, cpu, time_enabled, time_running,
             confidence, timestamp, ip, call_stack{insert_columns}
          ) VALUES ({placeholders});"
     ))?;
+    let mut cpu_observation_stmt = connection.prepare(
+        "INSERT INTO cpu_observations (
+            process_id, thread_id, cpu, timestamp, interval_start_ns,
+            weight_ns, source, call_stack
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+    )?;
 
     connection.execute("BEGIN IMMEDIATE TRANSACTION;")?;
     let result = (|| -> Result<()> {
@@ -526,6 +548,12 @@ async fn process_pmu_counters(
                 .is_none_or(|lead| evt.correlation_id != lead.correlation_id);
             if is_new_group {
                 if let Some(lead) = &lead_event {
+                    insert_cpu_observation(
+                        &mut cpu_observation_stmt,
+                        lead,
+                        &counters,
+                        cpu_clock_source,
+                    )?;
                     insert_counter_group(
                         &mut counter_stmt,
                         lead,
@@ -565,6 +593,7 @@ async fn process_pmu_counters(
                     correlation_id: evt.correlation_id,
                     process_id: evt.process_id,
                     thread_id: evt.thread_id,
+                    cpu: evt.cpu,
                     time_enabled: evt.time_enabled,
                     time_running: evt.time_running,
                     timestamp: evt.timestamp,
@@ -610,6 +639,12 @@ async fn process_pmu_counters(
         }
 
         if let Some(lead_event) = &lead_event {
+            insert_cpu_observation(
+                &mut cpu_observation_stmt,
+                lead_event,
+                &counters,
+                cpu_clock_source,
+            )?;
             insert_counter_group(
                 &mut counter_stmt,
                 lead_event,
@@ -625,6 +660,7 @@ async fn process_pmu_counters(
         pb.update_to(map.len())?;
         Ok(())
     })();
+    drop(cpu_observation_stmt);
     drop(counter_stmt);
     drop(proc_map_stmt);
     finish_transaction(connection, result)?;
@@ -810,35 +846,31 @@ fn insert_counter_group(
     } else {
         0.0
     };
-    let call_stack = format!(
-        "[{}]",
-        lead_event
-            .callstack
-            .iter()
-            .map(|frame| frame.as_ip().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    let call_stack = serialized_call_stack(&lead_event.callstack);
     statement.reset()?;
     bind_id(statement, 1, lead_event.unique_id)?;
     statement.bind((2, lead_event.process_id as i64))?;
     statement.bind((3, lead_event.thread_id as i64))?;
-    statement.bind((4, lead_event.time_enabled as i64))?;
-    statement.bind((5, lead_event.time_running as i64))?;
-    statement.bind((6, confidence))?;
-    statement.bind((7, lead_event.timestamp as i64))?;
     statement.bind((
-        8,
+        4,
+        (lead_event.cpu != u32::MAX).then_some(lead_event.cpu as i64),
+    ))?;
+    statement.bind((5, lead_event.time_enabled as i64))?;
+    statement.bind((6, lead_event.time_running as i64))?;
+    statement.bind((7, confidence))?;
+    statement.bind((8, lead_event.timestamp as i64))?;
+    statement.bind((
+        9,
         lead_event.callstack.first().map(|f| f.as_ip()).unwrap_or(0) as i64,
     ))?;
-    statement.bind((9, call_stack.as_str()))?;
+    statement.bind((10, call_stack.as_str()))?;
     for (offset, column) in event_columns.iter().enumerate() {
         let value = counters
             .get(column)
             .copied()
             .map(|value| value as i64)
             .or_else(|| (!missing_is_null).then_some(0));
-        statement.bind((10 + offset, value))?;
+        statement.bind((11 + offset, value))?;
     }
     statement.next()?;
     Ok(())
@@ -847,6 +879,51 @@ fn insert_counter_group(
 fn bind_id(statement: &mut sqlite::Statement<'_>, index: usize, id: u128) -> sqlite::Result<()> {
     let bytes = id.to_be_bytes();
     statement.bind((index, bytes.as_slice()))
+}
+
+fn insert_cpu_observation(
+    statement: &mut sqlite::Statement<'_>,
+    lead_event: &CounterLead,
+    counters: &HashMap<String, u64>,
+    source: &str,
+) -> Result<()> {
+    let Some(weight_ns) = counters
+        .get("os_cpu_clock")
+        .copied()
+        .filter(|value| *value > 0)
+    else {
+        return Ok(());
+    };
+
+    let call_stack = serialized_call_stack(&lead_event.callstack);
+    statement.reset()?;
+    statement.bind((1, lead_event.process_id as i64))?;
+    statement.bind((2, lead_event.thread_id as i64))?;
+    statement.bind((
+        3,
+        (lead_event.cpu != u32::MAX).then_some(lead_event.cpu as i64),
+    ))?;
+    statement.bind((4, lead_event.timestamp as i64))?;
+    let interval_start_ns = (source == CpuClockSource::CounterDelta.as_str()
+        && lead_event.time_enabled > 0)
+        .then_some(lead_event.timestamp.saturating_sub(lead_event.time_enabled) as i64);
+    statement.bind((5, interval_start_ns))?;
+    statement.bind((6, weight_ns as i64))?;
+    statement.bind((7, source))?;
+    statement.bind((8, call_stack.as_str()))?;
+    statement.next()?;
+    Ok(())
+}
+
+fn serialized_call_stack(callstack: &[CallFrame]) -> String {
+    format!(
+        "[{}]",
+        callstack
+            .iter()
+            .map(|frame| frame.as_ip().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// Persist one-second metric intervals and a machine-readable dominant verdict.
@@ -909,7 +986,9 @@ fn counter_group_has_profile_data(
 
 #[cfg(test)]
 mod counter_group_tests {
-    use super::{counter_group_has_profile_data, CounterLead};
+    use super::{
+        counter_group_has_profile_data, insert_counter_group, insert_cpu_observation, CounterLead,
+    };
     use mperf_data::CallFrame;
     use smallvec::SmallVec;
     use std::collections::HashMap;
@@ -920,6 +999,7 @@ mod counter_group_tests {
             correlation_id: 1,
             thread_id: 1,
             process_id: 1,
+            cpu: 0,
             time_enabled: 1,
             time_running: 1,
             timestamp: 1,
@@ -946,6 +1026,157 @@ mod counter_group_tests {
             &event(SmallVec::from_slice(&[CallFrame::IP(1)])),
             &counters
         ));
+    }
+
+    #[test]
+    fn persists_logical_cpu_and_uses_null_for_unknown_cpu() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE pmu_counters (
+                    unique_id BINARY(128),
+                    process_id INTEGER NOT NULL,
+                    thread_id INTEGER NOT NULL,
+                    cpu INTEGER,
+                    time_enabled INTEGER NOT NULL,
+                    time_running INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    timestamp INTEGER NOT NULL,
+                    ip INTEGER NOT NULL,
+                    call_stack TEXT,
+                    pmu_cycles INTEGER
+                );",
+            )
+            .unwrap();
+        let mut statement = connection
+            .prepare(
+                "INSERT INTO pmu_counters (
+                    unique_id, process_id, thread_id, cpu, time_enabled, time_running,
+                    confidence, timestamp, ip, call_stack, pmu_cycles
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            )
+            .unwrap();
+        let counters = HashMap::from([("pmu_cycles".to_string(), 1)]);
+        let columns = vec!["pmu_cycles".to_string()];
+
+        let mut known_cpu = event(SmallVec::from_slice(&[CallFrame::IP(1)]));
+        known_cpu.cpu = 7;
+        insert_counter_group(&mut statement, &known_cpu, &counters, &columns, false).unwrap();
+
+        let mut unknown_cpu = event(SmallVec::from_slice(&[CallFrame::IP(2)]));
+        unknown_cpu.cpu = u32::MAX;
+        insert_counter_group(&mut statement, &unknown_cpu, &counters, &columns, false).unwrap();
+        drop(statement);
+
+        let cpus = connection
+            .prepare("SELECT cpu FROM pmu_counters ORDER BY ip;")
+            .unwrap()
+            .into_iter()
+            .map(|row| row.unwrap().try_read::<Option<i64>, _>("cpu").unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(cpus, vec![Some(7), None]);
+    }
+
+    #[test]
+    fn preserves_cpu_observations_when_stack_collection_fails() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE cpu_observations (
+                    process_id INTEGER NOT NULL,
+                    thread_id INTEGER NOT NULL,
+                    cpu INTEGER,
+                    timestamp INTEGER NOT NULL,
+                    interval_start_ns INTEGER,
+                    weight_ns INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    call_stack TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let mut statement = connection
+            .prepare(
+                "INSERT INTO cpu_observations (
+                    process_id, thread_id, cpu, timestamp, interval_start_ns,
+                    weight_ns, source, call_stack
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            )
+            .unwrap();
+        let lead = event(SmallVec::new());
+        let counters = HashMap::from([("os_cpu_clock".to_string(), 1_000)]);
+
+        insert_cpu_observation(&mut statement, &lead, &counters, "sampled_occupancy").unwrap();
+        drop(statement);
+
+        let row = connection
+            .prepare(
+                "SELECT cpu, interval_start_ns, weight_ns, source, call_stack
+                 FROM cpu_observations LIMIT 1;",
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_read::<i64, _>("cpu").unwrap(), 0);
+        assert_eq!(row.try_read::<i64, _>("weight_ns").unwrap(), 1_000);
+        assert_eq!(
+            row.try_read::<&str, _>("source").unwrap(),
+            "sampled_occupancy"
+        );
+        assert_eq!(
+            row.try_read::<Option<i64>, _>("interval_start_ns").unwrap(),
+            None
+        );
+        assert_eq!(row.try_read::<&str, _>("call_stack").unwrap(), "[]");
+    }
+
+    #[test]
+    fn counter_delta_persists_its_first_wall_time_interval() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE cpu_observations (
+                    process_id INTEGER NOT NULL,
+                    thread_id INTEGER NOT NULL,
+                    cpu INTEGER,
+                    timestamp INTEGER NOT NULL,
+                    interval_start_ns INTEGER,
+                    weight_ns INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    call_stack TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let mut statement = connection
+            .prepare(
+                "INSERT INTO cpu_observations (
+                    process_id, thread_id, cpu, timestamp, interval_start_ns,
+                    weight_ns, source, call_stack
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+            )
+            .unwrap();
+        let mut lead = event(SmallVec::new());
+        lead.timestamp = 10_000_000;
+        lead.time_enabled = 10_000_000;
+        let counters = HashMap::from([("os_cpu_clock".to_string(), 2_000_000)]);
+
+        insert_cpu_observation(&mut statement, &lead, &counters, "counter_delta").unwrap();
+        drop(statement);
+
+        let row = connection
+            .prepare(
+                "SELECT timestamp, interval_start_ns, weight_ns
+                 FROM cpu_observations LIMIT 1;",
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_read::<i64, _>("timestamp").unwrap(), 10_000_000);
+        assert_eq!(row.try_read::<i64, _>("interval_start_ns").unwrap(), 0);
+        assert_eq!(row.try_read::<i64, _>("weight_ns").unwrap(), 2_000_000);
     }
 }
 

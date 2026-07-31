@@ -8,12 +8,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use config::scenario_ui;
 use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use flamegraph::FlamegraphTab;
 use loops::LoopsTab;
 use metrics_table::MetricsTableTab;
-use mperf_data::{RecordInfo, Scenario};
+use mperf_data::{scenario_ui, RecordInfo, Scenario};
 use parking_lot::{Mutex, RwLock};
 use ratatui::{
     layout::{Constraint, Flex, Layout},
@@ -26,7 +25,6 @@ use summary::SummaryTab;
 use tokio::fs::{self};
 use tokio_stream::StreamExt;
 
-mod config;
 mod flamegraph;
 mod loops;
 mod metrics_table;
@@ -198,7 +196,7 @@ impl Widget for &TabsWidget {
 
 #[derive(Clone)]
 enum Tab {
-    Summary(SummaryTab),
+    Summary(Box<SummaryTab>),
     MetricsTable(MetricsTableTab),
     Loops(LoopsTab),
     Flamegraph(FlamegraphTab),
@@ -266,9 +264,8 @@ impl TabsWidget {
 
         for tab in ui.tabs.iter() {
             match tab {
-                pmu_data::TabSpec::Summary => write_tabs.push(Tab::Summary(SummaryTab::new(
-                    info.clone(),
-                    connection.clone(),
+                pmu_data::TabSpec::Summary => write_tabs.push(Tab::Summary(Box::new(
+                    SummaryTab::new(info.clone(), connection.clone()),
                 ))),
                 pmu_data::TabSpec::Flamegraph => {
                     write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())))
@@ -345,7 +342,7 @@ impl Widget for &Tab {
         Self: Sized,
     {
         match self {
-            Tab::Summary(tab) => tab.clone().render(area, buf),
+            Tab::Summary(tab) => tab.as_ref().clone().render(area, buf),
             Tab::MetricsTable(tab) => tab.clone().render(area, buf),
             Tab::Loops(tab) => tab.clone().render(area, buf),
             Tab::Flamegraph(tab) => tab.clone().render(area, buf),

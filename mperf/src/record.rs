@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use mperf_data::{CallFrame, Event, ProcMapEntry, RecordInfo, ScenarioInfo};
+use mperf_data::{CallFrame, CpuClockSource, Event, ProcMapEntry, RecordInfo, ScenarioInfo};
 use std::{fs::File, path::Path, sync::Arc};
 
 #[cfg(target_os = "macos")]
@@ -85,6 +85,13 @@ pub async fn do_record(
         command: json_command,
         cpu_model,
         cpu_vendor,
+        sampling_frequency_hz: Some(pmu::DEFAULT_SAMPLE_FREQUENCY_HZ),
+        cpu_clock_source: Some(if cfg!(any(target_os = "macos", target_os = "linux")) {
+            CpuClockSource::SampledOccupancy
+        } else {
+            CpuClockSource::CounterDelta
+        }),
+        logical_cpu_count: host_logical_cpu_count(),
         cores,
         cpu_info,
         scenario_info: info,
@@ -105,6 +112,13 @@ pub async fn do_record(
     kdam::term::show_cursor()?;
 
     Ok(())
+}
+
+fn host_logical_cpu_count() -> Option<u32> {
+    let configured = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
+    (configured > 0)
+        .then(|| u32::try_from(configured).ok())
+        .flatten()
 }
 
 fn snapshot(
@@ -131,6 +145,7 @@ fn snapshot(
         builder = builder.pid(pid as i32);
     }
     let mut driver = builder.build()?;
+    let recorded_counters = driver.counters();
     let recorded_pid = pid.unwrap_or_else(|| process.as_ref().unwrap().pid() as u32) as i32;
     // On macOS Process::new returns an already-exec'd, suspended child, so its
     // dyld mappings are available before the first instruction is profiled.
@@ -201,7 +216,7 @@ fn snapshot(
 
     Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
         pid: recorded_pid,
-        counters: counters
+        counters: recorded_counters
             .iter()
             .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
             .collect(),
@@ -311,6 +326,7 @@ fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scena
         .counters(&counters)
         .process(&process)
         .build()?;
+    let recorded_counters = driver.counters();
     let recorded_pid = process.pid();
     if cfg!(target_os = "macos") {
         publish_process_maps(dispatcher.clone(), recorded_pid);
@@ -363,7 +379,7 @@ fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scena
 
     Ok(ScenarioInfo::TMA(mperf_data::TMAInfo {
         pid: recorded_pid,
-        counters: counters
+        counters: recorded_counters
             .iter()
             .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
             .collect(),

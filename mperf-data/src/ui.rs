@@ -1,6 +1,11 @@
-use mperf_data::{RecordInfo, Scenario, ScenarioInfo};
 use pmu_data::{MetricColumnSpec, MetricsTableSpec, OrderSpec, ScenarioUi, SortDirection, TabSpec};
 
+use crate::{RecordInfo, Scenario, ScenarioInfo};
+
+/// Returns the result-view tabs for a recorded scenario.
+///
+/// This is shared by the TUI and GUI so both frontends expose the same
+/// scenario-specific views and use the UI definition embedded in TMA results.
 pub fn scenario_ui(record: &RecordInfo) -> ScenarioUi {
     match record.scenario {
         Scenario::Snapshot => snapshot_ui(),
@@ -74,7 +79,7 @@ fn roofline_ui() -> ScenarioUi {
     }
 }
 
-fn tma_fallback_ui(tma: &mperf_data::TMAInfo) -> ScenarioUi {
+fn tma_fallback_ui(tma: &crate::TMAInfo) -> ScenarioUi {
     let mut ui = snapshot_ui();
     for tab in &mut ui.tabs {
         if let TabSpec::MetricsTable(table) = tab {
