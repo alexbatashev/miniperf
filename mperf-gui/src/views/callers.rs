@@ -15,9 +15,10 @@ use crate::{
 
 const HEADER_HEIGHT: f32 = 30.0;
 const LIST_HEADER_HEIGHT: f32 = 24.0;
-const FUNCTION_ROW_HEIGHT: f32 = 28.0;
+const FUNCTION_ROW_HEIGHT: f32 = 40.0;
 const RELATION_ROW_HEIGHT: f32 = 26.0;
 const RANKED_WIDTH: f32 = 350.0;
+const RANK_WIDTH: f32 = 42.0;
 const SAMPLES_WIDTH: f32 = 92.0;
 const PERCENT_WIDTH: f32 = 76.0;
 
@@ -201,7 +202,13 @@ impl MperfGui {
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(MUTED_TEXT))
-                    .child(div().w(px(34.0)).child("RANK"))
+                    .child(
+                        div()
+                            .w(px(RANK_WIDTH))
+                            .min_w(px(RANK_WIDTH))
+                            .whitespace_nowrap()
+                            .child("RANK"),
+                    )
                     .child(div().flex_1().child("FUNCTION"))
                     .child(div().w(px(68.0)).text_right().child("INCL %")),
             )
@@ -250,6 +257,7 @@ impl MperfGui {
             .min_h(px(FUNCTION_ROW_HEIGHT))
             .flex()
             .items_center()
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(BORDER))
             .cursor_pointer()
@@ -268,7 +276,8 @@ impl MperfGui {
             }))
             .child(
                 div()
-                    .w(px(42.0))
+                    .w(px(RANK_WIDTH))
+                    .min_w(px(RANK_WIDTH))
                     .pl_3()
                     .text_xs()
                     .text_color(rgb(MUTED_TEXT))
@@ -283,8 +292,14 @@ impl MperfGui {
                     .justify_center()
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .child(div().text_sm().child(label))
-                    .child(div().text_xs().text_color(rgb(MUTED_TEXT)).child(samples)),
+                    .child(div().line_height(px(18.0)).text_sm().child(label))
+                    .child(
+                        div()
+                            .line_height(px(16.0))
+                            .text_xs()
+                            .text_color(rgb(MUTED_TEXT))
+                            .child(samples),
+                    ),
             )
             .child(
                 div()
