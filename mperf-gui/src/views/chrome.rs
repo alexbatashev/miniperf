@@ -178,6 +178,9 @@ impl MperfGui {
             self.render_source_document(cx).into_any_element()
         } else {
             match self.active_visualization {
+                Some(crate::VisualizationKind::Roofline) => {
+                    self.render_roofline_workspace(cx).into_any_element()
+                }
                 Some(crate::VisualizationKind::Flamegraph) => {
                     self.render_flamegraph_workspace(cx).into_any_element()
                 }

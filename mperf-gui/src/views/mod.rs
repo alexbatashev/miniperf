@@ -6,6 +6,7 @@ mod flamegraph;
 mod flamescope;
 mod icicle;
 mod metrics_timeline;
+mod roofline;
 mod sidebar;
 mod source;
 mod stack_timeline;

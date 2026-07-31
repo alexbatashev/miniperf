@@ -4,6 +4,7 @@ mod model;
 mod profile;
 mod profile_analysis;
 mod recent;
+mod roofline;
 mod source;
 mod theme;
 mod views;
@@ -29,6 +30,7 @@ use theme::*;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VisualizationKind {
+    Roofline,
     #[default]
     Flamegraph,
     FlameScope,
@@ -40,7 +42,8 @@ enum VisualizationKind {
 }
 
 impl VisualizationKind {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
+        Self::Roofline,
         Self::Flamegraph,
         Self::FlameScope,
         Self::Icicle,
@@ -52,6 +55,7 @@ impl VisualizationKind {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Roofline => "Roofline",
             Self::Flamegraph => "Flamegraph",
             Self::FlameScope => "FlameScope",
             Self::Icicle => "Icicle",
@@ -64,6 +68,7 @@ impl VisualizationKind {
 
     fn id(self) -> &'static str {
         match self {
+            Self::Roofline => "roofline",
             Self::Flamegraph => "flamegraph",
             Self::FlameScope => "flamescope",
             Self::Icicle => "icicle",
@@ -153,6 +158,8 @@ struct MperfGui {
     selected_time_range: Option<profile::TimeRange>,
     icicle_focus_path: Vec<usize>,
     cpu_heatmap_bucket_ns: Option<u64>,
+    selected_roofline_loop: Option<usize>,
+    roofline_loop_scroll_handle: ScrollHandle,
 
     source_documents: Vec<SourceDocument>,
     active_source: Option<usize>,
@@ -187,6 +194,8 @@ impl MperfGui {
             selected_time_range: None,
             icicle_focus_path: Vec::new(),
             cpu_heatmap_bucket_ns: None,
+            selected_roofline_loop: None,
+            roofline_loop_scroll_handle: ScrollHandle::new(),
             source_documents: Vec::new(),
             active_source: None,
             metrics_scroll_handle: ScrollHandle::new(),
@@ -199,6 +208,13 @@ impl MperfGui {
     fn flamegraph_data(&self) -> Option<&FlamegraphData> {
         self.model.as_ref()?.tabs.iter().find_map(|tab| match tab {
             GuiTab::Flamegraph(data) => Some(data.as_ref()),
+            _ => None,
+        })
+    }
+
+    fn roofline_data(&self) -> Option<&roofline::RooflineData> {
+        self.model.as_ref()?.tabs.iter().find_map(|tab| match tab {
+            GuiTab::Loops(data) => Some(data.as_ref()),
             _ => None,
         })
     }
@@ -297,13 +313,19 @@ impl MperfGui {
         self.bottom_panel_collapsed = true;
         self.open_visualizations.clear();
         self.active_visualization = None;
-        if self.visualization_available(VisualizationKind::Flamegraph) {
+        if self.visualization_available(VisualizationKind::Roofline) {
+            self.open_visualizations.push(VisualizationKind::Roofline);
+            self.active_visualization = Some(VisualizationKind::Roofline);
+        } else if self.visualization_available(VisualizationKind::Flamegraph) {
             self.open_visualizations.push(VisualizationKind::Flamegraph);
             self.active_visualization = Some(VisualizationKind::Flamegraph);
         }
         self.selected_time_range = None;
         self.icicle_focus_path.clear();
         self.cpu_heatmap_bucket_ns = None;
+        self.selected_roofline_loop = None;
+        self.roofline_loop_scroll_handle
+            .set_offset(point(px(0.0), px(0.0)));
         self.source_documents.clear();
         self.active_source = None;
         self.metrics_scroll_handle
@@ -386,10 +408,14 @@ impl MperfGui {
         let Some(model) = self.model.as_ref() else {
             return false;
         };
-        if visualization == VisualizationKind::Flamegraph {
-            return self.flamegraph_data().is_some_and(|flamegraph| {
-                flamegraph.cycles.is_some() || flamegraph.instructions.is_some()
-            });
+        match visualization {
+            VisualizationKind::Roofline => return self.roofline_data().is_some(),
+            VisualizationKind::Flamegraph => {
+                return self.flamegraph_data().is_some_and(|flamegraph| {
+                    flamegraph.cycles.is_some() || flamegraph.instructions.is_some()
+                });
+            }
+            _ => {}
         }
         if model.profile.error.is_some() {
             return false;
@@ -405,7 +431,7 @@ impl MperfGui {
             .iter()
             .any(|sample| !sample.stack.is_empty());
         match visualization {
-            VisualizationKind::Flamegraph => unreachable!(),
+            VisualizationKind::Roofline | VisualizationKind::Flamegraph => unreachable!(),
             VisualizationKind::FlameScope => has_samples,
             VisualizationKind::Icicle
             | VisualizationKind::StackTimeline
@@ -468,6 +494,27 @@ impl MperfGui {
         self.hotspot_filter = None;
         self.flamegraph_zoom = ROOT_ID;
         self.icicle_focus_path.clear();
+    }
+
+    fn select_roofline_loop(&mut self, index: usize, open_source: bool) {
+        let source = self
+            .roofline_data()
+            .and_then(|data| data.loops.get(index))
+            .and_then(roofline::RooflineLoop::source);
+        if self
+            .roofline_data()
+            .is_none_or(|data| index >= data.loops.len())
+        {
+            return;
+        }
+        self.selected_roofline_loop = Some(index);
+        self.roofline_loop_scroll_handle.scroll_to_item(index);
+        self.active_source = None;
+        if open_source {
+            if let Some(source) = source {
+                self.open_source(source);
+            }
+        }
     }
 
     fn select_flame_frame(&mut self, id: StackIdentifier, function: String) {

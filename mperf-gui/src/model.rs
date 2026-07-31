@@ -10,7 +10,10 @@ use num_format::{Locale, ToFormattedString};
 use pmu_data::{TabSpec, TmaMetric};
 use sqlite::{Connection, Value};
 
-use crate::{flamegraph::FlamegraphData, metrics::MetricsTableData, profile::ProfileData};
+use crate::{
+    flamegraph::FlamegraphData, metrics::MetricsTableData, profile::ProfileData,
+    roofline::RooflineData,
+};
 
 #[derive(Debug)]
 pub struct ResultsModel {
@@ -44,7 +47,7 @@ pub enum GuiTab {
         title: String,
         data: MetricsTableData,
     },
-    Loops,
+    Loops(Box<RooflineData>),
     Flamegraph(Box<FlamegraphData>),
 }
 
@@ -92,7 +95,7 @@ impl ResultsModel {
         let tabs = scenario_ui(&record_info)
             .tabs
             .into_iter()
-            .map(|tab| GuiTab::load(tab, &connection, &result_directory))
+            .map(|tab| GuiTab::load(tab, &connection, &result_directory, &record_info))
             .collect();
 
         Ok(Self {
@@ -195,7 +198,12 @@ fn finite_tma_value(value: &Value) -> Option<f64> {
 }
 
 impl GuiTab {
-    fn load(tab: TabSpec, connection: &Connection, result_directory: &Path) -> Self {
+    fn load(
+        tab: TabSpec,
+        connection: &Connection,
+        result_directory: &Path,
+        record_info: &RecordInfo,
+    ) -> Self {
         match tab {
             TabSpec::Summary => Self::Summary,
             TabSpec::MetricsTable(spec) => {
@@ -205,7 +213,14 @@ impl GuiTab {
                     data: MetricsTableData::load(connection, &spec),
                 }
             }
-            TabSpec::Loops => Self::Loops,
+            TabSpec::Loops => Self::Loops(Box::new(RooflineData::load(
+                connection,
+                record_info
+                    .cpu_info
+                    .roofline_calibration
+                    .as_deref()
+                    .cloned(),
+            ))),
             TabSpec::Flamegraph => {
                 Self::Flamegraph(Box::new(FlamegraphData::load(result_directory)))
             }
@@ -529,6 +544,7 @@ mod tests {
             counters: Vec::new(),
         });
         let roofline = ScenarioInfo::Roofline(RooflineInfo {
+            backend: "compiler".to_string(),
             perf_pid: 1,
             counters: Vec::new(),
             inst_pid: 2,
