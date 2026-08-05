@@ -16,13 +16,16 @@ Both runs feed the same Roofline result schema used by the compiler backend.
 
 - x86 scalar and packed floating-point instructions are classified from QEMU
   disassembly. XMM, YMM, and ZMM operations are scaled by register width.
-- RISC-V scalar operations are classified by instruction mnemonic.
+- RISC-V scalar and vector operations are classified by a build-generated
+  table derived from the vendored TIR checked-AST specification.
 - RVV arithmetic is scaled at execution time using `vl`, `vstart`,
   `vtype.vsew`, and active `v0` mask bits.
 - Widening operations use the destination element width and fused
   multiply-add operations count as two operations per active element.
 - Missing mandatory RVV state is reported as an error instead of falling back
   to one operation per vector instruction.
+- Missing or semantically unclassified TIR operations count as zero and are
+  reported through `unclassified_instructions` and plugin diagnostics.
 - Memory callbacks count successful architectural guest accesses.
 
 Accounting currently covers the whole guest process, including its dynamic
