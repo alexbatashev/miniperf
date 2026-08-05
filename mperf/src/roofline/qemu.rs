@@ -32,6 +32,7 @@ struct Counts {
     bytes_load: u64,
     bytes_store: u64,
     rvv_state_errors: u64,
+    unclassified_instructions: u64,
 }
 
 impl QemuBackend {
@@ -144,6 +145,12 @@ impl RooflineBackend for QemuBackend {
                 anyhow::bail!(
                     "QEMU roofline could not read RVV state for {} executed vector instructions",
                     counts.rvv_state_errors
+                );
+            }
+            if counts.unclassified_instructions != 0 {
+                eprintln!(
+                    "Warning: TMDL could not classify {} executed RISC-V instructions; Roofline operation totals are conservative",
+                    counts.unclassified_instructions
                 );
             }
             publish_accounting_region(
@@ -364,6 +371,7 @@ fn parse_counts(input: &str) -> Result<Counts> {
         bytes_load: get("bytes_load"),
         bytes_store: get("bytes_store"),
         rvv_state_errors: get("rvv_state_errors"),
+        unclassified_instructions: get("unclassified_instructions"),
     })
 }
 
@@ -390,7 +398,7 @@ mod tests {
     #[test]
     fn parses_plugin_counts() {
         let counts = parse_counts(
-            "scalar_int_ops=7\nscalar_double_ops=3\nvector_float_ops=2\nbytes_load=64\nbytes_store=32\n",
+            "scalar_int_ops=7\nscalar_double_ops=3\nvector_float_ops=2\nbytes_load=64\nbytes_store=32\nunclassified_instructions=5\n",
         )
         .unwrap();
         assert_eq!(
@@ -401,6 +409,7 @@ mod tests {
                 vector_float_ops: 2,
                 bytes_load: 64,
                 bytes_store: 32,
+                unclassified_instructions: 5,
                 ..Counts::default()
             }
         );

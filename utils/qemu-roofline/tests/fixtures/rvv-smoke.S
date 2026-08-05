@@ -17,10 +17,12 @@ _start:
 
     vfadd.vv v1, v2, v3
     vfmacc.vv v1, v2, v3
+    vmfeq.vv v4, v2, v3
+    vfcvt.x.f.v v4, v2
 
     vsetvli t0, t0, e64, m1, ta, ma
     vfadd.vv v1, v2, v3
 
-    li a0, 0
+    sub a0, a0, a0
     li a7, 93
     ecall

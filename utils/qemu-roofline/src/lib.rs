@@ -127,7 +127,9 @@ static VECTOR_DOUBLE_OPS: AtomicU64 = AtomicU64::new(0);
 static BYTES_LOAD: AtomicU64 = AtomicU64::new(0);
 static BYTES_STORE: AtomicU64 = AtomicU64::new(0);
 static RVV_STATE_ERRORS: AtomicU64 = AtomicU64::new(0);
+static UNCLASSIFIED_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 static RVV_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
+static UNCLASSIFIED_MNEMONICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
@@ -176,6 +178,37 @@ enum RvvKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RiscvKind {
+    ScalarInteger,
+    ScalarFloat,
+    ScalarDouble,
+    VectorInteger,
+    VectorFloat,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RiscvCost {
+    kind: RiscvKind,
+    factor: u64,
+    sew_scale: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RiscvClassification {
+    Counted(RiscvCost),
+    NonCompute,
+    Unclassified,
+}
+
+struct RiscvOperationSpec {
+    mnemonic: &'static str,
+    masked: bool,
+    classification: RiscvClassification,
+}
+
+include!(concat!(env!("OUT_DIR"), "/riscv_operations.rs"));
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RvvCost {
     kind: RvvKind,
     factor: u64,
@@ -183,7 +216,7 @@ struct RvvCost {
     sew_scale: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Eq, PartialEq)]
 struct BlockCost {
     scalar_int: u64,
     scalar_float: u64,
@@ -212,6 +245,10 @@ extern "C" fn execute_block(_vcpu: c_uint, userdata: *mut c_void) {
     VECTOR_INT_OPS.fetch_add(cost.vector_int, Ordering::Relaxed);
     VECTOR_FLOAT_OPS.fetch_add(cost.vector_float, Ordering::Relaxed);
     VECTOR_DOUBLE_OPS.fetch_add(cost.vector_double, Ordering::Relaxed);
+}
+
+extern "C" fn execute_unclassified(_vcpu: c_uint, _userdata: *mut c_void) {
+    UNCLASSIFIED_INSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
 extern "C" fn memory_access(_vcpu: c_uint, info: MemInfo, _address: u64, _userdata: *mut c_void) {
@@ -319,7 +356,7 @@ extern "C" fn execute_rvv(vcpu: c_uint, userdata: *mut c_void) {
         };
         elements
     } else {
-        vl.saturating_sub(vstart)
+        active_elements(vstart, vl, None).unwrap()
     };
     let operations = elements.saturating_mul(cost.factor);
     match cost.kind {
@@ -364,9 +401,6 @@ fn read_register_value(handle: usize) -> Option<(u64, u32)> {
 }
 
 fn read_mask_elements(handle: usize, start: u64, end: u64) -> Option<u64> {
-    if start >= end {
-        return Some(0);
-    }
     REGISTER_BUFFER.with(|buffer| {
         let buffer = buffer.0;
         if buffer.is_null()
@@ -378,15 +412,22 @@ fn read_mask_elements(handle: usize, start: u64, end: u64) -> Option<u64> {
             return None;
         }
         let bytes = unsafe { std::slice::from_raw_parts((*buffer).data, (*buffer).len as usize) };
-        if end > bytes.len() as u64 * 8 {
-            return None;
-        }
-        Some(
-            (start..end)
-                .filter(|bit| bytes[(bit / 8) as usize] & (1 << (bit % 8)) != 0)
-                .count() as u64,
-        )
+        active_elements(start, end, Some(bytes))
     })
+}
+
+fn active_elements(start: u64, end: u64, mask: Option<&[u8]>) -> Option<u64> {
+    let Some(mask) = mask else {
+        return Some(end.saturating_sub(start));
+    };
+    if end > mask.len() as u64 * 8 {
+        return None;
+    }
+    Some(
+        (start..end)
+            .filter(|bit| mask[(bit / 8) as usize] & (1 << (bit % 8)) != 0)
+            .count() as u64,
+    )
 }
 
 fn rvv_sew(vtype: u64, xlen: u32) -> Option<u64> {
@@ -406,22 +447,54 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
         if !disassembly.is_null() {
             let text = unsafe { CStr::from_ptr(disassembly) }.to_string_lossy();
             if TARGET.get() == Some(&Target::Riscv) {
-                if let Some(rvv_cost) = classify_rvv(&text) {
-                    let rvv_cost = Box::into_raw(Box::new(rvv_cost));
-                    RVV_COSTS.lock().unwrap().push(rvv_cost as usize);
-                    unsafe {
-                        qemu_plugin_register_vcpu_insn_exec_cb(
-                            instruction,
-                            execute_rvv,
-                            CALLBACK_READ_REGS,
-                            rvv_cost.cast(),
-                        )
-                    };
-                } else {
-                    cost.add(classify_riscv(&mnemonic(&text)));
+                match classify_riscv(&text) {
+                    RiscvClassification::Counted(riscv_cost) => match riscv_cost.kind {
+                        RiscvKind::VectorInteger | RiscvKind::VectorFloat => {
+                            let rvv_cost = Box::into_raw(Box::new(RvvCost {
+                                kind: if riscv_cost.kind == RiscvKind::VectorFloat {
+                                    RvvKind::Float
+                                } else {
+                                    RvvKind::Integer
+                                },
+                                factor: riscv_cost.factor,
+                                masked: is_masked(&text),
+                                sew_scale: riscv_cost.sew_scale,
+                            }));
+                            RVV_COSTS.lock().unwrap().push(rvv_cost as usize);
+                            unsafe {
+                                qemu_plugin_register_vcpu_insn_exec_cb(
+                                    instruction,
+                                    execute_rvv,
+                                    CALLBACK_READ_REGS,
+                                    rvv_cost.cast(),
+                                )
+                            };
+                        }
+                        RiscvKind::ScalarInteger => {
+                            cost.scalar_int += riscv_cost.factor;
+                        }
+                        RiscvKind::ScalarFloat => {
+                            cost.scalar_float += riscv_cost.factor;
+                        }
+                        RiscvKind::ScalarDouble => {
+                            cost.scalar_double += riscv_cost.factor;
+                        }
+                    },
+                    RiscvClassification::NonCompute => {}
+                    RiscvClassification::Unclassified => {
+                        report_unclassified(&text);
+                        unsafe {
+                            qemu_plugin_register_vcpu_insn_exec_cb(
+                                instruction,
+                                execute_unclassified,
+                                CALLBACK_NO_REGS,
+                                ptr::null_mut(),
+                            )
+                        };
+                    }
                 }
             } else {
-                cost.add(classify(Target::X86, &text));
+                cost.add(classify_x86(&mnemonic(&text), &text));
             }
             unsafe { g_free(disassembly.cast()) };
         }
@@ -443,16 +516,8 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
     };
 }
 
-fn classify(target: Target, disassembly: &str) -> BlockCost {
-    let mnemonic = mnemonic(disassembly);
-    match target {
-        Target::Riscv => classify_riscv(&mnemonic),
-        Target::X86 => classify_x86(&mnemonic, disassembly),
-    }
-}
-
 fn mnemonic(disassembly: &str) -> String {
-    let mnemonic = disassembly
+    disassembly
         .split_whitespace()
         .find(|part| {
             part.chars().any(|c| c.is_ascii_alphabetic())
@@ -460,52 +525,42 @@ fn mnemonic(disassembly: &str) -> String {
         })
         .unwrap_or_default()
         .trim_matches(|c: char| c == ':' || c == ',')
-        .to_ascii_lowercase();
-    mnemonic.strip_prefix("c.").unwrap_or(&mnemonic).to_string()
+        .to_ascii_lowercase()
 }
 
-fn classify_riscv(mnemonic: &str) -> BlockCost {
-    let mut cost = BlockCost::default();
-
-    if is_riscv_scalar_float(mnemonic) {
-        let operations = if is_fused(mnemonic) { 2 } else { 1 };
-        if mnemonic.ends_with(".d") {
-            cost.scalar_double = operations;
-        } else {
-            cost.scalar_float = operations;
-        }
-    } else if is_riscv_scalar_integer(mnemonic) {
-        cost.scalar_int = 1;
-    }
-
-    cost
-}
-
-fn classify_rvv(disassembly: &str) -> Option<RvvCost> {
+fn classify_riscv(disassembly: &str) -> RiscvClassification {
     let mnemonic = mnemonic(disassembly);
-    let kind = if is_riscv_vector_float(&mnemonic) {
-        RvvKind::Float
-    } else if is_riscv_vector_integer(&mnemonic) {
-        RvvKind::Integer
+    let masked = is_masked(disassembly);
+    RISCV_OPERATIONS
+        .binary_search_by(|operation| {
+            operation
+                .mnemonic
+                .cmp(mnemonic.as_str())
+                .then_with(|| operation.masked.cmp(&masked))
+        })
+        .ok()
+        .map(|index| RISCV_OPERATIONS[index].classification)
+        .unwrap_or(RiscvClassification::Unclassified)
+}
+
+fn is_masked(disassembly: &str) -> bool {
+    disassembly.to_ascii_lowercase().contains("v0.t")
+}
+
+fn report_unclassified(disassembly: &str) {
+    let mnemonic = mnemonic(disassembly);
+    let operation = if is_masked(disassembly) {
+        format!("{mnemonic} (masked)")
     } else {
-        return None;
+        mnemonic
     };
-    let factor = if is_fused(&mnemonic)
-        || (kind == RvvKind::Integer
-            && ["macc", "madd", "msac", "msub"]
-                .iter()
-                .any(|part| mnemonic.contains(part)))
-    {
-        2
-    } else {
-        1
-    };
-    Some(RvvCost {
-        kind,
-        factor,
-        masked: disassembly.to_ascii_lowercase().contains("v0.t"),
-        sew_scale: if mnemonic.starts_with("vfw") { 2 } else { 1 },
-    })
+    let mut reported = UNCLASSIFIED_MNEMONICS.lock().unwrap();
+    if !reported.contains(&operation) {
+        eprintln!(
+            "miniperf roofline: TMDL cannot classify RISC-V operation '{operation}'; counting it as zero"
+        );
+        reported.push(operation);
+    }
 }
 
 fn classify_x86(mnemonic: &str, disassembly: &str) -> BlockCost {
@@ -535,61 +590,6 @@ fn classify_x86(mnemonic: &str, disassembly: &str) -> BlockCost {
     }
 
     cost
-}
-
-fn is_fused(mnemonic: &str) -> bool {
-    mnemonic.starts_with("fmadd")
-        || mnemonic.starts_with("fmsub")
-        || mnemonic.starts_with("fnmadd")
-        || mnemonic.starts_with("fnmsub")
-        || mnemonic.starts_with("vfmacc")
-        || mnemonic.starts_with("vfmsac")
-        || mnemonic.starts_with("vfnmacc")
-        || mnemonic.starts_with("vfnmsac")
-        || mnemonic.starts_with("vfmadd")
-        || mnemonic.starts_with("vfmsub")
-        || mnemonic.starts_with("vfnmadd")
-        || mnemonic.starts_with("vfnmsub")
-}
-
-fn is_riscv_scalar_float(mnemonic: &str) -> bool {
-    [
-        "fadd", "fsub", "fmul", "fdiv", "fsqrt", "fmin", "fmax", "feq", "flt", "fle", "fmadd",
-        "fmsub", "fnmadd", "fnmsub",
-    ]
-    .iter()
-    .any(|prefix| mnemonic.starts_with(prefix))
-}
-
-fn is_riscv_vector_float(mnemonic: &str) -> bool {
-    [
-        "vfadd", "vfsub", "vfrsub", "vfmul", "vfdiv", "vfrdiv", "vfsqrt", "vfmin", "vfmax",
-        "vmfeq", "vmfne", "vmflt", "vmfle", "vmfgt", "vmfge", "vfmacc", "vfmsac", "vfnmacc",
-        "vfnmsac", "vfmadd", "vfmsub", "vfnmadd", "vfnmsub", "vfwadd", "vfwsub", "vfwmul",
-        "vfwmacc", "vfwmsac", "vfwnmacc", "vfwnmsac",
-    ]
-    .iter()
-    .any(|prefix| mnemonic.starts_with(prefix))
-}
-
-fn is_riscv_vector_integer(mnemonic: &str) -> bool {
-    [
-        "vadd", "vsub", "vrsub", "vmul", "vdiv", "vrem", "vsll", "vsrl", "vsra", "vand", "vor",
-        "vxor", "vmin", "vmax", "vmseq", "vmsne", "vmslt", "vmsle", "vmsgt", "vmacc", "vnmsac",
-        "vmadd", "vnmsub", "vwadd", "vwsub", "vwmul", "vwmacc", "vwmadd", "vwnmsac", "vwnmsub",
-    ]
-    .iter()
-    .any(|prefix| mnemonic.starts_with(prefix))
-}
-
-fn is_riscv_scalar_integer(mnemonic: &str) -> bool {
-    [
-        "add", "sub", "mul", "div", "rem", "sll", "srl", "sra", "and", "or", "xor", "slt", "min",
-        "max", "sh1add", "sh2add", "sh3add", "amoadd", "amoand", "amoor", "amoxor", "amomin",
-        "amomax",
-    ]
-    .iter()
-    .any(|prefix| mnemonic.starts_with(prefix))
 }
 
 fn is_x86_fused(opcode: &str) -> bool {
@@ -669,6 +669,7 @@ extern "C" fn plugin_exit(_id: PluginId, _userdata: *mut c_void) {
                 ("bytes_load", &BYTES_LOAD),
                 ("bytes_store", &BYTES_STORE),
                 ("rvv_state_errors", &RVV_STATE_ERRORS),
+                ("unclassified_instructions", &UNCLASSIFIED_INSTRUCTIONS),
             ];
             for (name, counter) in counters {
                 let _ = writeln!(file, "{name}={}", counter.load(Ordering::Relaxed));
@@ -749,32 +750,120 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_riscv_scalar_and_vector_operations() {
-        let scalar = classify(Target::Riscv, "fmadd.d fa0,fa1,fa2,fa3");
-        assert_eq!(scalar.scalar_double, 2);
-
+    fn classifies_tmdl_scalar_and_compressed_operations() {
         assert_eq!(
-            classify_rvv("vfmacc.vv v8,v9,v10,v0.t"),
-            Some(RvvCost {
-                kind: RvvKind::Float,
-                factor: 2,
-                masked: true,
+            classify_riscv("fadd.d fa0,fa1,fa2"),
+            RiscvClassification::Counted(RiscvCost {
+                kind: RiscvKind::ScalarDouble,
+                factor: 1,
                 sew_scale: 1,
             })
         );
         assert_eq!(
-            classify_rvv("vfwadd.vv v8,v9,v10"),
-            Some(RvvCost {
-                kind: RvvKind::Float,
+            classify_riscv("c.add a0,a1"),
+            RiscvClassification::Counted(RiscvCost {
+                kind: RiscvKind::ScalarInteger,
                 factor: 1,
-                masked: false,
-                sew_scale: 2,
+                sew_scale: 1,
             })
         );
     }
 
     #[test]
-    fn decodes_rvv_sew_and_rejects_vill() {
+    fn classifies_tmdl_vector_arithmetic() {
+        assert_eq!(
+            classify_riscv("vfmacc.vv v8,v9,v10,v0.t"),
+            RiscvClassification::Counted(RiscvCost {
+                kind: RiscvKind::VectorFloat,
+                factor: 2,
+                sew_scale: 1,
+            })
+        );
+        assert_eq!(
+            classify_riscv("vfwadd.vv v8,v9,v10"),
+            RiscvClassification::Counted(RiscvCost {
+                kind: RiscvKind::VectorFloat,
+                factor: 1,
+                sew_scale: 2,
+            })
+        );
+        assert_eq!(
+            classify_riscv("vfredusum.vs v8,v9,v10"),
+            RiscvClassification::Counted(RiscvCost {
+                kind: RiscvKind::VectorFloat,
+                factor: 1,
+                sew_scale: 1,
+            })
+        );
+        assert_eq!(
+            classify_riscv("vmacc.vv v8,v9,v10"),
+            RiscvClassification::Counted(RiscvCost {
+                kind: RiscvKind::VectorInteger,
+                factor: 2,
+                sew_scale: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_count_control_flow_or_expand_integer_remainder() {
+        for instruction in ["auipc a0,0x10", "jal ra,0x20", "jalr ra,a0,0"] {
+            assert_eq!(
+                classify_riscv(instruction),
+                RiscvClassification::NonCompute,
+                "{instruction}"
+            );
+        }
+        assert_eq!(
+            classify_riscv("rem a0,a1,a2"),
+            RiscvClassification::Counted(RiscvCost {
+                kind: RiscvKind::ScalarInteger,
+                factor: 1,
+                sew_scale: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn treats_non_arithmetic_float_behavior_as_non_compute() {
+        for instruction in [
+            "vmfeq.vv v1,v2,v3",
+            "vfcvt.x.f.v v1,v2",
+            "vfsgnj.vv v1,v2,v3",
+        ] {
+            assert_eq!(
+                classify_riscv(instruction),
+                RiscvClassification::NonCompute,
+                "{instruction}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaves_missing_and_todo_operations_unclassified() {
+        assert_eq!(
+            classify_riscv("vfrsqrt7.v v1,v2"),
+            RiscvClassification::Unclassified
+        );
+        assert_eq!(
+            classify_riscv("madeup a0,a1"),
+            RiscvClassification::Unclassified
+        );
+
+        let before = UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed);
+        execute_unclassified(0, ptr::null_mut());
+        assert_eq!(
+            UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn applies_rvv_mask_vstart_and_sew() {
+        assert_eq!(active_elements(2, 7, Some(&[0b0110_1100])), Some(4));
+        assert_eq!(active_elements(2, 7, None), Some(5));
+        assert_eq!(active_elements(9, 7, None), Some(0));
+        assert_eq!(active_elements(0, 9, Some(&[0xff])), None);
         assert_eq!(rvv_sew(2 << 3, 64), Some(32));
         assert_eq!(rvv_sew(3 << 3, 64), Some(64));
         assert_eq!(rvv_sew(1_u64 << 63, 64), None);
@@ -782,19 +871,19 @@ mod tests {
 
     #[test]
     fn classifies_x86_scalar_and_vector_operations() {
-        let scalar = classify(Target::X86, "mulsd 0x8(%rax),%xmm0");
+        let scalar = classify_x86("mulsd", "mulsd 0x8(%rax),%xmm0");
         assert_eq!(scalar.scalar_double, 1);
 
-        let vector = classify(Target::X86, "vfmadd132ps %ymm1,%ymm2,%ymm3");
+        let vector = classify_x86("vfmadd132ps", "vfmadd132ps %ymm1,%ymm2,%ymm3");
         assert_eq!(vector.vector_float, 16);
 
-        let integer = classify(Target::X86, "vpaddd %zmm1,%zmm2,%zmm3");
+        let integer = classify_x86("vpaddd", "vpaddd %zmm1,%zmm2,%zmm3");
         assert_eq!(integer.vector_int, 16);
     }
 
     #[test]
     fn does_not_treat_x86_simd_logic_as_scalar_integer_work() {
-        let cost = classify(Target::X86, "orpd %xmm1,%xmm0");
+        let cost = classify_x86("orpd", "orpd %xmm1,%xmm0");
         assert_eq!(cost.scalar_int, 0);
     }
 }
