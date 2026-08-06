@@ -72,7 +72,7 @@ fn state_file() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{insert, MAX_RECENT_RESULTS};
+    use super::{MAX_RECENT_RESULTS, insert};
     use std::path::PathBuf;
 
     #[test]

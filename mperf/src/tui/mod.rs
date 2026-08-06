@@ -1,8 +1,8 @@
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -12,14 +12,14 @@ use crossterm::event::{EventStream, KeyCode, KeyEventKind};
 use flamegraph::FlamegraphTab;
 use loops::LoopsTab;
 use metrics_table::MetricsTableTab;
-use mperf_data::{scenario_ui, RecordInfo, Scenario};
+use mperf_data::{RecordInfo, Scenario, scenario_ui};
 use parking_lot::{Mutex, RwLock};
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Constraint, Flex, Layout},
-    style::{palette, Style, Stylize},
+    style::{Style, Stylize, palette},
     text::Line,
     widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs, Widget},
-    DefaultTerminal, Frame,
 };
 use summary::SummaryTab;
 use tokio::fs::{self};
@@ -121,25 +121,25 @@ impl App {
     }
 
     fn handle_event(&mut self, event: &crossterm::event::Event) {
-        if let crossterm::event::Event::Key(key) = event {
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Char('q') => self.should_quit = true,
-                    KeyCode::Tab => {
-                        if !self.show_help {
-                            self.tabs.next_tab()
-                        }
+        if let crossterm::event::Event::Key(key) = event
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Tab => {
+                    if !self.show_help {
+                        self.tabs.next_tab()
                     }
-                    KeyCode::BackTab => {
-                        if !self.show_help {
-                            self.tabs.previous_tab()
-                        }
+                }
+                KeyCode::BackTab => {
+                    if !self.show_help {
+                        self.tabs.previous_tab()
                     }
-                    KeyCode::Char('?') => self.show_help = !self.show_help,
-                    _ => {
-                        if !self.show_help {
-                            self.tabs.handle_event(key.code);
-                        }
+                }
+                KeyCode::Char('?') => self.show_help = !self.show_help,
+                _ => {
+                    if !self.show_help {
+                        self.tabs.handle_event(key.code);
                     }
                 }
             }

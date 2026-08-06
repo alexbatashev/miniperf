@@ -29,10 +29,10 @@ pub(crate) struct SampleFilter {
 
 impl SampleFilter {
     pub fn matches(&self, sample: &ProfileSample) -> bool {
-        if let Some(range) = &self.range {
-            if sample.timestamp_ns < range.start_ns || sample.timestamp_ns >= range.end_ns {
-                return false;
-            }
+        if let Some(range) = &self.range
+            && (sample.timestamp_ns < range.start_ns || sample.timestamp_ns >= range.end_ns)
+        {
+            return false;
         }
         self.matches_without_time(sample)
     }
@@ -834,11 +834,9 @@ impl CpuUtilizationHeatmap {
         let uses_cpu_lanes =
             !eligible.is_empty() && eligible.iter().all(|observation| observation.cpu.is_some());
         let mut lane_buckets = BTreeMap::<TimelineLaneKey, Vec<f64>>::new();
-        if uses_cpu_lanes {
-            if let Some(logical_cpu_count) = profile.logical_cpu_count {
-                for cpu in 0..logical_cpu_count {
-                    lane_buckets.insert(TimelineLaneKey::Cpu(Some(cpu)), vec![0.0; buckets]);
-                }
+        if uses_cpu_lanes && let Some(logical_cpu_count) = profile.logical_cpu_count {
+            for cpu in 0..logical_cpu_count {
+                lane_buckets.insert(TimelineLaneKey::Cpu(Some(cpu)), vec![0.0; buckets]);
             }
         }
 
@@ -1778,10 +1776,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [7.0, 7.0, 6.0]
         );
-        assert!(heatmap.lanes[0]
-            .buckets
-            .iter()
-            .all(|bucket| bucket.utilization == 1.0));
+        assert!(
+            heatmap.lanes[0]
+                .buckets
+                .iter()
+                .all(|bucket| bucket.utilization == 1.0)
+        );
         assert!(
             CpuUtilizationHeatmap::build_with_bucket_duration(&profile, &filter, 10, Some(0))
                 .is_none()

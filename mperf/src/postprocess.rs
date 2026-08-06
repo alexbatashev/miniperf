@@ -18,7 +18,7 @@ use tokio::{
     io::AsyncWriteExt,
 };
 
-use crate::disassembly::{default_disassembler, DisassembleRequest, DisassembleTarget};
+use crate::disassembly::{DisassembleRequest, DisassembleTarget, default_disassembler};
 use crate::utils;
 
 /// A core cluster resolved for post-processing: `(family_id, display name,
@@ -618,19 +618,20 @@ async fn process_pmu_counters(
                             .or_default() += weight;
                     }
                 }
-            } else if evt.ty == EventType::PmuInstructions && !folded_stack.is_empty() {
-                if let Some(weight) = flamegraph_sample_weight(evt.value) {
-                    *flamegraph_instructions
+            } else if evt.ty == EventType::PmuInstructions
+                && !folded_stack.is_empty()
+                && let Some(weight) = flamegraph_sample_weight(evt.value)
+            {
+                *flamegraph_instructions
+                    .entry(folded_stack.clone())
+                    .or_default() += weight;
+                if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
+                    *per_core_instructions
+                        .entry(family_id.to_owned())
+                        .or_insert_with(|| (name.to_owned(), HashMap::new()))
+                        .1
                         .entry(folded_stack.clone())
                         .or_default() += weight;
-                    if let Some((family_id, name)) = cluster_of(&clusters, evt.cpu) {
-                        *per_core_instructions
-                            .entry(family_id.to_owned())
-                            .or_insert_with(|| (name.to_owned(), HashMap::new()))
-                            .1
-                            .entry(folded_stack.clone())
-                            .or_default() += weight;
-                    }
                 }
             }
 
@@ -987,7 +988,7 @@ fn counter_group_has_profile_data(
 #[cfg(test)]
 mod counter_group_tests {
     use super::{
-        counter_group_has_profile_data, insert_counter_group, insert_cpu_observation, CounterLead,
+        CounterLead, counter_group_has_profile_data, insert_counter_group, insert_cpu_observation,
     };
     use mperf_data::CallFrame;
     use smallvec::SmallVec;
@@ -1683,7 +1684,7 @@ fn remove_load_bias(runtime: u64, load_bias: i64) -> Option<u64> {
 
 #[cfg(test)]
 mod optimized_postprocessing_tests {
-    use super::{bind_id, populate_assembly_samples, sampled_disassembly_targets, RooflineData};
+    use super::{RooflineData, bind_id, populate_assembly_samples, sampled_disassembly_targets};
     use mperf_data::{CallFrame, Event, EventType, Location, RooflineInfo, ScenarioInfo};
     use object::{Object, ObjectSymbol, SymbolKind};
     use sqlite::State;

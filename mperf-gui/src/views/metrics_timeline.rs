@@ -1,15 +1,15 @@
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, Bounds, Context, Div, FontWeight,
-    MouseButton, MouseDownEvent,
+    Bounds, Context, Div, FontWeight, MouseButton, MouseDownEvent, canvas, div, fill, point,
+    prelude::*, px, rgb, size,
 };
 
 use crate::{
+    MperfGui,
     profile::TimeRange,
     profile_analysis::{CounterAggregation, CounterTrack, CounterTracks},
     theme::{
         ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED, SURFACE, TEXT, WORKSPACE,
     },
-    MperfGui,
 };
 
 const MAX_BINS: usize = 160;

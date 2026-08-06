@@ -1,16 +1,16 @@
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, Bounds, Context, Div, FontWeight,
-    MouseButton, MouseDownEvent,
+    Bounds, Context, Div, FontWeight, MouseButton, MouseDownEvent, canvas, div, fill, point,
+    prelude::*, px, rgb, size,
 };
 
 use crate::{
+    MperfGui,
     profile::TimeRange,
     profile_analysis::FlameScopeHeatmap,
     theme::{
-        flame_frame_color, ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SURFACE, TEXT,
-        WORKSPACE,
+        ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SURFACE, TEXT, WORKSPACE,
+        flame_frame_color,
     },
-    MperfGui,
 };
 
 const MAX_COLUMNS: usize = 100;

@@ -12,8 +12,8 @@ use mperf_data::{CallFrame, Event, IPCMessage, ProcMapEntry, RooflineInfo, Scena
 use pmu::{Counter, Process, Record};
 
 use crate::{
-    counter_selection::get_pmu_counters, event_dispatcher::EventDispatcher,
-    utils::counter_to_event_ty, Scenario,
+    Scenario, counter_selection::get_pmu_counters, event_dispatcher::EventDispatcher,
+    utils::counter_to_event_ty,
 };
 
 mod calibrate;

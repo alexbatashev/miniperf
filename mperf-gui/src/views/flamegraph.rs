@@ -1,14 +1,14 @@
-use gpui::{div, prelude::*, px, relative, rgb, Context, Div, FontWeight, SharedString, Window};
+use gpui::{Context, Div, FontWeight, SharedString, Window, div, prelude::*, px, relative, rgb};
 use num_format::ToFormattedString;
 
 use crate::{
+    HoveredFrame, MperfGui,
     flamegraph::FlamegraphData,
     profile_analysis::CallTree,
     theme::{
-        flame_frame_color, ACCENT, BORDER, ERROR, FLAME_FRAME_HEIGHT, HOVER, MUTED_TEXT, SELECTION,
-        SURFACE, TEXT, TOOLBAR, WORKSPACE,
+        ACCENT, BORDER, ERROR, FLAME_FRAME_HEIGHT, HOVER, MUTED_TEXT, SELECTION, SURFACE, TEXT,
+        TOOLBAR, WORKSPACE, flame_frame_color,
     },
-    HoveredFrame, MperfGui,
 };
 
 impl MperfGui {

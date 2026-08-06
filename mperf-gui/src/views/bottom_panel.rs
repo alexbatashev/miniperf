@@ -1,11 +1,12 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, relative, rgb, Context, Div, FontWeight, IntoElement, MouseButton,
-    SharedString,
+    Context, Div, FontWeight, IntoElement, MouseButton, SharedString, div, prelude::*, px,
+    relative, rgb,
 };
 
 use crate::{
+    BottomPanelKind, MperfGui,
     metrics::{MetricsColumn, MetricsTableData},
     model::{CounterRow, GuiTab, ResultsModel, TmaSummaryData, TmaSummaryRow},
     profile::{CounterMetric, ProfileFrame, TimeRange},
@@ -15,7 +16,6 @@ use crate::{
         ACCENT, BORDER, BOTTOM_PANEL_MIN_HEIGHT, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED,
         SURFACE, TEXT, WORKSPACE,
     },
-    BottomPanelKind, MperfGui,
 };
 
 const PANEL_HEADER_HEIGHT: f32 = 28.0;
@@ -342,7 +342,7 @@ impl MperfGui {
         function: &FunctionStat,
         selected: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let frame_id = function.frame_id;
         let label = function.label.clone();
         let self_samples = function.self_samples.to_string();

@@ -279,10 +279,11 @@ mod tests {
         let data = RooflineData::load(&connection, Some(calibration()));
 
         assert!(data.loops.is_empty());
-        assert!(data
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("roofline")));
+        assert!(
+            data.error
+                .as_deref()
+                .is_some_and(|error| error.contains("roofline"))
+        );
         assert!(data.calibration.is_some());
     }
 }

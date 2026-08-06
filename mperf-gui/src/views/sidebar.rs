@@ -1,9 +1,8 @@
-use gpui::{div, prelude::*, px, rgb, Context, Div, IntoElement, MouseButton, SharedString};
+use gpui::{Context, Div, IntoElement, MouseButton, SharedString, div, prelude::*, px, rgb};
 
 use crate::{
-    result_name, same_directory,
+    LeftPaneKind, MperfGui, result_name, same_directory,
     theme::{ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED},
-    LeftPaneKind, MperfGui,
 };
 
 impl MperfGui {

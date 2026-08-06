@@ -5,10 +5,10 @@ use std::{
     path::Path,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use comfy_table::{
-    presets::UTF8_FULL_CONDENSED, Attribute, Cell, CellAlignment, ContentArrangement, Table,
+    Attribute, Cell, CellAlignment, ContentArrangement, Table, presets::UTF8_FULL_CONDENSED,
 };
 use mperf_data::{RecordInfo, ScenarioInfo};
 use num_format::{Locale, ToFormattedString};
@@ -273,10 +273,10 @@ fn render_text(
     table
         .load_preset(UTF8_FULL_CONDENSED)
         .set_content_arrangement(ContentArrangement::Dynamic);
-    if io::stdout().is_terminal() {
-        if let Ok((width, _)) = crossterm::terminal::size() {
-            table.set_width(width);
-        }
+    if io::stdout().is_terminal()
+        && let Ok((width, _)) = crossterm::terminal::size()
+    {
+        table.set_width(width);
     }
     table.set_header(result.columns.iter().map(|column| {
         Cell::new(column)

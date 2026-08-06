@@ -1,6 +1,6 @@
 use mperf_data::Scenario;
 use pmu::Counter;
-use pmu_data::{arith_parser::Expr, TmaScenario};
+use pmu_data::{TmaScenario, arith_parser::Expr};
 use std::collections::BTreeSet;
 
 pub fn get_pmu_counters(scenario: Scenario) -> Vec<Counter> {
@@ -57,13 +57,14 @@ pub fn get_tma_counter_groups(scenario: &TmaScenario) -> anyhow::Result<Vec<Vec<
         if group.events.is_empty() {
             anyhow::bail!("TMA group '{}' is empty", group.name);
         }
-        if let Some(limit) = capacity {
-            if group.events.len() > limit {
-                anyhow::bail!(
-                    "TMA group '{}' needs {} counters but this PMU has only {limit}; split the methodology into independent coherent formulas",
-                    group.name, group.events.len()
-                );
-            }
+        if let Some(limit) = capacity
+            && group.events.len() > limit
+        {
+            anyhow::bail!(
+                "TMA group '{}' needs {} counters but this PMU has only {limit}; split the methodology into independent coherent formulas",
+                group.name,
+                group.events.len()
+            );
         }
         for event in &group.events {
             if !available.contains(event) {

@@ -1,16 +1,16 @@
 use gpui::{
-    div, prelude::*, px, relative, rgb, Context, Div, FontWeight, IntoElement, ScrollHandle,
-    SharedString,
+    Context, Div, FontWeight, IntoElement, ScrollHandle, SharedString, div, prelude::*, px,
+    relative, rgb,
 };
 
 use crate::{
+    MperfGui,
     profile::TimeRange,
     profile_analysis::{TimeOrderLane, TimeOrderTimeline},
     theme::{
-        flame_frame_color, ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION, SURFACE,
-        TEXT, WORKSPACE,
+        ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION, SURFACE, TEXT, WORKSPACE,
+        flame_frame_color,
     },
-    MperfGui,
 };
 
 const MAX_BINS: usize = 240;

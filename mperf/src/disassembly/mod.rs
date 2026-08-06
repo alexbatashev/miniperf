@@ -4,7 +4,7 @@ use std::process::Command;
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(
@@ -289,11 +289,15 @@ mod tests {
             .unwrap();
 
         assert!(!lines.is_empty());
-        assert!(lines
-            .iter()
-            .all(|line| line.symbol.as_deref() == Some(owner_symbol.as_str())));
-        assert!(lines
-            .iter()
-            .any(|line| line.rel_address == symbol.address()));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.symbol.as_deref() == Some(owner_symbol.as_str()))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.rel_address == symbol.address())
+        );
     }
 }

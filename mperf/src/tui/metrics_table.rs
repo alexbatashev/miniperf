@@ -212,10 +212,10 @@ impl Widget for MetricsTableTab {
         if state.selected.is_none() {
             state.selected = Some(0);
         }
-        if let Some(selected) = state.selected {
-            if selected >= total_rows {
-                state.selected = Some(total_rows - 1);
-            }
+        if let Some(selected) = state.selected
+            && selected >= total_rows
+        {
+            state.selected = Some(total_rows - 1);
         }
 
         let sticky_columns = layout.sticky_columns.max(1).min(layout.columns.len());
@@ -1366,9 +1366,9 @@ fn interpolate_color(
     } else {
         (ratio - start.0) / span
     };
-    let r = lerp(start.1 .0, end.1 .0, t);
-    let g = lerp(start.1 .1, end.1 .1, t);
-    let b = lerp(start.1 .2, end.1 .2, t);
+    let r = lerp(start.1.0, end.1.0, t);
+    let g = lerp(start.1.1, end.1.1, t);
+    let b = lerp(start.1.2, end.1.2, t);
     (r, g, b)
 }
 
