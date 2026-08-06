@@ -22,13 +22,38 @@ use super::{
 use crate::event_dispatcher::EventDispatcher;
 
 pub(super) struct QemuBackend {
-    qemu: Option<PathBuf>,
-    plugin: PathBuf,
-    qemu_args: Vec<String>,
+    tool: AccountingTool,
     native_performance: bool,
     method: RooflineMethodInfo,
     cache: CacheInfo,
     memory_profile: bool,
+}
+
+/// Which same-artifact accounting tool drives run 2. Both emit the
+/// `qemu-roofline.*` artifact set; DynamoRIO instruments natively and only
+/// works when the guest matches the host architecture.
+pub(super) enum AccountingTool {
+    Qemu {
+        qemu: Option<PathBuf>,
+        plugin: PathBuf,
+        extra_args: Vec<String>,
+    },
+    DynamoRio {
+        drrun: PathBuf,
+        client: PathBuf,
+    },
+}
+
+/// Run-2 command line plus the extra environment it needs.
+type AccountingCommand = (Vec<String>, Vec<(String, String)>);
+
+impl AccountingTool {
+    fn name(&self) -> &'static str {
+        match self {
+            AccountingTool::Qemu { .. } => "QEMU",
+            AccountingTool::DynamoRio { .. } => "DynamoRIO",
+        }
+    }
 }
 
 #[derive(Default, Debug, Eq, PartialEq)]
@@ -165,9 +190,11 @@ impl QemuBackend {
         }
 
         Ok(Self {
-            qemu: options.qemu.clone(),
-            plugin,
-            qemu_args: options.qemu_args.clone(),
+            tool: AccountingTool::Qemu {
+                qemu: options.qemu.clone(),
+                plugin,
+                extra_args: options.qemu_args.clone(),
+            },
             native_performance,
             method,
             cache: detect_host_cache(),
@@ -175,8 +202,38 @@ impl QemuBackend {
         })
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn new_dynamorio(
+        _options: &Options,
+        _method: RooflineMethodInfo,
+        _memory_profile: bool,
+    ) -> Result<Self> {
+        anyhow::bail!("the DynamoRIO roofline backend supports Linux hosts only");
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn new_dynamorio(
+        options: &Options,
+        method: RooflineMethodInfo,
+        memory_profile: bool,
+    ) -> Result<Self> {
+        let (drrun, client) = dynamorio_paths(options)?;
+        Ok(Self {
+            tool: AccountingTool::DynamoRio { drrun, client },
+            // DynamoRIO instruments the native binary; performance always
+            // comes from a separate native run.
+            native_performance: true,
+            method,
+            cache: detect_host_cache(),
+            memory_profile,
+        })
+    }
+
     fn qemu_for(&self, guest: &Path) -> Result<PathBuf> {
-        if let Some(qemu) = &self.qemu {
+        let AccountingTool::Qemu { qemu, .. } = &self.tool else {
+            anyhow::bail!("qemu_for is only valid for the QEMU accounting tool");
+        };
+        if let Some(qemu) = qemu {
             return resolve_executable(qemu);
         }
         if let Some(qemu) = std::env::var_os("MPERF_QEMU") {
@@ -198,8 +255,14 @@ impl QemuBackend {
     }
 
     fn command(&self, qemu: &Path, guest: &[String], output: Option<&Path>) -> Result<Vec<String>> {
+        let AccountingTool::Qemu {
+            plugin, extra_args, ..
+        } = &self.tool
+        else {
+            anyhow::bail!("command is only valid for the QEMU accounting tool");
+        };
         let mut command = vec![qemu.to_string_lossy().to_string()];
-        command.extend(self.qemu_args.iter().cloned());
+        command.extend(extra_args.iter().cloned());
         if let Some(output) = output {
             let output = output.to_string_lossy();
             if output.contains(',') {
@@ -208,7 +271,7 @@ impl QemuBackend {
             command.push("-plugin".to_string());
             command.push(format!(
                 "{},output={output},cache-line={},llc-size={},llc-assoc={},memory-profile={}",
-                self.plugin.to_string_lossy(),
+                plugin.to_string_lossy(),
                 self.cache.line_size,
                 self.cache.capacity,
                 self.cache.associativity,
@@ -226,6 +289,50 @@ impl QemuBackend {
         command.extend(guest.iter().cloned());
         Ok(command)
     }
+
+    /// Builds the accounting (run 2) command and its extra environment.
+    fn accounting_command(&self, guest: &[String], output: &Path) -> Result<AccountingCommand> {
+        match &self.tool {
+            AccountingTool::Qemu { .. } => {
+                let qemu = self.qemu_for(Path::new(&guest[0]))?;
+                Ok((self.command(&qemu, guest, Some(output))?, Vec::new()))
+            }
+            AccountingTool::DynamoRio { drrun, client } => {
+                let mut command = vec![
+                    drrun.to_string_lossy().to_string(),
+                    // Clean-call-heavy instrumentation exceeds DynamoRIO's
+                    // block emit limits at the default 256-instruction blocks
+                    // (observed on riscv64); traces add no value here.
+                    "-disable_traces".to_string(),
+                    "-max_bb_instrs".to_string(),
+                    "32".to_string(),
+                    "-c".to_string(),
+                    client.to_string_lossy().to_string(),
+                    format!("output={}", output.to_string_lossy()),
+                    format!("cache-line={}", self.cache.line_size),
+                    format!("llc-size={}", self.cache.capacity),
+                    format!("llc-assoc={}", self.cache.associativity),
+                    format!(
+                        "memory-profile={}",
+                        if self.memory_profile { "on" } else { "off" }
+                    ),
+                    "--".to_string(),
+                ];
+                command.extend(guest.iter().cloned());
+                let mut env = Vec::new();
+                if self.memory_profile {
+                    if let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD") {
+                        env.push(("LD_PRELOAD".to_string(), preload.to_string()));
+                        env.push((
+                            "MPERF_MEMORY_ALLOCATIONS".to_string(),
+                            "/dev/null".to_string(),
+                        ));
+                    }
+                }
+                Ok((command, env))
+            }
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -240,9 +347,11 @@ pub(super) fn probe(options: &Options, guest: &Path) -> Result<()> {
         anyhow::bail!("QEMU roofline plugin '{}' was not found", plugin.display());
     }
     let backend = QemuBackend {
-        qemu: options.qemu.clone(),
-        plugin,
-        qemu_args: options.qemu_args.clone(),
+        tool: AccountingTool::Qemu {
+            qemu: options.qemu.clone(),
+            plugin,
+            extra_args: options.qemu_args.clone(),
+        },
         native_performance: false,
         method: RooflineMethodInfo {
             selection: String::new(),
@@ -258,6 +367,59 @@ pub(super) fn probe(options: &Options, guest: &Path) -> Result<()> {
     };
     let qemu = backend.qemu_for(guest)?;
     ensure_plugin_support(&qemu)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn probe_dynamorio(_options: &Options) -> Result<()> {
+    anyhow::bail!("the DynamoRIO roofline backend supports Linux hosts only")
+}
+
+/// Checks that drrun and the miniperf DynamoRIO client are available.
+#[cfg(target_os = "linux")]
+pub(super) fn probe_dynamorio(options: &Options) -> Result<()> {
+    dynamorio_paths(options).map(|_| ())
+}
+
+#[cfg(target_os = "linux")]
+fn dynamorio_paths(options: &Options) -> Result<(PathBuf, PathBuf)> {
+    let drrun = options
+        .dynamorio
+        .clone()
+        .or_else(|| std::env::var_os("MPERF_DYNAMORIO").map(PathBuf::from))
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let bundled = super::executable_directory()
+                .unwrap_or_default()
+                .join("dynamorio/bin64/drrun");
+            if bundled.is_file() {
+                Ok(bundled)
+            } else {
+                which::which("drrun").map_err(|_| {
+                    anyhow::anyhow!(
+                        "DynamoRIO 'drrun' was not found next to mperf or on PATH; pass --dynamorio"
+                    )
+                })
+            }
+        })?;
+    if !drrun.is_file() {
+        anyhow::bail!("DynamoRIO launcher '{}' was not found", drrun.display());
+    }
+    let client = options
+        .dynamorio_client
+        .clone()
+        .or_else(|| std::env::var_os("MPERF_DR_CLIENT").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            super::executable_directory()
+                .unwrap_or_default()
+                .join("libdr_roofline.so")
+        });
+    if !client.is_file() {
+        anyhow::bail!(
+            "miniperf DynamoRIO client '{}' was not found; build utils/dr-roofline or pass --dynamorio-client",
+            client.display()
+        );
+    }
+    Ok((drrun, client))
 }
 
 #[cfg(target_os = "linux")]
@@ -346,11 +508,14 @@ impl RooflineBackend for QemuBackend {
         output_directory: &'a Path,
     ) -> BackendFuture<'a> {
         Box::pin(async move {
-            let qemu = self.qemu_for(Path::new(&guest[0]))?;
-            ensure_plugin_support(&qemu)?;
+            if let AccountingTool::Qemu { .. } = &self.tool {
+                let qemu = self.qemu_for(Path::new(&guest[0]))?;
+                ensure_plugin_support(&qemu)?;
+            }
             let baseline_command = if self.native_performance {
                 guest.to_vec()
             } else {
+                let qemu = self.qemu_for(Path::new(&guest[0]))?;
                 self.command(&qemu, guest, None)?
             };
             println!(
@@ -392,19 +557,25 @@ impl RooflineBackend for QemuBackend {
             .await;
 
             let counts_path = output_directory.join("qemu-roofline.counts");
-            let accounting_command = self.command(&qemu, guest, Some(&counts_path))?;
+            let (accounting_command, accounting_env) =
+                self.accounting_command(guest, &counts_path)?;
             println!(
-                "Run 2: collecting QEMU instruction and memory accounting for '{}'",
+                "Run 2: collecting {} instruction and memory accounting for '{}'",
+                self.tool.name(),
                 guest.join(" ")
             );
-            let process = Process::new(&accounting_command, &[])?;
+            let process = Process::new(&accounting_command, &accounting_env)?;
             process.cont();
             process.wait()?;
-            super::ensure_process_success(&process, "QEMU Roofline accounting run")?;
+            super::ensure_process_success(
+                &process,
+                &format!("{} Roofline accounting run", self.tool.name()),
+            )?;
             let counts =
                 parse_counts(&std::fs::read_to_string(&counts_path).with_context(|| {
                     format!(
-                        "QEMU roofline plugin did not produce '{}'",
+                        "{} roofline accounting did not produce '{}'",
+                        self.tool.name(),
                         counts_path.display()
                     )
                 })?)?;
@@ -412,7 +583,8 @@ impl RooflineBackend for QemuBackend {
             let cfg_capture =
                 parse_dynamic_cfg(&std::fs::read_to_string(&cfg_path).with_context(|| {
                     format!(
-                        "QEMU roofline plugin did not produce dynamic CFG '{}'",
+                        "{} roofline accounting did not produce dynamic CFG '{}'",
+                        self.tool.name(),
                         cfg_path.display()
                     )
                 })?)?;
@@ -421,12 +593,14 @@ impl RooflineBackend for QemuBackend {
             let (natural_loops, irreducible_cycles) =
                 write_loop_artifact(&loops_path, &cfg_capture, Path::new(&guest[0]))?;
             println!(
-                "QEMU dynamic CFG: {natural_loops} natural loops, {irreducible_cycles} irreducible cycles; candidates saved to '{}'",
+                "{} dynamic CFG: {natural_loops} natural loops, {irreducible_cycles} irreducible cycles; candidates saved to '{}'",
+                self.tool.name(),
                 loops_path.display()
             );
             if counts.rvv_state_errors != 0 {
                 anyhow::bail!(
-                    "QEMU roofline could not read RVV state for {} executed vector instructions",
+                    "{} roofline could not read RVV state for {} executed vector instructions",
+                    self.tool.name(),
                     counts.rvv_state_errors
                 );
             }
@@ -447,7 +621,8 @@ impl RooflineBackend for QemuBackend {
                     / counts.instructions as f64;
                 if difference > 0.05 {
                     let warning = format!(
-                        "native and QEMU instruction totals differ by {:.1}% (native {}, QEMU {}); replay-dependent memory rates are degraded",
+                        "native and {} instruction totals differ by {:.1}% (native {}, instrumented {}); replay-dependent memory rates are degraded",
+                        self.tool.name(),
                         difference * 100.0,
                         baseline.instructions,
                         counts.instructions

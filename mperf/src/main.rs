@@ -69,6 +69,12 @@ enum Commands {
         /// Extra argument passed to QEMU before the guest executable.
         #[arg(long, allow_hyphen_values = true)]
         qemu_arg: Vec<String>,
+        /// DynamoRIO drrun launcher; defaults to the bundle next to mperf or PATH.
+        #[arg(long)]
+        dynamorio: Option<PathBuf>,
+        /// miniperf DynamoRIO client shared library; defaults to the artifact next to mperf.
+        #[arg(long)]
+        dynamorio_client: Option<PathBuf>,
         #[arg(short, long)]
         output_directory: String,
         #[arg(short, long)]
@@ -124,6 +130,8 @@ async fn main() -> Result<()> {
             qemu,
             qemu_plugin,
             qemu_arg,
+            dynamorio,
+            dynamorio_client,
             output_directory,
             pid,
             command,
@@ -133,6 +141,8 @@ async fn main() -> Result<()> {
                 qemu,
                 qemu_plugin,
                 qemu_args: qemu_arg,
+                dynamorio,
+                dynamorio_client,
             };
             roofline.validate_for(scenario)?;
 

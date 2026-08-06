@@ -3914,6 +3914,13 @@ name = "miniperf-qemu-roofline"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "miniperf-roofline-core",
+]
+
+[[package]]
+name = "miniperf-roofline-core"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

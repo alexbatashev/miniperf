@@ -1,9 +1,14 @@
-use serde::Serialize;
+//! QEMU TCG plugin for roofline/memory accounting. All analysis and artifact
+//! writing lives in `miniperf-roofline-core`; this crate is the QEMU plugin
+//! API adapter.
+
+use roofline_core::{
+    active_elements, artifacts, classify_flow, classify_riscv, classify_x86, is_masked, mnemonic,
+    rvv_sew, BlockCost, CacheDescription, CacheModel, CounterSnapshot, DynamicCfg, ImageInfo,
+    MemoryAnalysis, RiscvClassification, RiscvKind, RvvKind, Target, VectorClass,
+};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::{c_char, c_int, c_uint, c_void, CStr},
-    fs::File,
-    io::Write,
     path::PathBuf,
     ptr,
     sync::{
@@ -146,444 +151,11 @@ static RVV_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 static UNCLASSIFIED_MNEMONICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static CACHE_MODEL: OnceLock<Mutex<CacheModel>> = OnceLock::new();
 static MEMORY_ANALYSIS: OnceLock<Mutex<MemoryAnalysis>> = OnceLock::new();
+static DYNAMIC_CFG: Mutex<DynamicCfg> = Mutex::new(DynamicCfg::new());
 
 const DEFAULT_CACHE_LINE_SIZE: u64 = 64;
 const DEFAULT_LLC_SIZE: u64 = 8 * 1024 * 1024;
 const DEFAULT_LLC_ASSOCIATIVITY: usize = 16;
-
-const WORKING_SET_WINDOWS: [u64; 6] = [1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576];
-
-#[derive(Default)]
-struct LineFootprint {
-    bytes: [u64; 4],
-}
-
-impl LineFootprint {
-    fn touch(&mut self, offset: u64, length: u64, line_size: u64) {
-        for byte in offset..offset.saturating_add(length).min(line_size).min(256) {
-            self.bytes[(byte / 64) as usize] |= 1_u64 << (byte % 64);
-        }
-    }
-
-    fn count(&self) -> u64 {
-        self.bytes.iter().map(|word| word.count_ones() as u64).sum()
-    }
-}
-
-#[derive(Default)]
-struct WindowAccumulator {
-    width: u64,
-    references: u64,
-    lines: HashSet<u64>,
-    samples: Vec<u64>,
-}
-
-impl WindowAccumulator {
-    fn new(width: u64) -> Self {
-        Self {
-            width,
-            ..Self::default()
-        }
-    }
-
-    fn observe(&mut self, line: u64) {
-        self.references += 1;
-        self.lines.insert(line);
-        if self.references == self.width {
-            if self.samples.len() < 1_000_000 {
-                self.samples.push(self.lines.len() as u64);
-            }
-            self.references = 0;
-            self.lines.clear();
-        }
-    }
-}
-
-struct OrderNode {
-    key: u64,
-    priority: u64,
-    size: u64,
-    left: Option<Box<OrderNode>>,
-    right: Option<Box<OrderNode>>,
-}
-
-fn node_size(node: &Option<Box<OrderNode>>) -> u64 {
-    node.as_ref().map_or(0, |node| node.size)
-}
-
-fn refresh(node: &mut Box<OrderNode>) {
-    node.size = 1 + node_size(&node.left) + node_size(&node.right);
-}
-
-fn split(
-    root: Option<Box<OrderNode>>,
-    key: u64,
-) -> (Option<Box<OrderNode>>, Option<Box<OrderNode>>) {
-    let Some(mut root) = root else {
-        return (None, None);
-    };
-    if root.key < key {
-        let (left, right) = split(root.right.take(), key);
-        root.right = left;
-        refresh(&mut root);
-        (Some(root), right)
-    } else {
-        let (left, right) = split(root.left.take(), key);
-        root.left = right;
-        refresh(&mut root);
-        (left, Some(root))
-    }
-}
-
-fn merge(left: Option<Box<OrderNode>>, right: Option<Box<OrderNode>>) -> Option<Box<OrderNode>> {
-    match (left, right) {
-        (None, right) => right,
-        (left, None) => left,
-        (Some(mut left), Some(right)) if left.priority >= right.priority => {
-            left.right = merge(left.right.take(), Some(right));
-            refresh(&mut left);
-            Some(left)
-        }
-        (Some(left), Some(mut right)) => {
-            right.left = merge(Some(left), right.left.take());
-            refresh(&mut right);
-            Some(right)
-        }
-    }
-}
-
-fn insert(root: Option<Box<OrderNode>>, node: Box<OrderNode>) -> Option<Box<OrderNode>> {
-    let (left, right) = split(root, node.key);
-    merge(merge(left, Some(node)), right)
-}
-
-fn remove(root: Option<Box<OrderNode>>, key: u64) -> Option<Box<OrderNode>> {
-    let Some(mut root) = root else { return None };
-    if root.key == key {
-        return merge(root.left.take(), root.right.take());
-    }
-    if key < root.key {
-        root.left = remove(root.left.take(), key);
-    } else {
-        root.right = remove(root.right.take(), key);
-    }
-    refresh(&mut root);
-    Some(root)
-}
-
-fn count_greater(root: &Option<Box<OrderNode>>, key: u64) -> u64 {
-    let Some(root) = root else { return 0 };
-    if root.key > key {
-        1 + node_size(&root.right) + count_greater(&root.left, key)
-    } else {
-        count_greater(&root.right, key)
-    }
-}
-
-fn priority(key: u64) -> u64 {
-    let mut value = key.wrapping_add(0x9e3779b97f4a7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
-    value ^ (value >> 31)
-}
-
-struct MemoryAnalysis {
-    line_size: u64,
-    references: u64,
-    load_bytes: u64,
-    store_bytes: u64,
-    cold_references: u64,
-    footprints: HashMap<u64, LineFootprint>,
-    last_touch: HashMap<u64, u64>,
-    recency: Option<Box<OrderNode>>,
-    reuse_distance: BTreeMap<u32, u64>,
-    last_line_by_vcpu: Vec<Option<u64>>,
-    strides: BTreeMap<i32, u64>,
-    windows: Vec<WindowAccumulator>,
-}
-
-impl MemoryAnalysis {
-    fn new(line_size: u64) -> Self {
-        Self {
-            line_size,
-            references: 0,
-            load_bytes: 0,
-            store_bytes: 0,
-            cold_references: 0,
-            footprints: HashMap::new(),
-            last_touch: HashMap::new(),
-            recency: None,
-            reuse_distance: BTreeMap::new(),
-            last_line_by_vcpu: Vec::new(),
-            strides: BTreeMap::new(),
-            windows: WORKING_SET_WINDOWS
-                .into_iter()
-                .map(WindowAccumulator::new)
-                .collect(),
-        }
-    }
-
-    fn access(&mut self, vcpu: usize, address: u64, size: u64, store: bool) {
-        if store {
-            self.store_bytes = self.store_bytes.saturating_add(size);
-        } else {
-            self.load_bytes = self.load_bytes.saturating_add(size);
-        }
-        if size == 0 {
-            return;
-        }
-        let first = address / self.line_size;
-        let last = address.saturating_add(size - 1) / self.line_size;
-        for line in first..=last {
-            self.references = self.references.saturating_add(1);
-            let line_start = line.saturating_mul(self.line_size);
-            let start = address.max(line_start);
-            let end = address
-                .saturating_add(size)
-                .min(line_start.saturating_add(self.line_size));
-            self.footprints.entry(line).or_default().touch(
-                start - line_start,
-                end - start,
-                self.line_size,
-            );
-            for window in &mut self.windows {
-                window.observe(line);
-            }
-
-            if let Some(previous) = self.last_touch.insert(line, self.references) {
-                let distance = count_greater(&self.recency, previous);
-                let bucket = if distance == 0 {
-                    0
-                } else {
-                    64 - distance.leading_zeros()
-                };
-                *self.reuse_distance.entry(bucket).or_default() += 1;
-                self.recency = remove(self.recency.take(), previous);
-            } else {
-                self.cold_references += 1;
-            }
-            let key = self.references;
-            self.recency = insert(
-                self.recency.take(),
-                Box::new(OrderNode {
-                    key,
-                    priority: priority(key),
-                    size: 1,
-                    left: None,
-                    right: None,
-                }),
-            );
-
-            if self.last_line_by_vcpu.len() <= vcpu {
-                self.last_line_by_vcpu.resize(vcpu + 1, None);
-            }
-            if let Some(previous) = self.last_line_by_vcpu[vcpu] {
-                let delta = line as i128 - previous as i128;
-                let magnitude = delta.unsigned_abs() as u64;
-                let log = if magnitude == 0 {
-                    0
-                } else {
-                    64 - magnitude.leading_zeros() as i32
-                };
-                let bucket = if delta < 0 { -log } else { log };
-                *self.strides.entry(bucket).or_default() += 1;
-            }
-            self.last_line_by_vcpu[vcpu] = Some(line);
-        }
-    }
-
-    fn artifact(&self) -> MemoryArtifact {
-        let distinct_bytes = self.footprints.values().map(LineFootprint::count).sum();
-        let mut utilization = BTreeMap::new();
-        for line in self.footprints.values() {
-            let percent =
-                (line.count().saturating_mul(100) / self.line_size.max(1)).min(100) as u32;
-            let bucket = (percent / 10) * 10;
-            *utilization.entry(bucket).or_default() += 1;
-        }
-        let working_set = self
-            .windows
-            .iter()
-            .map(|window| {
-                let mut samples = window.samples.clone();
-                if window.references != 0 {
-                    samples.push(window.lines.len() as u64);
-                }
-                samples.sort_unstable();
-                let mean = if samples.is_empty() {
-                    0.0
-                } else {
-                    samples.iter().sum::<u64>() as f64 / samples.len() as f64
-                };
-                let p95 = samples
-                    .get(samples.len().saturating_sub(1) * 95 / 100)
-                    .copied()
-                    .unwrap_or(0);
-                WorkingSetArtifact {
-                    window_references: window.width,
-                    mean_lines: mean,
-                    p95_lines: p95,
-                    max_lines: samples.last().copied().unwrap_or(0),
-                }
-            })
-            .collect();
-        MemoryArtifact {
-            format_version: 1,
-            line_size: self.line_size,
-            references: self.references,
-            architectural_load_bytes: self.load_bytes,
-            architectural_store_bytes: self.store_bytes,
-            unique_lines: self.footprints.len() as u64,
-            distinct_bytes,
-            cold_references: self.cold_references,
-            reuse_distance_log2: self.reuse_distance.clone(),
-            spatial_utilization_percent: utilization,
-            stride_lines_log2: self.strides.clone(),
-            working_set,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct WorkingSetArtifact {
-    window_references: u64,
-    mean_lines: f64,
-    p95_lines: u64,
-    max_lines: u64,
-}
-
-#[derive(Serialize)]
-struct MemoryArtifact {
-    format_version: u32,
-    line_size: u64,
-    references: u64,
-    architectural_load_bytes: u64,
-    architectural_store_bytes: u64,
-    unique_lines: u64,
-    distinct_bytes: u64,
-    cold_references: u64,
-    reuse_distance_log2: BTreeMap<u32, u64>,
-    spatial_utilization_percent: BTreeMap<u32, u64>,
-    stride_lines_log2: BTreeMap<i32, u64>,
-    working_set: Vec<WorkingSetArtifact>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct MemoryTraffic {
-    bytes_load: u64,
-    bytes_store: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CacheLine {
-    tag: u64,
-    last_used: u64,
-    dirty: bool,
-}
-
-struct CacheModel {
-    line_size: u64,
-    capacity: u64,
-    associativity: usize,
-    sets: Vec<Vec<CacheLine>>,
-    clock: u64,
-}
-
-impl CacheModel {
-    fn new(line_size: u64, capacity: u64, associativity: usize) -> Option<Self> {
-        if !line_size.is_power_of_two() || line_size == 0 || associativity == 0 {
-            return None;
-        }
-        let lines = capacity / line_size;
-        let set_count = lines / associativity as u64;
-        if set_count == 0 {
-            return None;
-        }
-        Some(Self {
-            line_size,
-            capacity: set_count * associativity as u64 * line_size,
-            associativity,
-            sets: vec![Vec::with_capacity(associativity); set_count as usize],
-            clock: 0,
-        })
-    }
-
-    fn access(&mut self, address: u64, size: u64, store: bool) -> MemoryTraffic {
-        let mut traffic = MemoryTraffic::default();
-        if size == 0 {
-            return traffic;
-        }
-        let first_line = address / self.line_size;
-        let last_address = address.saturating_add(size - 1);
-        let last_line = last_address / self.line_size;
-
-        for line_address in first_line..=last_line {
-            self.clock = self.clock.wrapping_add(1);
-            let set_index = line_address as usize % self.sets.len();
-            let tag = line_address / self.sets.len() as u64;
-            let set = &mut self.sets[set_index];
-            if let Some(line) = set.iter_mut().find(|line| line.tag == tag) {
-                line.last_used = self.clock;
-                if store {
-                    line.dirty = true;
-                }
-                continue;
-            }
-
-            if set.len() == self.associativity {
-                let victim = set
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, line)| line.last_used)
-                    .map(|(index, _)| index)
-                    .unwrap_or(0);
-                let victim = set.swap_remove(victim);
-                if victim.dirty {
-                    traffic.bytes_store = traffic.bytes_store.saturating_add(self.line_size);
-                }
-            }
-            set.push(CacheLine {
-                tag,
-                last_used: self.clock,
-                dirty: store,
-            });
-            // A cold write uses ordinary write allocation. QEMU does not
-            // currently expose enough instruction semantics to identify every
-            // non-temporal store, so those are conservatively modeled here.
-            traffic.bytes_load = traffic.bytes_load.saturating_add(self.line_size);
-        }
-        traffic
-    }
-
-    fn flush(&mut self) -> MemoryTraffic {
-        let dirty = self
-            .sets
-            .iter()
-            .flat_map(|set| set.iter())
-            .filter(|line| line.dirty)
-            .count() as u64;
-        for set in &mut self.sets {
-            set.clear();
-        }
-        MemoryTraffic {
-            bytes_load: 0,
-            bytes_store: dirty.saturating_mul(self.line_size),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Target {
-    Riscv,
-    X86,
-}
-
-#[derive(Clone, Copy)]
-struct ImageInfo {
-    start: u64,
-    end: u64,
-    entry: u64,
-}
 
 #[derive(Clone, Copy, Default)]
 struct RvvRegisters {
@@ -620,113 +192,12 @@ thread_local! {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RvvKind {
-    Integer,
-    Float,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RiscvKind {
-    ScalarInteger,
-    ScalarFloat,
-    ScalarDouble,
-    VectorInteger,
-    VectorFloat,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RiscvCost {
-    kind: RiscvKind,
-    factor: u64,
-    sew_scale: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RiscvClassification {
-    Counted(RiscvCost),
-    NonCompute,
-    Unclassified,
-}
-
-struct RiscvOperationSpec {
-    mnemonic: &'static str,
-    masked: bool,
-    classification: RiscvClassification,
-}
-
-include!(concat!(env!("OUT_DIR"), "/riscv_operations.rs"));
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RvvCost {
     block: u64,
     kind: RvvKind,
     factor: u64,
     masked: bool,
     sew_scale: u64,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct BlockCost {
-    vaddr: u64,
-    end_vaddr: u64,
-    flow: FlowKind,
-    scalar_int: u64,
-    scalar_float: u64,
-    scalar_double: u64,
-    vector_int: u64,
-    vector_float: u64,
-    vector_double: u64,
-    instructions: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum FlowKind {
-    #[default]
-    Normal,
-    Call,
-    Return,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct DynamicBlockCounts {
-    end_vaddr: u64,
-    executions: u64,
-    scalar_int: u64,
-    scalar_float: u64,
-    scalar_double: u64,
-    vector_int: u64,
-    vector_float: u64,
-    vector_double: u64,
-    bytes_load: u64,
-    bytes_store: u64,
-    unclassified: u64,
-}
-
-struct DynamicCfg {
-    last_blocks: Vec<Option<(u64, FlowKind)>>,
-    call_stacks: Vec<Vec<u64>>,
-    entries: BTreeSet<u64>,
-    edges: BTreeMap<(u64, u64), u64>,
-    blocks: BTreeMap<u64, DynamicBlockCounts>,
-}
-
-static DYNAMIC_CFG: Mutex<DynamicCfg> = Mutex::new(DynamicCfg {
-    last_blocks: Vec::new(),
-    call_stacks: Vec::new(),
-    entries: BTreeSet::new(),
-    edges: BTreeMap::new(),
-    blocks: BTreeMap::new(),
-});
-
-impl BlockCost {
-    fn add(&mut self, other: Self) {
-        self.scalar_int += other.scalar_int;
-        self.scalar_float += other.scalar_float;
-        self.scalar_double += other.scalar_double;
-        self.vector_int += other.vector_int;
-        self.vector_float += other.vector_float;
-        self.vector_double += other.vector_double;
-    }
 }
 
 extern "C" fn execute_block(vcpu: c_uint, userdata: *mut c_void) {
@@ -746,53 +217,10 @@ extern "C" fn execute_block(vcpu: c_uint, userdata: *mut c_void) {
     VECTOR_FLOAT_OPS.fetch_add(cost.vector_float, Ordering::Relaxed);
     VECTOR_DOUBLE_OPS.fetch_add(cost.vector_double, Ordering::Relaxed);
 
-    let mut cfg = DYNAMIC_CFG.lock().unwrap();
-    if cfg.last_blocks.len() <= vcpu as usize {
-        cfg.last_blocks.resize(vcpu as usize + 1, None);
-    }
-    if cfg.call_stacks.len() <= vcpu as usize {
-        cfg.call_stacks.resize_with(vcpu as usize + 1, Vec::new);
-    }
-    if let Some((previous, flow)) = cfg.last_blocks[vcpu as usize] {
-        match flow {
-            FlowKind::Normal => {
-                *cfg.edges.entry((previous, cost.vaddr)).or_default() += 1;
-            }
-            FlowKind::Call => {
-                cfg.entries.insert(cost.vaddr);
-                cfg.call_stacks[vcpu as usize].push(previous);
-            }
-            FlowKind::Return => {
-                if let Some(caller) = cfg.call_stacks[vcpu as usize].pop() {
-                    // Summarize the call as an intraprocedural edge from the
-                    // call block to its observed continuation. This preserves
-                    // caller loops without adding call/return edges that can
-                    // create false interprocedural cycles.
-                    *cfg.edges.entry((caller, cost.vaddr)).or_default() += 1;
-                } else {
-                    cfg.entries.insert(cost.vaddr);
-                }
-            }
-        }
-    } else {
-        cfg.entries.insert(cost.vaddr);
-    }
-    cfg.last_blocks[vcpu as usize] = Some((cost.vaddr, cost.flow));
-    let block = cfg.blocks.entry(cost.vaddr).or_default();
-    if block.end_vaddr == 0 {
-        block.end_vaddr = cost.end_vaddr;
-    } else if block.end_vaddr != cost.end_vaddr {
-        // Self-modifying code or context-dependent translation at the same
-        // virtual address cannot be represented as one stable source range.
-        block.end_vaddr = block.end_vaddr.max(cost.end_vaddr);
-    }
-    block.executions = block.executions.saturating_add(1);
-    block.scalar_int = block.scalar_int.saturating_add(cost.scalar_int);
-    block.scalar_float = block.scalar_float.saturating_add(cost.scalar_float);
-    block.scalar_double = block.scalar_double.saturating_add(cost.scalar_double);
-    block.vector_int = block.vector_int.saturating_add(cost.vector_int);
-    block.vector_float = block.vector_float.saturating_add(cost.vector_float);
-    block.vector_double = block.vector_double.saturating_add(cost.vector_double);
+    DYNAMIC_CFG
+        .lock()
+        .unwrap()
+        .record_block(vcpu as usize, cost);
 }
 
 extern "C" fn execute_unclassified(_vcpu: c_uint, userdata: *mut c_void) {
@@ -805,9 +233,10 @@ extern "C" fn execute_unclassified(_vcpu: c_uint, userdata: *mut c_void) {
     }
     UNCLASSIFIED_INSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
     let block_address = userdata as usize as u64;
-    let mut cfg = DYNAMIC_CFG.lock().unwrap();
-    let block = cfg.blocks.entry(block_address).or_default();
-    block.unclassified = block.unclassified.saturating_add(1);
+    DYNAMIC_CFG
+        .lock()
+        .unwrap()
+        .attribute_unclassified(block_address);
 }
 
 extern "C" fn memory_access(vcpu: c_uint, info: MemInfo, address: u64, userdata: *mut c_void) {
@@ -838,10 +267,11 @@ extern "C" fn memory_access(vcpu: c_uint, info: MemInfo, address: u64, userdata:
     DRAM_BYTES_LOAD.fetch_add(traffic.bytes_load, Ordering::Relaxed);
     DRAM_BYTES_STORE.fetch_add(traffic.bytes_store, Ordering::Relaxed);
     let block_address = userdata as usize as u64;
-    let mut cfg = DYNAMIC_CFG.lock().unwrap();
-    let block = cfg.blocks.entry(block_address).or_default();
-    block.bytes_load = block.bytes_load.saturating_add(traffic.bytes_load);
-    block.bytes_store = block.bytes_store.saturating_add(traffic.bytes_store);
+    DYNAMIC_CFG.lock().unwrap().attribute_memory(
+        block_address,
+        traffic.bytes_load,
+        traffic.bytes_store,
+    );
 }
 
 extern "C" fn initialize_vcpu(_id: PluginId, vcpu: c_uint) {
@@ -957,26 +387,24 @@ extern "C" fn execute_rvv(vcpu: c_uint, userdata: *mut c_void) {
         active_elements(vstart, vl, None).unwrap()
     };
     let operations = elements.saturating_mul(cost.factor);
-    match cost.kind {
+    let class = match cost.kind {
         RvvKind::Integer => {
             VECTOR_INT_OPS.fetch_add(operations, Ordering::Relaxed);
-            let mut cfg = DYNAMIC_CFG.lock().unwrap();
-            let block = cfg.blocks.entry(cost.block).or_default();
-            block.vector_int = block.vector_int.saturating_add(operations);
+            VectorClass::Integer
         }
         RvvKind::Float if sew == 64 => {
             VECTOR_DOUBLE_OPS.fetch_add(operations, Ordering::Relaxed);
-            let mut cfg = DYNAMIC_CFG.lock().unwrap();
-            let block = cfg.blocks.entry(cost.block).or_default();
-            block.vector_double = block.vector_double.saturating_add(operations);
+            VectorClass::Double
         }
         RvvKind::Float => {
             VECTOR_FLOAT_OPS.fetch_add(operations, Ordering::Relaxed);
-            let mut cfg = DYNAMIC_CFG.lock().unwrap();
-            let block = cfg.blocks.entry(cost.block).or_default();
-            block.vector_float = block.vector_float.saturating_add(operations);
+            VectorClass::Float
         }
-    }
+    };
+    DYNAMIC_CFG
+        .lock()
+        .unwrap()
+        .attribute_vector(cost.block, class, operations);
 }
 
 fn rvv_state_error(message: &str) {
@@ -1021,27 +449,6 @@ fn read_mask_elements(handle: usize, start: u64, end: u64) -> Option<u64> {
         let bytes = unsafe { std::slice::from_raw_parts((*buffer).data, (*buffer).len as usize) };
         active_elements(start, end, Some(bytes))
     })
-}
-
-fn active_elements(start: u64, end: u64, mask: Option<&[u8]>) -> Option<u64> {
-    let Some(mask) = mask else {
-        return Some(end.saturating_sub(start));
-    };
-    if end > mask.len() as u64 * 8 {
-        return None;
-    }
-    Some(
-        (start..end)
-            .filter(|bit| mask[(bit / 8) as usize] & (1 << (bit % 8)) != 0)
-            .count() as u64,
-    )
-}
-
-fn rvv_sew(vtype: u64, xlen: u32) -> Option<u64> {
-    if xlen == 0 || xlen > 64 || vtype & (1_u64 << (xlen - 1)) != 0 {
-        return None;
-    }
-    8_u64.checked_shl(((vtype >> 3) & 0x7) as u32)
 }
 
 extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
@@ -1136,71 +543,6 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
     };
 }
 
-fn classify_flow(target: Option<Target>, disassembly: &str) -> FlowKind {
-    let operation = mnemonic(disassembly);
-    let operands = disassembly
-        .to_ascii_lowercase()
-        .split_once(&operation)
-        .map(|(_, operands)| operands.trim().replace(' ', ""))
-        .unwrap_or_default();
-
-    match target {
-        Some(Target::Riscv) => {
-            if matches!(operation.as_str(), "ret" | "c.ret")
-                || matches!(operation.as_str(), "jr" | "c.jr")
-                    && matches!(operands.as_str(), "ra" | "x1")
-                || operation == "jalr"
-                    && (operands.starts_with("zero,ra") || operands.starts_with("x0,x1"))
-            {
-                FlowKind::Return
-            } else if operation == "call"
-                || matches!(operation.as_str(), "jal" | "jalr")
-                    && (operands.starts_with("ra,") || operands.starts_with("x1,"))
-                || operation == "c.jal"
-                || operation == "c.jalr"
-            {
-                FlowKind::Call
-            } else {
-                FlowKind::Normal
-            }
-        }
-        Some(Target::X86) if operation.starts_with("ret") => FlowKind::Return,
-        Some(Target::X86) if operation.starts_with("call") => FlowKind::Call,
-        _ => FlowKind::Normal,
-    }
-}
-
-fn mnemonic(disassembly: &str) -> String {
-    disassembly
-        .split_whitespace()
-        .find(|part| {
-            part.chars().any(|c| c.is_ascii_alphabetic())
-                && !part.trim_end_matches(':').starts_with("0x")
-        })
-        .unwrap_or_default()
-        .trim_matches(|c: char| c == ':' || c == ',')
-        .to_ascii_lowercase()
-}
-
-fn classify_riscv(disassembly: &str) -> RiscvClassification {
-    let mnemonic = mnemonic(disassembly);
-    let masked = is_masked(disassembly);
-    RISCV_OPERATIONS
-        .binary_search_by(|operation| {
-            operation
-                .mnemonic
-                .cmp(mnemonic.as_str())
-                .then_with(|| operation.masked.cmp(&masked))
-        })
-        .ok()
-        .map(|index| RISCV_OPERATIONS[index].classification)
-        .unwrap_or(RiscvClassification::Unclassified)
-}
-
-fn is_masked(disassembly: &str) -> bool {
-    disassembly.to_ascii_lowercase().contains("v0.t")
-}
-
 fn report_unclassified(disassembly: &str) {
     let mnemonic = mnemonic(disassembly);
     let operation = if is_masked(disassembly) {
@@ -1217,99 +559,6 @@ fn report_unclassified(disassembly: &str) {
     }
 }
 
-fn classify_x86(mnemonic: &str, disassembly: &str) -> BlockCost {
-    let mut cost = BlockCost::default();
-    let opcode = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
-    let fused = is_x86_fused(opcode);
-    let operations = if fused { 2 } else { 1 };
-
-    if is_x86_float_arithmetic(opcode) {
-        if opcode.ends_with("ss") {
-            cost.scalar_float = operations;
-        } else if opcode.ends_with("sd") {
-            cost.scalar_double = operations;
-        } else if opcode.ends_with("ps") {
-            cost.vector_float = operations * x86_vector_bits(disassembly) / 32;
-        } else if opcode.ends_with("pd") {
-            cost.vector_double = operations * x86_vector_bits(disassembly) / 64;
-        } else if opcode.starts_with('f') {
-            // x87 uses extended precision internally. Keep it in the closest
-            // existing bucket until the event schema has an explicit type.
-            cost.scalar_double = operations;
-        }
-    } else if let Some(element_bits) = x86_vector_integer_element_bits(opcode) {
-        cost.vector_int = operations * x86_vector_bits(disassembly) / element_bits;
-    } else if is_x86_scalar_integer(opcode) {
-        cost.scalar_int = 1;
-    }
-
-    cost
-}
-
-fn is_x86_fused(opcode: &str) -> bool {
-    ["fmadd", "fmsub", "fnmadd", "fnmsub"]
-        .iter()
-        .any(|prefix| opcode.starts_with(prefix))
-}
-
-fn is_x86_float_arithmetic(opcode: &str) -> bool {
-    [
-        "add", "sub", "mul", "div", "sqrt", "min", "max", "cmp", "comi", "ucomi", "fmadd", "fmsub",
-        "fnmadd", "fnmsub",
-    ]
-    .iter()
-    .any(|prefix| opcode.starts_with(prefix))
-        && ["ss", "sd", "ps", "pd"]
-            .iter()
-            .any(|suffix| opcode.ends_with(suffix))
-        || [
-            "fadd", "faddp", "fsub", "fsubp", "fsubr", "fmul", "fdiv", "fdivp", "fdivr", "fsqrt",
-            "fcom", "fcomp", "fucom", "fucomp",
-        ]
-        .contains(&opcode)
-}
-
-fn x86_vector_bits(disassembly: &str) -> u64 {
-    if disassembly.contains("zmm") {
-        512
-    } else if disassembly.contains("ymm") {
-        256
-    } else {
-        128
-    }
-}
-
-fn x86_vector_integer_element_bits(opcode: &str) -> Option<u64> {
-    let vector_integer = [
-        "padd", "psub", "pmul", "pmadd", "pavg", "pmin", "pmax", "pcmpeq", "pcmpgt", "psll",
-        "psrl", "psra",
-    ]
-    .iter()
-    .any(|prefix| opcode.starts_with(prefix));
-    if !vector_integer {
-        return None;
-    }
-
-    match opcode.chars().last()? {
-        'b' => Some(8),
-        'w' => Some(16),
-        'd' => Some(32),
-        'q' => Some(64),
-        _ => None,
-    }
-}
-
-fn is_x86_scalar_integer(opcode: &str) -> bool {
-    let opcodes = [
-        "add", "adc", "sub", "sbb", "imul", "mul", "idiv", "div", "inc", "dec", "neg", "shl",
-        "shr", "sar", "sal", "and", "or", "xor", "cmp", "test",
-    ];
-    opcodes.contains(&opcode)
-        || opcode
-            .strip_suffix(['b', 'w', 'l', 'q'])
-            .is_some_and(|opcode| opcodes.contains(&opcode))
-}
-
 extern "C" fn plugin_exit(_id: PluginId, _userdata: *mut c_void) {
     if ROOT_PID
         .get()
@@ -1324,80 +573,42 @@ extern "C" fn plugin_exit(_id: PluginId, _userdata: *mut c_void) {
             DRAM_BYTES_LOAD.fetch_add(traffic.bytes_load, Ordering::Relaxed);
             DRAM_BYTES_STORE.fetch_add(traffic.bytes_store, Ordering::Relaxed);
         }
-        if let Ok(mut file) = File::create(path) {
-            let counters = [
-                ("scalar_int_ops", &SCALAR_INT_OPS),
-                ("scalar_float_ops", &SCALAR_FLOAT_OPS),
-                ("scalar_double_ops", &SCALAR_DOUBLE_OPS),
-                ("vector_int_ops", &VECTOR_INT_OPS),
-                ("vector_float_ops", &VECTOR_FLOAT_OPS),
-                ("vector_double_ops", &VECTOR_DOUBLE_OPS),
-                ("bytes_load", &BYTES_LOAD),
-                ("bytes_store", &BYTES_STORE),
-                ("dram_bytes_load", &DRAM_BYTES_LOAD),
-                ("dram_bytes_store", &DRAM_BYTES_STORE),
-                ("rvv_state_errors", &RVV_STATE_ERRORS),
-                ("unclassified_instructions", &UNCLASSIFIED_INSTRUCTIONS),
-                ("instructions", &RETIRED_INSTRUCTIONS),
-            ];
-            for (name, counter) in counters {
-                let _ = writeln!(file, "{name}={}", counter.load(Ordering::Relaxed));
+        let counters = CounterSnapshot {
+            scalar_int_ops: SCALAR_INT_OPS.load(Ordering::Relaxed),
+            scalar_float_ops: SCALAR_FLOAT_OPS.load(Ordering::Relaxed),
+            scalar_double_ops: SCALAR_DOUBLE_OPS.load(Ordering::Relaxed),
+            vector_int_ops: VECTOR_INT_OPS.load(Ordering::Relaxed),
+            vector_float_ops: VECTOR_FLOAT_OPS.load(Ordering::Relaxed),
+            vector_double_ops: VECTOR_DOUBLE_OPS.load(Ordering::Relaxed),
+            bytes_load: BYTES_LOAD.load(Ordering::Relaxed),
+            bytes_store: BYTES_STORE.load(Ordering::Relaxed),
+            dram_bytes_load: DRAM_BYTES_LOAD.load(Ordering::Relaxed),
+            dram_bytes_store: DRAM_BYTES_STORE.load(Ordering::Relaxed),
+            rvv_state_errors: RVV_STATE_ERRORS.load(Ordering::Relaxed),
+            unclassified_instructions: UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed),
+            instructions: RETIRED_INSTRUCTIONS.load(Ordering::Relaxed),
+            child_process_seen: CHILD_PROCESS_SEEN.load(Ordering::Relaxed),
+        };
+        artifacts::write_counts(path, &counters);
+        let cache = CACHE_MODEL.get().map(|cache| {
+            let cache = cache.lock().unwrap();
+            CacheDescription {
+                line_size: cache.line_size(),
+                capacity: cache.capacity(),
+                associativity: cache.associativity(),
             }
-            let _ = writeln!(
-                file,
-                "child_process_seen={}",
-                u64::from(CHILD_PROCESS_SEEN.load(Ordering::Relaxed))
-            );
-        }
-        let cfg_path = path.with_extension("cfg");
-        if let Ok(mut file) = File::create(cfg_path) {
-            let cfg = DYNAMIC_CFG.lock().unwrap();
-            let _ = writeln!(file, "miniperf-qemu-cfg=3");
-            if let Some(cache) = CACHE_MODEL.get() {
-                let cache = cache.lock().unwrap();
-                let _ = writeln!(
-                    file,
-                    "cache {} {} {} write-back-write-allocate",
-                    cache.line_size, cache.capacity, cache.associativity
-                );
-            }
-            if let Some(image) = IMAGE.get() {
-                let _ = writeln!(
-                    file,
-                    "image {:#x} {:#x} {:#x}",
-                    image.start, image.end, image.entry
-                );
-            }
-            for entry in &cfg.entries {
-                let _ = writeln!(file, "entry {entry:#x}");
-            }
-            for (&(from, to), &executions) in &cfg.edges {
-                let _ = writeln!(file, "edge {from:#x} {to:#x} {executions}");
-            }
-            for (&address, counts) in &cfg.blocks {
-                let _ = writeln!(
-                    file,
-                    "block {address:#x} {:#x} {} {} {} {} {} {} {} {} {} {}",
-                    counts.end_vaddr,
-                    counts.executions,
-                    counts.scalar_int,
-                    counts.scalar_float,
-                    counts.scalar_double,
-                    counts.vector_int,
-                    counts.vector_float,
-                    counts.vector_double,
-                    counts.bytes_load,
-                    counts.bytes_store,
-                    counts.unclassified,
-                );
-            }
-        }
+        });
+        artifacts::write_cfg(
+            &path.with_extension("cfg"),
+            cache,
+            IMAGE.get().copied(),
+            &DYNAMIC_CFG.lock().unwrap(),
+        );
         if let Some(analysis) = MEMORY_ANALYSIS.get() {
-            let memory_path = path.with_extension("memory.json");
-            if let Ok(file) = File::create(memory_path) {
-                let artifact = analysis.lock().unwrap().artifact();
-                let _ = serde_json::to_writer(file, &artifact);
-            }
+            artifacts::write_memory(
+                &path.with_extension("memory.json"),
+                &analysis.lock().unwrap().artifact(),
+            );
         }
     }
 
@@ -1515,15 +726,14 @@ pub unsafe extern "C" fn qemu_plugin_install(
     }
     let line_size = CACHE_MODEL
         .get()
-        .map(|cache| cache.lock().unwrap().line_size)
+        .map(|cache| cache.lock().unwrap().line_size())
         .unwrap_or(DEFAULT_CACHE_LINE_SIZE);
-    if memory_profile {
-        if MEMORY_ANALYSIS
+    if memory_profile
+        && MEMORY_ANALYSIS
             .set(Mutex::new(MemoryAnalysis::new(line_size)))
             .is_err()
-        {
-            return -1;
-        }
+    {
+        return -1;
     }
 
     unsafe {
@@ -1539,246 +749,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_analysis_counts_footprint_spatial_and_exact_stack_distance() {
-        let mut analysis = MemoryAnalysis::new(64);
-        analysis.access(0, 0, 8, false); // A
-        analysis.access(0, 64, 8, false); // B
-        analysis.access(0, 128, 8, false); // C
-        analysis.access(0, 0, 8, false); // A, two newer distinct lines
-        analysis.access(0, 0, 8, true); // A, immediate reuse
-        let artifact = analysis.artifact();
-        assert_eq!(artifact.references, 5);
-        assert_eq!(artifact.unique_lines, 3);
-        assert_eq!(artifact.distinct_bytes, 24);
-        assert_eq!(artifact.cold_references, 3);
-        assert_eq!(artifact.architectural_load_bytes, 32);
-        assert_eq!(artifact.architectural_store_bytes, 8);
-        assert_eq!(artifact.reuse_distance_log2.get(&2), Some(&1));
-        assert_eq!(artifact.reuse_distance_log2.get(&0), Some(&1));
-        assert_eq!(artifact.spatial_utilization_percent.get(&10), Some(&3));
-    }
-
-    #[test]
-    fn order_statistic_tree_tracks_more_recent_unique_lines() {
-        let mut root = None;
-        for key in [10, 20, 30, 40] {
-            root = insert(
-                root,
-                Box::new(OrderNode {
-                    key,
-                    priority: priority(key),
-                    size: 1,
-                    left: None,
-                    right: None,
-                }),
-            );
-        }
-        assert_eq!(count_greater(&root, 20), 2);
-        root = remove(root, 30);
-        assert_eq!(count_greater(&root, 20), 1);
-        assert_eq!(node_size(&root), 3);
-    }
-
-    #[test]
-    fn cache_model_counts_write_allocate_dirty_eviction_and_final_flush() {
-        let mut cache = CacheModel::new(64, 128, 1).unwrap();
-        assert_eq!(
-            cache.access(0, 8, false),
-            MemoryTraffic {
-                bytes_load: 64,
-                bytes_store: 0
-            }
-        );
-        assert_eq!(cache.access(8, 8, false), MemoryTraffic::default());
-        assert_eq!(cache.access(8, 8, true), MemoryTraffic::default());
-        assert_eq!(cache.access(16, 8, true), MemoryTraffic::default());
-        assert_eq!(
-            cache.access(128, 8, false),
-            MemoryTraffic {
-                bytes_load: 64,
-                bytes_store: 64
-            }
-        );
-        assert_eq!(cache.access(0, 8, false).bytes_load, 64);
-        assert_eq!(cache.flush(), MemoryTraffic::default());
-    }
-
-    #[test]
-    fn cache_model_splits_cross_line_accesses() {
-        let mut cache = CacheModel::new(64, 256, 1).unwrap();
-        assert_eq!(cache.access(60, 8, false).bytes_load, 128);
-        assert!(CacheModel::new(48, 256, 1).is_none());
-        assert!(CacheModel::new(64, 64, 2).is_none());
-    }
-
-    #[test]
-    fn classifies_call_and_return_edges() {
-        for instruction in [
-            "jal ra,0x20",
-            "jalr x1,a0,0",
-            "call 0x40",
-            "c.jal 0x10",
-            "c.jalr ra",
-        ] {
-            assert_eq!(
-                classify_flow(Some(Target::Riscv), instruction),
-                FlowKind::Call,
-                "{instruction}"
-            );
-        }
-        for instruction in ["ret", "jr ra", "jalr zero,ra,0", "c.jr x1"] {
-            assert_eq!(
-                classify_flow(Some(Target::Riscv), instruction),
-                FlowKind::Return,
-                "{instruction}"
-            );
-        }
-        assert_eq!(
-            classify_flow(Some(Target::Riscv), "jal zero,0x20"),
-            FlowKind::Normal
-        );
-        assert_eq!(
-            classify_flow(Some(Target::X86), "callq 0x20"),
-            FlowKind::Call
-        );
-        assert_eq!(classify_flow(Some(Target::X86), "retq"), FlowKind::Return);
-    }
-
-    #[test]
-    fn classifies_tmdl_scalar_and_compressed_operations() {
-        assert_eq!(
-            classify_riscv("fadd.d fa0,fa1,fa2"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::ScalarDouble,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-        assert_eq!(
-            classify_riscv("c.add a0,a1"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::ScalarInteger,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn classifies_tmdl_vector_arithmetic() {
-        assert_eq!(
-            classify_riscv("vfmacc.vv v8,v9,v10,v0.t"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorFloat,
-                factor: 2,
-                sew_scale: 1,
-            })
-        );
-        assert_eq!(
-            classify_riscv("vfwadd.vv v8,v9,v10"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorFloat,
-                factor: 1,
-                sew_scale: 2,
-            })
-        );
-        assert_eq!(
-            classify_riscv("vfredusum.vs v8,v9,v10"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorFloat,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-        assert_eq!(
-            classify_riscv("vmacc.vv v8,v9,v10"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorInteger,
-                factor: 2,
-                sew_scale: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn does_not_count_control_flow_or_expand_integer_remainder() {
-        for instruction in ["auipc a0,0x10", "jal ra,0x20", "jalr ra,a0,0"] {
-            assert_eq!(
-                classify_riscv(instruction),
-                RiscvClassification::NonCompute,
-                "{instruction}"
-            );
-        }
-        assert_eq!(
-            classify_riscv("rem a0,a1,a2"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::ScalarInteger,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn treats_non_arithmetic_float_behavior_as_non_compute() {
-        for instruction in [
-            "vmfeq.vv v1,v2,v3",
-            "vfcvt.x.f.v v1,v2",
-            "vfsgnj.vv v1,v2,v3",
-        ] {
-            assert_eq!(
-                classify_riscv(instruction),
-                RiscvClassification::NonCompute,
-                "{instruction}"
-            );
-        }
-    }
-
-    #[test]
-    fn leaves_missing_and_todo_operations_unclassified() {
-        assert_eq!(
-            classify_riscv("vfrsqrt7.v v1,v2"),
-            RiscvClassification::Unclassified
-        );
-        assert_eq!(
-            classify_riscv("madeup a0,a1"),
-            RiscvClassification::Unclassified
-        );
-
+    fn unclassified_callback_counts_and_attributes() {
         let before = UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed);
         execute_unclassified(0, ptr::null_mut());
         assert_eq!(
             UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed),
             before + 1
         );
-    }
-
-    #[test]
-    fn applies_rvv_mask_vstart_and_sew() {
-        assert_eq!(active_elements(2, 7, Some(&[0b0110_1100])), Some(4));
-        assert_eq!(active_elements(2, 7, None), Some(5));
-        assert_eq!(active_elements(9, 7, None), Some(0));
-        assert_eq!(active_elements(0, 9, Some(&[0xff])), None);
-        assert_eq!(rvv_sew(2 << 3, 64), Some(32));
-        assert_eq!(rvv_sew(3 << 3, 64), Some(64));
-        assert_eq!(rvv_sew(1_u64 << 63, 64), None);
-    }
-
-    #[test]
-    fn classifies_x86_scalar_and_vector_operations() {
-        let scalar = classify_x86("mulsd", "mulsd 0x8(%rax),%xmm0");
-        assert_eq!(scalar.scalar_double, 1);
-
-        let vector = classify_x86("vfmadd132ps", "vfmadd132ps %ymm1,%ymm2,%ymm3");
-        assert_eq!(vector.vector_float, 16);
-
-        let integer = classify_x86("vpaddd", "vpaddd %zmm1,%zmm2,%zmm3");
-        assert_eq!(integer.vector_int, 16);
-    }
-
-    #[test]
-    fn does_not_treat_x86_simd_logic_as_scalar_integer_work() {
-        let cost = classify_x86("orpd", "orpd %xmm1,%xmm0");
-        assert_eq!(cost.scalar_int, 0);
     }
 }

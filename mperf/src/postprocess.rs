@@ -1435,7 +1435,8 @@ fn process_binary_roofline_loops(
     let Some(method) = roofline_info.method.as_deref() else {
         return Ok(());
     };
-    if method.accounting != "qemu" || method.performance != "native" {
+    if !matches!(method.accounting.as_str(), "qemu" | "dynamorio") || method.performance != "native"
+    {
         return Ok(());
     }
     let artifact_path = res_dir.join("qemu-roofline.loops.json");

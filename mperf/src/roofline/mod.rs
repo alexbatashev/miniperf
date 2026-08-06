@@ -34,6 +34,8 @@ pub enum BackendKind {
     Auto,
     Compiler,
     Qemu,
+    #[value(name = "dynamorio")]
+    DynamoRio,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -42,25 +44,40 @@ pub struct Options {
     pub qemu: Option<PathBuf>,
     pub qemu_plugin: Option<PathBuf>,
     pub qemu_args: Vec<String>,
+    pub dynamorio: Option<PathBuf>,
+    pub dynamorio_client: Option<PathBuf>,
 }
 
 impl Options {
     pub fn validate_for(&self, scenario: Scenario) -> Result<()> {
         let has_qemu_options =
             self.qemu.is_some() || self.qemu_plugin.is_some() || !self.qemu_args.is_empty();
+        let has_dynamorio_options = self.dynamorio.is_some() || self.dynamorio_client.is_some();
         if !matches!(scenario, Scenario::Roofline | Scenario::Mem)
             && self.backend != BackendKind::Auto
         {
             anyhow::bail!("--roofline-backend is only valid with the roofline or mem scenario");
         }
-        if !matches!(scenario, Scenario::Roofline | Scenario::Mem) && has_qemu_options {
+        if !matches!(scenario, Scenario::Roofline | Scenario::Mem)
+            && (has_qemu_options || has_dynamorio_options)
+        {
             anyhow::bail!(
-                "--qemu, --qemu-plugin, and --qemu-arg are only valid with the roofline or mem scenario"
+                "--qemu, --qemu-plugin, --qemu-arg, --dynamorio, and --dynamorio-client are only valid with the roofline or mem scenario"
             );
         }
-        if self.backend == BackendKind::Compiler && has_qemu_options {
+        if self.backend == BackendKind::Compiler && (has_qemu_options || has_dynamorio_options) {
             anyhow::bail!(
-                "--qemu, --qemu-plugin, and --qemu-arg cannot be used with --roofline-backend compiler"
+                "--qemu, --qemu-plugin, --qemu-arg, --dynamorio, and --dynamorio-client cannot be used with --roofline-backend compiler"
+            );
+        }
+        if self.backend == BackendKind::Qemu && has_dynamorio_options {
+            anyhow::bail!(
+                "--dynamorio and --dynamorio-client cannot be used with --roofline-backend qemu"
+            );
+        }
+        if self.backend == BackendKind::DynamoRio && has_qemu_options {
+            anyhow::bail!(
+                "--qemu, --qemu-plugin, and --qemu-arg cannot be used with --roofline-backend dynamorio"
             );
         }
         Ok(())
@@ -112,6 +129,7 @@ pub async fn record(
     }
     let mut resolved_command = command.to_vec();
     resolved_command[0] = selected.executable.to_string_lossy().into_owned();
+    let fallback = qemu_fallback_for(options, &selected, &resolved_command);
 
     let backend: Box<dyn RooflineBackend> = match selected.backend {
         BackendKind::Auto => unreachable!("automatic Roofline method must resolve to a backend"),
@@ -124,10 +142,43 @@ pub async fn record(
             selected.info,
             false,
         )?),
+        BackendKind::DynamoRio => Box::new(qemu::QemuBackend::new_dynamorio(
+            options,
+            selected.info,
+            false,
+        )?),
     };
-    backend
-        .record(dispatcher, &resolved_command, output_directory)
-        .await
+    let result = backend
+        .record(dispatcher.clone(), &resolved_command, output_directory)
+        .await;
+    match (result, fallback) {
+        (Err(error), Some(fallback)) => {
+            eprintln!(
+                "Warning: DynamoRIO Roofline accounting failed ({error:#}); retrying with the QEMU backend"
+            );
+            let backend = qemu::QemuBackend::new(options, true, fallback.info, false)?;
+            backend
+                .record(dispatcher, &resolved_command, output_directory)
+                .await
+        }
+        (result, _) => result,
+    }
+}
+
+/// When DynamoRIO was chosen automatically, a working QEMU setup serves as
+/// the runtime fallback: the DynamoRIO port is experimental on some
+/// architectures and a failed accounting run should degrade to the slower
+/// path, not abort. Explicit --roofline-backend requests never fall back.
+fn qemu_fallback_for(
+    options: &Options,
+    selected: &SelectedMethod,
+    resolved_command: &[String],
+) -> Option<SelectedMethod> {
+    if selected.backend != BackendKind::DynamoRio || selected.info.selection != "auto" {
+        return None;
+    }
+    qemu::probe(options, Path::new(&resolved_command[0])).ok()?;
+    Some(qemu_method(true, true, PathBuf::from(&resolved_command[0])))
 }
 
 pub async fn record_memory(
@@ -140,9 +191,9 @@ pub async fn record_memory(
         anyhow::bail!("record mem requires a command");
     }
     let selected = select_method(options, command)?;
-    if selected.backend != BackendKind::Qemu {
+    if !matches!(selected.backend, BackendKind::Qemu | BackendKind::DynamoRio) {
         anyhow::bail!(
-            "the mem scenario requires QEMU address accounting; install a plugin-enabled QEMU and the miniperf QEMU plugin"
+            "the mem scenario requires address accounting; install DynamoRIO with the miniperf client, or a plugin-enabled QEMU and the miniperf QEMU plugin"
         );
     }
     if selected.performance != PerformanceSource::Native {
@@ -151,10 +202,27 @@ pub async fn record_memory(
     println!("Memory method: {}", selected.info.reason);
     let mut resolved_command = command.to_vec();
     resolved_command[0] = selected.executable.to_string_lossy().into_owned();
-    let backend = qemu::QemuBackend::new(options, true, selected.info, true)?;
-    let roofline = backend
-        .record(dispatcher, &resolved_command, output_directory)
-        .await?;
+    let fallback = qemu_fallback_for(options, &selected, &resolved_command);
+    let mut dynamorio = selected.backend == BackendKind::DynamoRio;
+    let backend = if dynamorio {
+        qemu::QemuBackend::new_dynamorio(options, selected.info, true)?
+    } else {
+        qemu::QemuBackend::new(options, true, selected.info, true)?
+    };
+    let mut roofline = backend
+        .record(dispatcher.clone(), &resolved_command, output_directory)
+        .await;
+    if let (Err(error), Some(fallback)) = (&roofline, fallback) {
+        eprintln!(
+            "Warning: DynamoRIO memory accounting failed ({error:#}); retrying with the QEMU backend"
+        );
+        let backend = qemu::QemuBackend::new(options, true, fallback.info, true)?;
+        roofline = backend
+            .record(dispatcher, &resolved_command, output_directory)
+            .await;
+        dynamorio = false;
+    }
+    let roofline = roofline?;
     let ScenarioInfo::Roofline(info) = roofline else {
         unreachable!("QEMU backend returned a non-Roofline result")
     };
@@ -171,7 +239,12 @@ pub async fn record_memory(
             selection: method
                 .map_or("explicit", |value| value.selection.as_str())
                 .to_string(),
-            accounting: "qemu-addresses".to_string(),
+            accounting: if dynamorio {
+                "dynamorio-addresses"
+            } else {
+                "qemu-addresses"
+            }
+            .to_string(),
             performance: "native".to_string(),
             bandwidth: if hardware_bandwidth {
                 "hardware_memory_controller"
@@ -191,11 +264,22 @@ fn select_method(options: &Options, command: &[String]) -> Result<SelectedMethod
     let guest = inspect_guest(Path::new(&command[0]))?;
     let native = guest.architecture == host_architecture();
     let qemu_probe = qemu::probe(options, &guest.path);
+    let dynamorio_probe = qemu::probe_dynamorio(options);
 
     match options.backend {
         BackendKind::Qemu => {
             qemu_probe?;
             Ok(qemu_method(false, native, guest.path))
+        }
+        BackendKind::DynamoRio => {
+            dynamorio_probe?;
+            if !native {
+                anyhow::bail!(
+                    "DynamoRIO instruments natively and cannot run cross-architecture executable '{}'; use --roofline-backend qemu instead",
+                    guest.path.display()
+                );
+            }
+            Ok(dynamorio_method(false, guest.path))
         }
         BackendKind::Compiler => {
             if !guest.compiler_instrumented {
@@ -207,6 +291,9 @@ fn select_method(options: &Options, command: &[String]) -> Result<SelectedMethod
             Ok(compiler_method(false, guest.path))
         }
         BackendKind::Auto => {
+            if dynamorio_probe.is_ok() && native {
+                return Ok(dynamorio_method(true, guest.path));
+            }
             if qemu_probe.is_ok() && native {
                 return Ok(qemu_method(true, native, guest.path));
             }
@@ -221,11 +308,35 @@ fn select_method(options: &Options, command: &[String]) -> Result<SelectedMethod
             }
 
             let qemu_error = qemu_probe.unwrap_err();
+            let dynamorio_error = dynamorio_probe.unwrap_err();
             anyhow::bail!(
-                "no accurate Roofline method is available for '{}': QEMU accounting is unavailable ({qemu_error:#}) and the executable has no miniperf loop instrumentation; install a plugin-enabled QEMU and the miniperf QEMU plugin",
+                "no accurate Roofline method is available for '{}': DynamoRIO accounting is unavailable ({dynamorio_error:#}), QEMU accounting is unavailable ({qemu_error:#}), and the executable has no miniperf loop instrumentation",
                 guest.path.display()
             )
         }
+    }
+}
+
+fn dynamorio_method(automatic: bool, executable: PathBuf) -> SelectedMethod {
+    SelectedMethod {
+        backend: BackendKind::DynamoRio,
+        performance: PerformanceSource::Native,
+        executable,
+        info: RooflineMethodInfo {
+            selection: if automatic { "auto" } else { "explicit" }.to_string(),
+            accounting: "dynamorio".to_string(),
+            performance: "native".to_string(),
+            traffic: "dram-model".to_string(),
+            quality: "hybrid-binary-sampled-cache-model".to_string(),
+            reason: "native timing with DynamoRIO operation accounting, shared-LLC traffic modeling, and dynamic binary loop discovery"
+                .to_string(),
+            warnings: vec![
+                "per-loop throughput is published only when native timing has at most 10% estimated 95% sampling error; lower-confidence loops retain accounting but are not plotted".to_string(),
+                "native timing and DynamoRIO accounting come from separate executions".to_string(),
+                "memory traffic is a deterministic host-LLC model, not a hardware memory-controller measurement".to_string(),
+                "the cache model uses write allocation/RFO and dirty writeback; non-temporal stores are conservative".to_string(),
+            ],
+        },
     }
 }
 

@@ -12,6 +12,7 @@ members = [
     "truth",
     "utils/event-import",
     "utils/qemu-roofline",
+    "utils/roofline-core",
 ]
 
 [profile.dev.package]
