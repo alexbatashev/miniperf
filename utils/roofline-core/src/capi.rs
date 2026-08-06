@@ -48,6 +48,29 @@ pub struct RcClassification {
     pub rvv_sew_scale: u64,
 }
 
+pub const RC_RECORD_BLOCK_EXEC: u32 = 0;
+pub const RC_RECORD_MEM: u32 = 1;
+pub const RC_RECORD_UNCLASSIFIED: u32 = 2;
+
+/// One buffered instrumentation event. `desc` packs a registered handle in the
+/// upper 30 bits and an `RC_RECORD_*` kind in the low 2 bits. `address` is only
+/// meaningful for `RC_RECORD_MEM` records (other records leave it
+/// uninitialized).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RcRecord {
+    pub desc: u32,
+    pub _pad: u32,
+    pub address: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RegisteredMem {
+    block: u64,
+    size: u64,
+    store: bool,
+}
+
 struct Inner {
     counters: CounterSnapshot,
     cfg: DynamicCfg,
@@ -55,6 +78,8 @@ struct Inner {
     memory: Option<MemoryAnalysis>,
     image: Option<ImageInfo>,
     output: PathBuf,
+    blocks: Vec<BlockCost>,
+    mems: Vec<RegisteredMem>,
 }
 
 pub struct Session {
@@ -103,6 +128,8 @@ pub unsafe extern "C" fn rc_session_new(
             memory: (memory_profile != 0).then(|| MemoryAnalysis::new(line_size)),
             image: None,
             output: path,
+            blocks: Vec::new(),
+            mems: Vec::new(),
         }),
     };
     Box::into_raw(Box::new(session))
@@ -244,19 +271,261 @@ pub unsafe extern "C" fn rc_block_exec(
         instructions,
     };
     let mut inner = session.inner.lock().unwrap();
-    let counters = &mut inner.counters;
-    counters.instructions = counters.instructions.saturating_add(instructions);
-    counters.scalar_int_ops = counters.scalar_int_ops.saturating_add(cost.scalar_int);
-    counters.scalar_float_ops = counters.scalar_float_ops.saturating_add(cost.scalar_float);
+    add_exec_counters(&mut inner.counters, &block, 1);
+    inner.cfg.record_block(thread as usize, &block);
+}
+
+fn add_exec_counters(counters: &mut CounterSnapshot, cost: &BlockCost, executions: u64) {
+    counters.instructions = counters
+        .instructions
+        .saturating_add(cost.instructions.saturating_mul(executions));
+    counters.scalar_int_ops = counters
+        .scalar_int_ops
+        .saturating_add(cost.scalar_int.saturating_mul(executions));
+    counters.scalar_float_ops = counters
+        .scalar_float_ops
+        .saturating_add(cost.scalar_float.saturating_mul(executions));
     counters.scalar_double_ops = counters
         .scalar_double_ops
-        .saturating_add(cost.scalar_double);
-    counters.vector_int_ops = counters.vector_int_ops.saturating_add(cost.vector_int);
-    counters.vector_float_ops = counters.vector_float_ops.saturating_add(cost.vector_float);
+        .saturating_add(cost.scalar_double.saturating_mul(executions));
+    counters.vector_int_ops = counters
+        .vector_int_ops
+        .saturating_add(cost.vector_int.saturating_mul(executions));
+    counters.vector_float_ops = counters
+        .vector_float_ops
+        .saturating_add(cost.vector_float.saturating_mul(executions));
     counters.vector_double_ops = counters
         .vector_double_ops
-        .saturating_add(cost.vector_double);
-    inner.cfg.record_block(thread as usize, &block);
+        .saturating_add(cost.vector_double.saturating_mul(executions));
+}
+
+/// Registers a translated block for use in `RC_RECORD_BLOCK_EXEC` /
+/// `RC_RECORD_UNCLASSIFIED` records and returns its handle.
+///
+/// # Safety
+/// `session` and `cost` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn rc_register_block(
+    session: *mut Session,
+    vaddr: u64,
+    end_vaddr: u64,
+    flow: u32,
+    cost: *const RcCost,
+    instructions: u64,
+) -> u32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return u32::MAX;
+    };
+    let Some(cost) = (unsafe { cost.as_ref() }) else {
+        return u32::MAX;
+    };
+    let block = BlockCost {
+        vaddr,
+        end_vaddr,
+        flow: match flow {
+            RC_FLOW_CALL => FlowKind::Call,
+            RC_FLOW_RETURN => FlowKind::Return,
+            _ => FlowKind::Normal,
+        },
+        scalar_int: cost.scalar_int,
+        scalar_float: cost.scalar_float,
+        scalar_double: cost.scalar_double,
+        vector_int: cost.vector_int,
+        vector_float: cost.vector_float,
+        vector_double: cost.vector_double,
+        instructions,
+    };
+    let mut inner = session.inner.lock().unwrap();
+    if inner.blocks.len() >= (u32::MAX >> 2) as usize {
+        return u32::MAX;
+    }
+    inner.blocks.push(block);
+    (inner.blocks.len() - 1) as u32
+}
+
+/// Registers a static memory operand (issuing block, access size, direction)
+/// for use in `RC_RECORD_MEM` records and returns its handle.
+///
+/// # Safety
+/// `session` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn rc_register_mem(
+    session: *mut Session,
+    block: u64,
+    size: u64,
+    is_store: u32,
+) -> u32 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return u32::MAX;
+    };
+    let mut inner = session.inner.lock().unwrap();
+    if inner.mems.len() >= (u32::MAX >> 2) as usize {
+        return u32::MAX;
+    }
+    inner.mems.push(RegisteredMem {
+        block,
+        size,
+        store: is_store != 0,
+    });
+    (inner.mems.len() - 1) as u32
+}
+
+/// Memory attribution for one run of consecutive accesses issued by the same
+/// block, folded into a single CFG update.
+#[derive(Default)]
+struct PendingMemory {
+    block: u64,
+    arch_bytes_load: u64,
+    arch_bytes_store: u64,
+    dram_bytes_load: u64,
+    dram_bytes_store: u64,
+}
+
+impl PendingMemory {
+    fn flush(&mut self, cfg: &mut DynamicCfg) {
+        if self.arch_bytes_load == 0
+            && self.arch_bytes_store == 0
+            && self.dram_bytes_load == 0
+            && self.dram_bytes_store == 0
+        {
+            return;
+        }
+        cfg.attribute_memory(
+            self.block,
+            self.arch_bytes_load,
+            self.arch_bytes_store,
+            self.dram_bytes_load,
+            self.dram_bytes_store,
+        );
+        self.arch_bytes_load = 0;
+        self.arch_bytes_store = 0;
+        self.dram_bytes_load = 0;
+        self.dram_bytes_store = 0;
+    }
+}
+
+fn flush_repeats(inner: &mut Inner, run_handle: u32, run_count: &mut u64) {
+    if *run_count == 0 {
+        return;
+    }
+    if let Some(cost) = inner.blocks.get(run_handle as usize) {
+        let cost = cost.clone();
+        add_exec_counters(&mut inner.counters, &cost, *run_count);
+        inner.cfg.record_repeats(&cost, *run_count);
+    }
+    *run_count = 0;
+}
+
+/// Processes a batch of buffered instrumentation records for one thread.
+/// Records must be in program order for that thread; handles referenced by
+/// `desc` must come from `rc_register_block` / `rc_register_mem` on the same
+/// session (out-of-range handles are ignored).
+///
+/// # Safety
+/// `session` must be a valid pointer and `records` must point to `count`
+/// readable records when non-null.
+#[no_mangle]
+pub unsafe extern "C" fn rc_process_batch(
+    session: *mut Session,
+    thread: u32,
+    records: *const RcRecord,
+    count: u64,
+) {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return;
+    };
+    if records.is_null() || count == 0 {
+        return;
+    }
+    let records = unsafe { std::slice::from_raw_parts(records, count as usize) };
+    let thread = thread as usize;
+    let mut guard = session.inner.lock().unwrap();
+    let inner = &mut *guard;
+    // Back-to-back executions of the same fall-through block (a self loop, the
+    // hot pattern in tight loops) are run-length aggregated: the run is applied
+    // as one edge/block update when it ends. Interleaved mem/unclassified
+    // records do not break a run because they do not affect edge bookkeeping.
+    let mut run_handle = u32::MAX;
+    let mut run_count = 0u64;
+    let mut pending = PendingMemory::default();
+    for record in records {
+        let kind = record.desc & 3;
+        let handle = (record.desc >> 2) as usize;
+        match kind {
+            RC_RECORD_MEM => {
+                let Some(mem) = inner.mems.get(handle) else {
+                    continue;
+                };
+                let mem = *mem;
+                if let Some(memory) = inner.memory.as_mut() {
+                    memory.access(thread, record.address, mem.size, mem.store);
+                }
+                if mem.store {
+                    inner.counters.bytes_store =
+                        inner.counters.bytes_store.saturating_add(mem.size);
+                } else {
+                    inner.counters.bytes_load = inner.counters.bytes_load.saturating_add(mem.size);
+                }
+                let traffic = inner.cache.access(record.address, mem.size, mem.store);
+                if traffic.bytes_load != 0 || traffic.bytes_store != 0 {
+                    inner.counters.dram_bytes_load = inner
+                        .counters
+                        .dram_bytes_load
+                        .saturating_add(traffic.bytes_load);
+                    inner.counters.dram_bytes_store = inner
+                        .counters
+                        .dram_bytes_store
+                        .saturating_add(traffic.bytes_store);
+                }
+                // Accesses issued by one block arrive consecutively, so the
+                // per-block CFG update is coalesced across the run instead of
+                // doing a BTreeMap lookup per access.
+                if pending.block != mem.block {
+                    pending.flush(&mut inner.cfg);
+                    pending.block = mem.block;
+                }
+                if mem.store {
+                    pending.arch_bytes_store = pending.arch_bytes_store.saturating_add(mem.size);
+                } else {
+                    pending.arch_bytes_load = pending.arch_bytes_load.saturating_add(mem.size);
+                }
+                pending.dram_bytes_load =
+                    pending.dram_bytes_load.saturating_add(traffic.bytes_load);
+                pending.dram_bytes_store =
+                    pending.dram_bytes_store.saturating_add(traffic.bytes_store);
+            }
+            RC_RECORD_BLOCK_EXEC => {
+                if handle as u32 == run_handle {
+                    run_count += 1;
+                    continue;
+                }
+                flush_repeats(inner, run_handle, &mut run_count);
+                let Some(cost) = inner.blocks.get(handle) else {
+                    run_handle = u32::MAX;
+                    continue;
+                };
+                let cost = cost.clone();
+                add_exec_counters(&mut inner.counters, &cost, 1);
+                inner.cfg.record_block(thread, &cost);
+                run_handle = if cost.flow == FlowKind::Normal {
+                    handle as u32
+                } else {
+                    u32::MAX
+                };
+            }
+            RC_RECORD_UNCLASSIFIED => {
+                let Some(vaddr) = inner.blocks.get(handle).map(|cost| cost.vaddr) else {
+                    continue;
+                };
+                inner.counters.unclassified_instructions =
+                    inner.counters.unclassified_instructions.saturating_add(1);
+                inner.cfg.attribute_unclassified(vaddr);
+            }
+            _ => {}
+        }
+    }
+    flush_repeats(inner, run_handle, &mut run_count);
+    pending.flush(&mut inner.cfg);
 }
 
 /// Records one memory access issued by `block`.
@@ -294,9 +563,14 @@ pub unsafe extern "C" fn rc_mem_access(
         .counters
         .dram_bytes_store
         .saturating_add(traffic.bytes_store);
-    inner
-        .cfg
-        .attribute_memory(block, traffic.bytes_load, traffic.bytes_store);
+    let (arch_load, arch_store) = if store { (0, size) } else { (size, 0) };
+    inner.cfg.attribute_memory(
+        block,
+        arch_load,
+        arch_store,
+        traffic.bytes_load,
+        traffic.bytes_store,
+    );
 }
 
 /// Records dynamically-counted RVV operations for `block`.
@@ -395,6 +669,113 @@ pub extern "C" fn rc_rvv_sew(vtype: u64, xlen: u32) -> i64 {
     match classify::rvv_sew(vtype, xlen) {
         Some(sew) => sew as i64,
         None => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_session(dir: &std::path::Path, name: &str) -> *mut Session {
+        let path = std::ffi::CString::new(dir.join(name).to_str().unwrap().to_owned() + ".counts")
+            .unwrap();
+        let session = unsafe { rc_session_new(path.as_ptr(), 64, 4096, 2, 1) };
+        assert!(!session.is_null());
+        session
+    }
+
+    /// The batched path (registration + rc_process_batch, including self-loop
+    /// run aggregation and the zero-traffic fast path) must produce artifacts
+    /// byte-identical to the per-event path.
+    #[test]
+    fn batch_processing_matches_per_event_processing() {
+        let dir = std::env::temp_dir().join(format!("rc-batch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cost_a = RcCost {
+            scalar_int: 2,
+            scalar_double: 1,
+            ..Default::default()
+        };
+        let cost_b = RcCost {
+            scalar_float: 3,
+            ..Default::default()
+        };
+        // Block A self-loops with two memory accesses per iteration, then
+        // calls block B, which is also the unclassified one.
+        let accesses = [(0x1000_u64, 8_u64, 0_u32), (0x2000, 8, 1)];
+
+        let reference = new_session(&dir, "reference");
+        let batched = new_session(&dir, "batched");
+
+        let block_a =
+            unsafe { rc_register_block(batched, 0x400, 0x420, RC_FLOW_NORMAL, &cost_a, 5) };
+        let block_b = unsafe { rc_register_block(batched, 0x500, 0x510, RC_FLOW_CALL, &cost_b, 3) };
+        let mem_handles: Vec<u32> = accesses
+            .iter()
+            .map(|&(_, size, store)| unsafe { rc_register_mem(batched, 0x400, size, store) })
+            .collect();
+
+        let mut records = Vec::new();
+        for iteration in 0..100_u64 {
+            unsafe {
+                rc_block_exec(reference, 0, 0x400, 0x420, RC_FLOW_NORMAL, &cost_a, 5);
+            }
+            records.push(RcRecord {
+                desc: block_a << 2 | RC_RECORD_BLOCK_EXEC,
+                _pad: 0,
+                address: 0,
+            });
+            for (index, &(base, size, store)) in accesses.iter().enumerate() {
+                let address = base + (iteration % 16) * 64;
+                unsafe {
+                    rc_mem_access(reference, 0, 0x400, address, size, store);
+                }
+                records.push(RcRecord {
+                    desc: mem_handles[index] << 2 | RC_RECORD_MEM,
+                    _pad: 0,
+                    address,
+                });
+            }
+        }
+        unsafe {
+            rc_block_exec(reference, 0, 0x500, 0x510, RC_FLOW_CALL, &cost_b, 3);
+            rc_unclassified(reference, 0x500);
+        }
+        records.push(RcRecord {
+            desc: block_b << 2 | RC_RECORD_BLOCK_EXEC,
+            _pad: 0,
+            address: 0,
+        });
+        records.push(RcRecord {
+            desc: block_b << 2 | RC_RECORD_UNCLASSIFIED,
+            _pad: 0,
+            address: 0,
+        });
+
+        // Split the batch to also exercise run state across batch boundaries.
+        let (first, second) = records.split_at(records.len() / 2);
+        unsafe {
+            rc_process_batch(batched, 0, first.as_ptr(), first.len() as u64);
+            rc_process_batch(batched, 0, second.as_ptr(), second.len() as u64);
+            assert_eq!(
+                rc_instruction_count(reference),
+                rc_instruction_count(batched)
+            );
+            assert_eq!(rc_finalize(reference), 0);
+            assert_eq!(rc_finalize(batched), 0);
+        }
+
+        for extension in ["counts", "cfg", "memory.json"] {
+            let reference_bytes =
+                std::fs::read(dir.join(format!("reference.{extension}"))).unwrap();
+            let batched_bytes = std::fs::read(dir.join(format!("batched.{extension}"))).unwrap();
+            assert_eq!(
+                reference_bytes, batched_bytes,
+                "artifact mismatch: {extension}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

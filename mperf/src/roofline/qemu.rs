@@ -94,6 +94,8 @@ struct BlockCounts {
     vector_double_ops: u64,
     bytes_load: u64,
     bytes_store: u64,
+    arch_bytes_load: u64,
+    arch_bytes_store: u64,
     unclassified_instructions: u64,
 }
 
@@ -1147,7 +1149,7 @@ fn parse_dynamic_cfg(input: &str) -> Result<DynamicCfgCapture> {
             if version_seen {
                 anyhow::bail!("duplicate QEMU dynamic CFG version");
             }
-            if version != "3" {
+            if version != "4" {
                 anyhow::bail!("unsupported QEMU dynamic CFG version '{version}'");
             }
             version_seen = true;
@@ -1213,7 +1215,7 @@ fn parse_dynamic_cfg(input: &str) -> Result<DynamicCfgCapture> {
                     );
                 }
             }
-            ["block", address, end, executions, scalar_int, scalar_float, scalar_double, vector_int, vector_float, vector_double, bytes_load, bytes_store, unclassified] =>
+            ["block", address, end, executions, scalar_int, scalar_float, scalar_double, vector_int, vector_float, vector_double, bytes_load, bytes_store, arch_bytes_load, arch_bytes_store, unclassified] =>
             {
                 let address = parse_address(address)?;
                 let counts = BlockCounts {
@@ -1227,6 +1229,8 @@ fn parse_dynamic_cfg(input: &str) -> Result<DynamicCfgCapture> {
                     vector_double_ops: parse_decimal(vector_double, line)?,
                     bytes_load: parse_decimal(bytes_load, line)?,
                     bytes_store: parse_decimal(bytes_store, line)?,
+                    arch_bytes_load: parse_decimal(arch_bytes_load, line)?,
+                    arch_bytes_store: parse_decimal(arch_bytes_store, line)?,
                     unclassified_instructions: parse_decimal(unclassified, line)?,
                 };
                 if counts.executions == 0 {
@@ -1292,6 +1296,10 @@ fn validate_cfg_totals(capture: &DynamicCfgCapture, counts: &Counts) -> Result<(
         vector_double_ops: counts.vector_double_ops,
         bytes_load: counts.dram_bytes_load,
         bytes_store: counts.dram_bytes_store,
+        // Every architectural access is attributed to the block that issued
+        // it, so unlike modeled DRAM traffic these must agree exactly.
+        arch_bytes_load: counts.bytes_load,
+        arch_bytes_store: counts.bytes_store,
         unclassified_instructions: counts.unclassified_instructions,
         ..BlockCounts::default()
     };
@@ -1546,6 +1554,10 @@ fn sum_blocks<'a>(blocks: impl IntoIterator<Item = &'a BlockCounts>) -> BlockCou
             .saturating_add(block.vector_double_ops);
         total.bytes_load = total.bytes_load.saturating_add(block.bytes_load);
         total.bytes_store = total.bytes_store.saturating_add(block.bytes_store);
+        total.arch_bytes_load = total.arch_bytes_load.saturating_add(block.arch_bytes_load);
+        total.arch_bytes_store = total
+            .arch_bytes_store
+            .saturating_add(block.arch_bytes_store);
         total.unclassified_instructions = total
             .unclassified_instructions
             .saturating_add(block.unclassified_instructions);
@@ -1631,7 +1643,7 @@ mod tests {
         let image_end = object.entry().max(base + 0x100) + 1;
         let external = image_end + 0x100;
         let capture = parse_dynamic_cfg(&format!(
-            "miniperf-qemu-cfg=3\n\
+            "miniperf-qemu-cfg=4\n\
              cache 64 8388608 16 write-back-no-rfo\n\
              image {base:#x} {image_end:#x} {external:#x}\n\
              entry {base:#x}\n\
@@ -1642,12 +1654,12 @@ mod tests {
              entry {external:#x}\n\
              edge {external:#x} {:#x} 1\n\
              edge {:#x} {external:#x} 1\n\
-             block {base:#x} {:#x} 1 1 0 0 0 0 0 0 0 0\n\
-             block {:#x} {:#x} 3 3 0 0 0 0 0 24 0 0\n\
-             block {:#x} {:#x} 3 3 0 0 0 0 0 0 12 0\n\
-             block {:#x} {:#x} 1 0 0 0 0 0 0 0 0 0\n\
-             block {external:#x} {:#x} 1 1 0 0 0 0 0 0 0 0\n\
-             block {:#x} {:#x} 1 1 0 0 0 0 0 0 0 0\n",
+             block {base:#x} {:#x} 1 1 0 0 0 0 0 0 0 0 0 0\n\
+             block {:#x} {:#x} 3 3 0 0 0 0 0 24 0 48 0 0\n\
+             block {:#x} {:#x} 3 3 0 0 0 0 0 0 12 0 36 0\n\
+             block {:#x} {:#x} 1 0 0 0 0 0 0 0 0 0 0 0\n\
+             block {external:#x} {:#x} 1 1 0 0 0 0 0 0 0 0 0 0\n\
+             block {:#x} {:#x} 1 1 0 0 0 0 0 0 0 0 0 0\n",
             base + 0x10,
             base + 0x10,
             base + 0x20,
@@ -1671,8 +1683,11 @@ mod tests {
         .unwrap();
         let counts = Counts {
             scalar_int_ops: 9,
-            bytes_load: 24,
-            bytes_store: 12,
+            // Architectural traffic exceeds modeled DRAM traffic: the cache
+            // absorbs part of it, which is exactly the case that leaves
+            // cache-resident loops with zero DRAM bytes.
+            bytes_load: 48,
+            bytes_store: 36,
             dram_bytes_load: 24,
             dram_bytes_store: 12,
             ..Counts::default()
@@ -1706,14 +1721,14 @@ mod tests {
     #[test]
     fn rejects_cfg_with_unknown_blocks_or_bad_totals() {
         let unknown = parse_dynamic_cfg(
-            "miniperf-qemu-cfg=3\ncache 64 8388608 16 write-back-no-rfo\nimage 0x100 0x300 0x100\nentry 0x100\nedge 0x100 0x200 1\nblock 0x100 0x110 1 0 0 0 0 0 0 0 0 0\n",
+            "miniperf-qemu-cfg=4\ncache 64 8388608 16 write-back-no-rfo\nimage 0x100 0x300 0x100\nentry 0x100\nedge 0x100 0x200 1\nblock 0x100 0x110 1 0 0 0 0 0 0 0 0 0 0 0\n",
         )
         .unwrap_err()
         .to_string();
         assert!(unknown.contains("unknown block"));
 
         let capture = parse_dynamic_cfg(
-            "miniperf-qemu-cfg=3\ncache 64 8388608 16 write-back-no-rfo\nimage 0x100 0x200 0x100\nentry 0x100\nblock 0x100 0x110 1 1 0 0 0 0 0 0 0 0\n",
+            "miniperf-qemu-cfg=4\ncache 64 8388608 16 write-back-no-rfo\nimage 0x100 0x200 0x100\nentry 0x100\nblock 0x100 0x110 1 1 0 0 0 0 0 0 0 0 0 0\n",
         )
         .unwrap();
         let mismatch = validate_cfg_totals(&capture, &Counts::default())

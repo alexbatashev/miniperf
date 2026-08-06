@@ -267,8 +267,11 @@ extern "C" fn memory_access(vcpu: c_uint, info: MemInfo, address: u64, userdata:
     DRAM_BYTES_LOAD.fetch_add(traffic.bytes_load, Ordering::Relaxed);
     DRAM_BYTES_STORE.fetch_add(traffic.bytes_store, Ordering::Relaxed);
     let block_address = userdata as usize as u64;
+    let (arch_load, arch_store) = if store { (0, bytes) } else { (bytes, 0) };
     DYNAMIC_CFG.lock().unwrap().attribute_memory(
         block_address,
+        arch_load,
+        arch_store,
         traffic.bytes_load,
         traffic.bytes_store,
     );

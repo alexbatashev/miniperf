@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use mperf_data::{MemoryBandwidthCalibration, RooflineCalibration};
+use mperf_data::{MemoryBandwidthCalibration, MemoryLevelCalibration, RooflineCalibration};
 use rayon::prelude::*;
 
 const SAMPLES: usize = 5;
@@ -31,9 +31,11 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         bail!("FP64 roof calibration produced an invalid result: {fp64_gflops}");
     }
 
+    let memory_levels = measure_memory_levels(threads, &memory);
+
     Ok(RooflineCalibration {
         threads,
-        cpu_affinity: memory.cpu_affinity.clone(),
+        cpu_affinity: memory.cpu_affinity,
         samples: SAMPLES,
         compute_kernel: kernel.name.to_string(),
         fp64_gflops,
@@ -42,7 +44,192 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         memory_gbytes_per_second_samples: memory.gbytes_per_second_samples,
         ridge_point_flops_per_byte: fp64_gflops / memory.gbytes_per_second,
         memory_working_set_bytes: memory.working_set_bytes,
+        memory_levels,
     })
+}
+
+/// Per-thread fraction of a cache level the triad's three buffers are sized to
+/// occupy. Staying well under capacity keeps the kernel resident once the
+/// buffers, stack and Rayon metadata share the level.
+const LEVEL_OCCUPANCY: f64 = 0.5;
+
+/// Measures a bandwidth roof per cache level plus the already-measured DRAM
+/// roof. Levels whose geometry cannot be detected, or that are too small to
+/// hold three usefully sized buffers, are skipped rather than guessed at.
+fn measure_memory_levels(
+    threads: usize,
+    dram: &MemoryBandwidthCalibration,
+) -> Vec<MemoryLevelCalibration> {
+    let mut levels = Vec::new();
+    for (level, capacity, sharers) in detect_cache_levels() {
+        // Divide the level between the threads that actually share it, not
+        // between all worker threads: an L1 shared by two SMT siblings is not
+        // contended by workers running on other cores.
+        let contenders = sharers.clamp(1, threads.max(1)) as f64;
+        let per_thread = (capacity as f64 * LEVEL_OCCUPANCY) / contenders;
+        // Three f64 buffers per thread.
+        let elements = (per_thread / (3.0 * size_of::<f64>() as f64)) as usize;
+        // Below a few hundred elements the loop is dominated by parallel
+        // dispatch rather than by the level's bandwidth.
+        if elements < 512 {
+            continue;
+        }
+        let Some((gbytes_per_second, samples)) = measure_level_bandwidth(threads, elements) else {
+            continue;
+        };
+        levels.push(MemoryLevelCalibration {
+            level: format!("L{level}"),
+            gbytes_per_second,
+            gbytes_per_second_samples: samples,
+            working_set_bytes: (elements * threads.max(1) * 3 * size_of::<f64>()) as u64,
+        });
+    }
+    levels.push(MemoryLevelCalibration {
+        level: "DRAM".to_string(),
+        gbytes_per_second: dram.gbytes_per_second,
+        gbytes_per_second_samples: dram.gbytes_per_second_samples.clone(),
+        working_set_bytes: dram.working_set_bytes,
+    });
+    // Bandwidth must not increase as the working set grows; if the host is
+    // noisy enough to invert two levels the roofs would be misleading.
+    levels.dedup_by(|later, earlier| later.gbytes_per_second >= earlier.gbytes_per_second);
+    levels
+}
+
+/// Runs the triad entirely within per-thread buffers so the traffic is served
+/// by the level those buffers fit in.
+fn measure_level_bandwidth(threads: usize, elements: usize) -> Option<(f64, Vec<f64>)> {
+    // Enough repetitions that a resident kernel runs for a measurable time.
+    let repetitions = (MEMORY_ELEMENTS * MEMORY_REPETITIONS / elements.max(1)).clamp(64, 1 << 20);
+    let run = || -> f64 {
+        let totals = (0..threads)
+            .into_par_iter()
+            .map(|_| {
+                let a = vec![1.0_f64; elements];
+                let b = vec![2.0_f64; elements];
+                let mut c = vec![0.0_f64; elements];
+                let kernel = |scale: f64, c: &mut [f64]| triad(&a, &b, c, scale);
+                // Warm the buffers into the level under test.
+                kernel(1.0, &mut c);
+                let start = Instant::now();
+                for repetition in 0..repetitions {
+                    // Vary the scalar so the loop cannot be hoisted.
+                    kernel(1.0 + repetition as f64 * 1.0e-12, &mut c);
+                    black_box(&c[..]);
+                }
+                let elapsed = nonzero_elapsed(start.elapsed());
+                let bytes = repetitions as f64 * elements as f64 * 3.0 * size_of::<f64>() as f64;
+                bytes / elapsed.as_secs_f64() / 1.0e9
+            })
+            .sum::<f64>();
+        totals
+    };
+    let _ = run();
+    let samples = (0..SAMPLES).map(|_| run()).collect::<Vec<_>>();
+    let median = median(&samples);
+    (median.is_finite() && median > 0.0).then_some((median, samples))
+}
+
+/// Bandwidth kernel for the cache-level roofs. Three details decide whether it
+/// measures bandwidth or just its own issue rate: it must use the widest
+/// vectors the host has (the crate is built for the x86-64 baseline, so without
+/// an explicit `target_feature` this stays scalar and every level reports the
+/// same wrong number); it must avoid `f64::mul_add`, which lowers to a libm
+/// call without `+fma`; and it must zip rather than index, so no bounds check
+/// blocks vectorization.
+#[inline(always)]
+fn triad_body(a: &[f64], b: &[f64], c: &mut [f64], scale: f64) {
+    for ((out, a), b) in c.iter_mut().zip(a.iter()).zip(b.iter()) {
+        *out = *a + *b * scale;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn triad_avx(a: &[f64], b: &[f64], c: &mut [f64], scale: f64) {
+    triad_body(a, b, c, scale);
+}
+
+fn triad(a: &[f64], b: &[f64], c: &mut [f64], scale: f64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx") {
+            // SAFETY: guarded by the runtime feature check above.
+            unsafe { triad_avx(a, b, c, scale) };
+            return;
+        }
+    }
+    triad_body(a, b, c, scale);
+}
+
+/// Data/unified cache levels of cpu0 as `(level, capacity, sharing CPUs)`,
+/// innermost first.
+#[cfg(target_os = "linux")]
+fn detect_cache_levels() -> Vec<(u32, u64, usize)> {
+    let Ok(indices) = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache") else {
+        return Vec::new();
+    };
+    let mut levels = Vec::new();
+    for index in indices.flatten() {
+        let path = index.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(path.join(name))
+                .ok()
+                .map(|value| value.trim().to_owned())
+        };
+        if !matches!(read("type").as_deref(), Some("Unified" | "Data")) {
+            continue;
+        }
+        let Some(level) = read("level").and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(capacity) = read("size").and_then(|value| parse_cache_size(&value)) else {
+            continue;
+        };
+        let sharers = read("shared_cpu_list")
+            .map(|list| count_cpu_list(&list))
+            .unwrap_or(1);
+        levels.push((level, capacity, sharers));
+    }
+    levels.sort_by_key(|(level, capacity, _)| (*level, *capacity));
+    levels.dedup_by_key(|(level, _, _)| *level);
+    levels
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_cache_levels() -> Vec<(u32, u64, usize)> {
+    Vec::new()
+}
+
+/// Counts CPUs in a sysfs list such as `0,4` or `0-7`.
+#[cfg(target_os = "linux")]
+fn count_cpu_list(list: &str) -> usize {
+    let count = list
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            match part.split_once('-') {
+                Some((first, last)) => {
+                    let first = first.trim().parse::<usize>().ok()?;
+                    let last = last.trim().parse::<usize>().ok()?;
+                    Some(last.saturating_sub(first) + 1)
+                }
+                None => part.parse::<usize>().ok().map(|_| 1),
+            }
+        })
+        .sum();
+    usize::max(count, 1)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cache_size(value: &str) -> Option<u64> {
+    let (number, multiplier) = match value.as_bytes().last().copied()? {
+        b'K' | b'k' => (&value[..value.len() - 1], 1024_u64),
+        b'M' | b'm' => (&value[..value.len() - 1], 1024_u64 * 1024),
+        b'G' | b'g' => (&value[..value.len() - 1], 1024_u64 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    number.trim().parse::<u64>().ok()?.checked_mul(multiplier)
 }
 
 pub(super) fn measure_memory() -> Result<MemoryBandwidthCalibration> {

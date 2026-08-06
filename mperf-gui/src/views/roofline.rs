@@ -479,6 +479,11 @@ struct RooflinePlot {
     points: Vec<RooflinePoint>,
     calibration: Option<mperf_data::RooflineCalibration>,
     compatible_memory_roof: bool,
+    /// One bandwidth roof per memory hierarchy level, fastest first. Loops are
+    /// plotted against architectural traffic (cache-aware roofline), so a
+    /// cache-resident loop sits above the DRAM roof and is bounded by whichever
+    /// level actually serves it.
+    roofs: Vec<(String, f64)>,
     x_min_log: f64,
     x_max_log: f64,
     y_min_log: f64,
@@ -520,6 +525,35 @@ impl RooflinePlot {
             y_values.push(calibration.fp64_gflops);
         }
 
+        let roofs = data
+            .calibration
+            .as_ref()
+            .filter(|_| data.has_compatible_memory_roof())
+            .map(|calibration| {
+                let mut roofs = calibration
+                    .memory_levels
+                    .iter()
+                    .map(|level| (level.level.clone(), level.gbytes_per_second))
+                    .filter(|(_, bandwidth)| bandwidth.is_finite() && *bandwidth > 0.0)
+                    .collect::<Vec<_>>();
+                if roofs.is_empty() {
+                    roofs.push(("DRAM".to_string(), calibration.memory_gbytes_per_second));
+                }
+                roofs.sort_by(|left, right| right.1.total_cmp(&left.1));
+                roofs
+            })
+            .unwrap_or_default();
+        // Every roof's ridge point has to be inside the x extent, otherwise the
+        // fastest level's knee is clipped off the chart.
+        if let Some(calibration) = data.calibration.as_ref() {
+            for (_, bandwidth) in &roofs {
+                let ridge = calibration.fp64_gflops / bandwidth;
+                if ridge.is_finite() && ridge > 0.0 {
+                    x_values.push(ridge);
+                }
+            }
+        }
+
         let (x_min_log, x_max_log) = log_extent(&x_values, -2.0, 2.0);
         let memory_at_left = data
             .has_compatible_memory_roof()
@@ -530,12 +564,19 @@ impl RooflinePlot {
         if let Some(value) = memory_at_left {
             y_values.push(value);
         }
+        for (_, bandwidth) in &roofs {
+            let value = bandwidth * 10.0_f64.powf(x_min_log);
+            if value.is_finite() && value > 0.0 {
+                y_values.push(value);
+            }
+        }
         let (y_min_log, y_max_log) = log_extent(&y_values, -1.0, 3.0);
 
         Self {
             points,
             calibration: data.calibration.clone(),
             compatible_memory_roof: data.has_compatible_memory_roof(),
+            roofs,
             x_min_log,
             x_max_log,
             y_min_log,
@@ -588,27 +629,57 @@ fn paint_roofline(
     }
 
     if let Some(calibration) = plot.calibration.as_ref() {
-        let mut path = PathBuilder::stroke(px(2.0));
-        for step in 0..=64 {
-            let fraction = step as f64 / 64.0;
-            let log_x = plot.x_min_log + fraction * (plot.x_max_log - plot.x_min_log);
-            let intensity = 10.0_f64.powf(log_x);
-            let gflops = if plot.compatible_memory_roof {
-                calibration
-                    .fp64_gflops
-                    .min(calibration.memory_gbytes_per_second * intensity)
-            } else {
-                calibration.fp64_gflops
-            };
-            let position = plot_position(bounds, plot, intensity, gflops);
-            if step == 0 {
-                path.move_to(position);
-            } else {
-                path.line_to(position);
+        // Without usable bandwidth roofs only the compute ceiling is known.
+        if !plot.compatible_memory_roof || plot.roofs.is_empty() {
+            let mut path = PathBuilder::stroke(px(2.0));
+            for step in 0..=64 {
+                let fraction = step as f64 / 64.0;
+                let log_x = plot.x_min_log + fraction * (plot.x_max_log - plot.x_min_log);
+                let intensity = 10.0_f64.powf(log_x);
+                let position = plot_position(bounds, plot, intensity, calibration.fp64_gflops);
+                if step == 0 {
+                    path.move_to(position);
+                } else {
+                    path.line_to(position);
+                }
             }
-        }
-        if let Ok(path) = path.build() {
-            window.paint_path(path, rgb(ACCENT));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(ACCENT));
+            }
+        } else {
+            // Draw the slowest level first so the fastest, which is the roof a
+            // cache-resident loop is actually bounded by, ends up on top.
+            for (index, (level, bandwidth)) in plot.roofs.iter().enumerate().rev() {
+                let binding = index == 0;
+                let mut path = PathBuilder::stroke(px(if binding { 2.0 } else { 1.0 }));
+                for step in 0..=64 {
+                    let fraction = step as f64 / 64.0;
+                    let log_x = plot.x_min_log + fraction * (plot.x_max_log - plot.x_min_log);
+                    let intensity = 10.0_f64.powf(log_x);
+                    let gflops = calibration.fp64_gflops.min(bandwidth * intensity);
+                    let position = plot_position(bounds, plot, intensity, gflops);
+                    if step == 0 {
+                        path.move_to(position);
+                    } else {
+                        path.line_to(position);
+                    }
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, rgb(if binding { ACCENT } else { MUTED_TEXT }));
+                }
+                // Label each roof on its sloped section, at the left edge.
+                let intensity = 10.0_f64.powf(plot.x_min_log);
+                let gflops = calibration.fp64_gflops.min(bandwidth * intensity);
+                let position = plot_position(bounds, plot, intensity, gflops);
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(position.x, position.y - px(1.0)),
+                        size(px(18.0), px(2.0)),
+                    ),
+                    rgb(if binding { ACCENT } else { MUTED_TEXT }),
+                ));
+                let _ = level;
+            }
         }
     }
 

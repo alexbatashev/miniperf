@@ -13,8 +13,16 @@ pub struct DynamicBlockCounts {
     pub vector_int: u64,
     pub vector_float: u64,
     pub vector_double: u64,
+    /// Modeled DRAM traffic attributed to this block. Cache-resident loops
+    /// legitimately have zero here, which is why arithmetic intensity must not
+    /// be derived from these alone.
     pub bytes_load: u64,
     pub bytes_store: u64,
+    /// Architectural bytes the block's memory operands moved, independent of
+    /// the cache model. Always non-zero for a block that touches memory, so
+    /// this is what gives every loop a finite arithmetic intensity.
+    pub arch_bytes_load: u64,
+    pub arch_bytes_store: u64,
     pub unclassified: u64,
 }
 
@@ -95,16 +103,60 @@ impl DynamicCfg {
         block.vector_double = block.vector_double.saturating_add(cost.vector_double);
     }
 
+    /// Records `count` additional back-to-back executions of a block that just
+    /// executed with `FlowKind::Normal` flow (a self loop). Equivalent to
+    /// calling `record_block` `count` more times on the same vcpu, but with a
+    /// single edge/block update. Callers must ensure the block is the most
+    /// recent one recorded for its vcpu.
+    pub fn record_repeats(&mut self, cost: &BlockCost, count: u64) {
+        if count == 0 {
+            return;
+        }
+        *self.edges.entry((cost.vaddr, cost.vaddr)).or_default() += count;
+        let block = self.blocks.entry(cost.vaddr).or_default();
+        block.executions = block.executions.saturating_add(count);
+        block.scalar_int = block
+            .scalar_int
+            .saturating_add(cost.scalar_int.saturating_mul(count));
+        block.scalar_float = block
+            .scalar_float
+            .saturating_add(cost.scalar_float.saturating_mul(count));
+        block.scalar_double = block
+            .scalar_double
+            .saturating_add(cost.scalar_double.saturating_mul(count));
+        block.vector_int = block
+            .vector_int
+            .saturating_add(cost.vector_int.saturating_mul(count));
+        block.vector_float = block
+            .vector_float
+            .saturating_add(cost.vector_float.saturating_mul(count));
+        block.vector_double = block
+            .vector_double
+            .saturating_add(cost.vector_double.saturating_mul(count));
+    }
+
     pub fn attribute_unclassified(&mut self, block_address: u64) {
         let block = self.blocks.entry(block_address).or_default();
         block.unclassified = block.unclassified.saturating_add(1);
     }
 
-    /// Attributes modeled DRAM traffic to the block that issued the access.
-    pub fn attribute_memory(&mut self, block_address: u64, bytes_load: u64, bytes_store: u64) {
+    /// Attributes one block's memory accesses: the architectural bytes its
+    /// operands moved plus the modeled DRAM traffic they caused. Both are
+    /// accumulated under a single lookup because this is the hottest path in
+    /// the instrumentation backends.
+    pub fn attribute_memory(
+        &mut self,
+        block_address: u64,
+        arch_bytes_load: u64,
+        arch_bytes_store: u64,
+        dram_bytes_load: u64,
+        dram_bytes_store: u64,
+    ) {
         let block = self.blocks.entry(block_address).or_default();
-        block.bytes_load = block.bytes_load.saturating_add(bytes_load);
-        block.bytes_store = block.bytes_store.saturating_add(bytes_store);
+        block.arch_bytes_load = block.arch_bytes_load.saturating_add(arch_bytes_load);
+        block.arch_bytes_store = block.arch_bytes_store.saturating_add(arch_bytes_store);
+        block.bytes_load = block.bytes_load.saturating_add(dram_bytes_load);
+        block.bytes_store = block.bytes_store.saturating_add(dram_bytes_store);
     }
 
     /// Attributes dynamically-counted vector operations (RVV) to a block.

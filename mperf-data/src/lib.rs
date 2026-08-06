@@ -198,6 +198,24 @@ pub struct RooflineCalibration {
     pub ridge_point_flops_per_byte: f64,
     /// Bytes in all three buffers used by the memory calibration.
     pub memory_working_set_bytes: u64,
+    /// Bandwidth roofs per memory hierarchy level, innermost first. The
+    /// cache-aware roofline plots loops against architectural traffic, so one
+    /// DRAM roof is not enough: a cache-resident loop is served far above DRAM
+    /// bandwidth and needs the cache-level roofs to be read correctly.
+    #[serde(default)]
+    pub memory_levels: Vec<MemoryLevelCalibration>,
+}
+
+/// One measured bandwidth roof of the memory hierarchy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLevelCalibration {
+    /// `L1`, `L2`, `L3` or `DRAM`.
+    pub level: String,
+    pub gbytes_per_second: f64,
+    #[serde(default)]
+    pub gbytes_per_second_samples: Vec<f64>,
+    /// Total bytes touched across all threads by this level's kernel.
+    pub working_set_bytes: u64,
 }
 
 /// How `os_cpu_clock` observations should be interpreted by time-based views.

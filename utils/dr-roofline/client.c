@@ -16,13 +16,22 @@
 #include "drmgr.h"
 #include "drutil.h"
 #include "drreg.h"
+#include "drx.h"
 #include "roofline_core.h"
+#include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 
 #define DEFAULT_CACHE_LINE 64
 #define DEFAULT_LLC_SIZE (8ULL * 1024 * 1024)
 #define DEFAULT_LLC_ASSOC 16
+
+/* Per-thread trace buffer of rc_record_t entries. Events are written inline
+ * (no clean calls) and handed to roofline-core in one batch per flush, which
+ * amortizes the C->Rust crossing and the session mutex over thousands of
+ * events. Each flush costs a guard-page fault (~15us of signal handling), so
+ * the buffer is sized generously: 1MiB = 64K records per flush. */
+#define RECORD_BUF_SIZE (1 << 20)
 
 static rc_session_t *session;
 static uint32_t target;
@@ -38,21 +47,11 @@ typedef struct bb_data_t {
     uint64_t vaddr;
     uint64_t end_vaddr;
     uint32_t flow;
+    uint32_t handle; /* rc_register_block handle; UINT32_MAX when invalid */
     rc_cost_t cost;
     uint64_t instructions;
     struct bb_data_t *next;
 } bb_data_t;
-
-/* Per-instruction data referenced from instrumented code. Clean-call
- * argument lists are kept to one or two operands: materializing several
- * 64-bit immediates per instruction can exceed DynamoRIO's basic-block
- * instrumentation size limit (seen on riscv64). */
-typedef struct mem_info_t {
-    uint64_t block;
-    uint32_t size;
-    uint32_t is_store;
-    struct mem_info_t *next;
-} mem_info_t;
 
 typedef struct rvv_info_t {
     uint64_t block;
@@ -65,8 +64,8 @@ typedef struct rvv_info_t {
 
 static void *bb_list_lock;
 static bb_data_t *bb_list;
-static mem_info_t *mem_list;
 static rvv_info_t *rvv_list;
+static drx_buf_t *record_buf;
 
 static uint32_t
 thread_index(void *drcontext)
@@ -76,32 +75,16 @@ thread_index(void *drcontext)
 
 /* ---------------- events fired from instrumented code ---------------- */
 
+/* Called by drx_buf when a thread's record buffer fills up (and once more at
+ * thread exit for the partial remainder). */
 static void
-block_exec_event(bb_data_t *data)
+flush_records(void *drcontext, void *buf_base, size_t size)
 {
-    if (in_child)
+    if (in_child || session == NULL)
         return;
-    void *drcontext = dr_get_current_drcontext();
-    rc_block_exec(session, thread_index(drcontext), data->vaddr, data->end_vaddr,
-                  data->flow, &data->cost, data->instructions);
-}
-
-static void
-mem_event(mem_info_t *info, app_pc address)
-{
-    if (in_child)
-        return;
-    void *drcontext = dr_get_current_drcontext();
-    rc_mem_access(session, thread_index(drcontext), info->block,
-                  (uint64_t)(uintptr_t)address, info->size, info->is_store);
-}
-
-static void
-unclassified_event(uint64_t block)
-{
-    if (in_child)
-        return;
-    rc_unclassified(session, block);
+    rc_process_batch(session, thread_index(drcontext),
+                     (const rc_record_t *)buf_base,
+                     size / sizeof(rc_record_t));
 }
 
 #ifdef RISCV64
@@ -203,6 +186,9 @@ event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb, bool for_trace,
         }
     }
 
+    data->handle = rc_register_block(session, data->vaddr, data->end_vaddr,
+                                     data->flow, &data->cost, data->instructions);
+
     dr_mutex_lock(bb_list_lock);
     data->next = bb_list;
     bb_list = data;
@@ -211,12 +197,36 @@ event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb, bool for_trace,
     return DR_EMIT_DEFAULT;
 }
 
+/* Inline-writes one rc_record_t with no payload address (block-exec and
+ * unclassified records; the address field is left uninitialized and ignored
+ * by roofline-core). */
+static void
+insert_record(void *drcontext, instrlist_t *bb, instr_t *where, uint32_t desc)
+{
+    reg_id_t reg_ptr, reg_scratch;
+    if (drreg_reserve_register(drcontext, bb, where, NULL, &reg_ptr) !=
+            DRREG_SUCCESS ||
+        drreg_reserve_register(drcontext, bb, where, NULL, &reg_scratch) !=
+            DRREG_SUCCESS) {
+        DR_ASSERT(false);
+        return;
+    }
+    drx_buf_insert_load_buf_ptr(drcontext, record_buf, bb, where, reg_ptr);
+    drx_buf_insert_buf_store(drcontext, record_buf, bb, where, reg_ptr,
+                             reg_scratch, OPND_CREATE_INT32((int)desc), OPSZ_4,
+                             offsetof(rc_record_t, desc));
+    drx_buf_insert_update_buf_ptr(drcontext, record_buf, bb, where, reg_ptr,
+                                  reg_scratch, sizeof(rc_record_t));
+    drreg_unreserve_register(drcontext, bb, where, reg_scratch);
+    drreg_unreserve_register(drcontext, bb, where, reg_ptr);
+}
+
 static void
 instrument_mem_refs(void *drcontext, instrlist_t *bb, instr_t *instr,
                     uint64_t block)
 {
     int i;
-    reg_id_t reg_addr, reg_scratch;
+    reg_id_t reg_addr, reg_ptr, reg_scratch;
     bool reserved = false;
 
     for (i = 0; i < instr_num_srcs(instr) + instr_num_dsts(instr); i++) {
@@ -233,8 +243,13 @@ instrument_mem_refs(void *drcontext, instrlist_t *bb, instr_t *instr,
         uint size = opnd_size_in_bytes(opnd_get_size(op));
         if (size == 0)
             continue;
+        uint32_t handle = rc_register_mem(session, block, size, is_store ? 1 : 0);
+        if (handle == UINT32_MAX)
+            continue;
         if (!reserved) {
             if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg_addr) !=
+                    DRREG_SUCCESS ||
+                drreg_reserve_register(drcontext, bb, instr, NULL, &reg_ptr) !=
                     DRREG_SUCCESS ||
                 drreg_reserve_register(drcontext, bb, instr, NULL, &reg_scratch) !=
                     DRREG_SUCCESS) {
@@ -246,19 +261,21 @@ instrument_mem_refs(void *drcontext, instrlist_t *bb, instr_t *instr,
         if (!drutil_insert_get_mem_addr(drcontext, bb, instr, op, reg_addr,
                                         reg_scratch))
             continue;
-        mem_info_t *info = dr_global_alloc(sizeof(mem_info_t));
-        info->block = block;
-        info->size = size;
-        info->is_store = is_store ? 1 : 0;
-        dr_mutex_lock(bb_list_lock);
-        info->next = mem_list;
-        mem_list = info;
-        dr_mutex_unlock(bb_list_lock);
-        dr_insert_clean_call(drcontext, bb, instr, (void *)mem_event, false, 2,
-                             OPND_CREATE_INTPTR(info), opnd_create_reg(reg_addr));
+        drx_buf_insert_load_buf_ptr(drcontext, record_buf, bb, instr, reg_ptr);
+        drx_buf_insert_buf_store(drcontext, record_buf, bb, instr, reg_ptr,
+                                 reg_scratch,
+                                 OPND_CREATE_INT32(
+                                     (int)((handle << 2) | RC_RECORD_MEM)),
+                                 OPSZ_4, offsetof(rc_record_t, desc));
+        drx_buf_insert_buf_store(drcontext, record_buf, bb, instr, reg_ptr,
+                                 reg_scratch, opnd_create_reg(reg_addr), OPSZ_8,
+                                 offsetof(rc_record_t, address));
+        drx_buf_insert_update_buf_ptr(drcontext, record_buf, bb, instr, reg_ptr,
+                                      reg_scratch, sizeof(rc_record_t));
     }
     if (reserved) {
         drreg_unreserve_register(drcontext, bb, instr, reg_scratch);
+        drreg_unreserve_register(drcontext, bb, instr, reg_ptr);
         drreg_unreserve_register(drcontext, bb, instr, reg_addr);
     }
 }
@@ -274,9 +291,9 @@ event_bb_insertion(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     if (!instr_is_app(instr))
         return DR_EMIT_DEFAULT;
 
-    if (instr == instrlist_first_app(bb)) {
-        dr_insert_clean_call(drcontext, bb, instr, (void *)block_exec_event,
-                             false, 1, OPND_CREATE_INTPTR(data));
+    if (instr == instrlist_first_app(bb) && data->handle != UINT32_MAX) {
+        insert_record(drcontext, bb, instr,
+                      (data->handle << 2) | RC_RECORD_BLOCK_EXEC);
     }
 
     disassemble_instr(drcontext, instr, text, sizeof(text));
@@ -291,8 +308,10 @@ event_bb_insertion(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     if (cls.kind == RC_KIND_UNCLASSIFIED) {
         if (debug_unclassified)
             dr_fprintf(STDERR, "miniperf dr-roofline: unclassified '%s'\n", text);
-        dr_insert_clean_call(drcontext, bb, instr, (void *)unclassified_event,
-                             false, 1, OPND_CREATE_INT64(data->vaddr));
+        if (data->handle != UINT32_MAX) {
+            insert_record(drcontext, bb, instr,
+                          (data->handle << 2) | RC_RECORD_UNCLASSIFIED);
+        }
     }
 #ifdef RISCV64
     if (cls.kind == RC_KIND_RVV) {
@@ -348,6 +367,12 @@ event_fork_init(void *drcontext)
 static void
 event_exit(void)
 {
+    /* Thread exit events (including drx_buf's final flush of each thread's
+     * partial buffer via flush_records) have already run by now. */
+    if (record_buf != NULL) {
+        drx_buf_free(record_buf);
+        record_buf = NULL;
+    }
     if (!in_child && session != NULL) {
         if (progress_file != INVALID_FILE)
             dr_fprintf(progress_file, "%llu\n", rc_instruction_count(session));
@@ -365,11 +390,6 @@ event_exit(void)
         dr_global_free(bb_list, sizeof(bb_data_t));
         bb_list = next;
     }
-    while (mem_list != NULL) {
-        mem_info_t *next = mem_list->next;
-        dr_global_free(mem_list, sizeof(mem_info_t));
-        mem_list = next;
-    }
     while (rvv_list != NULL) {
         rvv_info_t *next = rvv_list->next;
         dr_global_free(rvv_list, sizeof(rvv_info_t));
@@ -379,6 +399,7 @@ event_exit(void)
     dr_mutex_destroy(bb_list_lock);
 
     drmgr_unregister_tls_field(tls_index);
+    drx_exit();
     drreg_exit();
     drutil_exit();
     drmgr_exit();
@@ -455,15 +476,41 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     module_data_t *main_module = dr_get_main_module();
     if (main_module != NULL) {
-        rc_session_set_image(session, (uint64_t)(uintptr_t)main_module->start,
+        /* The artifact's image start must be the runtime address of the
+         * executable text, matching the QEMU plugin's qemu_plugin_start_code():
+         * mperf derives the module load bias as image_start minus the
+         * executable ELF segment's link address. main_module->start is the
+         * module base (the mapping of file offset 0), which for a PIE sits one
+         * page below the text segment, so reporting it would skew every loop's
+         * module offset and symbolize loops to unrelated symbols. */
+        uint64_t text_start = (uint64_t)(uintptr_t)main_module->start;
+#ifdef UNIX
+        bool text_found = false;
+        for (uint i = 0; i < main_module->num_segments; i++) {
+            if ((main_module->segments[i].prot & DR_MEMPROT_EXEC) == 0)
+                continue;
+            uint64_t start = (uint64_t)(uintptr_t)main_module->segments[i].start;
+            if (!text_found || start < text_start) {
+                text_start = start;
+                text_found = true;
+            }
+        }
+#endif
+        rc_session_set_image(session, text_start,
                              (uint64_t)(uintptr_t)main_module->end,
                              (uint64_t)(uintptr_t)main_module->entry_point);
         dr_free_module_data(main_module);
     }
 
-    drreg_options_t ops = { sizeof(ops), 4 /*spill slots*/, false };
-    if (!drmgr_init() || !drutil_init() || drreg_init(&ops) != DRREG_SUCCESS)
+    drreg_options_t ops = { sizeof(ops), 5 /*spill slots*/, false };
+    if (!drmgr_init() || !drutil_init() || drreg_init(&ops) != DRREG_SUCCESS ||
+        !drx_init())
         DR_ASSERT(false);
+    record_buf = drx_buf_create_trace_buffer(RECORD_BUF_SIZE, flush_records);
+    if (record_buf == NULL) {
+        dr_fprintf(STDERR, "miniperf dr-roofline: failed to create trace buffer\n");
+        dr_abort();
+    }
     bb_list_lock = dr_mutex_create();
     tls_index = drmgr_register_tls_field();
     DR_ASSERT(tls_index != -1);

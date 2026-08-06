@@ -822,6 +822,8 @@ struct BinaryLoopCounts {
     vector_double_ops: u64,
     bytes_load: u64,
     bytes_store: u64,
+    arch_bytes_load: u64,
+    arch_bytes_store: u64,
     unclassified_instructions: u64,
 }
 
@@ -1356,6 +1358,8 @@ fn create_roofline_tables(connection: &sqlite::Connection) -> Result<()> {
             timing_quality TEXT NOT NULL,
             bytes_load INTEGER NOT NULL,
             bytes_store INTEGER NOT NULL,
+            arch_bytes_load INTEGER NOT NULL,
+            arch_bytes_store INTEGER NOT NULL,
             scalar_int_ops INTEGER NOT NULL,
             scalar_float_ops INTEGER NOT NULL,
             scalar_double_ops INTEGER NOT NULL,
@@ -1503,9 +1507,10 @@ fn process_binary_roofline_loops(
         "INSERT INTO roofline_binary_loops (
             module_offset, function_name, file_name, line, trip_count,
             duration_ns, timing_samples, timing_relative_error, timing_quality,
-            bytes_load, bytes_store, scalar_int_ops, scalar_float_ops,
+            bytes_load, bytes_store, arch_bytes_load, arch_bytes_store,
+            scalar_int_ops, scalar_float_ops,
             scalar_double_ops, vector_int_ops, vector_float_ops, vector_double_ops
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
     )?;
 
     connection.execute("BEGIN IMMEDIATE TRANSACTION;")?;
@@ -1560,6 +1565,8 @@ fn process_binary_roofline_loops(
             for (index, value) in [
                 counts.bytes_load,
                 counts.bytes_store,
+                counts.arch_bytes_load,
+                counts.arch_bytes_store,
                 counts.scalar_int_ops,
                 counts.scalar_float_ops,
                 counts.scalar_double_ops,
@@ -1724,14 +1731,23 @@ mod binary_roofline_tests {
                     module_offset TEXT PRIMARY KEY, function_name TEXT, file_name TEXT,
                     line INTEGER, trip_count INTEGER, duration_ns INTEGER,
                     timing_samples INTEGER, timing_relative_error REAL, timing_quality TEXT,
-                    bytes_load INTEGER, bytes_store INTEGER, scalar_int_ops INTEGER,
+                    bytes_load INTEGER, bytes_store INTEGER,
+                    arch_bytes_load INTEGER, arch_bytes_store INTEGER, scalar_int_ops INTEGER,
                     scalar_float_ops INTEGER, scalar_double_ops INTEGER, vector_int_ops INTEGER,
                     vector_float_ops INTEGER, vector_double_ops INTEGER
                  );
                  INSERT INTO roofline_binary_loops VALUES (
                     '0x100', 'kernel', 'kernel.c', 7, 100, 1000000000,
-                    400, 0.098, 'advisor-grade', 800, 200,
+                    400, 0.098, 'advisor-grade', 800, 200, 4000, 1000,
                     0, 0, 2000000000, 0, 0, 6000000000
+                 );
+                 -- A cache-resident loop: zero modeled DRAM traffic, so its
+                 -- arithmetic intensity must come from architectural traffic
+                 -- instead of dropping the loop off the chart entirely.
+                 INSERT INTO roofline_binary_loops VALUES (
+                    '0x200', 'resident', 'kernel.c', 20, 100, 1000000000,
+                    400, 0.098, 'advisor-grade', 0, 0, 1000, 1000,
+                    0, 0, 0, 0, 0, 8000000000
                  );",
             )
             .unwrap();
@@ -1748,10 +1764,19 @@ mod binary_roofline_tests {
         assert_eq!(statement.read::<String, _>(0).unwrap(), "kernel");
         assert_eq!(statement.read::<f64, _>(1).unwrap(), 2_000_000_000.0);
         assert_eq!(statement.read::<f64, _>(2).unwrap(), 6_000_000_000.0);
-        assert_eq!(statement.read::<f64, _>(3).unwrap(), 2_000_000.0);
-        assert_eq!(statement.read::<f64, _>(4).unwrap(), 6_000_000.0);
+        // Arithmetic intensity is architectural (cache-aware roofline), so
+        // this divides by 4000 + 1000 architectural bytes, not by the 800 +
+        // 200 bytes that happened to reach DRAM.
+        assert_eq!(statement.read::<f64, _>(3).unwrap(), 400_000.0);
+        assert_eq!(statement.read::<f64, _>(4).unwrap(), 1_200_000.0);
         assert_eq!(statement.read::<String, _>(5).unwrap(), "advisor-grade");
         assert_eq!(statement.read::<String, _>(6).unwrap(), "0x100");
+
+        // A cache-resident loop has zero DRAM traffic but the same kind of
+        // finite architectural intensity: 8e9 ops / 2000 bytes.
+        assert_eq!(statement.next().unwrap(), State::Row);
+        assert_eq!(statement.read::<String, _>(0).unwrap(), "resident");
+        assert_eq!(statement.read::<f64, _>(4).unwrap(), 4_000_000.0);
         assert_eq!(statement.next().unwrap(), State::Done);
     }
 }
@@ -2824,7 +2849,9 @@ SELECT
   NULL AS timing_relative_error,
   'legacy' AS timing_quality,
   NULL AS module_offset,
-  NULL AS trip_count
+  NULL AS trip_count,
+  ops.bytes_load + ops.bytes_store AS arch_bytes,
+  NULL AS dram_bytes
 
 FROM runs
 LEFT JOIN ops
@@ -2843,27 +2870,29 @@ SELECT
   line,
 
   CAST(scalar_int_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
-  CAST(scalar_int_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+  CAST(scalar_int_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
 
   CAST(scalar_float_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
-  CAST(scalar_float_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+  CAST(scalar_float_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
 
   CAST(scalar_double_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
-  CAST(scalar_double_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+  CAST(scalar_double_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
 
   CAST(vector_int_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
-  CAST(vector_int_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+  CAST(vector_int_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
 
   CAST(vector_float_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
-  CAST(vector_float_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+  CAST(vector_float_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
 
   CAST(vector_double_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
-  CAST(vector_double_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+  CAST(vector_double_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
   timing_samples,
   timing_relative_error,
   timing_quality,
   module_offset,
-  trip_count
+  trip_count,
+  arch_bytes_load + arch_bytes_store,
+  bytes_load + bytes_store
 FROM roofline_binary_loops;
     ").expect("failed to create a view");
     Ok(())

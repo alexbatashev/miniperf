@@ -46,6 +46,21 @@ typedef struct rc_classification_t {
     uint64_t rvv_sew_scale;
 } rc_classification_t;
 
+enum {
+    RC_RECORD_BLOCK_EXEC = 0,
+    RC_RECORD_MEM = 1,
+    RC_RECORD_UNCLASSIFIED = 2,
+};
+
+/* One buffered instrumentation event. `desc` packs a registered handle in the
+ * upper 30 bits and an RC_RECORD_* kind in the low 2 bits. `address` is only
+ * meaningful for RC_RECORD_MEM records. */
+typedef struct rc_record_t {
+    uint32_t desc;
+    uint32_t pad;
+    uint64_t address;
+} rc_record_t;
+
 typedef struct rc_session_t rc_session_t;
 
 rc_session_t *
@@ -70,6 +85,18 @@ rc_block_exec(rc_session_t *session, uint32_t thread, uint64_t vaddr,
 void
 rc_mem_access(rc_session_t *session, uint32_t thread, uint64_t block,
               uint64_t address, uint64_t size, uint32_t is_store);
+
+uint32_t
+rc_register_block(rc_session_t *session, uint64_t vaddr, uint64_t end_vaddr,
+                  uint32_t flow, const rc_cost_t *cost, uint64_t instructions);
+
+uint32_t
+rc_register_mem(rc_session_t *session, uint64_t block, uint64_t size,
+                uint32_t is_store);
+
+void
+rc_process_batch(rc_session_t *session, uint32_t thread,
+                 const rc_record_t *records, uint64_t count);
 
 void
 rc_rvv_exec(rc_session_t *session, uint64_t block, uint32_t is_float,
