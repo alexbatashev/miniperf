@@ -9,7 +9,7 @@
  *
  * Client options (drrun -c libdr_roofline.so <options> -- app):
  *   output=<path> cache-line=<n> llc-size=<n> llc-assoc=<n>
- *   memory-profile=on|off
+ *   memory-profile=on|off progress=<path>
  */
 
 #include "dr_api.h"
@@ -29,6 +29,7 @@ static uint32_t target;
 static bool in_child; /* forked child: do not write artifacts */
 static bool debug_unclassified;
 static bool debug_classify;
+static file_t progress_file = INVALID_FILE;
 
 static int tls_index = -1;
 static uint thread_counter;
@@ -319,6 +320,17 @@ event_bb_insertion(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
 /* ---------------- lifecycle ---------------- */
 
 static void
+progress_thread(void *arg)
+{
+    rc_session_t *progress_session = (rc_session_t *)arg;
+    for (;;) {
+        dr_fprintf(progress_file, "%llu\n",
+                   rc_instruction_count(progress_session));
+        dr_sleep(100);
+    }
+}
+
+static void
 event_thread_init(void *drcontext)
 {
     uint index = dr_atomic_add32_return_sum((volatile int *)&thread_counter, 1) - 1;
@@ -336,9 +348,16 @@ event_fork_init(void *drcontext)
 static void
 event_exit(void)
 {
-    if (!in_child && session != NULL)
+    if (!in_child && session != NULL) {
+        if (progress_file != INVALID_FILE)
+            dr_fprintf(progress_file, "%llu\n", rc_instruction_count(session));
         rc_finalize(session);
+    }
     session = NULL;
+    if (progress_file != INVALID_FILE) {
+        dr_close_file(progress_file);
+        progress_file = INVALID_FILE;
+    }
 
     dr_mutex_lock(bb_list_lock);
     while (bb_list != NULL) {
@@ -411,6 +430,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     uint64_t llc_size = parse_u64_option(argc, argv, "llc-size", DEFAULT_LLC_SIZE);
     uint64_t llc_assoc = parse_u64_option(argc, argv, "llc-assoc", DEFAULT_LLC_ASSOC);
     const char *profile = parse_str_option(argc, argv, "memory-profile", "on");
+    const char *progress = parse_str_option(argc, argv, "progress", "");
     uint32_t memory_profile = strcmp(profile, "off") != 0;
     debug_unclassified = getenv("MPERF_DR_DEBUG_UNCLASSIFIED") != NULL;
     debug_classify = getenv("MPERF_DR_DEBUG_CLASSIFY") != NULL;
@@ -420,6 +440,17 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
         dr_fprintf(STDERR,
                    "miniperf dr-roofline: invalid cache-line/llc-size/llc-assoc\n");
         dr_abort();
+    }
+    if (progress[0] != '\0') {
+        progress_file = dr_open_file(
+            progress, DR_FILE_WRITE_OVERWRITE | DR_FILE_CLOSE_ON_FORK);
+        if (progress_file != INVALID_FILE) {
+            dr_fprintf(progress_file, "0\n");
+            if (!dr_create_client_thread(progress_thread, session)) {
+                dr_close_file(progress_file);
+                progress_file = INVALID_FILE;
+            }
+        }
     }
 
     module_data_t *main_module = dr_get_main_module();

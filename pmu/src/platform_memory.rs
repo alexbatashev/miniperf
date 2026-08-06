@@ -22,8 +22,20 @@ mod imp {
         path::{Path, PathBuf},
     };
 
-    const READ_ALIASES: &[&str] = &["cas_count_read", "dram_reads", "data_reads", "read"];
-    const WRITE_ALIASES: &[&str] = &["cas_count_write", "dram_writes", "data_writes", "write"];
+    const READ_ALIASES: &[&str] = &[
+        "cas_count_read",
+        "dram_reads",
+        "data_read",
+        "data_reads",
+        "read",
+    ];
+    const WRITE_ALIASES: &[&str] = &[
+        "cas_count_write",
+        "dram_writes",
+        "data_write",
+        "data_writes",
+        "write",
+    ];
 
     struct Handle {
         fd: RawFd,
@@ -280,6 +292,12 @@ mod imp {
         #[test]
         fn parses_first_cpu_from_range_list() {
             assert_eq!(first_cpu("4-7,12-15\n"), Some(4));
+        }
+
+        #[test]
+        fn recognizes_intel_free_running_imc_event_names() {
+            assert!(READ_ALIASES.contains(&"data_read"));
+            assert!(WRITE_ALIASES.contains(&"data_write"));
         }
     }
 }

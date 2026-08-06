@@ -2,11 +2,18 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap},
     fs::File,
+    io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
+use kdam::BarExt;
 use mperf_data::{
     CallFrame, Event, EventType, Location, RooflineInfo, RooflineMethodInfo, ScenarioInfo,
 };
@@ -291,7 +298,12 @@ impl QemuBackend {
     }
 
     /// Builds the accounting (run 2) command and its extra environment.
-    fn accounting_command(&self, guest: &[String], output: &Path) -> Result<AccountingCommand> {
+    fn accounting_command(
+        &self,
+        guest: &[String],
+        output: &Path,
+        progress: Option<&Path>,
+    ) -> Result<AccountingCommand> {
         match &self.tool {
             AccountingTool::Qemu { .. } => {
                 let qemu = self.qemu_for(Path::new(&guest[0]))?;
@@ -318,6 +330,12 @@ impl QemuBackend {
                     ),
                     "--".to_string(),
                 ];
+                if let Some(progress) = progress {
+                    command.insert(
+                        command.len() - 1,
+                        format!("progress={}", progress.to_string_lossy()),
+                    );
+                }
                 command.extend(guest.iter().cloned());
                 let mut env = Vec::new();
                 if self.memory_profile {
@@ -333,6 +351,98 @@ impl QemuBackend {
             }
         }
     }
+}
+
+struct DynamoRioProgress {
+    stop: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+    path: PathBuf,
+}
+
+impl DynamoRioProgress {
+    fn start(path: PathBuf, estimated_instructions: u64) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread_completed = completed.clone();
+        let thread_path = path.clone();
+        let thread = thread::spawn(move || {
+            let total = usize::try_from(estimated_instructions).unwrap_or(usize::MAX);
+            let mut progress = kdam::tqdm!(
+                total = total,
+                desc = "DynamoRIO accounting",
+                unit = "inst",
+                unit_scale = true,
+                leave = true
+            );
+            let mut instruction_stream = None;
+            while !thread_stop.load(Ordering::Acquire) {
+                if instruction_stream.is_none() {
+                    instruction_stream = File::open(&thread_path).ok();
+                }
+                if let Some(instructions) = instruction_stream
+                    .as_mut()
+                    .and_then(read_instruction_progress)
+                {
+                    let position = usize::try_from(instructions)
+                        .unwrap_or(usize::MAX)
+                        .min(total);
+                    let _ = progress.update_to(position);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            if let Some(instructions) = instruction_stream
+                .as_mut()
+                .and_then(read_instruction_progress)
+            {
+                let position = usize::try_from(instructions)
+                    .unwrap_or(usize::MAX)
+                    .min(total);
+                let _ = progress.update_to(position);
+            }
+            if thread_completed.load(Ordering::Relaxed) {
+                // Replay totals can differ slightly from Run 1. Process exit,
+                // rather than an exact counter match, is authoritative.
+                let _ = progress.update_to(total);
+            }
+        });
+        Self {
+            stop,
+            completed,
+            thread: Some(thread),
+            path,
+        }
+    }
+
+    fn finish(&mut self, completed: bool) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.completed.store(completed, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
+        let _ = thread.join();
+        let _ = std::fs::remove_file(&self.path);
+        eprintln!();
+    }
+}
+
+impl Drop for DynamoRioProgress {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
+fn read_instruction_progress(stream: &mut File) -> Option<u64> {
+    let mut update = String::new();
+    stream
+        .read_to_string(&mut update)
+        .ok()
+        .filter(|bytes| *bytes != 0)?;
+    update
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .next_back()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -382,44 +492,150 @@ pub(super) fn probe_dynamorio(options: &Options) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn dynamorio_paths(options: &Options) -> Result<(PathBuf, PathBuf)> {
-    let drrun = options
+    let configured_drrun = options
         .dynamorio
         .clone()
-        .or_else(|| std::env::var_os("MPERF_DYNAMORIO").map(PathBuf::from))
-        .map(Ok)
-        .unwrap_or_else(|| {
-            let bundled = super::executable_directory()
-                .unwrap_or_default()
-                .join("dynamorio/bin64/drrun");
-            if bundled.is_file() {
-                Ok(bundled)
-            } else {
-                which::which("drrun").map_err(|_| {
-                    anyhow::anyhow!(
-                        "DynamoRIO 'drrun' was not found next to mperf or on PATH; pass --dynamorio"
-                    )
-                })
-            }
-        })?;
-    if !drrun.is_file() {
-        anyhow::bail!("DynamoRIO launcher '{}' was not found", drrun.display());
-    }
-    let client = options
+        .or_else(|| std::env::var_os("MPERF_DYNAMORIO").map(PathBuf::from));
+    let drrun = if let Some(configured) = configured_drrun {
+        resolve_dynamorio_launcher(&configured)?
+    } else {
+        let bundled = super::executable_directory()
+            .unwrap_or_default()
+            .join("dynamorio/bin64/drrun");
+        if bundled.is_file() {
+            bundled
+        } else {
+            which::which("drrun").map_err(|_| {
+                anyhow::anyhow!(
+                    "DynamoRIO 'drrun' was not found next to mperf or on PATH; pass --dynamorio with a drrun executable or DynamoRIO build directory"
+                )
+            })?
+        }
+    };
+
+    let configured_client = options
         .dynamorio_client
         .clone()
-        .or_else(|| std::env::var_os("MPERF_DR_CLIENT").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            super::executable_directory()
-                .unwrap_or_default()
-                .join("libdr_roofline.so")
-        });
-    if !client.is_file() {
+        .or_else(|| std::env::var_os("MPERF_DR_CLIENT").map(PathBuf::from));
+    let client = if let Some(configured) = configured_client {
+        if !configured.is_file() {
+            anyhow::bail!(
+                "miniperf DynamoRIO client '{}' was not found",
+                configured.display()
+            );
+        }
+        configured
+    } else {
+        discover_dynamorio_client(&drrun)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "miniperf DynamoRIO client 'libdr_roofline.so' was not found next to mperf, in the DynamoRIO bundle, or in this miniperf source checkout; build utils/dr-roofline or pass --dynamorio-client"
+            )
+        })?
+    };
+    Ok((drrun, client))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_dynamorio_launcher(configured: &Path) -> Result<PathBuf> {
+    if configured.is_file() {
+        return Ok(configured.to_path_buf());
+    }
+    if configured.is_dir() {
+        for relative in ["bin64/drrun", "dynamorio/bin64/drrun"] {
+            let candidate = configured.join(relative);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
         anyhow::bail!(
-            "miniperf DynamoRIO client '{}' was not found; build utils/dr-roofline or pass --dynamorio-client",
-            client.display()
+            "DynamoRIO directory '{}' contains neither bin64/drrun nor dynamorio/bin64/drrun",
+            configured.display()
         );
     }
-    Ok((drrun, client))
+    if configured.components().count() == 1 {
+        if let Ok(found) = which::which(configured) {
+            return Ok(found);
+        }
+    }
+    anyhow::bail!(
+        "DynamoRIO launcher or build directory '{}' was not found",
+        configured.display()
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn discover_dynamorio_client(drrun: &Path) -> Result<Option<PathBuf>> {
+    let executable_directory = super::executable_directory().ok();
+    if let Some(client) = executable_directory
+        .as_deref()
+        .map(|directory| directory.join("libdr_roofline.so"))
+        .filter(|client| client.is_file())
+    {
+        return Ok(Some(client));
+    }
+
+    // A release bundle stores drrun under dynamorio/bin64 and the client at
+    // the bundle root. Also accept a client copied to a normal DR build root.
+    let mut directory = drrun.parent();
+    for _ in 0..3 {
+        let Some(current) = directory else { break };
+        let candidate = current.join("libdr_roofline.so");
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+        directory = current.parent();
+    }
+
+    let mut clients = Vec::new();
+    if let Ok(current_directory) = std::env::current_dir() {
+        clients.extend(discover_checkout_clients(&current_directory)?);
+    }
+    if let Some(executable_directory) = executable_directory {
+        clients.extend(discover_checkout_clients(&executable_directory)?);
+    }
+    clients.sort();
+    clients.dedup();
+    match clients.as_slice() {
+        [] => Ok(None),
+        [client] => Ok(Some(client.clone())),
+        _ => anyhow::bail!(
+            "multiple built miniperf DynamoRIO clients were found ({}); select one with --dynamorio-client",
+            clients
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn discover_checkout_clients(start: &Path) -> Result<Vec<PathBuf>> {
+    let Some(root) = start.ancestors().find(|candidate| {
+        candidate.join("Cargo.toml").is_file()
+            && candidate.join("utils/dr-roofline/CMakeLists.txt").is_file()
+    }) else {
+        return Ok(Vec::new());
+    };
+    let client_source = root.join("utils/dr-roofline");
+    let mut clients = Vec::new();
+    for entry in std::fs::read_dir(&client_source)
+        .with_context(|| format!("failed to inspect '{}'", client_source.display()))?
+    {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        for candidate in [
+            path.join("libdr_roofline.so"),
+            path.join("Release/libdr_roofline.so"),
+        ] {
+            if candidate.is_file() {
+                clients.push(candidate);
+            }
+        }
+    }
+    Ok(clients)
 }
 
 #[cfg(target_os = "linux")]
@@ -557,16 +773,27 @@ impl RooflineBackend for QemuBackend {
             .await;
 
             let counts_path = output_directory.join("qemu-roofline.counts");
+            let progress_path = matches!(&self.tool, AccountingTool::DynamoRio { .. })
+                .then(|| {
+                    output_directory.join(format!(".dynamorio-progress-{}", uuid::Uuid::now_v7()))
+                })
+                .filter(|_| baseline.instructions != 0);
             let (accounting_command, accounting_env) =
-                self.accounting_command(guest, &counts_path)?;
+                self.accounting_command(guest, &counts_path, progress_path.as_deref())?;
             println!(
                 "Run 2: collecting {} instruction and memory accounting for '{}'",
                 self.tool.name(),
                 guest.join(" ")
             );
             let process = Process::new(&accounting_command, &accounting_env)?;
+            let mut progress =
+                progress_path.map(|path| DynamoRioProgress::start(path, baseline.instructions));
             process.cont();
-            process.wait()?;
+            let wait = process.wait();
+            if let Some(progress) = progress.as_mut() {
+                progress.finish(wait.is_ok() && process.exit_code() == Some(0));
+            }
+            wait?;
             super::ensure_process_success(
                 &process,
                 &format!("{} Roofline accounting run", self.tool.name()),
@@ -1387,6 +1614,15 @@ mod tests {
     }
 
     #[test]
+    fn reads_latest_complete_instruction_progress() {
+        let temporary = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temporary.path(), "0\n125\ninvalid\n900\n").unwrap();
+        let mut stream = File::open(temporary.path()).unwrap();
+        assert_eq!(read_instruction_progress(&mut stream), Some(900));
+        assert_eq!(read_instruction_progress(&mut stream), None);
+    }
+
+    #[test]
     fn parses_validates_and_analyzes_dynamic_cfg() {
         let executable = Path::new("/bin/true");
         let object_data = std::fs::read(executable).unwrap();
@@ -1508,5 +1744,43 @@ mod tests {
             b"  -plugin [file=]file[,arg=<string>]\n"
         ));
         assert!(!qemu_help_has_plugin(b"  -cpu model\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_dynamorio_build_and_bundle_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let build = temporary.path().join("build");
+        std::fs::create_dir_all(build.join("bin64")).unwrap();
+        File::create(build.join("bin64/drrun")).unwrap();
+        assert_eq!(
+            resolve_dynamorio_launcher(&build).unwrap(),
+            build.join("bin64/drrun")
+        );
+
+        let bundle = temporary.path().join("bundle");
+        std::fs::create_dir_all(bundle.join("dynamorio/bin64")).unwrap();
+        File::create(bundle.join("dynamorio/bin64/drrun")).unwrap();
+        assert_eq!(
+            resolve_dynamorio_launcher(&bundle).unwrap(),
+            bundle.join("dynamorio/bin64/drrun")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovers_client_in_source_checkout_cmake_build() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let client_source = root.join("utils/dr-roofline");
+        let client = client_source.join("build-host/libdr_roofline.so");
+        let start = root.join("target/release");
+        std::fs::create_dir_all(client.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&start).unwrap();
+        File::create(root.join("Cargo.toml")).unwrap();
+        File::create(client_source.join("CMakeLists.txt")).unwrap();
+        File::create(&client).unwrap();
+
+        assert_eq!(discover_checkout_clients(&start).unwrap(), vec![client]);
     }
 }

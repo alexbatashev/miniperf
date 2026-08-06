@@ -354,6 +354,18 @@ pub unsafe extern "C" fn rc_rvv_state_error(session: *mut Session) {
     inner.counters.rvv_state_errors = inner.counters.rvv_state_errors.saturating_add(1);
 }
 
+/// Returns the number of guest instructions recorded so far.
+///
+/// # Safety
+/// `session` must be a live pointer from `rc_session_new`.
+#[no_mangle]
+pub unsafe extern "C" fn rc_instruction_count(session: *mut Session) -> u64 {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return 0;
+    };
+    session.inner.lock().unwrap().counters.instructions
+}
+
 /// Counts active elements in [vstart, vl) under an optional v0 mask.
 /// Returns -1 when the mask is too short for vl.
 ///

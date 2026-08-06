@@ -27,6 +27,21 @@ cmake --build build
   -c build/libdr_roofline.so output=out.counts memory-profile=on -- ./app
 ```
 
+When running mperf from a source checkout, the built client is discovered in
+any CMake build directory directly below `utils/dr-roofline`; it does not need
+to be copied beside the mperf executable. `--dynamorio` accepts either the
+launcher or the DynamoRIO build directory, so no `PATH` or `LD_LIBRARY_PATH`
+changes are normally needed:
+
+```sh
+mperf record --dynamorio <dynamorio-build> --scenario roofline \
+  -o results -- ./app
+```
+
+Packaged bundles are also self-discovering. `--dynamorio-client` is only
+needed when keeping a manually built client outside the source checkout or
+bundle.
+
 `-disable_traces -max_bb_instrs 32` are required: the per-instruction clean
 calls exceed DynamoRIO's block emit limits at default sizes (observed on
 riscv64). The mperf driver passes them automatically.

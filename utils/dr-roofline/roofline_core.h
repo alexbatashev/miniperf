@@ -81,6 +81,9 @@ rc_unclassified(rc_session_t *session, uint64_t block);
 void
 rc_rvv_state_error(rc_session_t *session);
 
+uint64_t
+rc_instruction_count(rc_session_t *session);
+
 int64_t
 rc_active_elements(uint64_t vstart, uint64_t vl, const uint8_t *mask,
                    uint64_t mask_len);

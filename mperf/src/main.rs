@@ -69,10 +69,10 @@ enum Commands {
         /// Extra argument passed to QEMU before the guest executable.
         #[arg(long, allow_hyphen_values = true)]
         qemu_arg: Vec<String>,
-        /// DynamoRIO drrun launcher; defaults to the bundle next to mperf or PATH.
+        /// DynamoRIO drrun launcher or build/bundle directory; defaults to the bundle next to mperf or PATH.
         #[arg(long)]
         dynamorio: Option<PathBuf>,
-        /// miniperf DynamoRIO client shared library; defaults to the artifact next to mperf.
+        /// miniperf DynamoRIO client shared library; normally discovered automatically.
         #[arg(long)]
         dynamorio_client: Option<PathBuf>,
         #[arg(short, long)]
