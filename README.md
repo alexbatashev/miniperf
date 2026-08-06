@@ -26,7 +26,10 @@ miniperf is implemented in Rust.
 
 1. Rust Toolchain
    1. Install Rust by following instructions on [rustup.rs](https://rustup.rs)
-2. Clang 19 or 20 for Roofline analysis
+2. A plugin-enabled QEMU user-mode binary for automatic binary Roofline
+   accounting (recommended, especially for RISC-V)
+3. Clang 19 or 20 only when building the optional compiler-instrumented
+   Roofline fallback
 
 #### Building
 
@@ -38,8 +41,7 @@ cargo build --release
 
 #### Building Clang plugins
 
-Roofline analysis requires compiler-based instrumentation. You need to build
-a Clang plugin to make it work:
+Compiler-based source-loop instrumentation is an optional Roofline fallback:
 
 ```sh
 mkdir target/clang_plugin && cd target/clang_plugin
@@ -107,23 +109,31 @@ Available Scenarios
 
 - `snapshot`: A basic performance snapshot similar to stat command but in
   sampling mode. Useful for general performance overview.
-- `roofline`: Two-pass Roofline analysis capture:
+- `roofline`: Automatic multi-pass Roofline analysis capture:
     1. First to collect PMU (Performance Monitoring Unit) counters
     2. Second to gather operation and memory statistics
 
-  Choose compiler-instrumented source-loop accounting or binary accounting with
-  plugin-enabled QEMU:
+  The profiler probes the executable and host, then chooses the most accurate
+  available method. The normal interface remains one command:
 
   ```sh
   cargo build -p mperf -p miniperf-qemu-roofline
-  mperf record -s roofline --roofline-backend qemu \
-    -o roofline-results -- ./kernel-riscv64
+  mperf record --scenario=roofline \
+    --output-directory roofline-results -- ./kernel-riscv64
   ```
 
-  Miniperf calibrates FP64 compute and memory-bandwidth ceilings before every
-  recording and stores the raw samples and derived ridge point with the CPU
-  metadata. See the [Roofline tutorial](docs/tutorials/roofline.md) for setup,
-  AVX-512 and RVV examples, backend selection, and result interpretation.
+  For a same-architecture executable, miniperf combines native timing with
+  QEMU operation accounting, a host-configured shared-LLC traffic model, and
+  calibrated host ceilings. Exact architectural bytes remain in the raw QEMU
+  counters for audit; the viewer labels the Roofline denominator as modeled
+  DRAM traffic rather than presenting it as a hardware memory-controller
+  measurement. For a
+  cross-architecture RISC-V executable, automatic mode refuses to present
+  emulator throughput as a hardware Roofline result and directs the user to a
+  compatible RISC-V host. It falls back to detected compiler instrumentation
+  when QEMU accounting is unavailable, otherwise it fails with a capability
+  diagnostic instead of silently producing a weak result. See the
+  [Roofline tutorial](docs/tutorials/roofline.md) for setup and interpretation.
 
 #### Call-stack collection overhead
 

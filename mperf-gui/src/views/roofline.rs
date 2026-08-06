@@ -70,29 +70,52 @@ impl MperfGui {
             .border_b_1()
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("FP64 Roofline"),
-            )
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                if data.has_compatible_memory_roof() {
+                    if data.uses_modeled_traffic() {
+                        "FP64 Roofline · modeled LLC traffic"
+                    } else {
+                        "FP64 Roofline"
+                    }
+                } else {
+                    "FP64 Architectural-Intensity Analysis"
+                },
+            ))
             .child(div().text_xs().text_color(rgb(MUTED_TEXT)).child(format!(
                 "{plotted_count} plotted · {loop_count} recorded loops"
             )))
+            .when_some(data.method.as_ref(), |element, method| {
+                element.child(metric_chip(
+                    "Method",
+                    format!("{} · {}", method.performance, method.quality),
+                ))
+            })
             .child(div().flex_1())
             .when_some(data.calibration.as_ref(), |element, calibration| {
-                element
-                    .child(metric_chip(
-                        "Compute",
-                        format!("{:.2} GFLOP/s", calibration.fp64_gflops),
+                let element = element.child(metric_chip(
+                    "Compute",
+                    format!("{:.2} GFLOP/s", calibration.fp64_gflops),
+                ));
+                if data.has_compatible_memory_roof() {
+                    element
+                        .child(metric_chip(
+                            if data.uses_modeled_traffic() {
+                                "Memory (model)"
+                            } else {
+                                "Memory"
+                            },
+                            format!("{:.2} GB/s", calibration.memory_gbytes_per_second),
+                        ))
+                        .child(metric_chip(
+                            "Ridge",
+                            format!("{:.3} FLOP/B", calibration.ridge_point_flops_per_byte),
+                        ))
+                } else {
+                    element.child(metric_chip(
+                        "Memory roof",
+                        "Unavailable for architectural bytes".to_string(),
                     ))
-                    .child(metric_chip(
-                        "Memory",
-                        format!("{:.2} GB/s", calibration.memory_gbytes_per_second),
-                    ))
-                    .child(metric_chip(
-                        "Ridge",
-                        format!("{:.3} FLOP/B", calibration.ridge_point_flops_per_byte),
-                    ))
+                }
             })
             .when(data.calibration.is_none(), |element| {
                 element.child(
@@ -192,7 +215,14 @@ impl MperfGui {
                     .bg(rgb(CHROME))
                     .text_xs()
                     .text_color(rgb(MUTED_TEXT))
-                    .child(legend_item(ACCENT, "Calibrated attainable roof"))
+                    .child(legend_item(
+                        ACCENT,
+                        if data.has_compatible_memory_roof() {
+                            "Calibrated attainable roof"
+                        } else {
+                            "Calibrated FP64 compute ceiling"
+                        },
+                    ))
                     .child(legend_item(POINT, "Recorded FP64 loop"))
                     .child(div().flex_1())
                     .child("Double-click a point to open source"),
@@ -273,7 +303,15 @@ impl MperfGui {
                                     .justify_center()
                                     .text_xs()
                                     .text_color(rgb(MUTED_TEXT))
-                                    .child("Arithmetic intensity (FLOP / byte)"),
+                                    .child(if data.has_compatible_memory_roof() {
+                                        if data.uses_modeled_traffic() {
+                                            "Modeled DRAM intensity (FLOP / byte)"
+                                        } else {
+                                            "Arithmetic intensity (FLOP / byte)"
+                                        }
+                                    } else {
+                                        "Architectural intensity (FLOP / architectural byte)"
+                                    }),
                             ),
                     ),
             )
@@ -362,8 +400,9 @@ impl MperfGui {
             .map(format_metric)
             .unwrap_or_else(|| "—".to_string());
         let efficiency = data
-            .calibration
-            .as_ref()
+            .has_compatible_memory_roof()
+            .then_some(data.calibration.as_ref())
+            .flatten()
             .and_then(|calibration| loop_data.efficiency(calibration))
             .map(|value| format!("{:.1}%", value * 100.0))
             .unwrap_or_else(|| "—".to_string());
@@ -439,6 +478,7 @@ impl MperfGui {
 struct RooflinePlot {
     points: Vec<RooflinePoint>,
     calibration: Option<mperf_data::RooflineCalibration>,
+    compatible_memory_roof: bool,
     x_min_log: f64,
     x_max_log: f64,
     y_min_log: f64,
@@ -472,15 +512,19 @@ impl RooflinePlot {
             .map(|point| point.intensity)
             .collect::<Vec<_>>();
         let mut y_values = points.iter().map(|point| point.gflops).collect::<Vec<_>>();
-        if let Some(calibration) = data.calibration.as_ref() {
+        if data.has_compatible_memory_roof() {
+            let calibration = data.calibration.as_ref().expect("checked above");
             x_values.push(calibration.ridge_point_flops_per_byte);
+            y_values.push(calibration.fp64_gflops);
+        } else if let Some(calibration) = data.calibration.as_ref() {
             y_values.push(calibration.fp64_gflops);
         }
 
         let (x_min_log, x_max_log) = log_extent(&x_values, -2.0, 2.0);
         let memory_at_left = data
-            .calibration
-            .as_ref()
+            .has_compatible_memory_roof()
+            .then_some(data.calibration.as_ref())
+            .flatten()
             .map(|calibration| calibration.memory_gbytes_per_second * 10.0_f64.powf(x_min_log))
             .filter(|value| value.is_finite() && *value > 0.0);
         if let Some(value) = memory_at_left {
@@ -491,6 +535,7 @@ impl RooflinePlot {
         Self {
             points,
             calibration: data.calibration.clone(),
+            compatible_memory_roof: data.has_compatible_memory_roof(),
             x_min_log,
             x_max_log,
             y_min_log,
@@ -548,9 +593,13 @@ fn paint_roofline(
             let fraction = step as f64 / 64.0;
             let log_x = plot.x_min_log + fraction * (plot.x_max_log - plot.x_min_log);
             let intensity = 10.0_f64.powf(log_x);
-            let gflops = calibration
-                .fp64_gflops
-                .min(calibration.memory_gbytes_per_second * intensity);
+            let gflops = if plot.compatible_memory_roof {
+                calibration
+                    .fp64_gflops
+                    .min(calibration.memory_gbytes_per_second * intensity)
+            } else {
+                calibration.fp64_gflops
+            };
             let position = plot_position(bounds, plot, intensity, gflops);
             if step == 0 {
                 path.move_to(position);
@@ -719,11 +768,35 @@ fn numeric_cell(value: String, width: f32) -> Div {
 }
 
 fn loop_location(loop_data: &RooflineLoop) -> String {
-    match (loop_data.file_name.trim().is_empty(), loop_data.line > 0) {
+    let location = match (loop_data.file_name.trim().is_empty(), loop_data.line > 0) {
         (false, true) => format!("{}:{}", loop_data.file_name, loop_data.line),
         (false, false) => loop_data.file_name.clone(),
         (true, true) => format!("Line {}", loop_data.line),
-        (true, false) => "No source location".to_string(),
+        (true, false) => loop_data
+            .module_offset
+            .as_ref()
+            .map(|offset| format!("Binary {offset}"))
+            .unwrap_or_else(|| "No source location".to_string()),
+    };
+    if let Some(quality) = &loop_data.timing_quality {
+        let quality = match quality.as_str() {
+            "advisor-grade" => "Advisor-grade",
+            "low-confidence" => "Low confidence",
+            "insufficient-samples" => "Insufficient samples",
+            "unclassified-instructions" => "Unclassified instructions",
+            other => other,
+        };
+        let samples = loop_data
+            .timing_samples
+            .map(|samples| format!(" · {samples} samples"))
+            .unwrap_or_default();
+        let error = loop_data
+            .timing_relative_error
+            .map(|error| format!(" · ±{:.1}%", error * 100.0))
+            .unwrap_or_default();
+        format!("{location} · {quality}{samples}{error}")
+    } else {
+        location
     }
 }
 
@@ -790,6 +863,11 @@ mod tests {
             vector_float_ai: None,
             vector_double_ops: None,
             vector_double_ai: None,
+            timing_samples: None,
+            timing_relative_error: None,
+            timing_quality: None,
+            module_offset: None,
+            trip_count: None,
         }
     }
 
@@ -798,6 +876,7 @@ mod tests {
         let data = RooflineData {
             loops: vec![loop_data("low", 1.0, 0.1), loop_data("high", 100.0, 10.0)],
             calibration: None,
+            method: None,
             error: None,
         };
         let plot = RooflinePlot::build(&data);
@@ -817,6 +896,7 @@ mod tests {
         let data = RooflineData {
             loops: vec![loop_data("fp64", 10.0, 2.0), integer_only],
             calibration: None,
+            method: None,
             error: None,
         };
 

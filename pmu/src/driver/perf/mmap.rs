@@ -1,7 +1,7 @@
 use std::{ffi::CStr, sync::atomic::AtomicU64};
 
 use perf_event_open_sys::bindings::{
-    perf_event_header, perf_event_mmap_page, PERF_RECORD_MMAP, PERF_RECORD_SAMPLE,
+    perf_event_header, perf_event_mmap_page, PERF_RECORD_LOST, PERF_RECORD_MMAP, PERF_RECORD_SAMPLE,
 };
 use smallvec::{SmallVec, ToSmallVec};
 
@@ -51,6 +51,9 @@ pub enum MmapRecord {
         offset: u64,
         filename: String,
     },
+    Lost {
+        count: u64,
+    },
     Unknown,
 }
 
@@ -84,6 +87,13 @@ struct ProcMmap {
     len: u64,
     pgoff: u64,
     // Filename
+}
+
+#[repr(C)]
+struct LostRecord {
+    header: perf_event_header,
+    id: u64,
+    lost: u64,
 }
 
 impl Records {
@@ -244,6 +254,9 @@ impl Iterator for Records {
                 }
                 None => MmapRecord::Unknown,
             },
+            PERF_RECORD_LOST => LostRecord::read_from_bytes(&record_buf)
+                .map(|record| MmapRecord::Lost { count: record.lost })
+                .unwrap_or(MmapRecord::Unknown),
             _ => MmapRecord::Unknown,
         };
 
@@ -437,9 +450,28 @@ impl ProcMmap {
     }
 }
 
+impl LostRecord {
+    fn read_from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+        Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Self) })
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::Records;
+    use super::{LostRecord, Records};
+
+    #[test]
+    fn reads_kernel_lost_record_count() {
+        let mut bytes = vec![0_u8; std::mem::size_of::<LostRecord>()];
+        bytes[8..16].copy_from_slice(&7_u64.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&13_u64.to_ne_bytes());
+        let record = LostRecord::read_from_bytes(&bytes).unwrap();
+        assert_eq!(record.id, 7);
+        assert_eq!(record.lost, 13);
+    }
 
     #[test]
     fn basic_test() {

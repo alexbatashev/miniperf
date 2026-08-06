@@ -8,7 +8,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use mperf_data::{CallFrame, Event, IPCMessage, ProcMapEntry, RooflineInfo, ScenarioInfo};
+use mperf_data::{
+    CallFrame, Event, IPCMessage, ProcMapEntry, RooflineInfo, RooflineMethodInfo, ScenarioInfo,
+};
+use object::{Object, ObjectSymbol};
 use pmu::{Counter, Process, Record};
 
 use crate::{
@@ -17,6 +20,7 @@ use crate::{
 };
 
 mod calibrate;
+mod loops;
 mod qemu;
 
 const SIZE_16MB: usize = 16 * 1024 * 1024;
@@ -24,6 +28,7 @@ const SIZE_16MB: usize = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BackendKind {
     #[default]
+    Auto,
     Compiler,
     Qemu,
 }
@@ -40,14 +45,34 @@ impl Options {
     pub fn validate_for(&self, scenario: Scenario) -> Result<()> {
         let has_qemu_options =
             self.qemu.is_some() || self.qemu_plugin.is_some() || !self.qemu_args.is_empty();
-        if scenario != Scenario::Roofline && self.backend != BackendKind::Compiler {
+        if scenario != Scenario::Roofline && self.backend != BackendKind::Auto {
             anyhow::bail!("--roofline-backend is only valid with the roofline scenario");
         }
-        if self.backend != BackendKind::Qemu && has_qemu_options {
-            anyhow::bail!("--qemu, --qemu-plugin, and --qemu-arg require --roofline-backend qemu");
+        if scenario != Scenario::Roofline && has_qemu_options {
+            anyhow::bail!(
+                "--qemu, --qemu-plugin, and --qemu-arg are only valid with the roofline scenario"
+            );
+        }
+        if self.backend == BackendKind::Compiler && has_qemu_options {
+            anyhow::bail!(
+                "--qemu, --qemu-plugin, and --qemu-arg cannot be used with --roofline-backend compiler"
+            );
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerformanceSource {
+    Native,
+    Qemu,
+}
+
+struct SelectedMethod {
+    backend: BackendKind,
+    performance: PerformanceSource,
+    executable: PathBuf,
+    info: RooflineMethodInfo,
 }
 
 type BackendFuture<'a> = Pin<Box<dyn Future<Output = Result<ScenarioInfo>> + 'a>>;
@@ -61,7 +86,9 @@ trait RooflineBackend {
     ) -> BackendFuture<'a>;
 }
 
-struct CompilerBackend;
+struct CompilerBackend {
+    method: RooflineMethodInfo,
+}
 
 pub async fn record(
     options: &Options,
@@ -73,15 +100,198 @@ pub async fn record(
         anyhow::bail!("record roofline requires a command");
     }
 
-    let backend: Box<dyn RooflineBackend> = match options.backend {
-        BackendKind::Compiler => Box::new(CompilerBackend),
-        BackendKind::Qemu => Box::new(qemu::QemuBackend::new(options)?),
+    let selected = select_method(options, command)?;
+    println!("Roofline method: {}", selected.info.reason);
+    for warning in &selected.info.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    let mut resolved_command = command.to_vec();
+    resolved_command[0] = selected.executable.to_string_lossy().into_owned();
+
+    let backend: Box<dyn RooflineBackend> = match selected.backend {
+        BackendKind::Auto => unreachable!("automatic Roofline method must resolve to a backend"),
+        BackendKind::Compiler => Box::new(CompilerBackend {
+            method: selected.info,
+        }),
+        BackendKind::Qemu => Box::new(qemu::QemuBackend::new(
+            options,
+            selected.performance == PerformanceSource::Native,
+            selected.info,
+        )?),
     };
-    backend.record(dispatcher, command, output_directory).await
+    backend
+        .record(dispatcher, &resolved_command, output_directory)
+        .await
+}
+
+fn select_method(options: &Options, command: &[String]) -> Result<SelectedMethod> {
+    let guest = inspect_guest(Path::new(&command[0]))?;
+    let native = guest.architecture == host_architecture();
+    let qemu_probe = qemu::probe(options, &guest.path);
+
+    match options.backend {
+        BackendKind::Qemu => {
+            qemu_probe?;
+            Ok(qemu_method(false, native, guest.path))
+        }
+        BackendKind::Compiler => {
+            if !guest.compiler_instrumented {
+                anyhow::bail!(
+                    "compiler Roofline was requested, but '{}' does not contain complete miniperf loop instrumentation",
+                    guest.path.display()
+                );
+            }
+            Ok(compiler_method(false, guest.path))
+        }
+        BackendKind::Auto => {
+            if qemu_probe.is_ok() && native {
+                return Ok(qemu_method(true, native, guest.path));
+            }
+            if qemu_probe.is_ok() {
+                anyhow::bail!(
+                    "accurate Roofline performance is unavailable for cross-architecture executable '{}': QEMU can provide operation accounting but not native RISC-V timing; run the same mperf command on a compatible RISC-V host (explicit --roofline-backend qemu remains available for emulation diagnostics)",
+                    guest.path.display()
+                );
+            }
+            if guest.compiler_instrumented {
+                return Ok(compiler_method(true, guest.path));
+            }
+
+            let qemu_error = qemu_probe.unwrap_err();
+            anyhow::bail!(
+                "no accurate Roofline method is available for '{}': QEMU accounting is unavailable ({qemu_error:#}) and the executable has no miniperf loop instrumentation; install a plugin-enabled QEMU and the miniperf QEMU plugin",
+                guest.path.display()
+            )
+        }
+    }
+}
+
+fn qemu_method(automatic: bool, native: bool, executable: PathBuf) -> SelectedMethod {
+    let performance = if native {
+        PerformanceSource::Native
+    } else {
+        PerformanceSource::Qemu
+    };
+    let (quality, reason, warnings) = if native {
+        (
+            "hybrid-binary-sampled-cache-model".to_string(),
+            "native timing with QEMU operation accounting, shared-LLC traffic modeling, and dynamic binary loop discovery"
+                .to_string(),
+            vec![
+                "per-loop throughput is published only when native timing has at most 10% estimated 95% sampling error; lower-confidence loops retain accounting but are not plotted".to_string(),
+                "native timing and QEMU accounting come from separate executions".to_string(),
+                "memory traffic is a deterministic host-LLC model, not a hardware memory-controller measurement".to_string(),
+                "the cache model uses write-back stores without read-for-ownership traffic".to_string(),
+            ],
+        )
+    } else {
+        (
+            "emulation-analysis".to_string(),
+            "QEMU timing, operation accounting, and shared-LLC traffic modeling because the guest cannot execute natively"
+                .to_string(),
+            vec![
+                "throughput is based on emulator time and must not be interpreted as guest-hardware performance".to_string(),
+                "the Roofline UI point is currently whole-process; per-loop candidates and accounting are saved in qemu-roofline.loops.json".to_string(),
+                "memory traffic is a deterministic host-LLC model, not a hardware memory-controller measurement".to_string(),
+            ],
+        )
+    };
+    SelectedMethod {
+        backend: BackendKind::Qemu,
+        performance,
+        executable,
+        info: RooflineMethodInfo {
+            selection: if automatic { "auto" } else { "explicit" }.to_string(),
+            accounting: "qemu".to_string(),
+            performance: if native { "native" } else { "qemu" }.to_string(),
+            traffic: "dram-model".to_string(),
+            quality,
+            reason,
+            warnings,
+        },
+    }
+}
+
+fn compiler_method(automatic: bool, executable: PathBuf) -> SelectedMethod {
+    SelectedMethod {
+        backend: BackendKind::Compiler,
+        performance: PerformanceSource::Native,
+        executable,
+        info: RooflineMethodInfo {
+            selection: if automatic { "auto" } else { "explicit" }.to_string(),
+            accounting: "compiler".to_string(),
+            performance: "native".to_string(),
+            traffic: "architectural".to_string(),
+            quality: "compiler-instrumented".to_string(),
+            reason: "native timing and detected miniperf compiler instrumentation".to_string(),
+            warnings: vec![
+                "the legacy compiler backend only reports loops transformed by the miniperf LLVM pass"
+                    .to_string(),
+            ],
+        },
+    }
+}
+
+struct GuestInfo {
+    path: PathBuf,
+    architecture: object::Architecture,
+    compiler_instrumented: bool,
+}
+
+fn inspect_guest(path: &Path) -> Result<GuestInfo> {
+    let path = if path.components().count() == 1 {
+        which::which(path)
+            .with_context(|| format!("could not find executable '{}'", path.display()))?
+    } else {
+        path.to_owned()
+    };
+    let data = std::fs::read(&path)
+        .with_context(|| format!("read Roofline executable '{}'", path.display()))?;
+    let object = object::File::parse(data.as_slice())
+        .with_context(|| format!("parse Roofline executable '{}'", path.display()))?;
+    let instrumentation_symbols = object
+        .symbols()
+        .chain(object.dynamic_symbols())
+        .filter_map(|symbol| symbol.name().ok())
+        .filter(|name| {
+            matches!(
+                *name,
+                "mperf_roofline_internal_notify_loop_begin"
+                    | "mperf_roofline_internal_notify_loop_end"
+                    | "mperf_roofline_internal_notify_loop_stats"
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let compiler_instrumented = instrumentation_symbols.len() == 3;
+    Ok(GuestInfo {
+        path,
+        architecture: object.architecture(),
+        compiler_instrumented,
+    })
+}
+
+fn host_architecture() -> object::Architecture {
+    #[cfg(target_arch = "x86_64")]
+    return object::Architecture::X86_64;
+    #[cfg(target_arch = "riscv64")]
+    return object::Architecture::Riscv64;
+    #[cfg(target_arch = "riscv32")]
+    return object::Architecture::Riscv32;
+    #[cfg(target_arch = "aarch64")]
+    return object::Architecture::Aarch64;
+    #[allow(unreachable_code)]
+    object::Architecture::Unknown
 }
 
 pub(crate) fn calibrate_host() -> Result<mperf_data::RooflineCalibration> {
     calibrate::measure()
+}
+
+pub(crate) fn uses_native_performance(options: &Options, command: &[String]) -> Result<bool> {
+    if command.is_empty() {
+        anyhow::bail!("record roofline requires a command");
+    }
+    Ok(select_method(options, command)?.performance == PerformanceSource::Native)
 }
 
 impl RooflineBackend for CompilerBackend {
@@ -133,12 +343,14 @@ impl RooflineBackend for CompilerBackend {
             process.cont();
             process.wait()?;
             task.await?;
+            ensure_process_success(&process, "compiler Roofline accounting run")?;
 
             Ok(ScenarioInfo::Roofline(RooflineInfo {
                 backend: "compiler".to_string(),
                 perf_pid: baseline.pid,
                 counters: baseline.counters,
                 inst_pid: process.pid(),
+                method: Some(Box::new(self.method.clone())),
             }))
         })
     }
@@ -178,6 +390,14 @@ async fn profile_command(
             } else {
                 0
             };
+            let mut callstack = smallvec::smallvec![CallFrame::IP(sample.ip)];
+            callstack.extend(
+                sample
+                    .callstack
+                    .into_iter()
+                    .filter(|address| *address != sample.ip)
+                    .map(CallFrame::IP),
+            );
             sample_dispatcher.publish_event_sync(Event {
                 unique_id: uuid::Uuid::now_v7().as_u128(),
                 correlation_id: sample.event_id,
@@ -191,7 +411,7 @@ async fn profile_command(
                 value: sample.value,
                 timestamp: sample.time,
                 name,
-                callstack: sample.callstack.into_iter().map(CallFrame::IP).collect(),
+                callstack,
                 user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
                     abi: regs.abi,
                     mask: regs.mask,
@@ -219,6 +439,7 @@ async fn profile_command(
     if let Some(task) = collector {
         task.await?;
     }
+    ensure_process_success(&process, "Roofline performance run")?;
 
     Ok(ProfiledRun {
         pid: process.pid(),
@@ -229,6 +450,14 @@ async fn profile_command(
             .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
             .collect(),
     })
+}
+
+fn ensure_process_success(process: &Process, description: &str) -> Result<()> {
+    match process.exit_code() {
+        Some(0) => Ok(()),
+        Some(code) => anyhow::bail!("{description} exited with status {code}"),
+        None => anyhow::bail!("{description} finished without an observable exit status"),
+    }
 }
 
 fn create_shmem_pipe(

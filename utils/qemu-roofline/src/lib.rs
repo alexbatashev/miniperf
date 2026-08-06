@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::{c_char, c_int, c_uint, c_void, CStr},
     fs::File,
     io::Write,
@@ -75,7 +76,10 @@ const REQUIRED_QEMU_PLUGIN_API: c_int = 6;
 unsafe extern "C" {
     fn qemu_plugin_register_vcpu_tb_trans_cb(id: PluginId, callback: TranslationCallback);
     fn qemu_plugin_tb_n_insns(tb: *const TranslationBlock) -> usize;
+    fn qemu_plugin_tb_vaddr(tb: *const TranslationBlock) -> u64;
     fn qemu_plugin_tb_get_insn(tb: *const TranslationBlock, index: usize) -> *mut Instruction;
+    fn qemu_plugin_insn_vaddr(instruction: *const Instruction) -> u64;
+    fn qemu_plugin_insn_size(instruction: *const Instruction) -> usize;
     fn qemu_plugin_insn_disas(instruction: *const Instruction) -> *mut c_char;
     fn qemu_plugin_register_vcpu_tb_exec_cb(
         tb: *mut TranslationBlock,
@@ -97,6 +101,9 @@ unsafe extern "C" {
         userdata: *mut c_void,
     );
     fn qemu_plugin_register_vcpu_init_cb(id: PluginId, callback: VcpuInitCallback);
+    fn qemu_plugin_start_code() -> u64;
+    fn qemu_plugin_end_code() -> u64;
+    fn qemu_plugin_entry_code() -> u64;
     fn qemu_plugin_get_registers() -> *mut GArray;
     fn qemu_plugin_read_register(handle: *mut QemuRegister, buffer: *mut GByteArray) -> bool;
     fn qemu_plugin_mem_size_shift(info: MemInfo) -> c_uint;
@@ -115,6 +122,7 @@ pub static qemu_plugin_version: c_int = REQUIRED_QEMU_PLUGIN_API;
 
 static OUTPUT: OnceLock<PathBuf> = OnceLock::new();
 static TARGET: OnceLock<Target> = OnceLock::new();
+static IMAGE: OnceLock<ImageInfo> = OnceLock::new();
 static BLOCK_COSTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static RVV_COSTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static RVV_REGISTERS: Mutex<Vec<RvvRegisters>> = Mutex::new(Vec::new());
@@ -126,15 +134,120 @@ static VECTOR_FLOAT_OPS: AtomicU64 = AtomicU64::new(0);
 static VECTOR_DOUBLE_OPS: AtomicU64 = AtomicU64::new(0);
 static BYTES_LOAD: AtomicU64 = AtomicU64::new(0);
 static BYTES_STORE: AtomicU64 = AtomicU64::new(0);
+static DRAM_BYTES_LOAD: AtomicU64 = AtomicU64::new(0);
+static DRAM_BYTES_STORE: AtomicU64 = AtomicU64::new(0);
 static RVV_STATE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static UNCLASSIFIED_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 static RVV_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 static UNCLASSIFIED_MNEMONICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CACHE_MODEL: OnceLock<Mutex<CacheModel>> = OnceLock::new();
+
+const DEFAULT_CACHE_LINE_SIZE: u64 = 64;
+const DEFAULT_LLC_SIZE: u64 = 8 * 1024 * 1024;
+const DEFAULT_LLC_ASSOCIATIVITY: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MemoryTraffic {
+    bytes_load: u64,
+    bytes_store: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CacheLine {
+    tag: u64,
+    last_used: u64,
+    dirty: bool,
+}
+
+struct CacheModel {
+    line_size: u64,
+    capacity: u64,
+    associativity: usize,
+    sets: Vec<Vec<CacheLine>>,
+    clock: u64,
+}
+
+impl CacheModel {
+    fn new(line_size: u64, capacity: u64, associativity: usize) -> Option<Self> {
+        if !line_size.is_power_of_two() || line_size == 0 || associativity == 0 {
+            return None;
+        }
+        let lines = capacity / line_size;
+        let set_count = lines / associativity as u64;
+        if set_count == 0 {
+            return None;
+        }
+        Some(Self {
+            line_size,
+            capacity: set_count * associativity as u64 * line_size,
+            associativity,
+            sets: vec![Vec::with_capacity(associativity); set_count as usize],
+            clock: 0,
+        })
+    }
+
+    fn access(&mut self, address: u64, size: u64, store: bool) -> MemoryTraffic {
+        let mut traffic = MemoryTraffic::default();
+        if size == 0 {
+            return traffic;
+        }
+        let first_line = address / self.line_size;
+        let last_address = address.saturating_add(size - 1);
+        let last_line = last_address / self.line_size;
+
+        for line_address in first_line..=last_line {
+            self.clock = self.clock.wrapping_add(1);
+            let set_index = line_address as usize % self.sets.len();
+            let tag = line_address / self.sets.len() as u64;
+            let set = &mut self.sets[set_index];
+            if let Some(line) = set.iter_mut().find(|line| line.tag == tag) {
+                line.last_used = self.clock;
+                if store && !line.dirty {
+                    line.dirty = true;
+                    traffic.bytes_store = traffic.bytes_store.saturating_add(self.line_size);
+                }
+                continue;
+            }
+
+            if set.len() == self.associativity {
+                let victim = set
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, line)| line.last_used)
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                set.swap_remove(victim);
+            }
+            set.push(CacheLine {
+                tag,
+                last_used: self.clock,
+                dirty: store,
+            });
+            if store {
+                // Charge a dirty line when it is first created. This models
+                // the eventual writeback without assigning a later eviction
+                // to an unrelated loop. Read-for-ownership is intentionally
+                // excluded to match the conventional Roofline byte model.
+                traffic.bytes_store = traffic.bytes_store.saturating_add(self.line_size);
+            } else {
+                traffic.bytes_load = traffic.bytes_load.saturating_add(self.line_size);
+            }
+        }
+        traffic
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Target {
     Riscv,
     X86,
+}
+
+#[derive(Clone, Copy)]
+struct ImageInfo {
+    start: u64,
+    end: u64,
+    entry: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -210,14 +323,18 @@ include!(concat!(env!("OUT_DIR"), "/riscv_operations.rs"));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RvvCost {
+    block: u64,
     kind: RvvKind,
     factor: u64,
     masked: bool,
     sew_scale: u64,
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct BlockCost {
+    vaddr: u64,
+    end_vaddr: u64,
+    flow: FlowKind,
     scalar_int: u64,
     scalar_float: u64,
     scalar_double: u64,
@@ -225,6 +342,45 @@ struct BlockCost {
     vector_float: u64,
     vector_double: u64,
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FlowKind {
+    #[default]
+    Normal,
+    Call,
+    Return,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DynamicBlockCounts {
+    end_vaddr: u64,
+    executions: u64,
+    scalar_int: u64,
+    scalar_float: u64,
+    scalar_double: u64,
+    vector_int: u64,
+    vector_float: u64,
+    vector_double: u64,
+    bytes_load: u64,
+    bytes_store: u64,
+    unclassified: u64,
+}
+
+struct DynamicCfg {
+    last_blocks: Vec<Option<(u64, FlowKind)>>,
+    call_stacks: Vec<Vec<u64>>,
+    entries: BTreeSet<u64>,
+    edges: BTreeMap<(u64, u64), u64>,
+    blocks: BTreeMap<u64, DynamicBlockCounts>,
+}
+
+static DYNAMIC_CFG: Mutex<DynamicCfg> = Mutex::new(DynamicCfg {
+    last_blocks: Vec::new(),
+    call_stacks: Vec::new(),
+    entries: BTreeSet::new(),
+    edges: BTreeMap::new(),
+    blocks: BTreeMap::new(),
+});
 
 impl BlockCost {
     fn add(&mut self, other: Self) {
@@ -237,7 +393,7 @@ impl BlockCost {
     }
 }
 
-extern "C" fn execute_block(_vcpu: c_uint, userdata: *mut c_void) {
+extern "C" fn execute_block(vcpu: c_uint, userdata: *mut c_void) {
     let cost = unsafe { &*(userdata.cast::<BlockCost>()) };
     SCALAR_INT_OPS.fetch_add(cost.scalar_int, Ordering::Relaxed);
     SCALAR_FLOAT_OPS.fetch_add(cost.scalar_float, Ordering::Relaxed);
@@ -245,24 +401,95 @@ extern "C" fn execute_block(_vcpu: c_uint, userdata: *mut c_void) {
     VECTOR_INT_OPS.fetch_add(cost.vector_int, Ordering::Relaxed);
     VECTOR_FLOAT_OPS.fetch_add(cost.vector_float, Ordering::Relaxed);
     VECTOR_DOUBLE_OPS.fetch_add(cost.vector_double, Ordering::Relaxed);
+
+    let mut cfg = DYNAMIC_CFG.lock().unwrap();
+    if cfg.last_blocks.len() <= vcpu as usize {
+        cfg.last_blocks.resize(vcpu as usize + 1, None);
+    }
+    if cfg.call_stacks.len() <= vcpu as usize {
+        cfg.call_stacks.resize_with(vcpu as usize + 1, Vec::new);
+    }
+    if let Some((previous, flow)) = cfg.last_blocks[vcpu as usize] {
+        match flow {
+            FlowKind::Normal => {
+                *cfg.edges.entry((previous, cost.vaddr)).or_default() += 1;
+            }
+            FlowKind::Call => {
+                cfg.entries.insert(cost.vaddr);
+                cfg.call_stacks[vcpu as usize].push(previous);
+            }
+            FlowKind::Return => {
+                if let Some(caller) = cfg.call_stacks[vcpu as usize].pop() {
+                    // Summarize the call as an intraprocedural edge from the
+                    // call block to its observed continuation. This preserves
+                    // caller loops without adding call/return edges that can
+                    // create false interprocedural cycles.
+                    *cfg.edges.entry((caller, cost.vaddr)).or_default() += 1;
+                } else {
+                    cfg.entries.insert(cost.vaddr);
+                }
+            }
+        }
+    } else {
+        cfg.entries.insert(cost.vaddr);
+    }
+    cfg.last_blocks[vcpu as usize] = Some((cost.vaddr, cost.flow));
+    let block = cfg.blocks.entry(cost.vaddr).or_default();
+    if block.end_vaddr == 0 {
+        block.end_vaddr = cost.end_vaddr;
+    } else if block.end_vaddr != cost.end_vaddr {
+        // Self-modifying code or context-dependent translation at the same
+        // virtual address cannot be represented as one stable source range.
+        block.end_vaddr = block.end_vaddr.max(cost.end_vaddr);
+    }
+    block.executions = block.executions.saturating_add(1);
+    block.scalar_int = block.scalar_int.saturating_add(cost.scalar_int);
+    block.scalar_float = block.scalar_float.saturating_add(cost.scalar_float);
+    block.scalar_double = block.scalar_double.saturating_add(cost.scalar_double);
+    block.vector_int = block.vector_int.saturating_add(cost.vector_int);
+    block.vector_float = block.vector_float.saturating_add(cost.vector_float);
+    block.vector_double = block.vector_double.saturating_add(cost.vector_double);
 }
 
-extern "C" fn execute_unclassified(_vcpu: c_uint, _userdata: *mut c_void) {
+extern "C" fn execute_unclassified(_vcpu: c_uint, userdata: *mut c_void) {
     UNCLASSIFIED_INSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+    let block_address = userdata as usize as u64;
+    let mut cfg = DYNAMIC_CFG.lock().unwrap();
+    let block = cfg.blocks.entry(block_address).or_default();
+    block.unclassified = block.unclassified.saturating_add(1);
 }
 
-extern "C" fn memory_access(_vcpu: c_uint, info: MemInfo, _address: u64, _userdata: *mut c_void) {
+extern "C" fn memory_access(_vcpu: c_uint, info: MemInfo, address: u64, userdata: *mut c_void) {
     let shift = unsafe { qemu_plugin_mem_size_shift(info) };
     let bytes = 1_u64.checked_shl(shift).unwrap_or_default();
-    let counter = if unsafe { qemu_plugin_mem_is_store(info) } {
-        &BYTES_STORE
-    } else {
-        &BYTES_LOAD
-    };
+    let store = unsafe { qemu_plugin_mem_is_store(info) };
+    let counter = if store { &BYTES_STORE } else { &BYTES_LOAD };
     counter.fetch_add(bytes, Ordering::Relaxed);
+    let traffic = CACHE_MODEL
+        .get()
+        .expect("cache model initialized before translation")
+        .lock()
+        .unwrap()
+        .access(address, bytes, store);
+    DRAM_BYTES_LOAD.fetch_add(traffic.bytes_load, Ordering::Relaxed);
+    DRAM_BYTES_STORE.fetch_add(traffic.bytes_store, Ordering::Relaxed);
+    let block_address = userdata as usize as u64;
+    let mut cfg = DYNAMIC_CFG.lock().unwrap();
+    let block = cfg.blocks.entry(block_address).or_default();
+    block.bytes_load = block.bytes_load.saturating_add(traffic.bytes_load);
+    block.bytes_store = block.bytes_store.saturating_add(traffic.bytes_store);
 }
 
 extern "C" fn initialize_vcpu(_id: PluginId, vcpu: c_uint) {
+    IMAGE.get_or_init(|| ImageInfo {
+        start: unsafe { qemu_plugin_start_code() },
+        end: unsafe { qemu_plugin_end_code() },
+        entry: unsafe { qemu_plugin_entry_code() },
+    });
+    if TARGET.get() != Some(&Target::Riscv) {
+        return;
+    }
+
     let array = unsafe { qemu_plugin_get_registers() };
     if array.is_null() {
         return;
@@ -362,12 +589,21 @@ extern "C" fn execute_rvv(vcpu: c_uint, userdata: *mut c_void) {
     match cost.kind {
         RvvKind::Integer => {
             VECTOR_INT_OPS.fetch_add(operations, Ordering::Relaxed);
+            let mut cfg = DYNAMIC_CFG.lock().unwrap();
+            let block = cfg.blocks.entry(cost.block).or_default();
+            block.vector_int = block.vector_int.saturating_add(operations);
         }
         RvvKind::Float if sew == 64 => {
             VECTOR_DOUBLE_OPS.fetch_add(operations, Ordering::Relaxed);
+            let mut cfg = DYNAMIC_CFG.lock().unwrap();
+            let block = cfg.blocks.entry(cost.block).or_default();
+            block.vector_double = block.vector_double.saturating_add(operations);
         }
         RvvKind::Float => {
             VECTOR_FLOAT_OPS.fetch_add(operations, Ordering::Relaxed);
+            let mut cfg = DYNAMIC_CFG.lock().unwrap();
+            let block = cfg.blocks.entry(cost.block).or_default();
+            block.vector_float = block.vector_float.saturating_add(operations);
         }
     }
 }
@@ -438,19 +674,31 @@ fn rvv_sew(vtype: u64, xlen: u32) -> Option<u64> {
 }
 
 extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
-    let mut cost = BlockCost::default();
+    let block_address = unsafe { qemu_plugin_tb_vaddr(tb) };
+    let mut cost = BlockCost {
+        vaddr: block_address,
+        ..BlockCost::default()
+    };
     let instruction_count = unsafe { qemu_plugin_tb_n_insns(tb) };
 
     for index in 0..instruction_count {
         let instruction = unsafe { qemu_plugin_tb_get_insn(tb, index) };
+        if index + 1 == instruction_count {
+            cost.end_vaddr = unsafe { qemu_plugin_insn_vaddr(instruction) }
+                .saturating_add(unsafe { qemu_plugin_insn_size(instruction) } as u64);
+        }
         let disassembly = unsafe { qemu_plugin_insn_disas(instruction) };
         if !disassembly.is_null() {
             let text = unsafe { CStr::from_ptr(disassembly) }.to_string_lossy();
+            if index + 1 == instruction_count {
+                cost.flow = classify_flow(TARGET.get().copied(), &text);
+            }
             if TARGET.get() == Some(&Target::Riscv) {
                 match classify_riscv(&text) {
                     RiscvClassification::Counted(riscv_cost) => match riscv_cost.kind {
                         RiscvKind::VectorInteger | RiscvKind::VectorFloat => {
                             let rvv_cost = Box::into_raw(Box::new(RvvCost {
+                                block: block_address,
                                 kind: if riscv_cost.kind == RiscvKind::VectorFloat {
                                     RvvKind::Float
                                 } else {
@@ -488,7 +736,7 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
                                 instruction,
                                 execute_unclassified,
                                 CALLBACK_NO_REGS,
-                                ptr::null_mut(),
+                                block_address as usize as *mut c_void,
                             )
                         };
                     }
@@ -504,7 +752,7 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
                 memory_access,
                 CALLBACK_NO_REGS,
                 MEMORY_READ_WRITE,
-                ptr::null_mut(),
+                block_address as usize as *mut c_void,
             )
         };
     }
@@ -514,6 +762,40 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
     unsafe {
         qemu_plugin_register_vcpu_tb_exec_cb(tb, execute_block, CALLBACK_NO_REGS, cost.cast())
     };
+}
+
+fn classify_flow(target: Option<Target>, disassembly: &str) -> FlowKind {
+    let operation = mnemonic(disassembly);
+    let operands = disassembly
+        .to_ascii_lowercase()
+        .split_once(&operation)
+        .map(|(_, operands)| operands.trim().replace(' ', ""))
+        .unwrap_or_default();
+
+    match target {
+        Some(Target::Riscv) => {
+            if matches!(operation.as_str(), "ret" | "c.ret")
+                || matches!(operation.as_str(), "jr" | "c.jr")
+                    && matches!(operands.as_str(), "ra" | "x1")
+                || operation == "jalr"
+                    && (operands.starts_with("zero,ra") || operands.starts_with("x0,x1"))
+            {
+                FlowKind::Return
+            } else if operation == "call"
+                || matches!(operation.as_str(), "jal" | "jalr")
+                    && (operands.starts_with("ra,") || operands.starts_with("x1,"))
+                || operation == "c.jal"
+                || operation == "c.jalr"
+            {
+                FlowKind::Call
+            } else {
+                FlowKind::Normal
+            }
+        }
+        Some(Target::X86) if operation.starts_with("ret") => FlowKind::Return,
+        Some(Target::X86) if operation.starts_with("call") => FlowKind::Call,
+        _ => FlowKind::Normal,
+    }
 }
 
 fn mnemonic(disassembly: &str) -> String {
@@ -668,11 +950,56 @@ extern "C" fn plugin_exit(_id: PluginId, _userdata: *mut c_void) {
                 ("vector_double_ops", &VECTOR_DOUBLE_OPS),
                 ("bytes_load", &BYTES_LOAD),
                 ("bytes_store", &BYTES_STORE),
+                ("dram_bytes_load", &DRAM_BYTES_LOAD),
+                ("dram_bytes_store", &DRAM_BYTES_STORE),
                 ("rvv_state_errors", &RVV_STATE_ERRORS),
                 ("unclassified_instructions", &UNCLASSIFIED_INSTRUCTIONS),
             ];
             for (name, counter) in counters {
                 let _ = writeln!(file, "{name}={}", counter.load(Ordering::Relaxed));
+            }
+        }
+        let cfg_path = path.with_extension("cfg");
+        if let Ok(mut file) = File::create(cfg_path) {
+            let cfg = DYNAMIC_CFG.lock().unwrap();
+            let _ = writeln!(file, "miniperf-qemu-cfg=3");
+            if let Some(cache) = CACHE_MODEL.get() {
+                let cache = cache.lock().unwrap();
+                let _ = writeln!(
+                    file,
+                    "cache {} {} {} write-back-no-rfo",
+                    cache.line_size, cache.capacity, cache.associativity
+                );
+            }
+            if let Some(image) = IMAGE.get() {
+                let _ = writeln!(
+                    file,
+                    "image {:#x} {:#x} {:#x}",
+                    image.start, image.end, image.entry
+                );
+            }
+            for entry in &cfg.entries {
+                let _ = writeln!(file, "entry {entry:#x}");
+            }
+            for (&(from, to), &executions) in &cfg.edges {
+                let _ = writeln!(file, "edge {from:#x} {to:#x} {executions}");
+            }
+            for (&address, counts) in &cfg.blocks {
+                let _ = writeln!(
+                    file,
+                    "block {address:#x} {:#x} {} {} {} {} {} {} {} {} {} {}",
+                    counts.end_vaddr,
+                    counts.executions,
+                    counts.scalar_int,
+                    counts.scalar_float,
+                    counts.scalar_double,
+                    counts.vector_int,
+                    counts.vector_float,
+                    counts.vector_double,
+                    counts.bytes_load,
+                    counts.bytes_store,
+                    counts.unclassified,
+                );
             }
         }
     }
@@ -717,16 +1044,22 @@ pub unsafe extern "C" fn qemu_plugin_install(
     if TARGET.set(target).is_err() {
         return -1;
     }
-
     let args = if argc <= 0 || argv.is_null() {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
-    let output = args.iter().find_map(|arg| {
-        let arg = unsafe { CStr::from_ptr(*arg) }.to_string_lossy();
-        arg.strip_prefix("output=").map(PathBuf::from)
-    });
+    let arguments = args
+        .iter()
+        .map(|arg| {
+            unsafe { CStr::from_ptr(*arg) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    let output = arguments
+        .iter()
+        .find_map(|arg| arg.strip_prefix("output=").map(PathBuf::from));
     let Some(output) = output else {
         unsafe { qemu_plugin_outs(c"miniperf roofline: missing output=<path>\n".as_ptr()) };
         return -1;
@@ -734,11 +1067,37 @@ pub unsafe extern "C" fn qemu_plugin_install(
     if OUTPUT.set(output).is_err() {
         return -1;
     }
+    let parse_u64 = |name: &str, default: u64| {
+        arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix(&format!("{name}=")))
+            .map(str::parse::<u64>)
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    let cache_line = parse_u64("cache-line", DEFAULT_CACHE_LINE_SIZE);
+    let cache_size = parse_u64("llc-size", DEFAULT_LLC_SIZE);
+    let cache_associativity = parse_u64("llc-assoc", DEFAULT_LLC_ASSOCIATIVITY as u64)
+        .ok()
+        .and_then(|value| usize::try_from(value).ok());
+    let cache = match (cache_line.ok(), cache_size.ok(), cache_associativity) {
+        (Some(line), Some(size), Some(associativity)) => CacheModel::new(line, size, associativity),
+        _ => None,
+    };
+    let Some(cache) = cache else {
+        unsafe {
+            qemu_plugin_outs(
+                c"miniperf roofline: invalid cache-line, llc-size, or llc-assoc option\n".as_ptr(),
+            )
+        };
+        return -1;
+    };
+    if CACHE_MODEL.set(Mutex::new(cache)).is_err() {
+        return -1;
+    }
 
     unsafe {
-        if target == Target::Riscv {
-            qemu_plugin_register_vcpu_init_cb(id, initialize_vcpu);
-        }
+        qemu_plugin_register_vcpu_init_cb(id, initialize_vcpu);
         qemu_plugin_register_vcpu_tb_trans_cb(id, translate_block);
         qemu_plugin_register_atexit_cb(id, plugin_exit, ptr::null_mut());
     }
@@ -748,6 +1107,70 @@ pub unsafe extern "C" fn qemu_plugin_install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_model_counts_line_fills_dirty_transitions_and_eviction_reloads() {
+        let mut cache = CacheModel::new(64, 128, 1).unwrap();
+        assert_eq!(
+            cache.access(0, 8, false),
+            MemoryTraffic {
+                bytes_load: 64,
+                bytes_store: 0
+            }
+        );
+        assert_eq!(cache.access(8, 8, false), MemoryTraffic::default());
+        assert_eq!(
+            cache.access(8, 8, true),
+            MemoryTraffic {
+                bytes_load: 0,
+                bytes_store: 64
+            }
+        );
+        assert_eq!(cache.access(16, 8, true), MemoryTraffic::default());
+        assert_eq!(cache.access(128, 8, false).bytes_load, 64);
+        assert_eq!(cache.access(0, 8, false).bytes_load, 64);
+    }
+
+    #[test]
+    fn cache_model_splits_cross_line_accesses() {
+        let mut cache = CacheModel::new(64, 256, 1).unwrap();
+        assert_eq!(cache.access(60, 8, false).bytes_load, 128);
+        assert!(CacheModel::new(48, 256, 1).is_none());
+        assert!(CacheModel::new(64, 64, 2).is_none());
+    }
+
+    #[test]
+    fn classifies_call_and_return_edges() {
+        for instruction in [
+            "jal ra,0x20",
+            "jalr x1,a0,0",
+            "call 0x40",
+            "c.jal 0x10",
+            "c.jalr ra",
+        ] {
+            assert_eq!(
+                classify_flow(Some(Target::Riscv), instruction),
+                FlowKind::Call,
+                "{instruction}"
+            );
+        }
+        for instruction in ["ret", "jr ra", "jalr zero,ra,0", "c.jr x1"] {
+            assert_eq!(
+                classify_flow(Some(Target::Riscv), instruction),
+                FlowKind::Return,
+                "{instruction}"
+            );
+        }
+        assert_eq!(
+            classify_flow(Some(Target::Riscv), "jal zero,0x20"),
+            FlowKind::Normal
+        );
+        assert_eq!(
+            classify_flow(Some(Target::X86), "callq 0x20"),
+            FlowKind::Call
+        );
+        assert_eq!(classify_flow(Some(Target::X86), "retq"), FlowKind::Return);
+    }
 
     #[test]
     fn classifies_tmdl_scalar_and_compressed_operations() {

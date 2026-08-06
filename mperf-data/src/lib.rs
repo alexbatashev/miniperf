@@ -37,10 +37,43 @@ pub struct RooflineInfo {
     pub perf_pid: i32,
     pub counters: Vec<(EventType, String)>,
     pub inst_pid: i32,
+    /// How the profiler selected and composed this Roofline measurement.
+    /// Absent in recordings produced before automatic method selection.
+    #[serde(default)]
+    pub method: Option<Box<RooflineMethodInfo>>,
 }
 
 fn default_roofline_backend() -> String {
     "compiler".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RooflineMethodInfo {
+    /// `auto` for capability-based selection, otherwise `explicit`.
+    pub selection: String,
+    /// Source of operation and byte accounting, such as `qemu` or `compiler`.
+    pub accounting: String,
+    /// Source of elapsed time: `native` or `qemu`.
+    pub performance: String,
+    /// Meaning of the byte denominator, such as `architectural`, `dram`, or
+    /// `dram-model` for deterministic last-level-cache modeling.
+    ///
+    /// A memory-bandwidth roof is compatible only with traffic measured at the
+    /// same hierarchy level. Recordings predating this field deserialize as
+    /// `unknown` and must not silently use a DRAM roof.
+    #[serde(default = "default_roofline_traffic")]
+    pub traffic: String,
+    /// Short machine-readable quality classification.
+    pub quality: String,
+    /// Human-readable explanation of why this method was selected.
+    pub reason: String,
+    /// Limitations which must remain visible to result consumers.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+fn default_roofline_traffic() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +272,16 @@ mod tests {
             serde_json::to_string(&CpuClockSource::SampledOccupancy).unwrap(),
             "\"sampled_occupancy\""
         );
+    }
+
+    #[test]
+    fn legacy_roofline_method_does_not_assume_a_traffic_level() {
+        let method: RooflineMethodInfo = serde_json::from_str(
+            r#"{"selection":"auto","accounting":"qemu","performance":"native","quality":"test","reason":"test","warnings":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(method.traffic, "unknown");
     }
 
     #[test]

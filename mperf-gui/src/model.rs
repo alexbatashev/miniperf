@@ -220,6 +220,10 @@ impl GuiTab {
                     .roofline_calibration
                     .as_deref()
                     .cloned(),
+                match &record_info.scenario_info {
+                    ScenarioInfo::Roofline(info) => info.method.as_deref().cloned(),
+                    _ => None,
+                },
             ))),
             TabSpec::Flamegraph => {
                 Self::Flamegraph(Box::new(FlamegraphData::load(result_directory)))
@@ -550,6 +554,7 @@ mod tests {
             perf_pid: 1,
             counters: Vec::new(),
             inst_pid: 2,
+            method: None,
         });
         assert!(TmaSummaryData::for_scenario(&snapshot, &connection).is_none());
         assert!(TmaSummaryData::for_scenario(&roofline, &connection).is_none());

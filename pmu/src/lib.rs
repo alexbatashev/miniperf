@@ -176,6 +176,12 @@ pub enum Error {
     /// A sampling reader thread panicked.
     #[error("sampling worker thread panicked")]
     WorkerPanicked,
+    /// The kernel dropped sampling records because a perf ring overflowed.
+    #[error("perf sampling lost {count} records; reduce sampling frequency or increase the perf ring allowance")]
+    SamplesLost {
+        /// Number of records reported lost by the kernel.
+        count: u64,
+    },
     /// A grouped counter read failed.
     #[error("failed to read perf counter group: {source}")]
     PerfRead {

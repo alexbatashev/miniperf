@@ -4,14 +4,15 @@ use std::{
     path::Path,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kdam::BarExt;
 use memmap2::{Advice, Mmap};
 use mperf_data::{
     CallFrame, CpuClockSource, Event, EventType, IString, ProcMapEntry, RecordInfo, Scenario,
     ScenarioInfo,
 };
-use object::{Object, ObjectSymbol, SymbolKind};
+use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
+use serde::Deserialize;
 use smallvec::SmallVec;
 use tokio::{
     fs::{self, File},
@@ -57,6 +58,7 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
         }
         Scenario::Roofline => {
             process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
+            process_binary_roofline_loops(&connection, &info, res_dir)?;
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
             create_roofline_view(&connection).await?;
@@ -252,6 +254,54 @@ struct RooflineData {
     loops: HashMap<u128, RooflineLoopInfo>,
     runs: Vec<(RooflineLoopInfo, u64)>,
     ops: Vec<RooflineLoopInfo>,
+}
+
+#[derive(Deserialize)]
+struct BinaryLoopFile {
+    format_version: u32,
+    executable: String,
+    loops: Vec<BinaryLoop>,
+}
+
+#[derive(Deserialize)]
+struct BinaryLoop {
+    module_offset: String,
+    function: Option<String>,
+    file: Option<String>,
+    line: Option<u32>,
+    trip_count: u64,
+    block_ranges: Vec<BinaryBlockRange>,
+    inclusive: BinaryLoopCounts,
+}
+
+#[derive(Deserialize)]
+struct BinaryBlockRange {
+    module_start: String,
+    module_end: String,
+}
+
+#[derive(Default, Deserialize)]
+struct BinaryLoopCounts {
+    scalar_int_ops: u64,
+    scalar_float_ops: u64,
+    scalar_double_ops: u64,
+    vector_int_ops: u64,
+    vector_float_ops: u64,
+    vector_double_ops: u64,
+    bytes_load: u64,
+    bytes_store: u64,
+    unclassified_instructions: u64,
+}
+
+struct ModuleMapping {
+    runtime_start: u64,
+    runtime_end: u64,
+    svma_start: u64,
+}
+
+struct BinaryTimingSample {
+    timestamp: u64,
+    module_address: u64,
 }
 
 impl RooflineData {
@@ -760,6 +810,25 @@ fn create_roofline_tables(connection: &sqlite::Connection) -> Result<()> {
             unique_id BINARY(128), process_id INTEGER NOT NULL, thread_id INTEGER NOT NULL,
             file_name BINARY(128) NOT NULL, function_name BINARY(128) NOT NULL,
             line INTEGER NOT NULL, loop_start_ts INTEGER NOT NULL, loop_end_ts INTEGER NOT NULL
+        );
+        CREATE TABLE roofline_binary_loops(
+            module_offset TEXT PRIMARY KEY,
+            function_name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            trip_count INTEGER NOT NULL,
+            duration_ns INTEGER,
+            timing_samples INTEGER NOT NULL,
+            timing_relative_error REAL,
+            timing_quality TEXT NOT NULL,
+            bytes_load INTEGER NOT NULL,
+            bytes_store INTEGER NOT NULL,
+            scalar_int_ops INTEGER NOT NULL,
+            scalar_float_ops INTEGER NOT NULL,
+            scalar_double_ops INTEGER NOT NULL,
+            vector_int_ops INTEGER NOT NULL,
+            vector_float_ops INTEGER NOT NULL,
+            vector_double_ops INTEGER NOT NULL
         );",
     )?;
     Ok(())
@@ -818,6 +887,339 @@ fn persist_roofline_data(connection: &sqlite::Connection, data: RooflineData) ->
         ops_stmt.next()?;
     }
     Ok(())
+}
+
+fn process_binary_roofline_loops(
+    connection: &sqlite::Connection,
+    record_info: &RecordInfo,
+    res_dir: &Path,
+) -> Result<()> {
+    use sqlite::State;
+
+    let ScenarioInfo::Roofline(roofline_info) = &record_info.scenario_info else {
+        return Ok(());
+    };
+    let Some(method) = roofline_info.method.as_deref() else {
+        return Ok(());
+    };
+    if method.accounting != "qemu" || method.performance != "native" {
+        return Ok(());
+    }
+    let artifact_path = res_dir.join("qemu-roofline.loops.json");
+    if !artifact_path.is_file() {
+        anyhow::bail!(
+            "native QEMU Roofline recording is missing '{}'",
+            artifact_path.display()
+        );
+    }
+    let artifact: BinaryLoopFile = serde_json::from_reader(
+        std::fs::File::open(&artifact_path)
+            .with_context(|| format!("open binary loop artifact '{}'", artifact_path.display()))?,
+    )
+    .with_context(|| format!("parse binary loop artifact '{}'", artifact_path.display()))?;
+    if artifact.format_version != 3 {
+        anyhow::bail!(
+            "unsupported binary loop artifact version {}",
+            artifact.format_version
+        );
+    }
+
+    let executable = Path::new(&artifact.executable);
+    let object_data = std::fs::read(executable)
+        .with_context(|| format!("read Roofline executable '{}'", executable.display()))?;
+    let object = object::File::parse(object_data.as_slice())
+        .with_context(|| format!("parse Roofline executable '{}'", executable.display()))?;
+    let proc_maps: Vec<ProcMapEntry> =
+        serde_json::from_reader(std::fs::File::open(res_dir.join("proc_map.json"))?)?;
+    let mappings = executable_mappings(
+        &proc_maps,
+        roofline_info.perf_pid as u32,
+        executable,
+        &object,
+    );
+    if mappings.is_empty() {
+        anyhow::bail!(
+            "native Roofline samples have no executable mapping for '{}'",
+            executable.display()
+        );
+    }
+
+    let mut sample_statement = connection.prepare(
+        "SELECT timestamp, ip FROM pmu_counters
+         WHERE process_id = ? AND os_cpu_clock > 0 AND ip != 0
+         ORDER BY timestamp;",
+    )?;
+    sample_statement.bind((1, roofline_info.perf_pid as i64))?;
+    let mut samples = Vec::new();
+    while sample_statement.next()? == State::Row {
+        let timestamp = sample_statement.read::<i64, _>(0)? as u64;
+        let ip = sample_statement.read::<i64, _>(1)? as u64;
+        if let Some(module_address) = normalize_sample_ip(ip, &mappings) {
+            samples.push(BinaryTimingSample {
+                timestamp,
+                module_address,
+            });
+        }
+    }
+
+    let sample_period_ns = 1_000_000_000_u64
+        .checked_div(record_info.sampling_frequency_hz.unwrap_or(1_000).max(1))
+        .unwrap_or(1_000_000);
+    let mut insert = connection.prepare(
+        "INSERT INTO roofline_binary_loops (
+            module_offset, function_name, file_name, line, trip_count,
+            duration_ns, timing_samples, timing_relative_error, timing_quality,
+            bytes_load, bytes_store, scalar_int_ops, scalar_float_ops,
+            scalar_double_ops, vector_int_ops, vector_float_ops, vector_double_ops
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+    )?;
+
+    connection.execute("BEGIN IMMEDIATE TRANSACTION;")?;
+    let result = (|| -> Result<()> {
+        for loop_info in artifact.loops {
+            let ranges = loop_info
+                .block_ranges
+                .iter()
+                .map(|range| {
+                    Ok((
+                        parse_hex_address(&range.module_start)?,
+                        parse_hex_address(&range.module_end)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let timestamps = samples
+                .iter()
+                .filter(|sample| {
+                    ranges.iter().any(|(start, end)| {
+                        sample.module_address >= *start && sample.module_address < *end
+                    })
+                })
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>();
+            let timing_samples = timestamps.len() as u64;
+            // Treat samples as independent occupancy observations. The 95%
+            // relative sampling error is approximately 1.96/sqrt(N). Only
+            // rows at or below 10% are allowed to produce a throughput point.
+            let relative_error =
+                (timing_samples > 0).then(|| 1.96 / (timing_samples as f64).sqrt());
+            let timing_quality = match (counts_are_classified(&loop_info.inclusive), relative_error)
+            {
+                (false, _) => "unclassified-instructions",
+                (true, Some(error)) if error <= 0.10 => "advisor-grade",
+                (true, Some(error)) if error <= 0.20 => "low-confidence",
+                _ => "insufficient-samples",
+            };
+            let duration_ns = (timing_quality == "advisor-grade")
+                .then(|| sampled_active_duration(&timestamps, sample_period_ns));
+            let counts = loop_info.inclusive;
+
+            insert.reset()?;
+            insert.bind((1, loop_info.module_offset.as_str()))?;
+            insert.bind((2, loop_info.function.as_deref().unwrap_or("[unknown loop]")))?;
+            insert.bind((3, loop_info.file.as_deref().unwrap_or("")))?;
+            insert.bind((4, loop_info.line.unwrap_or_default() as i64))?;
+            insert.bind((5, sqlite_u64(loop_info.trip_count)))?;
+            insert.bind((6, duration_ns.map(sqlite_u64)))?;
+            insert.bind((7, sqlite_u64(timing_samples)))?;
+            insert.bind((8, relative_error))?;
+            insert.bind((9, timing_quality))?;
+            for (index, value) in [
+                counts.bytes_load,
+                counts.bytes_store,
+                counts.scalar_int_ops,
+                counts.scalar_float_ops,
+                counts.scalar_double_ops,
+                counts.vector_int_ops,
+                counts.vector_float_ops,
+                counts.vector_double_ops,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                insert.bind((10 + index, sqlite_u64(value)))?;
+            }
+            insert.next()?;
+        }
+        Ok(())
+    })();
+    drop(insert);
+    finish_transaction(connection, result)
+}
+
+fn executable_mappings<'data>(
+    proc_maps: &[ProcMapEntry],
+    pid: u32,
+    executable: &Path,
+    object: &object::File<'data>,
+) -> Vec<ModuleMapping> {
+    proc_maps
+        .iter()
+        .filter(|mapping| mapping.pid == pid)
+        .filter(|mapping| paths_refer_to_same_file(Path::new(&mapping.filename), executable))
+        .filter_map(|mapping| {
+            let mapping_offset = mapping.offset as u64;
+            let segment = object
+                .segments()
+                .filter(|segment| {
+                    let (file_offset, file_size) = segment.file_range();
+                    mapping_offset >= (file_offset & !0xfff)
+                        && mapping_offset < file_offset.saturating_add(file_size)
+                })
+                .min_by_key(|segment| segment.file_range().0.abs_diff(mapping_offset))?;
+            let (file_offset, _) = segment.file_range();
+            Some(ModuleMapping {
+                runtime_start: mapping.address as u64,
+                runtime_end: mapping.address.saturating_add(mapping.size) as u64,
+                svma_start: segment
+                    .address()
+                    .saturating_add(mapping_offset)
+                    .saturating_sub(file_offset),
+            })
+        })
+        .collect()
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    let left_text = left.to_string_lossy();
+    let left = Path::new(
+        left_text
+            .strip_suffix(" (deleted)")
+            .unwrap_or(left_text.as_ref()),
+    );
+    left == right
+        || std::fs::canonicalize(left)
+            .ok()
+            .zip(std::fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn normalize_sample_ip(ip: u64, mappings: &[ModuleMapping]) -> Option<u64> {
+    mappings
+        .iter()
+        .find(|mapping| ip >= mapping.runtime_start && ip < mapping.runtime_end)
+        .map(|mapping| {
+            mapping
+                .svma_start
+                .saturating_add(ip.saturating_sub(mapping.runtime_start))
+        })
+}
+
+fn sampled_active_duration(timestamps: &[u64], period_ns: u64) -> u64 {
+    let mut intervals = timestamps
+        .iter()
+        .map(|timestamp| (timestamp.saturating_sub(period_ns), *timestamp))
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut duration = 0_u64;
+    let mut current: Option<(u64, u64)> = None;
+    for (start, end) in intervals {
+        match current {
+            Some((current_start, current_end)) if start <= current_end => {
+                current = Some((current_start, current_end.max(end)));
+            }
+            Some((current_start, current_end)) => {
+                duration = duration.saturating_add(current_end.saturating_sub(current_start));
+                current = Some((start, end));
+            }
+            None => current = Some((start, end)),
+        }
+    }
+    if let Some((start, end)) = current {
+        duration = duration.saturating_add(end.saturating_sub(start));
+    }
+    duration
+}
+
+fn parse_hex_address(value: &str) -> Result<u64> {
+    let value = value
+        .strip_prefix("0x")
+        .with_context(|| format!("binary loop address is not hexadecimal: '{value}'"))?;
+    u64::from_str_radix(value, 16)
+        .with_context(|| format!("invalid binary loop address '0x{value}'"))
+}
+
+fn sqlite_u64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn counts_are_classified(counts: &BinaryLoopCounts) -> bool {
+    counts.unclassified_instructions == 0
+}
+
+#[cfg(test)]
+mod binary_roofline_tests {
+    use super::*;
+    use sqlite::State;
+
+    #[test]
+    fn sampled_duration_unions_parallel_and_separated_observations() {
+        assert_eq!(sampled_active_duration(&[1_000, 1_500], 1_000), 1_500);
+        assert_eq!(sampled_active_duration(&[1_000, 3_000], 1_000), 2_000);
+        assert_eq!(sampled_active_duration(&[], 1_000), 0);
+    }
+
+    #[test]
+    fn requires_complete_operation_classification() {
+        assert!(counts_are_classified(&BinaryLoopCounts::default()));
+        assert!(!counts_are_classified(&BinaryLoopCounts {
+            unclassified_instructions: 1,
+            ..BinaryLoopCounts::default()
+        }));
+    }
+
+    #[tokio::test]
+    async fn binary_loops_replace_the_whole_process_placeholder() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE strings (id BLOB, string TEXT);
+                 CREATE TABLE roofline_ops(
+                    unique_id BLOB, process_id INTEGER, thread_id INTEGER,
+                    file_name BLOB, function_name BLOB, line INTEGER,
+                    bytes_load INTEGER, bytes_store INTEGER,
+                    scalar_int_ops INTEGER, scalar_float_ops INTEGER,
+                    scalar_double_ops INTEGER, vector_int_ops INTEGER,
+                    vector_float_ops INTEGER, vector_double_ops INTEGER
+                 );
+                 CREATE TABLE roofline_loop_runs(
+                    unique_id BLOB, process_id INTEGER, thread_id INTEGER,
+                    file_name BLOB, function_name BLOB, line INTEGER,
+                    loop_start_ts INTEGER, loop_end_ts INTEGER
+                 );
+                 CREATE TABLE roofline_binary_loops(
+                    module_offset TEXT PRIMARY KEY, function_name TEXT, file_name TEXT,
+                    line INTEGER, trip_count INTEGER, duration_ns INTEGER,
+                    timing_samples INTEGER, timing_relative_error REAL, timing_quality TEXT,
+                    bytes_load INTEGER, bytes_store INTEGER, scalar_int_ops INTEGER,
+                    scalar_float_ops INTEGER, scalar_double_ops INTEGER, vector_int_ops INTEGER,
+                    vector_float_ops INTEGER, vector_double_ops INTEGER
+                 );
+                 INSERT INTO roofline_binary_loops VALUES (
+                    '0x100', 'kernel', 'kernel.c', 7, 100, 1000000000,
+                    400, 0.098, 'advisor-grade', 800, 200,
+                    0, 0, 2000000000, 0, 0, 6000000000
+                 );",
+            )
+            .unwrap();
+        create_roofline_view(&connection).await.unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT function_name, scalar_double_ops, vector_double_ops,
+                        scalar_double_ai, vector_double_ai, timing_quality, module_offset
+                 FROM roofline;",
+            )
+            .unwrap();
+        assert_eq!(statement.next().unwrap(), State::Row);
+        assert_eq!(statement.read::<String, _>(0).unwrap(), "kernel");
+        assert_eq!(statement.read::<f64, _>(1).unwrap(), 2_000_000_000.0);
+        assert_eq!(statement.read::<f64, _>(2).unwrap(), 6_000_000_000.0);
+        assert_eq!(statement.read::<f64, _>(3).unwrap(), 2_000_000.0);
+        assert_eq!(statement.read::<f64, _>(4).unwrap(), 6_000_000.0);
+        assert_eq!(statement.read::<String, _>(5).unwrap(), "advisor-grade");
+        assert_eq!(statement.read::<String, _>(6).unwrap(), "0x100");
+        assert_eq!(statement.next().unwrap(), State::Done);
+    }
 }
 
 fn flamegraph_sample_weight(counter_delta: u64) -> Option<u64> {
@@ -1762,6 +2164,7 @@ mod optimized_postprocessing_tests {
             perf_pid: 10,
             counters: Vec::new(),
             inst_pid: 20,
+            method: None,
         });
         let mut data = RooflineData::new(&info).unwrap();
         let mut start = event(EventType::RooflineLoopStart, 10);
@@ -1882,7 +2285,12 @@ SELECT
   CAST(ops.vector_float_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_float_ai,
 
   CAST(ops.vector_double_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_double_ops,
-  CAST(ops.vector_double_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_double_ai
+  CAST(ops.vector_double_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_double_ai,
+  NULL AS timing_samples,
+  NULL AS timing_relative_error,
+  'legacy' AS timing_quality,
+  NULL AS module_offset,
+  NULL AS trip_count
 
 FROM runs
 LEFT JOIN ops
@@ -1890,7 +2298,39 @@ LEFT JOIN ops
   AND runs.function_name = ops.function_name
   AND runs.line = ops.line
 LEFT JOIN strings s_file ON runs.file_name = s_file.id
-LEFT JOIN strings s_func ON runs.function_name = s_func.id;
+LEFT JOIN strings s_func ON runs.function_name = s_func.id
+WHERE NOT EXISTS (SELECT 1 FROM roofline_binary_loops)
+
+UNION ALL
+
+SELECT
+  file_name,
+  function_name,
+  line,
+
+  CAST(scalar_int_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(scalar_int_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+
+  CAST(scalar_float_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(scalar_float_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+
+  CAST(scalar_double_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(scalar_double_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+
+  CAST(vector_int_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(vector_int_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+
+  CAST(vector_float_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(vector_float_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+
+  CAST(vector_double_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(vector_double_ops AS REAL) / NULLIF(bytes_load + bytes_store, 0),
+  timing_samples,
+  timing_relative_error,
+  timing_quality,
+  module_offset,
+  trip_count
+FROM roofline_binary_loops;
     ").expect("failed to create a view");
     Ok(())
 }

@@ -28,7 +28,9 @@ pub async fn do_record(
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
 
-    let cpu_info = if scenario == Scenario::Roofline {
+    let cpu_info = if scenario == Scenario::Roofline
+        && roofline::uses_native_performance(&roofline_options, &command)?
+    {
         println!("Calibrating host Roofline ceilings...");
         let calibration = roofline::calibrate_host()?;
         println!(
@@ -39,6 +41,11 @@ pub async fn do_record(
             roofline_calibration: Some(Box::new(calibration)),
         }
     } else {
+        if scenario == Scenario::Roofline {
+            println!(
+                "Skipping host Roofline calibration: the selected method does not measure native performance"
+            );
+        }
         mperf_data::CpuInfo::default()
     };
 
@@ -159,7 +166,14 @@ fn snapshot(
         match record {
             Record::Sample(sample) => {
                 let unique_id = uuid::Uuid::now_v7().as_u128();
-                let callstack = sample.callstack.into_iter().map(CallFrame::IP).collect();
+                let mut callstack = smallvec::smallvec![CallFrame::IP(sample.ip)];
+                callstack.extend(
+                    sample
+                        .callstack
+                        .into_iter()
+                        .filter(|address| *address != sample.ip)
+                        .map(CallFrame::IP),
+                );
                 let name = if let Counter::Custom(name) = &sample.counter {
                     sample_dispatcher.string_id(name)
                 } else {

@@ -56,10 +56,16 @@ pub fn direct(
     Ok(handles)
 }
 
-pub fn grouped(
+/// Open coherent hardware sampling groups for one task on one CPU.
+///
+/// Linux cannot mmap a sampling ring for an inherited event opened with
+/// `cpu == -1`. Process-wide inherited sampling therefore opens this form once
+/// for every CPU in the target's affinity mask.
+pub fn grouped_on_cpu(
     counters: &[Counter],
     attrs: &mut [perf_event_attr],
-    pid: Option<i32>,
+    pid: i32,
+    cpu: i32,
 ) -> Result<Vec<NativeCounterHandle>, Error> {
     // TMA passes one complete group after another, each beginning with cycles.
     // Do not flatten these into the historical arbitrary chunks: doing so
@@ -81,11 +87,15 @@ pub fn grouped(
                     "invalid coherent sampling group".to_owned(),
                 ));
             }
-            handles.extend(grouped_all(
-                &counters[*start..end],
-                &mut attrs[*start..end],
-                pid,
-            )?);
+            let group_handles =
+                grouped_all_on_cpu(&counters[*start..end], &mut attrs[*start..end], pid, cpu);
+            match group_handles {
+                Ok(group_handles) => handles.extend(group_handles),
+                Err(error) => {
+                    close_handles(&handles);
+                    return Err(error);
+                }
+            }
         }
         return Ok(handles);
     }
@@ -147,17 +157,15 @@ pub fn grouped(
             let leader_counter = leader_cntr.ok_or_else(|| {
                 Error::InvalidConfiguration("configured sampling leader is missing".to_owned())
             })?;
-            let leader_fd =
-                unsafe { sys::perf_event_open(&mut leader_attr, pid.unwrap_or(0), -1, -1, 0) };
-            push_handle(&mut handles, leader_fd, leader_counter.clone(), true)?;
+            let leader_fd = unsafe { sys::perf_event_open(&mut leader_attr, pid, cpu, -1, 0) };
+            push_handle(&mut handles, leader_fd, leader_counter.clone(), true, cpu)?;
             leader_fd
         } else {
             -1
         };
 
-        let cycles_fd = unsafe {
-            sys::perf_event_open(&mut cycles_attrs, pid.unwrap_or(0), -1, cycles_leader_fd, 0)
-        };
+        let cycles_fd =
+            unsafe { sys::perf_event_open(&mut cycles_attrs, pid, cpu, cycles_leader_fd, 0) };
 
         let leader_fd = if leader.is_some() {
             cycles_leader_fd
@@ -165,19 +173,23 @@ pub fn grouped(
             cycles_fd
         };
 
-        push_handle(&mut handles, cycles_fd, Counter::Cycles, leader.is_none())?;
+        push_handle(
+            &mut handles,
+            cycles_fd,
+            Counter::Cycles,
+            leader.is_none(),
+            cpu,
+        )?;
 
-        let instr_fd =
-            unsafe { sys::perf_event_open(&mut instr_attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
+        let instr_fd = unsafe { sys::perf_event_open(&mut instr_attrs, pid, cpu, leader_fd, 0) };
 
-        push_handle(&mut handles, instr_fd, Counter::Instructions, false)?;
+        push_handle(&mut handles, instr_fd, Counter::Instructions, false, cpu)?;
 
         for index in group.hardware_indices {
             let cntr = &counters[index];
             let attrs = &mut attrs[index];
-            let new_fd =
-                unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
-            push_handle(&mut handles, new_fd, cntr.clone(), false)?;
+            let new_fd = unsafe { sys::perf_event_open(&mut *attrs, pid, cpu, leader_fd, 0) };
+            push_handle(&mut handles, new_fd, cntr.clone(), false, cpu)?;
         }
 
         if !group.include_software {
@@ -186,9 +198,8 @@ pub fn grouped(
         for &index in &software_indices {
             let cntr = &counters[index];
             let attrs = &mut attrs[index];
-            let new_fd =
-                unsafe { sys::perf_event_open(&mut *attrs, pid.unwrap_or(0), -1, leader_fd, 0) };
-            push_handle(&mut handles, new_fd, cntr.clone(), false)?;
+            let new_fd = unsafe { sys::perf_event_open(&mut *attrs, pid, cpu, leader_fd, 0) };
+            push_handle(&mut handles, new_fd, cntr.clone(), false, cpu)?;
         }
     }
 
@@ -242,10 +253,12 @@ fn sampling_group_plan(
 /// Build a single software-event sampling group used when the hardware PMU is
 /// unavailable. `cpu-clock` is the group leader and therefore owns the mmap
 /// ring buffer that carries samples and grouped counter reads.
-pub fn grouped_software(
+/// Open the software fallback sampling group for one task on one CPU.
+pub fn grouped_software_on_cpu(
     counters: &[Counter],
     attrs: &mut [perf_event_attr],
-    pid: Option<i32>,
+    pid: i32,
+    cpu: i32,
 ) -> Result<Vec<NativeCounterHandle>, Error> {
     let Some(leader_index) = counters
         .iter()
@@ -257,16 +270,15 @@ pub fn grouped_software(
     };
 
     let mut handles = Vec::with_capacity(counters.len());
-    let leader_fd =
-        unsafe { sys::perf_event_open(&mut attrs[leader_index], pid.unwrap_or(0), -1, -1, 0) };
-    push_handle(&mut handles, leader_fd, Counter::CpuClock, true)?;
+    let leader_fd = unsafe { sys::perf_event_open(&mut attrs[leader_index], pid, cpu, -1, 0) };
+    push_handle(&mut handles, leader_fd, Counter::CpuClock, true, cpu)?;
 
     for (index, (counter, attr)) in zip(counters, attrs).enumerate() {
         if index == leader_index {
             continue;
         }
-        let fd = unsafe { sys::perf_event_open(attr, pid.unwrap_or(0), -1, leader_fd, 0) };
-        push_handle(&mut handles, fd, counter.clone(), false)?;
+        let fd = unsafe { sys::perf_event_open(attr, pid, cpu, leader_fd, 0) };
+        push_handle(&mut handles, fd, counter.clone(), false, cpu)?;
     }
 
     Ok(handles)
@@ -279,6 +291,15 @@ pub fn grouped_all(
     attrs: &mut [perf_event_attr],
     pid: Option<i32>,
 ) -> Result<Vec<NativeCounterHandle>, Error> {
+    grouped_all_on_cpu(counters, attrs, pid.unwrap_or(0), -1)
+}
+
+fn grouped_all_on_cpu(
+    counters: &[Counter],
+    attrs: &mut [perf_event_attr],
+    pid: i32,
+    cpu: i32,
+) -> Result<Vec<NativeCounterHandle>, Error> {
     if counters.is_empty() || counters.len() != attrs.len() {
         return Err(Error::InvalidConfiguration(
             "a sampling group requires matching non-empty counters and attributes".to_owned(),
@@ -286,11 +307,11 @@ pub fn grouped_all(
     }
 
     let mut handles = Vec::with_capacity(counters.len());
-    let leader_fd = unsafe { sys::perf_event_open(&mut attrs[0], pid.unwrap_or(0), -1, -1, 0) };
-    push_handle(&mut handles, leader_fd, counters[0].clone(), true)?;
+    let leader_fd = unsafe { sys::perf_event_open(&mut attrs[0], pid, cpu, -1, 0) };
+    push_handle(&mut handles, leader_fd, counters[0].clone(), true, cpu)?;
     for (counter, attr) in zip(&counters[1..], &mut attrs[1..]) {
-        let fd = unsafe { sys::perf_event_open(attr, pid.unwrap_or(0), -1, leader_fd, 0) };
-        push_handle(&mut handles, fd, counter.clone(), false)?;
+        let fd = unsafe { sys::perf_event_open(attr, pid, cpu, leader_fd, 0) };
+        push_handle(&mut handles, fd, counter.clone(), false, cpu)?;
     }
     Ok(handles)
 }
@@ -300,8 +321,9 @@ fn push_handle(
     fd: i32,
     counter: Counter,
     leader: bool,
+    cpu: i32,
 ) -> Result<(), Error> {
-    match get_native_handle(fd, counter, leader) {
+    match get_native_handle(fd, counter, leader, cpu) {
         Ok(handle) => {
             handles.push(handle);
             Ok(())
@@ -314,9 +336,14 @@ fn push_handle(
     }
 }
 
-fn get_native_handle(fd: i32, cntr: Counter, leader: bool) -> Result<NativeCounterHandle, Error> {
+fn get_native_handle(
+    fd: i32,
+    cntr: Counter,
+    leader: bool,
+    cpu: i32,
+) -> Result<NativeCounterHandle, Error> {
     if fd < 0 {
-        return Err(Error::perf_event_open(&cntr, None));
+        return Err(Error::perf_event_open(&cntr, (cpu >= 0).then_some(cpu)));
     }
 
     let mut id: u64 = 0;

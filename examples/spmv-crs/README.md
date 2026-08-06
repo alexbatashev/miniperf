@@ -1,9 +1,11 @@
 # CRS SpMV example
 
 This example implements the same deterministic CRS sparse matrix-vector
-multiplication with AVX-512 and RISC-V Vector kernels. OpenMP partitions rows
-statically across the worker team.
+multiplication with AVX2, AVX-512, and RISC-V Vector kernels. OpenMP partitions
+rows statically across the worker team.
 
+- AVX2 uses four-wide FP64 loads, gathers, FMA, and horizontal reduction. This
+  is the x86 variant supported by QEMU TCG Roofline accounting.
 - AVX-512 uses eight-wide FP64 loads, gathers, FMA, and horizontal reduction.
 - RVV selects `vl` at runtime and uses indexed FP64 gathers, vector multiply,
   and an unordered reduction.
@@ -22,11 +24,11 @@ algorithmic byte count includes each FP64 value, 32-bit column index, and FP64
 `x` element, plus CRS row offsets and the output vector. Cache reuse can make
 the physical DRAM traffic lower than this algorithmic model.
 
-Run the native AVX-512 executable on four CPUs:
+Run the QEMU-compatible AVX2 executable on four CPUs:
 
 ```sh
 OMP_NUM_THREADS=4 OMP_PLACES=cores OMP_PROC_BIND=close \
-  taskset -c 0-3 examples/spmv-crs/build/spmv-avx512
+  taskset -c 0-3 examples/spmv-crs/build/spmv-avx2
 ```
 
 The executable reports its OpenMP team size, elapsed time, arithmetic

@@ -24,6 +24,15 @@ $$
 A point to the left of the ridge is normally bandwidth-bound. A point to the
 right is normally compute-bound.
 
+This comparison is valid only when the point's byte denominator and the
+bandwidth ceiling describe the same memory-hierarchy level. The QEMU plugin
+retains exact architectural load/store bytes for audit, and separately runs a
+deterministic shared-LLC model configured from the host's sysfs cache geometry.
+The modeled LLC misses and dirty-line transitions form the byte denominator
+used with the DRAM-sized streaming ceiling. The viewer labels this explicitly
+as modeled traffic: it is suitable for an Advisor-style model Roofline, but it
+is not a claim that hardware memory-controller transactions were measured.
+
 ## Build miniperf
 
 Build the profiler and QEMU accounting plugin:
@@ -40,11 +49,39 @@ utils/build-qemu-user-bundle.sh dist
 ```
 
 The script creates a versioned archive under `dist/`. Extract it and use the
-appropriate executable from its `bin/` directory.
+appropriate executable from its `bin/` directory. Before packaging, the script
+checks the required exported plugin APIs and runs the miniperf plugin end to end
+against static x86-64 SSE2 and RISC-V RVV fixtures with exact expected operation
+and modeled traffic counts. The build fails if either capture has incomplete
+counters, RVV state errors, unclassified compute instructions, malformed cache
+metadata, or malformed CFG block ranges.
+
+## One command, automatic method selection
+
+The user-facing workflow is always:
+
+```sh
+mperf record --scenario=roofline --output-directory results -- ./workload
+```
+
+Miniperf inspects the executable and probes QEMU plugin support before starting
+the workload. It then selects, in order:
+
+1. QEMU operation and shared-LLC traffic accounting plus native performance
+   measurement when the executable can run on the host.
+2. The compiler-instrumented method when instrumentation is present and QEMU is
+   unavailable.
+
+If none is accurate enough, recording stops with a capability diagnostic. The
+`--roofline-backend` option remains available as a testing/debugging override,
+but normal users should not need to choose a backend. In particular, automatic
+mode refuses cross-architecture emulator timing because it cannot represent
+RISC-V hardware performance; run the same command on a compatible RISC-V host.
 
 ## Build the SpMV example
 
-The CRS SpMV example supplies explicit AVX-512 and RVV kernels:
+The CRS SpMV example supplies explicit AVX2, AVX-512, and RVV kernels. Use the
+AVX2 binary for QEMU TCG analysis; QEMU 11 TCG does not implement AVX-512:
 
 ```sh
 make -C examples/spmv-crs
@@ -55,9 +92,11 @@ by Git.
 
 ## Keep the calibration and workload comparable
 
-Miniperf measures the FP64 compute roof and memory-bandwidth roof immediately
-before every Roofline recording. The calibration and workload run in the same
-process affinity, but Rayon and OpenMP have independent worker counts.
+Miniperf measures the FP64 compute ceiling and a DRAM-sized streaming-bandwidth
+ceiling immediately before every Roofline recording. The calibration and
+workload run in the same process affinity, but Rayon and OpenMP have independent
+worker counts. The memory ceiling is retained for provenance, but is used in a
+Roofline comparison only when the recording reports a compatible traffic level.
 
 Set both explicitly when studying a fixed CPU set:
 
@@ -80,26 +119,33 @@ memory-intensive work during calibration.
 
 ## Record an x86 workload through QEMU
 
-The following command records the AVX-512 SpMV example. Replace the QEMU path
+The following command records the AVX2 SpMV example. Replace the QEMU path
 with the plugin-enabled binary you installed or extracted:
 
 ```sh
 taskset -c 0-3 target/release/mperf record \
-  --scenario roofline \
-  --roofline-backend qemu \
+  --scenario=roofline \
   --qemu /path/to/qemu-x86_64 \
-  --output-directory examples/spmv-crs/results/avx512-4t \
-  -- examples/spmv-crs/build/spmv-avx512
+  --output-directory examples/spmv-crs/results/avx2-4t \
+  -- examples/spmv-crs/build/spmv-avx2
 ```
 
 Miniperf performs three pieces of work:
 
 1. It measures host FP64 and memory ceilings with Rayon.
-2. It runs the workload under QEMU for duration and PMU sampling.
-3. It runs the workload again with the QEMU plugin for operation and byte
-   accounting.
+2. It runs the workload natively for duration and PMU sampling.
+3. It runs the workload again with the QEMU plugin for operation, exact
+   architectural-byte, and modeled DRAM-traffic accounting.
 
-The QEMU backend emits one whole-process Roofline row.
+The accounting run captures an observed translation-block CFG, summarizes
+call/return pairs, and writes natural-loop candidates with latches, nesting,
+trip counts, inclusive counts, self counts, stable module offsets, and source
+locations (when debug information is available) to
+`qemu-roofline.loops.json`. Native PMU samples are matched to those block ranges
+after recording. A loop receives a plotted throughput point only when its
+estimated 95% timing error is at most 10%; lower-confidence loops remain visible
+with their accounting and confidence state. Loops from shared libraries and the
+dynamic loader are excluded.
 
 ## Record an RVV workload through QEMU
 
@@ -107,8 +153,7 @@ For the Ubuntu RISC-V cross sysroot:
 
 ```sh
 taskset -c 0-3 target/release/mperf record \
-  --scenario roofline \
-  --roofline-backend qemu \
+  --scenario=roofline \
   --qemu /path/to/qemu-riscv64 \
   --qemu-arg=-L \
   --qemu-arg=/usr/riscv64-linux-gnu \
@@ -122,10 +167,12 @@ RVV accounting uses the executed instruction's runtime `vl`, `vstart`, SEW,
 and mask state. Changing `vlen` therefore changes lane capacity without
 changing the accounting rule.
 
-This measures the guest while it is emulated. The operation counts and
-arithmetic intensity describe the guest instruction stream, but throughput is
-based on host QEMU duration. Do not treat it as projected RISC-V hardware
-performance.
+On a non-RISC-V host automatic mode stops because native RISC-V performance is
+unavailable. Explicit `--roofline-backend qemu` remains an emulation diagnostic:
+its operation counts describe the guest instruction stream, but its throughput
+is based on host QEMU duration and is never a projected RISC-V hardware result.
+On a compatible RISC-V host, the normal command uses native performance
+measurement automatically and QEMU only for accounting.
 
 ## Use the compiler backend
 
@@ -162,7 +209,7 @@ target/release/mperf record \
 Open the interactive result viewer:
 
 ```sh
-target/release/mperf show examples/spmv-crs/results/avx512-4t
+target/release/mperf show examples/spmv-crs/results/avx2-4t
 ```
 
 Use `Tab` and `Shift-Tab` to move between Summary, Loops, and Flamegraph; press
@@ -175,13 +222,16 @@ The recording directory contains:
 - `events.bin`, `strings.json`, and `proc_map.json`: raw capture data.
 - `flamegraph_*.svg`: generated flame graphs for sampled counters.
 - `qemu-roofline.counts`: QEMU plugin totals when using that backend.
+- `qemu-roofline.cfg`: observed QEMU translation-block entries, edges, and
+  per-block counts.
+- `qemu-roofline.loops.json`: binary loop candidates and per-loop accounting.
 
-The Summary tab reports the calibrated FP64 and memory roofs. The full
-calibration is available in JSON:
+The Summary tab reports the calibrated FP64 and streaming-memory ceilings. The
+full calibration is available in JSON:
 
 ```sh
 jq '.cpu_info.roofline_calibration' \
-  examples/spmv-crs/results/avx512-4t/info.json
+  examples/spmv-crs/results/avx2-4t/info.json
 ```
 
 It includes all five samples, their medians, the Rayon worker count, CPU
@@ -201,7 +251,10 @@ The calibrated compute roof is currently FP64, so compare it with the double
 precision columns. If a loop mixes scalar and vector FP64, add their DP
 throughputs before comparing with the aggregate FP64 roof.
 
-For example, suppose calibration reports:
+The following calculation applies only to a recording whose byte denominator
+is explicitly marked as measured or modeled DRAM traffic. QEMU rows use the
+modeled form and the UI labels them accordingly. Suppose compatible calibration
+reports:
 
 ```text
 FP64 compute roof: 240 GFLOP/s
@@ -222,7 +275,7 @@ observed 150 GFLOP/s is about 63% of that roof.
 You can query the same values directly:
 
 ```sh
-sqlite3 examples/spmv-crs/results/avx512-4t/perf.db \
+sqlite3 examples/spmv-crs/results/avx2-4t/perf.db \
   'SELECT function_name, vector_double_ops / 1e9 AS vector_dp_gflops,
           vector_double_ai
      FROM roofline;'
@@ -230,18 +283,21 @@ sqlite3 examples/spmv-crs/results/avx512-4t/perf.db \
 
 ## Interpret the result carefully
 
-- A point far below the sloped roof can indicate poor locality, insufficient
-  memory-level parallelism, synchronization, or accounting that includes work
-  outside the kernel.
+- For a recording with compatible hierarchy traffic, a point far below the
+  sloped roof can indicate poor locality, insufficient memory-level parallelism,
+  synchronization, or accounting that includes work outside the kernel.
 - A point far below the horizontal roof can indicate dependency chains,
   instruction-mix limits, front-end pressure, or too little parallel work.
-- QEMU counts architectural guest loads and stores, not physical DRAM
-  transactions. Cached accesses are included.
+- QEMU's exact architectural guest load/store totals remain in
+  `qemu-roofline.counts`. Roofline loop bytes come from a shared, set-associative
+  LRU LLC model using the detected host line size, capacity, and associativity.
+  It models write-back traffic without read-for-ownership and is not a hardware
+  memory-controller measurement.
 - The SpMV executable's printed byte model is algorithmic and may differ from
   both architectural traffic and DRAM traffic.
-- The compiler backend attributes data to instrumented source loops; the QEMU
-  backend currently attributes the whole guest process, including loader and
-  library activity.
+- The compiler backend attributes data to instrumented source loops. The QEMU
+  backend discovers dynamic binary loops in the main executable and excludes
+  the loader and shared-library address ranges.
 - Compare recordings only when affinity, thread counts, matrix size, precision,
   backend, and calibration conditions are equivalent.
 

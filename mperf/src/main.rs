@@ -57,8 +57,8 @@ enum Commands {
     Record {
         #[arg(short, long)]
         scenario: Scenario,
-        /// Roofline accounting implementation.
-        #[arg(long, value_enum, default_value_t = roofline::BackendKind::Compiler)]
+        /// Roofline accounting implementation. The default probes the workload and host.
+        #[arg(long, value_enum, default_value_t = roofline::BackendKind::Auto)]
         roofline_backend: roofline::BackendKind,
         /// QEMU user-mode binary; auto-detected from the guest ELF when omitted.
         #[arg(long)]

@@ -13,6 +13,7 @@ pub struct Process {
     /// driver's `stop()` even though the child has already finished.
     exited: Cell<bool>,
     reaped: Cell<bool>,
+    exit_code: Cell<Option<i32>>,
 }
 
 impl Process {
@@ -95,6 +96,7 @@ impl Process {
             pid,
             exited: Cell::new(false),
             reaped: Cell::new(false),
+            exit_code: Cell::new(None),
         })
     }
 
@@ -149,6 +151,7 @@ impl Process {
             write_fd: pipe_fds[1],
             exited: Cell::new(false),
             reaped: Cell::new(false),
+            exit_code: Cell::new(None),
         })
     }
 
@@ -185,9 +188,22 @@ impl Process {
             {
                 return Err(std::io::Error::last_os_error());
             }
+            let status = info.si_status();
+            self.exit_code
+                .set(Some(if info.si_code == libc::CLD_EXITED {
+                    status
+                } else {
+                    128_i32.saturating_add(status)
+                }));
         }
         self.exited.set(true);
         Ok(())
+    }
+
+    /// Returns the conventional process exit code after [`Process::wait`].
+    /// Signal termination is represented as `128 + signal`.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code.get()
     }
 
     /// Reap the child if it has exited, releasing the zombie. Idempotent.

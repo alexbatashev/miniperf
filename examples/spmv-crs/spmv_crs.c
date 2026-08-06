@@ -10,12 +10,12 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || defined(__AVX2__)
 #include <immintrin.h>
 #elif defined(__riscv_vector)
 #include <riscv_vector.h>
 #else
-#error "Build this benchmark for AVX-512 or RVV"
+#error "Build this benchmark for AVX2, AVX-512, or RVV"
 #endif
 
 typedef struct {
@@ -152,6 +152,36 @@ static void spmv(const CrsMatrix *matrix) {
         }
 
         double sum = _mm512_reduce_add_pd(vector_sum);
+        for (; position < end; ++position) {
+            sum += matrix->values[position] * matrix->x[matrix->column_indices[position]];
+        }
+        matrix->y[row] = sum;
+    }
+}
+#elif defined(__AVX2__)
+static const char *implementation_name(void) {
+    return "avx2";
+}
+
+static void spmv(const CrsMatrix *matrix) {
+#pragma omp parallel for schedule(static)
+    for (size_t row = 0; row < matrix->rows; ++row) {
+        size_t position = matrix->row_offsets[row];
+        const size_t end = matrix->row_offsets[row + 1];
+        __m256d vector_sum = _mm256_setzero_pd();
+
+        for (; position + 4 <= end; position += 4) {
+            const __m256d values = _mm256_loadu_pd(&matrix->values[position]);
+            const __m128i indices =
+                _mm_loadu_si128((const __m128i *)&matrix->column_indices[position]);
+            const __m256d x = _mm256_i32gather_pd(matrix->x, indices, 8);
+            vector_sum = _mm256_fmadd_pd(values, x, vector_sum);
+        }
+
+        const __m128d halves = _mm_add_pd(
+            _mm256_castpd256_pd128(vector_sum),
+            _mm256_extractf128_pd(vector_sum, 1));
+        double sum = _mm_cvtsd_f64(_mm_hadd_pd(halves, halves));
         for (; position < end; ++position) {
             sum += matrix->values[position] * matrix->x[matrix->column_indices[position]];
         }

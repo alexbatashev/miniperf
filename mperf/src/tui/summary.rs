@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use mperf_data::RecordInfo;
+use mperf_data::{RecordInfo, ScenarioInfo};
 use num_format::Locale;
 use num_format::ToFormattedString;
 use parking_lot::{Mutex, RwLock};
@@ -322,6 +322,10 @@ impl Widget for SummaryTab {
         let block = Block::bordered().title("Result info");
         block.render(info_area, buf);
 
+        let roofline_method = match &self.record_info.scenario_info {
+            ScenarioInfo::Roofline(info) => info.method.as_deref().cloned(),
+            _ => None,
+        };
         let command = self
             .record_info
             .command
@@ -340,6 +344,22 @@ impl Widget for SummaryTab {
                 self.record_info.cpu_vendor.clone(),
             ]),
         ];
+        if let Some(method) = roofline_method {
+            rows.push(Row::new([
+                "Roofline method".to_string(),
+                format!(
+                    "{} accounting · {} performance · {}",
+                    method.accounting, method.performance, method.quality
+                ),
+            ]));
+            rows.push(Row::new(["Method reason".to_string(), method.reason]));
+            if !method.warnings.is_empty() {
+                rows.push(Row::new([
+                    "Method warnings".to_string(),
+                    method.warnings.join("; "),
+                ]));
+            }
+        }
         if let Some(calibration) = &self.record_info.cpu_info.roofline_calibration {
             rows.push(Row::new([
                 "Roof ceilings".to_string(),

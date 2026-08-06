@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use mperf_data::RooflineCalibration;
+use mperf_data::{RooflineCalibration, RooflineMethodInfo};
 use sqlite::{Connection, Value};
 
 use crate::source::SourceLocation;
@@ -10,6 +10,7 @@ use crate::source::SourceLocation;
 pub struct RooflineData {
     pub loops: Vec<RooflineLoop>,
     pub calibration: Option<RooflineCalibration>,
+    pub method: Option<RooflineMethodInfo>,
     pub error: Option<String>,
 }
 
@@ -30,22 +31,51 @@ pub struct RooflineLoop {
     pub vector_float_ai: Option<f64>,
     pub vector_double_ops: Option<f64>,
     pub vector_double_ai: Option<f64>,
+    pub timing_samples: Option<u64>,
+    pub timing_relative_error: Option<f64>,
+    pub timing_quality: Option<String>,
+    pub module_offset: Option<String>,
+    pub trip_count: Option<u64>,
 }
 
 impl RooflineData {
-    pub fn load(connection: &Connection, calibration: Option<RooflineCalibration>) -> RooflineData {
+    pub fn load(
+        connection: &Connection,
+        calibration: Option<RooflineCalibration>,
+        method: Option<RooflineMethodInfo>,
+    ) -> RooflineData {
         match load_loops(connection) {
             Ok(loops) => Self {
                 loops,
                 calibration,
+                method,
                 error: None,
             },
             Err(error) => Self {
                 loops: Vec::new(),
                 calibration,
+                method,
                 error: Some(format!("{error:#}")),
             },
         }
+    }
+
+    /// Whether the loop byte denominator and calibrated memory ceiling refer
+    /// to the same hierarchy level. The current calibration is a DRAM-sized
+    /// streaming roof, so either measured DRAM traffic or the explicit shared-
+    /// LLC DRAM model is compatible; architectural instruction bytes are not.
+    pub fn has_compatible_memory_roof(&self) -> bool {
+        self.calibration.is_some()
+            && self
+                .method
+                .as_ref()
+                .is_some_and(|method| matches!(method.traffic.as_str(), "dram" | "dram-model"))
+    }
+
+    pub fn uses_modeled_traffic(&self) -> bool {
+        self.method
+            .as_ref()
+            .is_some_and(|method| method.traffic == "dram-model")
     }
 }
 
@@ -86,7 +116,16 @@ impl RooflineLoop {
 }
 
 fn load_loops(connection: &Connection) -> Result<Vec<RooflineLoop>> {
-    let query = "
+    let confidence_columns = if connection
+        .prepare("SELECT timing_quality FROM roofline LIMIT 0")
+        .is_ok()
+    {
+        "timing_samples, timing_relative_error, timing_quality, module_offset, trip_count"
+    } else {
+        "NULL AS timing_samples, NULL AS timing_relative_error, NULL AS timing_quality, NULL AS module_offset, NULL AS trip_count"
+    };
+    let query = format!(
+        "
         SELECT
             function_name,
             file_name,
@@ -102,14 +141,16 @@ fn load_loops(connection: &Connection) -> Result<Vec<RooflineLoop>> {
             vector_float_ops,
             vector_float_ai,
             vector_double_ops,
-            vector_double_ai
+            vector_double_ai,
+            {confidence_columns}
         FROM roofline
         ORDER BY
             COALESCE(scalar_double_ops, 0) + COALESCE(vector_double_ops, 0) DESC,
             function_name ASC,
             file_name ASC,
             line ASC;
-    ";
+    "
+    );
     connection
         .prepare(query)
         .context("Roofline data is unavailable: failed to query SQLite view `roofline`")?
@@ -133,6 +174,13 @@ fn load_loops(connection: &Connection) -> Result<Vec<RooflineLoop>> {
                 vector_float_ai: finite_value(&row["vector_float_ai"]),
                 vector_double_ops: finite_value(&row["vector_double_ops"]),
                 vector_double_ai: finite_value(&row["vector_double_ai"]),
+                timing_samples: integer_value(&row["timing_samples"])
+                    .and_then(|value| u64::try_from(value).ok()),
+                timing_relative_error: finite_value(&row["timing_relative_error"]),
+                timing_quality: string_value(&row["timing_quality"]),
+                module_offset: string_value(&row["module_offset"]),
+                trip_count: integer_value(&row["trip_count"])
+                    .and_then(|value| u64::try_from(value).ok()),
             })
         })
         .collect()
@@ -225,7 +273,7 @@ mod tests {
             )
             .unwrap();
 
-        let data = RooflineData::load(&connection, Some(calibration()));
+        let data = RooflineData::load(&connection, Some(calibration()), None);
 
         assert_eq!(data.error, None);
         assert_eq!(data.loops.len(), 2);
@@ -261,6 +309,11 @@ mod tests {
             vector_float_ai: None,
             vector_double_ops: None,
             vector_double_ai: None,
+            timing_samples: None,
+            timing_relative_error: None,
+            timing_quality: None,
+            module_offset: None,
+            trip_count: None,
         };
         let calibration = calibration();
 
@@ -276,7 +329,7 @@ mod tests {
     #[test]
     fn reports_a_missing_roofline_view_without_hiding_the_tab() {
         let connection = sqlite::open(":memory:").unwrap();
-        let data = RooflineData::load(&connection, Some(calibration()));
+        let data = RooflineData::load(&connection, Some(calibration()), None);
 
         assert!(data.loops.is_empty());
         assert!(
@@ -285,5 +338,34 @@ mod tests {
                 .is_some_and(|error| error.contains("roofline"))
         );
         assert!(data.calibration.is_some());
+    }
+
+    #[test]
+    fn memory_roof_requires_explicitly_compatible_traffic() {
+        let connection = sqlite::open(":memory:").unwrap();
+        let method = |traffic: &str| RooflineMethodInfo {
+            selection: "auto".to_string(),
+            accounting: "qemu".to_string(),
+            performance: "native".to_string(),
+            traffic: traffic.to_string(),
+            quality: "test".to_string(),
+            reason: "test".to_string(),
+            warnings: Vec::new(),
+        };
+
+        let architectural = RooflineData::load(
+            &connection,
+            Some(calibration()),
+            Some(method("architectural")),
+        );
+        assert!(!architectural.has_compatible_memory_roof());
+
+        let dram = RooflineData::load(&connection, Some(calibration()), Some(method("dram")));
+        assert!(dram.has_compatible_memory_roof());
+
+        let modeled =
+            RooflineData::load(&connection, Some(calibration()), Some(method("dram-model")));
+        assert!(modeled.has_compatible_memory_roof());
+        assert!(modeled.uses_modeled_traffic());
     }
 }
