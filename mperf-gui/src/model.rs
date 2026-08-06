@@ -11,8 +11,8 @@ use pmu_data::{TabSpec, TmaMetric};
 use sqlite::{Connection, Value};
 
 use crate::{
-    flamegraph::FlamegraphData, metrics::MetricsTableData, profile::ProfileData,
-    roofline::RooflineData,
+    flamegraph::FlamegraphData, memory::MemoryData, metrics::MetricsTableData,
+    profile::ProfileData, roofline::RooflineData,
 };
 
 #[derive(Debug)]
@@ -48,6 +48,7 @@ pub enum GuiTab {
         data: MetricsTableData,
     },
     Loops(Box<RooflineData>),
+    Memory(Box<MemoryData>),
     Flamegraph(Box<FlamegraphData>),
 }
 
@@ -225,6 +226,7 @@ impl GuiTab {
                     _ => None,
                 },
             ))),
+            TabSpec::Memory => Self::Memory(Box::new(MemoryData::load(connection))),
             TabSpec::Flamegraph => {
                 Self::Flamegraph(Box::new(FlamegraphData::load(result_directory)))
             }

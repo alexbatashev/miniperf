@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use mperf_data::RooflineCalibration;
+use mperf_data::{MemoryBandwidthCalibration, RooflineCalibration};
 use rayon::prelude::*;
 
 const SAMPLES: usize = 5;
@@ -24,7 +24,30 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         .map(|_| measure_compute_sample(kernel, threads, COMPUTE_ITERATIONS))
         .collect::<Vec<_>>();
 
-    let mut a = allocate_vector(MEMORY_ELEMENTS).context("allocate roofline triad input A")?;
+    let memory = measure_memory()?;
+
+    let fp64_gflops = median(&compute_samples);
+    if !fp64_gflops.is_finite() || fp64_gflops <= 0.0 {
+        bail!("FP64 roof calibration produced an invalid result: {fp64_gflops}");
+    }
+
+    Ok(RooflineCalibration {
+        threads,
+        cpu_affinity: memory.cpu_affinity.clone(),
+        samples: SAMPLES,
+        compute_kernel: kernel.name.to_string(),
+        fp64_gflops,
+        fp64_gflops_samples: compute_samples,
+        memory_gbytes_per_second: memory.gbytes_per_second,
+        memory_gbytes_per_second_samples: memory.gbytes_per_second_samples,
+        ridge_point_flops_per_byte: fp64_gflops / memory.gbytes_per_second,
+        memory_working_set_bytes: memory.working_set_bytes,
+    })
+}
+
+pub(super) fn measure_memory() -> Result<MemoryBandwidthCalibration> {
+    let threads = rayon::current_num_threads();
+    let mut a = allocate_vector(MEMORY_ELEMENTS).context("allocate memory triad input A")?;
     let mut b = allocate_vector(MEMORY_ELEMENTS).context("allocate roofline triad input B")?;
     let mut c = allocate_vector(MEMORY_ELEMENTS).context("allocate roofline triad output")?;
     a.par_iter_mut()
@@ -40,11 +63,7 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         .map(|_| measure_memory_sample(&a, &b, &mut c, MEMORY_REPETITIONS))
         .collect::<Vec<_>>();
 
-    let fp64_gflops = median(&compute_samples);
     let memory_gbytes_per_second = median(&memory_samples);
-    if !fp64_gflops.is_finite() || fp64_gflops <= 0.0 {
-        bail!("FP64 roof calibration produced an invalid result: {fp64_gflops}");
-    }
     if !memory_gbytes_per_second.is_finite() || memory_gbytes_per_second <= 0.0 {
         bail!(
             "memory roof calibration produced an invalid result: \
@@ -55,17 +74,14 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         .saturating_mul(MEMORY_ELEMENTS as u64)
         .saturating_mul(size_of::<f64>() as u64);
 
-    Ok(RooflineCalibration {
+    Ok(MemoryBandwidthCalibration {
         threads,
         cpu_affinity: cpu_affinity(),
         samples: SAMPLES,
-        compute_kernel: kernel.name.to_string(),
-        fp64_gflops,
-        fp64_gflops_samples: compute_samples,
-        memory_gbytes_per_second,
-        memory_gbytes_per_second_samples: memory_samples,
-        ridge_point_flops_per_byte: fp64_gflops / memory_gbytes_per_second,
-        memory_working_set_bytes,
+        gbytes_per_second: memory_gbytes_per_second,
+        gbytes_per_second_samples: memory_samples,
+        working_set_bytes: memory_working_set_bytes,
+        source: "effective_stream".to_string(),
     })
 }
 

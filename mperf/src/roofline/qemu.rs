@@ -28,10 +28,12 @@ pub(super) struct QemuBackend {
     native_performance: bool,
     method: RooflineMethodInfo,
     cache: CacheInfo,
+    memory_profile: bool,
 }
 
 #[derive(Default, Debug, Eq, PartialEq)]
 struct Counts {
+    instructions: u64,
     scalar_int_ops: u64,
     scalar_float_ops: u64,
     scalar_double_ops: u64,
@@ -44,6 +46,7 @@ struct Counts {
     dram_bytes_store: u64,
     rvv_state_errors: u64,
     unclassified_instructions: u64,
+    child_process_seen: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -128,12 +131,20 @@ struct DynamicCfgArtifact {
     irreducible_cycles: Vec<Vec<String>>,
 }
 
+#[derive(Serialize)]
+struct NativeTimingArtifact {
+    pid: i32,
+    start_ns: u64,
+    end_ns: u64,
+}
+
 impl QemuBackend {
     #[cfg(not(target_os = "linux"))]
     pub(super) fn new(
         _options: &Options,
         _native_performance: bool,
         _method: RooflineMethodInfo,
+        _memory_profile: bool,
     ) -> Result<Self> {
         anyhow::bail!("the QEMU roofline backend supports Linux hosts only");
     }
@@ -143,6 +154,7 @@ impl QemuBackend {
         options: &Options,
         native_performance: bool,
         method: RooflineMethodInfo,
+        memory_profile: bool,
     ) -> Result<Self> {
         let plugin = plugin_path(options);
         if !plugin.is_file() {
@@ -159,6 +171,7 @@ impl QemuBackend {
             native_performance,
             method,
             cache: detect_host_cache(),
+            memory_profile,
         })
     }
 
@@ -194,12 +207,21 @@ impl QemuBackend {
             }
             command.push("-plugin".to_string());
             command.push(format!(
-                "{},output={output},cache-line={},llc-size={},llc-assoc={}",
+                "{},output={output},cache-line={},llc-size={},llc-assoc={},memory-profile={}",
                 self.plugin.to_string_lossy(),
                 self.cache.line_size,
                 self.cache.capacity,
-                self.cache.associativity
+                self.cache.associativity,
+                if self.memory_profile { "on" } else { "off" }
             ));
+            if self.memory_profile {
+                if let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD") {
+                    command.push("-E".to_string());
+                    command.push(format!("LD_PRELOAD={preload}"));
+                    command.push("-E".to_string());
+                    command.push("MPERF_MEMORY_ALLOCATIONS=/dev/null".to_string());
+                }
+            }
         }
         command.extend(guest.iter().cloned());
         Ok(command)
@@ -232,6 +254,7 @@ pub(super) fn probe(options: &Options, guest: &Path) -> Result<()> {
             warnings: Vec::new(),
         },
         cache: detect_host_cache(),
+        memory_profile: false,
     };
     let qemu = backend.qemu_for(guest)?;
     ensure_plugin_support(&qemu)
@@ -339,8 +362,26 @@ impl RooflineBackend for QemuBackend {
                 },
                 guest.join(" ")
             );
-            let baseline =
-                profile_command(dispatcher.clone(), &baseline_command, Vec::new(), false).await?;
+            let baseline = profile_command(
+                dispatcher.clone(),
+                &baseline_command,
+                Vec::new(),
+                false,
+                self.memory_profile
+                    .then(|| output_directory.join("memory-rss.txt")),
+            )
+            .await?;
+            let timing_path = output_directory.join("memory-native.json");
+            let timing_file = File::create(&timing_path)
+                .with_context(|| format!("create '{}'", timing_path.display()))?;
+            serde_json::to_writer(
+                timing_file,
+                &NativeTimingArtifact {
+                    pid: baseline.pid,
+                    start_ns: baseline.start_ns,
+                    end_ns: baseline.end_ns,
+                },
+            )?;
             publish_baseline_region(
                 dispatcher.clone(),
                 baseline.pid,
@@ -395,6 +436,33 @@ impl RooflineBackend for QemuBackend {
                     counts.unclassified_instructions
                 );
             }
+            if counts.child_process_seen != 0 {
+                eprintln!(
+                    "Warning: child processes were detected and excluded from memory accounting"
+                );
+            }
+            let mut method = self.method.clone();
+            if baseline.instructions != 0 && counts.instructions != 0 {
+                let difference = baseline.instructions.abs_diff(counts.instructions) as f64
+                    / counts.instructions as f64;
+                if difference > 0.05 {
+                    let warning = format!(
+                        "native and QEMU instruction totals differ by {:.1}% (native {}, QEMU {}); replay-dependent memory rates are degraded",
+                        difference * 100.0,
+                        baseline.instructions,
+                        counts.instructions
+                    );
+                    eprintln!("Warning: {warning}");
+                    method.quality = "replay-diverged".to_string();
+                    method.warnings.push(warning);
+                }
+            }
+            if counts.child_process_seen != 0 {
+                method.warnings.push(
+                    "child processes were detected and excluded; v1 reports only the launched process and its threads"
+                        .to_string(),
+                );
+            }
             publish_accounting_region(
                 dispatcher,
                 process.pid(),
@@ -408,7 +476,7 @@ impl RooflineBackend for QemuBackend {
                 baseline,
                 process.pid(),
                 self.native_performance,
-                self.method.clone(),
+                method,
             ))
         })
     }
@@ -664,6 +732,8 @@ fn parse_counts(input: &str) -> Result<Counts> {
         dram_bytes_store: get("dram_bytes_store")?,
         rvv_state_errors: get("rvv_state_errors")?,
         unclassified_instructions: get("unclassified_instructions")?,
+        instructions: get("instructions")?,
+        child_process_seen: get("child_process_seen")?,
     })
 }
 
@@ -684,7 +754,9 @@ fn parse_dynamic_cfg(input: &str) -> Result<DynamicCfgCapture> {
 
         let fields = line.split_whitespace().collect::<Vec<_>>();
         match fields.as_slice() {
-            ["cache", line_size, capacity, associativity, "write-back-no-rfo"] => {
+            ["cache", line_size, capacity, associativity, model]
+                if matches!(*model, "write-back-no-rfo" | "write-back-write-allocate") =>
+            {
                 if capture.cache.is_some() {
                     anyhow::bail!("duplicate QEMU dynamic CFG cache metadata");
                 }
@@ -823,7 +895,12 @@ fn validate_cfg_totals(capture: &DynamicCfgCapture, counts: &Counts) -> Result<(
     };
     let mut comparable = totals;
     comparable.executions = 0;
-    if comparable != expected {
+    // Dirty lines still resident at process exit are flushed into the
+    // whole-process traffic total. They have no honest final basic-block
+    // owner, so per-block stores may be smaller but can never be larger.
+    let stores_are_valid = comparable.bytes_store <= expected.bytes_store;
+    comparable.bytes_store = expected.bytes_store;
+    if !stores_are_valid || comparable != expected {
         anyhow::bail!(
             "QEMU per-block accounting does not match whole-process totals: blocks={comparable:?}, process={expected:?}"
         );
@@ -972,13 +1049,13 @@ fn write_loop_artifact(
             "Only control-flow edges executed during the accounting run are present.",
             "Call/return pairs are summarized; non-local control transfers can split a region.",
             "Loop bytes are deterministic shared-LLC model traffic, not hardware memory-controller measurements.",
-            "The cache model uses write-back stores without read-for-ownership traffic.",
+            "The cache model uses write allocation/RFO and dirty writeback; non-temporal stores are conservative.",
             "Source locations require debug information; optimized code may map multiple loops to one line.",
         ],
         cache_line_size: cache.line_size,
         llc_capacity: cache.capacity,
         llc_associativity: cache.associativity,
-        traffic_model: "shared-llc-write-back-no-rfo",
+        traffic_model: "shared-llc-write-back-write-allocate",
         image_start: hex(image.start),
         image_end: hex(image.end),
         image_entry: hex(runtime_entry),
@@ -1101,7 +1178,7 @@ mod tests {
     #[test]
     fn parses_plugin_counts() {
         let counts = parse_counts(
-            "scalar_int_ops=7\nscalar_float_ops=0\nscalar_double_ops=3\nvector_int_ops=0\nvector_float_ops=2\nvector_double_ops=0\nbytes_load=64\nbytes_store=32\ndram_bytes_load=128\ndram_bytes_store=64\nrvv_state_errors=0\nunclassified_instructions=5\n",
+            "scalar_int_ops=7\nscalar_float_ops=0\nscalar_double_ops=3\nvector_int_ops=0\nvector_float_ops=2\nvector_double_ops=0\nbytes_load=64\nbytes_store=32\ndram_bytes_load=128\ndram_bytes_store=64\nrvv_state_errors=0\nunclassified_instructions=5\ninstructions=99\nchild_process_seen=0\n",
         )
         .unwrap();
         assert_eq!(
@@ -1115,6 +1192,7 @@ mod tests {
                 dram_bytes_load: 128,
                 dram_bytes_store: 64,
                 unclassified_instructions: 5,
+                instructions: 99,
                 ..Counts::default()
             }
         );
@@ -1126,7 +1204,7 @@ mod tests {
         assert!(missing.contains("missing required count"));
 
         let duplicate = parse_counts(
-            "scalar_int_ops=1\nscalar_int_ops=2\nscalar_float_ops=0\nscalar_double_ops=0\nvector_int_ops=0\nvector_float_ops=0\nvector_double_ops=0\nbytes_load=0\nbytes_store=0\ndram_bytes_load=0\ndram_bytes_store=0\nrvv_state_errors=0\nunclassified_instructions=0\n",
+            "scalar_int_ops=1\nscalar_int_ops=2\nscalar_float_ops=0\nscalar_double_ops=0\nvector_int_ops=0\nvector_float_ops=0\nvector_double_ops=0\nbytes_load=0\nbytes_store=0\ndram_bytes_load=0\ndram_bytes_store=0\nrvv_state_errors=0\nunclassified_instructions=0\ninstructions=0\nchild_process_seen=0\n",
         )
         .unwrap_err()
         .to_string();

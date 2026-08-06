@@ -1,4 +1,5 @@
 mod flamegraph;
+mod memory;
 mod metrics;
 mod model;
 mod profile;
@@ -30,6 +31,7 @@ use theme::*;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VisualizationKind {
+    Memory,
     Roofline,
     #[default]
     Flamegraph,
@@ -42,7 +44,8 @@ enum VisualizationKind {
 }
 
 impl VisualizationKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
+        Self::Memory,
         Self::Roofline,
         Self::Flamegraph,
         Self::FlameScope,
@@ -55,6 +58,7 @@ impl VisualizationKind {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Memory => "Memory",
             Self::Roofline => "Roofline",
             Self::Flamegraph => "Flamegraph",
             Self::FlameScope => "FlameScope",
@@ -68,6 +72,7 @@ impl VisualizationKind {
 
     fn id(self) -> &'static str {
         match self {
+            Self::Memory => "memory",
             Self::Roofline => "roofline",
             Self::Flamegraph => "flamegraph",
             Self::FlameScope => "flamescope",
@@ -219,6 +224,13 @@ impl MperfGui {
         })
     }
 
+    fn memory_data(&self) -> Option<&memory::MemoryData> {
+        self.model.as_ref()?.tabs.iter().find_map(|tab| match tab {
+            GuiTab::Memory(data) => Some(data.as_ref()),
+            _ => None,
+        })
+    }
+
     fn select_result_directory(&mut self, cx: &mut Context<Self>) {
         if self.picking_directory {
             return;
@@ -313,9 +325,19 @@ impl MperfGui {
         self.bottom_panel_collapsed = true;
         self.open_visualizations.clear();
         self.active_visualization = None;
-        if self.visualization_available(VisualizationKind::Roofline) {
+        let memory_scenario = self
+            .model
+            .as_ref()
+            .is_some_and(|model| model.record_info.scenario == mperf_data::Scenario::Mem);
+        if memory_scenario && self.visualization_available(VisualizationKind::Memory) {
+            self.open_visualizations.push(VisualizationKind::Memory);
+            self.active_visualization = Some(VisualizationKind::Memory);
+        } else if self.visualization_available(VisualizationKind::Roofline) {
             self.open_visualizations.push(VisualizationKind::Roofline);
             self.active_visualization = Some(VisualizationKind::Roofline);
+        } else if self.visualization_available(VisualizationKind::Memory) {
+            self.open_visualizations.push(VisualizationKind::Memory);
+            self.active_visualization = Some(VisualizationKind::Memory);
         } else if self.visualization_available(VisualizationKind::Flamegraph) {
             self.open_visualizations.push(VisualizationKind::Flamegraph);
             self.active_visualization = Some(VisualizationKind::Flamegraph);
@@ -409,6 +431,7 @@ impl MperfGui {
             return false;
         };
         match visualization {
+            VisualizationKind::Memory => return self.memory_data().is_some(),
             VisualizationKind::Roofline => return self.roofline_data().is_some(),
             VisualizationKind::Flamegraph => {
                 return self.flamegraph_data().is_some_and(|flamegraph| {
@@ -431,7 +454,9 @@ impl MperfGui {
             .iter()
             .any(|sample| !sample.stack.is_empty());
         match visualization {
-            VisualizationKind::Roofline | VisualizationKind::Flamegraph => unreachable!(),
+            VisualizationKind::Memory
+            | VisualizationKind::Roofline
+            | VisualizationKind::Flamegraph => unreachable!(),
             VisualizationKind::FlameScope => has_samples,
             VisualizationKind::Icicle
             | VisualizationKind::StackTimeline

@@ -179,6 +179,8 @@ pub enum TabSpec {
     Flamegraph,
     /// Instrumented loop statistics.
     Loops,
+    /// Process-wide memory footprint, locality, and bandwidth analysis.
+    Memory,
     /// Configurable table backed by a SQLite view.
     MetricsTable(MetricsTableSpec),
 }

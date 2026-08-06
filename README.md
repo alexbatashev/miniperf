@@ -109,6 +109,24 @@ Available Scenarios
 
 - `snapshot`: A basic performance snapshot similar to stat command but in
   sampling mode. Useful for general performance overview.
+- `mem`: Hybrid whole-process memory analysis. A native pass records timing,
+  hotspots, allocation lifetime, RSS, and supported Intel IMC/AMD data-fabric
+  bandwidth counters; a QEMU pass accounts every memory reference to derive
+  accessed and windowed working sets, spatial utilization, stride patterns,
+  exact LRU reuse distance, a miss-ratio curve, and modeled DRAM traffic.
+
+  ```sh
+  cargo build -p mperf -p miniperf-qemu-roofline
+  mperf record --scenario=mem \
+    --output-directory memory-results -- ./workload
+  ```
+
+  Hardware controller bandwidth is explicitly system-scoped during the target
+  lifetime. When it is unavailable, the result uses process-specific modeled
+  traffic and preserves that provenance in the Memory view and SQLite tables.
+  Version 1 profiles the launched process and its threads, not attached PIDs or
+  process trees. The complete implementation design and metric definitions are
+  recorded in [the memory profiling plan](docs/plans/memory-profiling.md).
 - `roofline`: Automatic multi-pass Roofline analysis capture:
     1. First to collect PMU (Performance Monitoring Unit) counters
     2. Second to gather operation and memory statistics

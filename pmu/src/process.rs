@@ -54,6 +54,7 @@ impl Process {
         c_arg_ptrs.push(std::ptr::null_mut());
 
         let c_env: Vec<CString> = std::env::vars()
+            .filter(|(key, _)| !env.iter().any(|(override_key, _)| override_key == key))
             .chain(env.iter().cloned())
             .map(|(key, val)| CString::new(format!("{key}={val}")))
             .collect::<Result<_, _>>()?;
@@ -122,10 +123,17 @@ impl Process {
                 c_args.iter().map(|arg| arg.as_ptr()).collect();
             c_arg_ptrs.push(std::ptr::null());
 
-            let c_env: Vec<CString> = std::env::vars()
+            let mut c_env: Vec<CString> = std::env::vars()
+                .filter(|(key, _)| !env.iter().any(|(override_key, _)| override_key == key))
                 .chain(env.iter().cloned())
                 .map(|(key, val)| CString::new(format!("{}={}", key, val)).unwrap())
                 .collect();
+            c_env.push(
+                CString::new(format!("MPERF_PROFILE_ROOT_PID={}", unsafe {
+                    libc::getpid()
+                }))
+                .unwrap(),
+            );
             let mut c_env_ptrs: Vec<*const libc::c_char> =
                 c_env.iter().map(|env| env.as_ptr()).collect();
             c_env_ptrs.push(std::ptr::null());

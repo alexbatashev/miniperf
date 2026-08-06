@@ -20,6 +20,7 @@ pub const CURRENT_FORMAT_VERSION: u32 = 2;
 #[derive(Clone, Debug, Copy, ValueEnum, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scenario {
     Snapshot,
+    Mem,
     Roofline,
     TMA,
 }
@@ -28,6 +29,29 @@ pub enum Scenario {
 pub struct SnapshotInfo {
     pub pid: i32,
     pub counters: Vec<(EventType, String)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryInfo {
+    /// PID of the native, timed process.
+    pub perf_pid: i32,
+    /// PID of the QEMU accounting process.
+    pub accounting_pid: i32,
+    pub counters: Vec<(EventType, String)>,
+    /// Complete address accounting is process-specific and modeled; hardware
+    /// memory-controller counters, when present, are system-scoped.
+    pub method: MemoryMethodInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryMethodInfo {
+    pub selection: String,
+    pub accounting: String,
+    pub performance: String,
+    pub bandwidth: String,
+    pub quality: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +118,7 @@ pub struct TMAInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ScenarioInfo {
     Snapshot(SnapshotInfo),
+    Mem(MemoryInfo),
     Roofline(RooflineInfo),
     TMA(TMAInfo),
 }
@@ -112,9 +137,40 @@ pub struct CoreCluster {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CpuInfo {
+    /// Sustainable host memory bandwidth, shared by memory and Roofline analyses.
+    #[serde(default)]
+    pub memory_calibration: Option<Box<MemoryBandwidthCalibration>>,
     /// Host ceilings measured immediately before a Roofline recording.
     #[serde(default)]
     pub roofline_calibration: Option<Box<RooflineCalibration>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryBandwidthCalibration {
+    pub threads: usize,
+    #[serde(default)]
+    pub cpu_affinity: Option<String>,
+    pub samples: usize,
+    pub gbytes_per_second: f64,
+    #[serde(default)]
+    pub gbytes_per_second_samples: Vec<f64>,
+    pub working_set_bytes: u64,
+    /// `effective_stream` until a supported memory-controller PMU is used.
+    pub source: String,
+}
+
+impl From<&RooflineCalibration> for MemoryBandwidthCalibration {
+    fn from(value: &RooflineCalibration) -> Self {
+        Self {
+            threads: value.threads,
+            cpu_affinity: value.cpu_affinity.clone(),
+            samples: value.samples,
+            gbytes_per_second: value.memory_gbytes_per_second,
+            gbytes_per_second_samples: value.memory_gbytes_per_second_samples.clone(),
+            working_set_bytes: value.memory_working_set_bytes,
+            source: "effective_stream".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +288,7 @@ impl Scenario {
     pub fn name(&self) -> &'static str {
         match self {
             Scenario::Snapshot => "Snapshot",
+            Scenario::Mem => "Memory",
             Scenario::Roofline => "Roofline",
             Scenario::TMA => "Top-Down",
         }
@@ -309,6 +366,7 @@ mod tests {
             memory_working_set_bytes: 1024,
         };
         let cpu_info = CpuInfo {
+            memory_calibration: None,
             roofline_calibration: Some(Box::new(calibration)),
         };
 

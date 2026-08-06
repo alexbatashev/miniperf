@@ -10,6 +10,7 @@ mod cpu_family;
 mod criterion_measurement;
 mod driver;
 mod event_timer;
+mod platform_memory;
 mod process;
 mod quick;
 
@@ -28,6 +29,7 @@ pub use event_timer::{
     CounterStatistics, EventTimer, Measurement, MeasurementSpan, MeasurementStatistics,
     Measurements, ReadCost, ReadMethod,
 };
+pub use platform_memory::{MemoryControllerMonitor, MemoryControllerSample};
 pub use pmu_data::{Metric, MetricError, MetricExpression};
 pub use process::Process;
 #[cfg(feature = "symbolize")]

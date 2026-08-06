@@ -28,7 +28,20 @@ pub async fn do_record(
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
 
-    let cpu_info = if scenario == Scenario::Roofline
+    let cpu_info = if scenario == Scenario::Mem
+        && roofline::uses_native_performance(&roofline_options, &command)?
+    {
+        println!("Calibrating sustainable host memory bandwidth...");
+        let calibration = roofline::calibrate_memory_host()?;
+        println!(
+            "Host memory ceiling: {:.2} GB/s ({} Rayon threads)",
+            calibration.gbytes_per_second, calibration.threads
+        );
+        mperf_data::CpuInfo {
+            memory_calibration: Some(Box::new(calibration)),
+            roofline_calibration: None,
+        }
+    } else if scenario == Scenario::Roofline
         && roofline::uses_native_performance(&roofline_options, &command)?
     {
         println!("Calibrating host Roofline ceilings...");
@@ -38,10 +51,11 @@ pub async fn do_record(
             calibration.fp64_gflops, calibration.memory_gbytes_per_second, calibration.threads
         );
         mperf_data::CpuInfo {
+            memory_calibration: Some(Box::new((&calibration).into())),
             roofline_calibration: Some(Box::new(calibration)),
         }
     } else {
-        if scenario == Scenario::Roofline {
+        if matches!(scenario, Scenario::Roofline | Scenario::Mem) {
             println!(
                 "Skipping host Roofline calibration: the selected method does not measure native performance"
             );
@@ -53,6 +67,18 @@ pub async fn do_record(
 
     let info = match scenario {
         Scenario::Snapshot => snapshot(dispatcher.clone(), pid, &command)?,
+        Scenario::Mem => {
+            if pid.is_some() {
+                anyhow::bail!("record mem requires a command and does not support --pid");
+            }
+            roofline::record_memory(
+                &roofline_options,
+                dispatcher.clone(),
+                &command,
+                output_directory,
+            )
+            .await?
+        }
         Scenario::Roofline => {
             roofline::record(
                 &roofline_options,

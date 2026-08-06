@@ -3,7 +3,10 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{Context, Result};
@@ -45,12 +48,14 @@ impl Options {
     pub fn validate_for(&self, scenario: Scenario) -> Result<()> {
         let has_qemu_options =
             self.qemu.is_some() || self.qemu_plugin.is_some() || !self.qemu_args.is_empty();
-        if scenario != Scenario::Roofline && self.backend != BackendKind::Auto {
-            anyhow::bail!("--roofline-backend is only valid with the roofline scenario");
+        if !matches!(scenario, Scenario::Roofline | Scenario::Mem)
+            && self.backend != BackendKind::Auto
+        {
+            anyhow::bail!("--roofline-backend is only valid with the roofline or mem scenario");
         }
-        if scenario != Scenario::Roofline && has_qemu_options {
+        if !matches!(scenario, Scenario::Roofline | Scenario::Mem) && has_qemu_options {
             anyhow::bail!(
-                "--qemu, --qemu-plugin, and --qemu-arg are only valid with the roofline scenario"
+                "--qemu, --qemu-plugin, and --qemu-arg are only valid with the roofline or mem scenario"
             );
         }
         if self.backend == BackendKind::Compiler && has_qemu_options {
@@ -117,11 +122,69 @@ pub async fn record(
             options,
             selected.performance == PerformanceSource::Native,
             selected.info,
+            false,
         )?),
     };
     backend
         .record(dispatcher, &resolved_command, output_directory)
         .await
+}
+
+pub async fn record_memory(
+    options: &Options,
+    dispatcher: Arc<EventDispatcher>,
+    command: &[String],
+    output_directory: &Path,
+) -> Result<ScenarioInfo> {
+    if command.is_empty() {
+        anyhow::bail!("record mem requires a command");
+    }
+    let selected = select_method(options, command)?;
+    if selected.backend != BackendKind::Qemu {
+        anyhow::bail!(
+            "the mem scenario requires QEMU address accounting; install a plugin-enabled QEMU and the miniperf QEMU plugin"
+        );
+    }
+    if selected.performance != PerformanceSource::Native {
+        anyhow::bail!("the mem scenario requires a native executable for trustworthy timing");
+    }
+    println!("Memory method: {}", selected.info.reason);
+    let mut resolved_command = command.to_vec();
+    resolved_command[0] = selected.executable.to_string_lossy().into_owned();
+    let backend = qemu::QemuBackend::new(options, true, selected.info, true)?;
+    let roofline = backend
+        .record(dispatcher, &resolved_command, output_directory)
+        .await?;
+    let ScenarioInfo::Roofline(info) = roofline else {
+        unreachable!("QEMU backend returned a non-Roofline result")
+    };
+    let method = info.method.as_deref();
+    let hardware_bandwidth = output_directory
+        .join("memory-bandwidth.txt")
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() != 0);
+    Ok(ScenarioInfo::Mem(mperf_data::MemoryInfo {
+        perf_pid: info.perf_pid,
+        accounting_pid: info.inst_pid,
+        counters: info.counters,
+        method: mperf_data::MemoryMethodInfo {
+            selection: method
+                .map_or("explicit", |value| value.selection.as_str())
+                .to_string(),
+            accounting: "qemu-addresses".to_string(),
+            performance: "native".to_string(),
+            bandwidth: if hardware_bandwidth {
+                "hardware_memory_controller"
+            } else {
+                "process_modeled"
+            }
+            .to_string(),
+            quality: method
+                .map_or("hybrid", |value| value.quality.as_str())
+                .to_string(),
+            warnings: method.map_or_else(Vec::new, |value| value.warnings.clone()),
+        },
+    }))
 }
 
 fn select_method(options: &Options, command: &[String]) -> Result<SelectedMethod> {
@@ -181,7 +244,7 @@ fn qemu_method(automatic: bool, native: bool, executable: PathBuf) -> SelectedMe
                 "per-loop throughput is published only when native timing has at most 10% estimated 95% sampling error; lower-confidence loops retain accounting but are not plotted".to_string(),
                 "native timing and QEMU accounting come from separate executions".to_string(),
                 "memory traffic is a deterministic host-LLC model, not a hardware memory-controller measurement".to_string(),
-                "the cache model uses write-back stores without read-for-ownership traffic".to_string(),
+                "the cache model uses write allocation/RFO and dirty writeback; non-temporal stores are conservative".to_string(),
             ],
         )
     } else {
@@ -287,6 +350,10 @@ pub(crate) fn calibrate_host() -> Result<mperf_data::RooflineCalibration> {
     calibrate::measure()
 }
 
+pub(crate) fn calibrate_memory_host() -> Result<mperf_data::MemoryBandwidthCalibration> {
+    calibrate::measure_memory()
+}
+
 pub(crate) fn uses_native_performance(options: &Options, command: &[String]) -> Result<bool> {
     if command.is_empty() {
         anyhow::bail!("record roofline requires a command");
@@ -320,6 +387,7 @@ impl RooflineBackend for CompilerBackend {
                     ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
                 ],
                 true,
+                None,
             )
             .await?;
 
@@ -361,6 +429,7 @@ struct ProfiledRun {
     start_ns: u64,
     end_ns: u64,
     counters: Vec<(mperf_data::EventType, String)>,
+    instructions: u64,
 }
 
 async fn profile_command(
@@ -368,6 +437,7 @@ async fn profile_command(
     command: &[String],
     mut env: Vec<(String, String)>,
     receive_collector_events: bool,
+    rss_output: Option<PathBuf>,
 ) -> Result<ProfiledRun> {
     let collector = if receive_collector_events {
         let (pipe_name, task) = create_shmem_pipe(command_name(command), dispatcher.clone())?;
@@ -376,8 +446,43 @@ async fn profile_command(
     } else {
         None
     };
+    if let Some(rss_path) = rss_output.as_ref() {
+        let allocation_path = rss_path.with_file_name("memory-allocations.txt");
+        env.push((
+            "MPERF_MEMORY_ALLOCATIONS".to_string(),
+            allocation_path.to_string_lossy().into_owned(),
+        ));
+        if let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD") {
+            let preload = std::env::var("LD_PRELOAD")
+                .map(|current| format!("{preload}:{current}"))
+                .unwrap_or_else(|_| preload.to_string());
+            env.push(("LD_PRELOAD".to_string(), preload));
+        }
+    }
     let process = Process::new(command, &env)?;
+    let rss_stop = Arc::new(AtomicBool::new(false));
+    let memory_controller = if rss_output.is_some() {
+        match pmu::MemoryControllerMonitor::start() {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                eprintln!("Warning: hardware memory-controller bandwidth is unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let rss_thread = rss_output.map(|path| {
+        let stop = rss_stop.clone();
+        let pid = process.pid();
+        std::thread::spawn(move || sample_memory_timeline(pid, &path, stop, memory_controller))
+    });
     let counters = get_pmu_counters(Scenario::Roofline);
+    let mut instruction_counter = pmu::CountingDriverBuilder::new()
+        .counters(&[Counter::Instructions])
+        .process(Some(&process))
+        .build()
+        .ok();
     let mut driver = pmu::SamplingDriverBuilder::new()
         .counters(&counters)
         .process(&process)
@@ -430,10 +535,30 @@ async fn profile_command(
             });
         }
     }))?;
+    if let Some(counter) = instruction_counter.as_mut() {
+        if counter.start().is_err() {
+            instruction_counter = None;
+        }
+    }
 
     let start_ns = monotonic_timestamp()?;
     process.cont();
     process.wait()?;
+    let instructions = if let Some(counter) = instruction_counter.as_mut() {
+        counter.stop()?;
+        counter
+            .counters()?
+            .get(Counter::Instructions)
+            .map_or(0, |value| value.value)
+    } else {
+        0
+    };
+    rss_stop.store(true, Ordering::Relaxed);
+    if let Some(thread) = rss_thread {
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("RSS sampler panicked"))??;
+    }
     let end_ns = monotonic_timestamp()?;
     driver.stop()?;
     if let Some(task) = collector {
@@ -449,7 +574,59 @@ async fn profile_command(
             .iter()
             .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
             .collect(),
+        instructions,
     })
+}
+
+fn sample_memory_timeline(
+    pid: i32,
+    output: &Path,
+    stop: Arc<AtomicBool>,
+    mut memory_controller: Option<pmu::MemoryControllerMonitor>,
+) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(output)
+        .with_context(|| format!("create RSS timeline '{}'", output.display()))?;
+    let bandwidth_path = output.with_file_name("memory-bandwidth.txt");
+    let mut bandwidth_file = memory_controller
+        .as_ref()
+        .map(|_| std::fs::File::create(&bandwidth_path))
+        .transpose()
+        .with_context(|| format!("create bandwidth timeline '{}'", bandwidth_path.display()))?;
+    while !stop.load(Ordering::Relaxed) {
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            if let Some(kbytes) = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                let timestamp = monotonic_timestamp()?;
+                writeln!(file, "{} {}", timestamp, kbytes.saturating_mul(1024))?;
+                if let Some(monitor) = memory_controller.as_ref() {
+                    match monitor.sample() {
+                        Ok(sample) => {
+                            if let Some(bandwidth_file) = bandwidth_file.as_mut() {
+                                writeln!(
+                                    bandwidth_file,
+                                    "{} {} {}",
+                                    timestamp, sample.read_bytes, sample.write_bytes
+                                )?;
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Warning: memory-controller sampling stopped: {error}");
+                            memory_controller = None;
+                            bandwidth_file = None;
+                            let _ = std::fs::remove_file(&bandwidth_path);
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn ensure_process_success(process: &Process, description: &str) -> Result<()> {

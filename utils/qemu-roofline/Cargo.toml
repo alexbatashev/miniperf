@@ -7,6 +7,11 @@ edition = "2021"
 name = "miniperf_qemu_roofline"
 crate-type = ["cdylib"]
 
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+libc = "0.2"
+
 [build-dependencies]
 serde_json = "1.0"
 

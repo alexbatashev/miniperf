@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
@@ -56,8 +56,17 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
         }
+        Scenario::Mem => {
+            process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
+            process_memory_artifact(&connection, &info, res_dir)?;
+            process_disassembly(&connection, res_dir, &mut pb).await?;
+            create_hotspots_view(&connection).await?;
+        }
         Scenario::Roofline => {
             process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
+            if res_dir.join("qemu-roofline.memory.json").exists() {
+                process_memory_artifact(&connection, &info, res_dir)?;
+            }
             process_binary_roofline_loops(&connection, &info, res_dir)?;
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
@@ -72,6 +81,529 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
 
     persist_derived_metrics(&connection)?;
 
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct MemoryArtifact {
+    format_version: u32,
+    line_size: u64,
+    references: u64,
+    architectural_load_bytes: u64,
+    architectural_store_bytes: u64,
+    unique_lines: u64,
+    distinct_bytes: u64,
+    cold_references: u64,
+    reuse_distance_log2: BTreeMap<u32, u64>,
+    spatial_utilization_percent: BTreeMap<u32, u64>,
+    stride_lines_log2: BTreeMap<i32, u64>,
+    working_set: Vec<MemoryWorkingSetArtifact>,
+}
+
+#[derive(Deserialize)]
+struct MemoryWorkingSetArtifact {
+    window_references: u64,
+    mean_lines: f64,
+    p95_lines: u64,
+    max_lines: u64,
+}
+
+#[derive(Deserialize)]
+struct NativeTimingArtifact {
+    pid: i32,
+    start_ns: u64,
+    end_ns: u64,
+}
+
+fn process_memory_artifact(
+    connection: &sqlite::Connection,
+    record_info: &RecordInfo,
+    res_dir: &Path,
+) -> Result<()> {
+    let artifact_path = res_dir.join("qemu-roofline.memory.json");
+    let artifact: MemoryArtifact = serde_json::from_reader(
+        std::fs::File::open(&artifact_path)
+            .with_context(|| format!("open memory artifact '{}'", artifact_path.display()))?,
+    )
+    .with_context(|| format!("parse memory artifact '{}'", artifact_path.display()))?;
+    if artifact.format_version != 1 {
+        anyhow::bail!(
+            "unsupported memory artifact version {}",
+            artifact.format_version
+        );
+    }
+    let timing: NativeTimingArtifact = serde_json::from_reader(
+        std::fs::File::open(res_dir.join("memory-native.json"))
+            .context("open native memory timing artifact")?,
+    )
+    .context("parse native memory timing artifact")?;
+    let duration_ns = timing.end_ns.saturating_sub(timing.start_ns);
+    let counts = parse_counter_file(&res_dir.join("qemu-roofline.counts"))?;
+    let modeled_load = counts.get("dram_bytes_load").copied().unwrap_or(0);
+    let modeled_store = counts.get("dram_bytes_store").copied().unwrap_or(0);
+    let modeled_total = modeled_load.saturating_add(modeled_store);
+    let bandwidth_samples = parse_bandwidth_samples(&res_dir.join("memory-bandwidth.txt"))?;
+    let hardware_total = bandwidth_samples
+        .last()
+        .map(|sample| sample.read_bytes.saturating_add(sample.write_bytes));
+    let primary_total = hardware_total.unwrap_or(modeled_total);
+    let (bandwidth_source, bandwidth_scope) = if hardware_total.is_some() {
+        ("hardware_memory_controller", "system_during_target")
+    } else {
+        ("process_modeled", "process")
+    };
+    let achieved_gbytes_per_second =
+        (duration_ns != 0).then(|| primary_total as f64 / duration_ns as f64);
+    let calibration = record_info.cpu_info.memory_calibration.as_deref();
+    let peak = calibration.map(|value| value.gbytes_per_second);
+    let utilization = achieved_gbytes_per_second
+        .zip(peak)
+        .filter(|(_, peak)| *peak > 0.0)
+        .map(|(achieved, peak)| achieved / peak);
+    let cold_fraction = (artifact.references != 0)
+        .then(|| artifact.cold_references as f64 / artifact.references as f64);
+
+    connection.execute(
+        "CREATE TABLE memory_summary (
+            format_version INTEGER NOT NULL,
+            process_id INTEGER NOT NULL,
+            line_size INTEGER NOT NULL,
+            reference_count INTEGER NOT NULL,
+            architectural_load_bytes INTEGER NOT NULL,
+            architectural_store_bytes INTEGER NOT NULL,
+            unique_lines INTEGER NOT NULL,
+            accessed_footprint_bytes INTEGER NOT NULL,
+            cold_references INTEGER NOT NULL,
+            cold_fraction REAL,
+            modeled_dram_read_bytes INTEGER NOT NULL,
+            modeled_dram_write_bytes INTEGER NOT NULL,
+            native_duration_ns INTEGER NOT NULL,
+            achieved_gbytes_per_second REAL,
+            peak_gbytes_per_second REAL,
+            bandwidth_utilization REAL,
+            bandwidth_source TEXT NOT NULL,
+            bandwidth_scope TEXT NOT NULL,
+            live_allocated_bytes INTEGER,
+            peak_allocated_bytes INTEGER,
+            live_mapped_bytes INTEGER,
+            peak_rss_bytes INTEGER,
+            quality TEXT NOT NULL
+        );
+        CREATE TABLE memory_timeline (
+            timestamp_ns INTEGER NOT NULL,
+            live_allocated_bytes INTEGER,
+            live_mapped_bytes INTEGER,
+            rss_bytes INTEGER,
+            dram_read_gbytes_per_second REAL,
+            dram_write_gbytes_per_second REAL,
+            bandwidth_source TEXT
+        );
+        CREATE TABLE memory_working_set (
+            window_references INTEGER NOT NULL,
+            mean_bytes REAL NOT NULL,
+            p95_bytes INTEGER NOT NULL,
+            max_bytes INTEGER NOT NULL
+        );
+        CREATE TABLE memory_spatial_utilization (
+            utilization_percent INTEGER NOT NULL,
+            lines INTEGER NOT NULL
+        );
+        CREATE TABLE memory_strides (
+            stride_log2_lines INTEGER NOT NULL,
+            reference_count INTEGER NOT NULL
+        );
+        CREATE TABLE memory_reuse_distance (
+            distance_log2_lines INTEGER NOT NULL,
+            reference_count INTEGER NOT NULL
+        );
+        CREATE TABLE memory_miss_ratio (
+            cache_lines INTEGER NOT NULL,
+            cache_bytes INTEGER NOT NULL,
+            miss_ratio REAL NOT NULL
+        );",
+    )?;
+
+    let quality = match &record_info.scenario_info {
+        ScenarioInfo::Mem(info) => info.method.quality.as_str(),
+        ScenarioInfo::Roofline(info) => info
+            .method
+            .as_deref()
+            .map_or("legacy", |method| method.quality.as_str()),
+        _ => "unknown",
+    };
+    let mut insert = connection.prepare(
+        "INSERT INTO memory_summary (
+            format_version, process_id, line_size, reference_count,
+            architectural_load_bytes, architectural_store_bytes, unique_lines,
+            accessed_footprint_bytes, cold_references, cold_fraction,
+            modeled_dram_read_bytes, modeled_dram_write_bytes, native_duration_ns,
+            achieved_gbytes_per_second, peak_gbytes_per_second,
+            bandwidth_utilization, bandwidth_source, bandwidth_scope, quality
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+    )?;
+    insert.bind((1, artifact.format_version as i64))?;
+    insert.bind((2, timing.pid as i64))?;
+    insert.bind((3, sqlite_u64(artifact.line_size)))?;
+    insert.bind((4, sqlite_u64(artifact.references)))?;
+    insert.bind((5, sqlite_u64(artifact.architectural_load_bytes)))?;
+    insert.bind((6, sqlite_u64(artifact.architectural_store_bytes)))?;
+    insert.bind((7, sqlite_u64(artifact.unique_lines)))?;
+    insert.bind((8, sqlite_u64(artifact.distinct_bytes)))?;
+    insert.bind((9, sqlite_u64(artifact.cold_references)))?;
+    insert.bind((10, cold_fraction))?;
+    insert.bind((11, sqlite_u64(modeled_load)))?;
+    insert.bind((12, sqlite_u64(modeled_store)))?;
+    insert.bind((13, sqlite_u64(duration_ns)))?;
+    insert.bind((14, achieved_gbytes_per_second))?;
+    insert.bind((15, peak))?;
+    insert.bind((16, utilization))?;
+    insert.bind((17, bandwidth_source))?;
+    insert.bind((18, bandwidth_scope))?;
+    insert.bind((19, quality))?;
+    insert.next()?;
+
+    let rss_samples = parse_rss_samples(&res_dir.join("memory-rss.txt"))?;
+    let peak_rss = rss_samples.iter().map(|(_, rss)| *rss).max();
+    if let Some(peak_rss) = peak_rss {
+        let mut update = connection.prepare("UPDATE memory_summary SET peak_rss_bytes = ?;")?;
+        update.bind((1, sqlite_u64(peak_rss)))?;
+        update.next()?;
+    }
+    let mut timeline = connection.prepare(
+        "INSERT INTO memory_timeline (
+            timestamp_ns, live_allocated_bytes, live_mapped_bytes, rss_bytes,
+            dram_read_gbytes_per_second, dram_write_gbytes_per_second, bandwidth_source
+         ) VALUES (?, NULL, NULL, ?, NULL, NULL, NULL);",
+    )?;
+    for (timestamp, rss) in rss_samples {
+        timeline.reset()?;
+        timeline.bind((1, sqlite_u64(timestamp)))?;
+        timeline.bind((2, sqlite_u64(rss)))?;
+        timeline.next()?;
+    }
+    let mut bandwidth_timeline = connection.prepare(
+        "INSERT INTO memory_timeline (
+            timestamp_ns, live_allocated_bytes, live_mapped_bytes, rss_bytes,
+            dram_read_gbytes_per_second, dram_write_gbytes_per_second, bandwidth_source
+         ) VALUES (?, NULL, NULL, NULL, ?, ?, 'hardware_memory_controller');",
+    )?;
+    for pair in bandwidth_samples.windows(2) {
+        let elapsed = pair[1].timestamp.saturating_sub(pair[0].timestamp);
+        if elapsed == 0 {
+            continue;
+        }
+        let read = pair[1].read_bytes.saturating_sub(pair[0].read_bytes) as f64 / elapsed as f64;
+        let write = pair[1].write_bytes.saturating_sub(pair[0].write_bytes) as f64 / elapsed as f64;
+        bandwidth_timeline.reset()?;
+        bandwidth_timeline.bind((1, sqlite_u64(pair[1].timestamp)))?;
+        bandwidth_timeline.bind((2, read))?;
+        bandwidth_timeline.bind((3, write))?;
+        bandwidth_timeline.next()?;
+    }
+    if let Some(allocations) = parse_allocation_samples(&res_dir.join("memory-allocations.txt"))? {
+        let mut update = connection.prepare(
+            "UPDATE memory_summary SET
+                live_allocated_bytes = ?, peak_allocated_bytes = ?, live_mapped_bytes = ?;",
+        )?;
+        update.bind((1, sqlite_u64(allocations.live_allocated)))?;
+        update.bind((2, sqlite_u64(allocations.peak_allocated)))?;
+        update.bind((3, sqlite_u64(allocations.live_mapped)))?;
+        update.next()?;
+        if allocations.child_seen {
+            connection
+                .execute("UPDATE memory_summary SET quality = quality || '+children-excluded';")?;
+        }
+        let mut allocation_timeline = connection.prepare(
+            "INSERT INTO memory_timeline (
+                timestamp_ns, live_allocated_bytes, live_mapped_bytes, rss_bytes,
+                dram_read_gbytes_per_second, dram_write_gbytes_per_second, bandwidth_source
+             ) VALUES (?, ?, ?, NULL, NULL, NULL, NULL);",
+        )?;
+        for point in allocations.points {
+            allocation_timeline.reset()?;
+            allocation_timeline.bind((1, sqlite_u64(point.timestamp)))?;
+            allocation_timeline.bind((2, sqlite_u64(point.live_allocated)))?;
+            allocation_timeline.bind((3, sqlite_u64(point.live_mapped)))?;
+            allocation_timeline.next()?;
+        }
+    }
+
+    let mut statement =
+        connection.prepare("INSERT INTO memory_working_set VALUES (?, ?, ?, ?);")?;
+    for window in artifact.working_set {
+        statement.reset()?;
+        statement.bind((1, sqlite_u64(window.window_references)))?;
+        statement.bind((2, window.mean_lines * artifact.line_size as f64))?;
+        statement.bind((
+            3,
+            sqlite_u64(window.p95_lines.saturating_mul(artifact.line_size)),
+        ))?;
+        statement.bind((
+            4,
+            sqlite_u64(window.max_lines.saturating_mul(artifact.line_size)),
+        ))?;
+        statement.next()?;
+    }
+    insert_histogram(
+        connection,
+        "memory_spatial_utilization",
+        artifact.spatial_utilization_percent,
+    )?;
+    insert_histogram(connection, "memory_strides", artifact.stride_lines_log2)?;
+    insert_histogram(
+        connection,
+        "memory_reuse_distance",
+        artifact.reuse_distance_log2.clone(),
+    )?;
+
+    let mut miss = connection.prepare("INSERT INTO memory_miss_ratio VALUES (?, ?, ?);")?;
+    for power in 0..=30_u32 {
+        let lines = 1_u64 << power;
+        let hits = artifact
+            .reuse_distance_log2
+            .iter()
+            .filter(|(bucket, _)| **bucket <= power)
+            .map(|(_, count)| *count)
+            .sum::<u64>();
+        let ratio = if artifact.references == 0 {
+            0.0
+        } else {
+            1.0 - hits as f64 / artifact.references as f64
+        };
+        miss.reset()?;
+        miss.bind((1, sqlite_u64(lines)))?;
+        miss.bind((2, sqlite_u64(lines.saturating_mul(artifact.line_size))))?;
+        miss.bind((3, ratio))?;
+        miss.next()?;
+    }
+    Ok(())
+}
+
+fn parse_rss_samples(path: &Path) -> Result<Vec<(u64, u64)>> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    contents
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let timestamp = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("RSS sample has no timestamp"))?
+                .parse()?;
+            let rss = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("RSS sample has no value"))?
+                .parse()?;
+            Ok((timestamp, rss))
+        })
+        .collect()
+}
+
+struct BandwidthSample {
+    timestamp: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+fn parse_bandwidth_samples(path: &Path) -> Result<Vec<BandwidthSample>> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    contents
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            Ok(BandwidthSample {
+                timestamp: fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("bandwidth sample has no timestamp"))?
+                    .parse()?,
+                read_bytes: fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("bandwidth sample has no read count"))?
+                    .parse()?,
+                write_bytes: fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("bandwidth sample has no write count"))?
+                    .parse()?,
+            })
+        })
+        .collect()
+}
+
+struct AllocationPoint {
+    timestamp: u64,
+    live_allocated: u64,
+    live_mapped: u64,
+}
+
+struct AllocationSummary {
+    live_allocated: u64,
+    peak_allocated: u64,
+    live_mapped: u64,
+    points: Vec<AllocationPoint>,
+    child_seen: bool,
+}
+
+fn parse_allocation_samples(path: &Path) -> Result<Option<AllocationSummary>> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let mut heap = HashMap::<u64, u64>::new();
+    let mut mappings = BTreeMap::<u64, u64>::new();
+    let mut live_allocated = 0_u64;
+    let mut peak_allocated = 0_u64;
+    let mut live_mapped = 0_u64;
+    let mut points = Vec::new();
+    let mut child_seen = false;
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let operation = fields
+            .next()
+            .and_then(|value| value.as_bytes().first())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid allocation event '{line}'"))?;
+        let timestamp = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("allocation event has no timestamp"))?
+            .parse::<u64>()?;
+        let first = u64::from_str_radix(
+            fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("allocation event has no address"))?,
+            16,
+        )?;
+        let second = u64::from_str_radix(
+            fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("allocation event has no second address"))?,
+            16,
+        )?;
+        let size = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("allocation event has no size"))?
+            .parse::<u64>()?;
+        match operation {
+            b'A' if first != 0 => {
+                if let Some(old) = heap.insert(first, size) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+                live_allocated = live_allocated.saturating_add(size);
+            }
+            b'F' => {
+                if let Some(old) = heap.remove(&first) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+            }
+            b'R' if second != 0 => {
+                if let Some(old) = heap.remove(&first) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+                if let Some(old) = heap.insert(second, size) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+                live_allocated = live_allocated.saturating_add(size);
+            }
+            b'M' if first != 0 => {
+                if let Some(old) = mappings.insert(first, size) {
+                    live_mapped = live_mapped.saturating_sub(old);
+                }
+                live_mapped = live_mapped.saturating_add(size);
+            }
+            b'U' => unmap_range(&mut mappings, first, size, &mut live_mapped),
+            b'C' => child_seen = true,
+            _ => {}
+        }
+        peak_allocated = peak_allocated.max(live_allocated);
+        points.push(AllocationPoint {
+            timestamp,
+            live_allocated,
+            live_mapped,
+        });
+    }
+    Ok(Some(AllocationSummary {
+        live_allocated,
+        peak_allocated,
+        live_mapped,
+        points,
+        child_seen,
+    }))
+}
+
+fn unmap_range(mappings: &mut BTreeMap<u64, u64>, start: u64, size: u64, live: &mut u64) {
+    let end = start.saturating_add(size);
+    let overlaps = mappings
+        .range(..end)
+        .filter_map(|(&base, &length)| {
+            (base.saturating_add(length) > start).then_some((base, length))
+        })
+        .collect::<Vec<_>>();
+    for (base, length) in overlaps {
+        mappings.remove(&base);
+        let mapping_end = base.saturating_add(length);
+        let removed_start = base.max(start);
+        let removed_end = mapping_end.min(end);
+        *live = live.saturating_sub(removed_end.saturating_sub(removed_start));
+        if base < start {
+            mappings.insert(base, start - base);
+        }
+        if mapping_end > end {
+            mappings.insert(end, mapping_end - end);
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_profile_tests {
+    use super::*;
+
+    #[test]
+    fn allocation_replay_tracks_realloc_free_and_partial_unmap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("allocations.txt");
+        std::fs::write(
+            &path,
+            "A 1 1000 0 64\nA 2 2000 0 32\nR 3 1000 3000 128\nF 4 2000 0 0\nM 5 4000 0 4096\nU 6 4400 0 1024\n",
+        )
+        .unwrap();
+        let summary = parse_allocation_samples(&path).unwrap().unwrap();
+        assert_eq!(summary.live_allocated, 128);
+        assert_eq!(summary.peak_allocated, 160);
+        assert_eq!(summary.live_mapped, 3072);
+        assert_eq!(summary.points.len(), 6);
+    }
+}
+
+fn parse_counter_file(path: &Path) -> Result<HashMap<String, u64>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("read counter artifact '{}'", path.display()))?;
+    contents
+        .lines()
+        .map(|line| {
+            let (name, value) = line
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("invalid counter line '{line}'"))?;
+            Ok((name.to_string(), value.parse::<u64>()?))
+        })
+        .collect()
+}
+
+fn insert_histogram<K>(
+    connection: &sqlite::Connection,
+    table: &str,
+    values: BTreeMap<K, u64>,
+) -> Result<()>
+where
+    K: Into<i64> + Copy,
+{
+    let mut statement = connection.prepare(format!("INSERT INTO {table} VALUES (?, ?);"))?;
+    for (bucket, count) in values {
+        statement.reset()?;
+        statement.bind((1, bucket.into()))?;
+        statement.bind((2, sqlite_u64(count)))?;
+        statement.next()?;
+    }
     Ok(())
 }
 
@@ -401,6 +933,7 @@ async fn process_pmu_counters(
     let info = &record_info.scenario_info;
     let events = match info {
         ScenarioInfo::Snapshot(s) => &s.counters,
+        ScenarioInfo::Mem(m) => &m.counters,
         ScenarioInfo::Roofline(r) => &r.counters,
         ScenarioInfo::TMA(t) => &t.counters,
     };
