@@ -4,7 +4,7 @@
  * roofline_core.h); this file is the DynamoRIO instrumentation adapter. It
  * emits the same three artifacts as the QEMU plugin:
  *   <output>            key=value counters
- *   <output minus .counts>.cfg          dynamic CFG v3
+ *   <output minus .counts>.cfg          CFG v4
  *   <output minus .counts>.memory.json  memory profile (when enabled)
  *
  * Client options (drrun -c libdr_roofline.so <options> -- app):
@@ -26,11 +26,9 @@
 #define DEFAULT_LLC_SIZE (8ULL * 1024 * 1024)
 #define DEFAULT_LLC_ASSOC 16
 
-/* Per-thread trace buffer of rc_record_t entries. Events are written inline
- * (no clean calls) and handed to roofline-core in one batch per flush, which
- * amortizes the C->Rust crossing and the session mutex over thousands of
- * events. Each flush costs a guard-page fault (~15us of signal handling), so
- * the buffer is sized generously: 1MiB = 64K records per flush. */
+/* Exact-address and unclassified events use a per-thread trace buffer. The
+ * low-overhead x86 Roofline pass instead keeps one atomic execution counter
+ * per translated block and derives architectural bytes from static operands. */
 #define RECORD_BUF_SIZE (1 << 20)
 
 static rc_session_t *session;
@@ -38,6 +36,7 @@ static uint32_t target;
 static bool in_child; /* forked child: do not write artifacts */
 static bool debug_unclassified;
 static bool debug_classify;
+static bool memory_profile;
 static file_t progress_file = INVALID_FILE;
 
 static int tls_index = -1;
@@ -50,6 +49,11 @@ typedef struct bb_data_t {
     uint32_t handle; /* rc_register_block handle; UINT32_MAX when invalid */
     rc_cost_t cost;
     uint64_t instructions;
+    uint64_t arch_bytes_load;
+    uint64_t arch_bytes_store;
+    uint64_t executions;
+    uint64_t successors[2];
+    uint32_t successor_count;
     struct bb_data_t *next;
 } bb_data_t;
 
@@ -184,10 +188,40 @@ event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb, bool for_trace,
             data->cost.vector_float += cls.cost.vector_float;
             data->cost.vector_double += cls.cost.vector_double;
         }
+        if (!memory_profile && target == RC_TARGET_X86) {
+            int i;
+            for (i = 0; i < instr_num_srcs(instr); i++) {
+                opnd_t op = instr_get_src(instr, i);
+                if (opnd_is_memory_reference(op) && instr_reads_memory(instr))
+                    data->arch_bytes_load +=
+                        opnd_size_in_bytes(opnd_get_size(op));
+            }
+            for (i = 0; i < instr_num_dsts(instr); i++) {
+                opnd_t op = instr_get_dst(instr, i);
+                if (opnd_is_memory_reference(op) && instr_writes_memory(instr))
+                    data->arch_bytes_store +=
+                        opnd_size_in_bytes(opnd_get_size(op));
+            }
+        }
     }
 
     data->handle = rc_register_block(session, data->vaddr, data->end_vaddr,
-                                     data->flow, &data->cost, data->instructions);
+                                     data->flow, &data->cost, data->instructions,
+                                     data->arch_bytes_load,
+                                     data->arch_bytes_store);
+    instr_t *last = instrlist_last_app(bb);
+    if (last != NULL && (instr_is_cbr(last) || instr_is_ubr(last))) {
+        opnd_t target_opnd = instr_get_target(last);
+        if (opnd_is_pc(target_opnd)) {
+            data->successors[data->successor_count++] =
+                (uint64_t)(uintptr_t)opnd_get_pc(target_opnd);
+        }
+        if (instr_is_cbr(last) && data->successor_count < 2)
+            data->successors[data->successor_count++] = data->end_vaddr;
+    } else if (data->flow == RC_FLOW_NORMAL && last != NULL &&
+               !instr_is_mbr(last)) {
+        data->successors[data->successor_count++] = data->end_vaddr;
+    }
 
     dr_mutex_lock(bb_list_lock);
     data->next = bb_list;
@@ -220,6 +254,29 @@ insert_record(void *drcontext, instrlist_t *bb, instr_t *where, uint32_t desc)
     drreg_unreserve_register(drcontext, bb, where, reg_scratch);
     drreg_unreserve_register(drcontext, bb, where, reg_ptr);
 }
+
+#ifdef X86
+static void
+insert_block_counter(void *drcontext, instrlist_t *bb, instr_t *where,
+                     uint64_t *counter)
+{
+    /* drx_insert_counter_update always spills arithmetic flags when called
+     * through drmgr. Most compute-loop bodies overwrite them before reading
+     * them, so avoid that dominant cost when liveness proves it is safe. */
+    bool preserve_aflags = !drx_aflags_are_dead(where);
+    if (preserve_aflags &&
+        drreg_reserve_aflags(drcontext, bb, where) != DRREG_SUCCESS) {
+        DR_ASSERT(false);
+        return;
+    }
+    instrlist_meta_preinsert(
+        bb, where,
+        LOCK(INSTR_CREATE_add(drcontext, OPND_CREATE_ABSMEM(counter, OPSZ_8),
+                              OPND_CREATE_INT8(1))));
+    if (preserve_aflags)
+        drreg_unreserve_aflags(drcontext, bb, where);
+}
+#endif
 
 static void
 instrument_mem_refs(void *drcontext, instrlist_t *bb, instr_t *instr,
@@ -292,8 +349,16 @@ event_bb_insertion(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
         return DR_EMIT_DEFAULT;
 
     if (instr == instrlist_first_app(bb) && data->handle != UINT32_MAX) {
+#ifdef X86
+        if (!memory_profile)
+            insert_block_counter(drcontext, bb, instr, &data->executions);
+        else
+            insert_record(drcontext, bb, instr,
+                          (data->handle << 2) | RC_RECORD_BLOCK_EXEC);
+#else
         insert_record(drcontext, bb, instr,
                       (data->handle << 2) | RC_RECORD_BLOCK_EXEC);
+#endif
     }
 
     disassemble_instr(drcontext, instr, text, sizeof(text));
@@ -330,7 +395,8 @@ event_bb_insertion(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     }
 #endif
 
-    if (instr_reads_memory(instr) || instr_writes_memory(instr))
+    if ((memory_profile || target != RC_TARGET_X86) &&
+        (instr_reads_memory(instr) || instr_writes_memory(instr)))
         instrument_mem_refs(drcontext, bb, instr, data->vaddr);
 
     return DR_EMIT_DEFAULT;
@@ -343,8 +409,25 @@ progress_thread(void *arg)
 {
     rc_session_t *progress_session = (rc_session_t *)arg;
     for (;;) {
-        dr_fprintf(progress_file, "%llu\n",
-                   rc_instruction_count(progress_session));
+        uint64_t instructions = rc_instruction_count(progress_session);
+#ifdef X86
+        uint64_t aggregate = 0;
+        dr_mutex_lock(bb_list_lock);
+        for (bb_data_t *data = bb_list; data != NULL; data = data->next) {
+            uint64_t executions = (uint64_t)dr_atomic_load64(
+                (volatile int64 *)&data->executions);
+            uint64_t block_instructions = executions > 0 &&
+                    data->instructions > UINT64_MAX / executions
+                ? UINT64_MAX
+                : executions * data->instructions;
+            aggregate = UINT64_MAX - aggregate < block_instructions
+                ? UINT64_MAX
+                : aggregate + block_instructions;
+        }
+        dr_mutex_unlock(bb_list_lock);
+        instructions = aggregate;
+#endif
+        dr_fprintf(progress_file, "%llu\n", instructions);
         dr_sleep(100);
     }
 }
@@ -374,6 +457,28 @@ event_exit(void)
         record_buf = NULL;
     }
     if (!in_child && session != NULL) {
+        dr_mutex_lock(bb_list_lock);
+        for (bb_data_t *data = bb_list; data != NULL; data = data->next) {
+            if (data->executions == 0)
+                continue;
+            uint64_t executed_successors[2] = { 0, 0 };
+            uint32_t executed_count = 0;
+            for (uint32_t i = 0; i < data->successor_count; i++) {
+                for (bb_data_t *candidate = bb_list; candidate != NULL;
+                     candidate = candidate->next) {
+                    if (candidate->executions != 0 &&
+                        candidate->vaddr == data->successors[i]) {
+                        executed_successors[executed_count++] =
+                            data->successors[i];
+                        break;
+                    }
+                }
+            }
+            rc_counted_block(session, data->handle, data->executions,
+                             executed_successors[0], executed_successors[1],
+                             executed_count);
+        }
+        dr_mutex_unlock(bb_list_lock);
         if (progress_file != INVALID_FILE)
             dr_fprintf(progress_file, "%llu\n", rc_instruction_count(session));
         rc_finalize(session);
@@ -452,9 +557,10 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     uint64_t llc_assoc = parse_u64_option(argc, argv, "llc-assoc", DEFAULT_LLC_ASSOC);
     const char *profile = parse_str_option(argc, argv, "memory-profile", "on");
     const char *progress = parse_str_option(argc, argv, "progress", "");
-    uint32_t memory_profile = strcmp(profile, "off") != 0;
+    memory_profile = strcmp(profile, "off") != 0;
     debug_unclassified = getenv("MPERF_DR_DEBUG_UNCLASSIFIED") != NULL;
     debug_classify = getenv("MPERF_DR_DEBUG_CLASSIFY") != NULL;
+    bb_list_lock = dr_mutex_create();
 
     session = rc_session_new(output, cache_line, llc_size, llc_assoc, memory_profile);
     if (session == NULL) {
@@ -511,7 +617,6 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
         dr_fprintf(STDERR, "miniperf dr-roofline: failed to create trace buffer\n");
         dr_abort();
     }
-    bb_list_lock = dr_mutex_create();
     tls_index = drmgr_register_tls_field();
     DR_ASSERT(tls_index != -1);
     if (!drmgr_register_thread_init_event(event_thread_init) ||

@@ -326,15 +326,12 @@ fn dynamorio_method(automatic: bool, executable: PathBuf) -> SelectedMethod {
             selection: if automatic { "auto" } else { "explicit" }.to_string(),
             accounting: "dynamorio".to_string(),
             performance: "native".to_string(),
-            traffic: "dram-model".to_string(),
-            quality: "hybrid-binary-sampled-cache-model".to_string(),
-            reason: "native timing with DynamoRIO operation accounting, shared-LLC traffic modeling, and dynamic binary loop discovery"
-                .to_string(),
+            traffic: "architectural".to_string(),
+            quality: "hybrid-binary".to_string(),
+            reason: "native timing with DynamoRIO binary accounting".to_string(),
             warnings: vec![
                 "per-loop throughput is published only when native timing has at most 10% estimated 95% sampling error; lower-confidence loops retain accounting but are not plotted".to_string(),
                 "native timing and DynamoRIO accounting come from separate executions".to_string(),
-                "memory traffic is a deterministic host-LLC model, not a hardware memory-controller measurement".to_string(),
-                "the cache model uses write allocation/RFO and dirty writeback; non-temporal stores are conservative".to_string(),
             ],
         },
     }

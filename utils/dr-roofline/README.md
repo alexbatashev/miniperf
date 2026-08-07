@@ -1,7 +1,7 @@
 # dr-roofline — DynamoRIO backend for roofline/memory accounting
 
 DynamoRIO client emitting the same three artifacts as the QEMU plugin
-(`qemu-roofline.counts`, `.cfg` dynamic-CFG v4, `.memory.json`); all analysis
+(`qemu-roofline.counts`, CFG v4, `.memory.json`); all analysis
 lives in the shared `miniperf-roofline-core` crate (`utils/roofline-core`),
 linked in as a staticlib via the C API in `roofline_core.h`.
 
@@ -48,37 +48,33 @@ instrumentation can exceed DynamoRIO's block emit limits at default sizes
 
 ## Instrumentation design
 
-Events are not delivered via clean calls. Each block execution and each memory
-operand inline-writes a 16-byte `rc_record_t` into a per-thread 1MiB drx_buf
-trace buffer; when the buffer fills (or the thread exits), one call into
-`rc_process_batch` processes 64K records under a single session-mutex
-acquisition. Translation-time metadata (block costs, operand sizes) is
-registered once via `rc_register_block`/`rc_register_mem` and referenced from
-records by handle. Batch processing run-length-aggregates back-to-back
-self-loop block executions and skips CFG traffic attribution for accesses
-whose modeled LLC traffic is zero. Per-thread event order is exact; with
-multiple threads, interleaving across threads is approximated at buffer-flush
-granularity (single-threaded results are bit-identical to per-event
-processing — see `batch_processing_matches_per_event_processing` in
-roofline-core). RVV operations still use clean calls because they must read
-vl/vtype/vstart/v0 from the machine context at execution time.
+The x86 Roofline pass (`memory-profile=off`) uses one atomic execution counter
+per translated basic block. Operation counts, instruction counts, and
+architectural load/store bytes are multiplied by those counters at shutdown,
+removing dynamic-address and trace-record work from hot loops. Direct successor
+topology is registered at translation time; block counts are exact while
+conditional edge weights are approximate. This pass intentionally does not
+produce modeled DRAM traffic. Use the `mem` scenario (`memory-profile=on`) when
+exact addresses, reuse distance, or shared-LLC modeling are required.
+
+Exact-address events are inline-written to a per-thread 1MiB `drx_buf` and
+processed in 64K-record batches. RVV operations still use clean calls because
+they must read vl/vtype/vstart/v0 from the machine context at execution time.
+Non-x86 Roofline accounting retains this buffered path until aggregate-counter
+instrumentation is validated on those ports.
 
 ## Validation status (Aug 2026, DR master 1fd3603b)
 
-- x86_64: counts parity with the QEMU plugin (FP ops identical, bytes and
-  modeled DRAM within 0.01%, instructions within 0.1%). Overhead vs native
-  after the buffered-instrumentation redesign, measured on an optimized AVX
-  matmul (worst case: ~4 records per 4-wide vector iteration): ~55×
-  accounting-only (was ~680× with per-event clean calls). memory-profile=on
-  remains dominated by the exact reuse-distance/working-set analysis
-  (~2500× on the same matmul).
-- x86_64 artifact equivalence: with ASLR disabled, the counters, per-block CFG
-  and memory profile from the buffered client are byte-identical to the
-  per-event clean-call client (modeled DRAM bytes vary by ±0.01% between runs
-  under ASLR because set mapping depends on absolute addresses). The `image`
-  line legitimately differs — see below.
+- x86_64: FP operation counts and architectural bytes remain exact. On the
+  AVX2/FMA matmul benchmark (256×256, 100 repeats), the timed kernel measured
+  0.713 s under DynamoRIO versus 0.171 s native (~4.2×); the former buffered
+  design was roughly 20× locally and had measured as high as ~55× elsewhere.
+  Fixed launcher/translation overhead was 0.13 s in this short run.
+- `memory-profile=on` retains exact dynamic addresses and shared-LLC/reuse
+  analysis; it remains substantially slower and is intended for the `mem`
+  scenario rather than the normal Roofline pass.
 
-Dynamic CFG v4 adds per-block `arch_bytes_load`/`arch_bytes_store` next to the
+CFG v4 adds per-block `arch_bytes_load`/`arch_bytes_store` next to the
 existing modeled-DRAM `bytes_load`/`bytes_store`.
 
 Arithmetic intensity is computed from **architectural** traffic — the bytes the
@@ -92,10 +88,11 @@ the chart exists to show. The two must not be mixed per loop: that would put
 different loops on different x-axes and make a single loop's intensity jump
 when its working set crosses the LLC.
 
-The `roofline` view exposes `arch_bytes` and `dram_bytes` separately, so
-`arch_bytes / dram_bytes` gives each loop's cache reuse (1x for a streaming
-loop, unbounded for a cache-resident one). Unlike modeled DRAM stores,
-architectural bytes are attributed to the issuing block for every access, so
+The `roofline` view exposes `arch_bytes` and `dram_bytes` separately. Exact
+address backends provide both, so `arch_bytes / dram_bytes` gives each loop's
+cache reuse (1x for a streaming loop, unbounded for a cache-resident one). The
+low-overhead x86 Roofline pass leaves `dram_bytes` at zero. Unlike modeled DRAM
+stores, architectural bytes are attributed to the issuing block for every access, so
 their per-block sum must equal the whole-process totals exactly —
 `validate_cfg_totals` enforces that.
 

@@ -1,4 +1,7 @@
 #include "bench.h"
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#endif
 #ifdef MINIPERF_MANUAL_ROOFLINE
 #include "roofline.h"
 #endif
@@ -29,9 +32,36 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < n; ++i) {
             for (size_t k = 0; k < n; ++k) {
                 const double aik = a[i * n + k];
+#if defined(__AVX2__) && defined(__FMA__)
+                const __m256d va = _mm256_set1_pd(aik);
+                size_t j = 0;
+                for (; j + 15 < n; j += 16) {
+                    __m256d c0 = _mm256_loadu_pd(&c[i * n + j]);
+                    __m256d c1 = _mm256_loadu_pd(&c[i * n + j + 4]);
+                    __m256d c2 = _mm256_loadu_pd(&c[i * n + j + 8]);
+                    __m256d c3 = _mm256_loadu_pd(&c[i * n + j + 12]);
+                    c0 = _mm256_fmadd_pd(va, _mm256_loadu_pd(&b[k * n + j]), c0);
+                    c1 = _mm256_fmadd_pd(va, _mm256_loadu_pd(&b[k * n + j + 4]), c1);
+                    c2 = _mm256_fmadd_pd(va, _mm256_loadu_pd(&b[k * n + j + 8]), c2);
+                    c3 = _mm256_fmadd_pd(va, _mm256_loadu_pd(&b[k * n + j + 12]), c3);
+                    _mm256_storeu_pd(&c[i * n + j], c0);
+                    _mm256_storeu_pd(&c[i * n + j + 4], c1);
+                    _mm256_storeu_pd(&c[i * n + j + 8], c2);
+                    _mm256_storeu_pd(&c[i * n + j + 12], c3);
+                }
+                for (; j + 3 < n; j += 4) {
+                    __m256d cv = _mm256_loadu_pd(&c[i * n + j]);
+                    cv = _mm256_fmadd_pd(va, _mm256_loadu_pd(&b[k * n + j]), cv);
+                    _mm256_storeu_pd(&c[i * n + j], cv);
+                }
+                for (; j < n; ++j) {
+                    c[i * n + j] += aik * b[k * n + j];
+                }
+#else
                 for (size_t j = 0; j < n; ++j) {
                     c[i * n + j] += aik * b[k * n + j];
                 }
+#endif
             }
         }
     }

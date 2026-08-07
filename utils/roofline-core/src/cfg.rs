@@ -135,6 +135,46 @@ impl DynamicCfg {
             .saturating_add(cost.vector_double.saturating_mul(count));
     }
 
+    /// Adds executions collected by a direct counter plus static successors.
+    /// These blocks bypass the ordered event stream to keep their hot path to
+    /// one counter update.
+    pub fn record_counted_block(&mut self, cost: &BlockCost, count: u64, successors: &[u64]) {
+        if count == 0 {
+            return;
+        }
+        let block = self.blocks.entry(cost.vaddr).or_default();
+        block.end_vaddr = block.end_vaddr.max(cost.end_vaddr);
+        block.executions = block.executions.saturating_add(count);
+        block.scalar_int = block
+            .scalar_int
+            .saturating_add(cost.scalar_int.saturating_mul(count));
+        block.scalar_float = block
+            .scalar_float
+            .saturating_add(cost.scalar_float.saturating_mul(count));
+        block.scalar_double = block
+            .scalar_double
+            .saturating_add(cost.scalar_double.saturating_mul(count));
+        block.vector_int = block
+            .vector_int
+            .saturating_add(cost.vector_int.saturating_mul(count));
+        block.vector_float = block
+            .vector_float
+            .saturating_add(cost.vector_float.saturating_mul(count));
+        block.vector_double = block
+            .vector_double
+            .saturating_add(cost.vector_double.saturating_mul(count));
+        for &successor in successors {
+            let edge_count = if successor == cost.vaddr {
+                count.saturating_sub(1)
+            } else {
+                count
+            };
+            if edge_count != 0 {
+                *self.edges.entry((cost.vaddr, successor)).or_default() += edge_count;
+            }
+        }
+    }
+
     pub fn attribute_unclassified(&mut self, block_address: u64) {
         let block = self.blocks.entry(block_address).or_default();
         block.unclassified = block.unclassified.saturating_add(1);
@@ -179,5 +219,32 @@ impl DynamicCfg {
 impl Default for DynamicCfg {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counted_blocks_preserve_costs_and_static_successors() {
+        let mut cfg = DynamicCfg::new();
+        let cost = BlockCost {
+            vaddr: 0x100,
+            end_vaddr: 0x120,
+            flow: FlowKind::Normal,
+            scalar_int: 2,
+            vector_double: 8,
+            instructions: 5,
+            ..BlockCost::default()
+        };
+        cfg.record_counted_block(&cost, 10, &[0x100, 0x120]);
+
+        let block = &cfg.blocks[&0x100];
+        assert_eq!(block.executions, 10);
+        assert_eq!(block.scalar_int, 20);
+        assert_eq!(block.vector_double, 80);
+        assert_eq!(cfg.edges[&(0x100, 0x100)], 9);
+        assert_eq!(cfg.edges[&(0x100, 0x120)], 10);
     }
 }

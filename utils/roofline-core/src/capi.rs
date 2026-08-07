@@ -71,6 +71,13 @@ struct RegisteredMem {
     store: bool,
 }
 
+#[derive(Clone)]
+struct RegisteredBlock {
+    cost: BlockCost,
+    arch_bytes_load: u64,
+    arch_bytes_store: u64,
+}
+
 struct Inner {
     counters: CounterSnapshot,
     cfg: DynamicCfg,
@@ -78,7 +85,7 @@ struct Inner {
     memory: Option<MemoryAnalysis>,
     image: Option<ImageInfo>,
     output: PathBuf,
-    blocks: Vec<BlockCost>,
+    blocks: Vec<RegisteredBlock>,
     mems: Vec<RegisteredMem>,
 }
 
@@ -312,6 +319,8 @@ pub unsafe extern "C" fn rc_register_block(
     flow: u32,
     cost: *const RcCost,
     instructions: u64,
+    arch_bytes_load: u64,
+    arch_bytes_store: u64,
 ) -> u32 {
     let Some(session) = (unsafe { session.as_ref() }) else {
         return u32::MAX;
@@ -339,7 +348,11 @@ pub unsafe extern "C" fn rc_register_block(
     if inner.blocks.len() >= (u32::MAX >> 2) as usize {
         return u32::MAX;
     }
-    inner.blocks.push(block);
+    inner.blocks.push(RegisteredBlock {
+        cost: block,
+        arch_bytes_load,
+        arch_bytes_store,
+    });
     (inner.blocks.len() - 1) as u32
 }
 
@@ -368,6 +381,39 @@ pub unsafe extern "C" fn rc_register_mem(
         store: is_store != 0,
     });
     (inner.mems.len() - 1) as u32
+}
+
+/// Applies an aggregate execution count and static successors for a block.
+///
+/// # Safety
+/// `session` must be live and `handle` must come from `rc_register_block`.
+#[no_mangle]
+pub unsafe extern "C" fn rc_counted_block(
+    session: *mut Session,
+    handle: u32,
+    executions: u64,
+    successor_a: u64,
+    successor_b: u64,
+    successor_count: u32,
+) {
+    let Some(session) = (unsafe { session.as_ref() }) else {
+        return;
+    };
+    if executions == 0 {
+        return;
+    }
+    let mut inner = session.inner.lock().unwrap();
+    let Some(block) = inner.blocks.get(handle as usize).cloned() else {
+        return;
+    };
+    add_exec_counters(&mut inner.counters, &block.cost, executions);
+    let successors = [successor_a, successor_b];
+    inner.cfg.record_counted_block(
+        &block.cost,
+        executions,
+        &successors[..(successor_count as usize).min(successors.len())],
+    );
+    add_static_memory(&mut inner, &block, executions);
 }
 
 /// Memory attribution for one run of consecutive accesses issued by the same
@@ -408,12 +454,25 @@ fn flush_repeats(inner: &mut Inner, run_handle: u32, run_count: &mut u64) {
     if *run_count == 0 {
         return;
     }
-    if let Some(cost) = inner.blocks.get(run_handle as usize) {
-        let cost = cost.clone();
-        add_exec_counters(&mut inner.counters, &cost, *run_count);
-        inner.cfg.record_repeats(&cost, *run_count);
+    if let Some(block) = inner.blocks.get(run_handle as usize) {
+        let block = block.clone();
+        add_exec_counters(&mut inner.counters, &block.cost, *run_count);
+        inner.cfg.record_repeats(&block.cost, *run_count);
+        add_static_memory(inner, &block, *run_count);
     }
     *run_count = 0;
+}
+
+fn add_static_memory(inner: &mut Inner, block: &RegisteredBlock, executions: u64) {
+    let bytes_load = block.arch_bytes_load.saturating_mul(executions);
+    let bytes_store = block.arch_bytes_store.saturating_mul(executions);
+    inner.counters.bytes_load = inner.counters.bytes_load.saturating_add(bytes_load);
+    inner.counters.bytes_store = inner.counters.bytes_store.saturating_add(bytes_store);
+    if bytes_load != 0 || bytes_store != 0 {
+        inner
+            .cfg
+            .attribute_memory(block.cost.vaddr, bytes_load, bytes_store, 0, 0);
+    }
 }
 
 /// Processes a batch of buffered instrumentation records for one thread.
@@ -500,21 +559,22 @@ pub unsafe extern "C" fn rc_process_batch(
                     continue;
                 }
                 flush_repeats(inner, run_handle, &mut run_count);
-                let Some(cost) = inner.blocks.get(handle) else {
+                let Some(block) = inner.blocks.get(handle) else {
                     run_handle = u32::MAX;
                     continue;
                 };
-                let cost = cost.clone();
-                add_exec_counters(&mut inner.counters, &cost, 1);
-                inner.cfg.record_block(thread, &cost);
-                run_handle = if cost.flow == FlowKind::Normal {
+                let block = block.clone();
+                add_exec_counters(&mut inner.counters, &block.cost, 1);
+                inner.cfg.record_block(thread, &block.cost);
+                add_static_memory(inner, &block, 1);
+                run_handle = if block.cost.flow == FlowKind::Normal {
                     handle as u32
                 } else {
                     u32::MAX
                 };
             }
             RC_RECORD_UNCLASSIFIED => {
-                let Some(vaddr) = inner.blocks.get(handle).map(|cost| cost.vaddr) else {
+                let Some(vaddr) = inner.blocks.get(handle).map(|block| block.cost.vaddr) else {
                     continue;
                 };
                 inner.counters.unclassified_instructions =
@@ -709,8 +769,9 @@ mod tests {
         let batched = new_session(&dir, "batched");
 
         let block_a =
-            unsafe { rc_register_block(batched, 0x400, 0x420, RC_FLOW_NORMAL, &cost_a, 5) };
-        let block_b = unsafe { rc_register_block(batched, 0x500, 0x510, RC_FLOW_CALL, &cost_b, 3) };
+            unsafe { rc_register_block(batched, 0x400, 0x420, RC_FLOW_NORMAL, &cost_a, 5, 0, 0) };
+        let block_b =
+            unsafe { rc_register_block(batched, 0x500, 0x510, RC_FLOW_CALL, &cost_b, 3, 0, 0) };
         let mem_handles: Vec<u32> = accesses
             .iter()
             .map(|&(_, size, store)| unsafe { rc_register_mem(batched, 0x400, size, store) })

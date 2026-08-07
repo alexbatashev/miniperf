@@ -223,10 +223,40 @@ impl QemuBackend {
     #[cfg(target_os = "linux")]
     pub(super) fn new_dynamorio(
         options: &Options,
-        method: RooflineMethodInfo,
+        mut method: RooflineMethodInfo,
         memory_profile: bool,
     ) -> Result<Self> {
         let (drrun, client) = dynamorio_paths(options)?;
+        if memory_profile {
+            method.traffic = "dram-model".to_string();
+            method.quality = "hybrid-binary-exact-addresses".to_string();
+            method.reason =
+                "native timing with DynamoRIO exact-address and shared-LLC analysis".to_string();
+            method.warnings.push(
+                "memory traffic is a deterministic host-LLC model, not a hardware memory-controller measurement"
+                    .to_string(),
+            );
+            method.warnings.push(
+                "the cache model uses write allocation/RFO and dirty writeback; non-temporal stores are conservative"
+                    .to_string(),
+            );
+        } else {
+            method.traffic = "architectural".to_string();
+            method.quality = "hybrid-binary-aggregate-blocks".to_string();
+            method.reason = "native timing with low-overhead DynamoRIO operation and architectural-traffic accounting"
+                .to_string();
+            method.warnings.retain(|warning| {
+                !warning.contains("host-LLC model") && !warning.contains("write allocation/RFO")
+            });
+            method.warnings.push(
+                "the low-overhead Roofline pass does not collect dynamic addresses or modeled DRAM traffic; use the mem scenario for exact address and shared-LLC analysis"
+                    .to_string(),
+            );
+            method.warnings.push(
+                "basic-block counts are exact; CFG successor topology is static and conditional edge weights are approximate"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             tool: AccountingTool::DynamoRio { drrun, client },
             // DynamoRIO instruments the native binary; performance always
@@ -819,10 +849,21 @@ impl RooflineBackend for QemuBackend {
                 })?)?;
             validate_cfg_totals(&cfg_capture, &counts)?;
             let loops_path = output_directory.join("qemu-roofline.loops.json");
-            let (natural_loops, irreducible_cycles) =
-                write_loop_artifact(&loops_path, &cfg_capture, Path::new(&guest[0]))?;
+            let aggregate_blocks =
+                matches!(&self.tool, AccountingTool::DynamoRio { .. }) && !self.memory_profile;
+            let (natural_loops, irreducible_cycles) = write_loop_artifact(
+                &loops_path,
+                &cfg_capture,
+                Path::new(&guest[0]),
+                aggregate_blocks,
+            )?;
+            let cfg_kind = if aggregate_blocks {
+                "aggregate CFG"
+            } else {
+                "dynamic CFG"
+            };
             println!(
-                "{} dynamic CFG: {natural_loops} natural loops, {irreducible_cycles} irreducible cycles; candidates saved to '{}'",
+                "{} {cfg_kind}: {natural_loops} natural loops, {irreducible_cycles} irreducible cycles; candidates saved to '{}'",
                 self.tool.name(),
                 loops_path.display()
             );
@@ -1322,6 +1363,7 @@ fn write_loop_artifact(
     path: &Path,
     capture: &DynamicCfgCapture,
     executable: &Path,
+    aggregate_blocks: bool,
 ) -> Result<(usize, usize)> {
     let image = capture
         .image
@@ -1451,21 +1493,38 @@ fn write_loop_artifact(
     let cache = capture
         .cache
         .context("QEMU dynamic CFG has no cache-model metadata")?;
+    let (model, warnings, traffic_model) = if aggregate_blocks {
+        (
+            "static-successor CFG with exact aggregate block counts",
+            vec![
+                "Direct successor topology is static; conditional edge weights are approximate.",
+                "Loop bytes are exact architectural operand traffic; modeled DRAM traffic is not collected.",
+                "Source locations require debug information; optimized code may map multiple loops to one line.",
+            ],
+            "architectural-operands",
+        )
+    } else {
+        (
+            "observed translation-block CFG with summarized calls",
+            vec![
+                "Only control-flow edges executed during the accounting run are present.",
+                "Call/return pairs are summarized; non-local control transfers can split a region.",
+                "Loop bytes are deterministic shared-LLC model traffic, not hardware memory-controller measurements.",
+                "The cache model uses write allocation/RFO and dirty writeback; non-temporal stores are conservative.",
+                "Source locations require debug information; optimized code may map multiple loops to one line.",
+            ],
+            "shared-llc-write-back-write-allocate",
+        )
+    };
     let artifact = DynamicCfgArtifact {
         format_version: 3,
-        model: "observed QEMU translation-block CFG with summarized calls",
+        model,
         executable: executable.to_string_lossy().into_owned(),
-        warnings: vec![
-            "Only control-flow edges executed during the accounting run are present.",
-            "Call/return pairs are summarized; non-local control transfers can split a region.",
-            "Loop bytes are deterministic shared-LLC model traffic, not hardware memory-controller measurements.",
-            "The cache model uses write allocation/RFO and dirty writeback; non-temporal stores are conservative.",
-            "Source locations require debug information; optimized code may map multiple loops to one line.",
-        ],
+        warnings,
         cache_line_size: cache.line_size,
         llc_capacity: cache.capacity,
         llc_associativity: cache.associativity,
-        traffic_model: "shared-llc-write-back-write-allocate",
+        traffic_model,
         image_start: hex(image.start),
         image_end: hex(image.end),
         image_entry: hex(runtime_entry),
@@ -1699,7 +1758,7 @@ mod tests {
             uuid::Uuid::now_v7()
         ));
         assert_eq!(
-            write_loop_artifact(&path, &capture, executable).unwrap(),
+            write_loop_artifact(&path, &capture, executable, false).unwrap(),
             (1, 0)
         );
         let artifact: serde_json::Value =

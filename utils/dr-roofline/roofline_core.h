@@ -88,11 +88,17 @@ rc_mem_access(rc_session_t *session, uint32_t thread, uint64_t block,
 
 uint32_t
 rc_register_block(rc_session_t *session, uint64_t vaddr, uint64_t end_vaddr,
-                  uint32_t flow, const rc_cost_t *cost, uint64_t instructions);
+                  uint32_t flow, const rc_cost_t *cost, uint64_t instructions,
+                  uint64_t arch_bytes_load, uint64_t arch_bytes_store);
 
 uint32_t
 rc_register_mem(rc_session_t *session, uint64_t block, uint64_t size,
                 uint32_t is_store);
+
+void
+rc_counted_block(rc_session_t *session, uint32_t handle, uint64_t executions,
+                 uint64_t successor_a, uint64_t successor_b,
+                 uint32_t successor_count);
 
 void
 rc_process_batch(rc_session_t *session, uint32_t thread,
