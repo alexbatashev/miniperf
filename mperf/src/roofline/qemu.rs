@@ -5,8 +5,8 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
@@ -23,7 +23,7 @@ use serde::Serialize;
 use smallvec::smallvec;
 
 use super::{
-    loops::ControlFlowGraph, BackendFuture, Options, ProfiledRun, RooflineBackend,
+    BackendFuture, Options, ProfiledRun, RooflineBackend, loops::ControlFlowGraph,
     monotonic_timestamp, profile_command,
 };
 use crate::event_dispatcher::EventDispatcher;
@@ -39,6 +39,13 @@ pub(super) struct QemuBackend {
 /// Which same-artifact accounting tool drives run 2. Both emit the
 /// `qemu-roofline.*` artifact set; DynamoRIO instruments natively and only
 /// works when the guest matches the host architecture.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        dead_code,
+        reason = "QEMU and DynamoRIO accounting tools are constructed only on Linux"
+    )
+)]
 pub(super) enum AccountingTool {
     Qemu {
         qemu: Option<PathBuf>,
@@ -316,13 +323,13 @@ impl QemuBackend {
                 self.cache.associativity,
                 if self.memory_profile { "on" } else { "off" }
             ));
-            if self.memory_profile {
-                if let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD") {
-                    command.push("-E".to_string());
-                    command.push(format!("LD_PRELOAD={preload}"));
-                    command.push("-E".to_string());
-                    command.push("MPERF_MEMORY_ALLOCATIONS=/dev/null".to_string());
-                }
+            if self.memory_profile
+                && let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD")
+            {
+                command.push("-E".to_string());
+                command.push(format!("LD_PRELOAD={preload}"));
+                command.push("-E".to_string());
+                command.push("MPERF_MEMORY_ALLOCATIONS=/dev/null".to_string());
             }
         }
         command.extend(guest.iter().cloned());
@@ -370,14 +377,14 @@ impl QemuBackend {
                 }
                 command.extend(guest.iter().cloned());
                 let mut env = Vec::new();
-                if self.memory_profile {
-                    if let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD") {
-                        env.push(("LD_PRELOAD".to_string(), preload.to_string()));
-                        env.push((
-                            "MPERF_MEMORY_ALLOCATIONS".to_string(),
-                            "/dev/null".to_string(),
-                        ));
-                    }
+                if self.memory_profile
+                    && let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD")
+                {
+                    env.push(("LD_PRELOAD".to_string(), preload.to_string()));
+                    env.push((
+                        "MPERF_MEMORY_ALLOCATIONS".to_string(),
+                        "/dev/null".to_string(),
+                    ));
                 }
                 Ok((command, env))
             }
@@ -584,10 +591,10 @@ fn resolve_dynamorio_launcher(configured: &Path) -> Result<PathBuf> {
             configured.display()
         );
     }
-    if configured.components().count() == 1 {
-        if let Ok(found) = which::which(configured) {
-            return Ok(found);
-        }
+    if configured.components().count() == 1
+        && let Ok(found) = which::which(configured)
+    {
+        return Ok(found);
     }
     anyhow::bail!(
         "DynamoRIO launcher or build directory '{}' was not found",
@@ -1256,8 +1263,23 @@ fn parse_dynamic_cfg(input: &str) -> Result<DynamicCfgCapture> {
                     );
                 }
             }
-            ["block", address, end, executions, scalar_int, scalar_float, scalar_double, vector_int, vector_float, vector_double, bytes_load, bytes_store, arch_bytes_load, arch_bytes_store, unclassified] =>
-            {
+            [
+                "block",
+                address,
+                end,
+                executions,
+                scalar_int,
+                scalar_float,
+                scalar_double,
+                vector_int,
+                vector_float,
+                vector_double,
+                bytes_load,
+                bytes_store,
+                arch_bytes_load,
+                arch_bytes_store,
+                unclassified,
+            ] => {
                 let address = parse_address(address)?;
                 let counts = BlockCounts {
                     end: parse_address(end)?,
@@ -1693,6 +1715,7 @@ mod tests {
         assert_eq!(read_instruction_progress(&mut stream), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn parses_validates_and_analyzes_dynamic_cfg() {
         let executable = Path::new("/bin/true");

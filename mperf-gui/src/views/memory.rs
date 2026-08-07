@@ -1,9 +1,9 @@
-use gpui::{div, prelude::*, px, relative, rgb, Div, FontWeight};
+use gpui::{Div, FontWeight, div, prelude::*, px, relative, rgb};
 
 use crate::{
+    MperfGui,
     memory::{CacheTrafficLevel, MemoryData, MemorySummary},
     theme::{ACCENT, BORDER, CHROME, ERROR, MUTED_TEXT, SURFACE, TEXT, WORKSPACE},
-    MperfGui,
 };
 
 const READ_COLOR: u32 = 0x6d86b3;

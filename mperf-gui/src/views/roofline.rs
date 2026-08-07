@@ -6,7 +6,7 @@ use gpui::{
 
 use crate::{
     MperfGui,
-    roofline::{roofline_label_asset, RooflineData, RooflineLoop},
+    roofline::{RooflineData, RooflineLoop, roofline_label_asset},
     theme::{
         ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED, SURFACE, TEXT, WORKSPACE,
     },

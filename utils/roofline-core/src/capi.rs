@@ -732,6 +732,46 @@ pub extern "C" fn rc_rvv_sew(vtype: u64, xlen: u32) -> i64 {
     }
 }
 
+/// Writes the three artifacts and frees the session. `session` is invalid
+/// afterwards.
+///
+/// # Safety
+/// `session` must be a live pointer from `rc_session_new`, not used again.
+#[no_mangle]
+pub unsafe extern "C" fn rc_finalize(session: *mut Session) -> i32 {
+    if session.is_null() {
+        return -1;
+    }
+    let session = unsafe { Box::from_raw(session) };
+    let mut inner = session.inner.lock().unwrap();
+    let flush = inner.cache.flush();
+    inner.counters.dram_bytes_load = inner
+        .counters
+        .dram_bytes_load
+        .saturating_add(flush.bytes_load);
+    inner.counters.dram_bytes_store = inner
+        .counters
+        .dram_bytes_store
+        .saturating_add(flush.bytes_store);
+
+    let output = inner.output.clone();
+    artifacts::write_counts(&output, &inner.counters);
+    artifacts::write_cfg(
+        &output.with_extension("cfg"),
+        Some(CacheDescription {
+            line_size: inner.cache.line_size(),
+            capacity: inner.cache.capacity(),
+            associativity: inner.cache.associativity(),
+        }),
+        inner.image,
+        &inner.cfg,
+    );
+    if let Some(memory) = inner.memory.as_ref() {
+        artifacts::write_memory(&output.with_extension("memory.json"), &memory.artifact());
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,44 +878,4 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
-}
-
-/// Writes the three artifacts and frees the session. `session` is invalid
-/// afterwards.
-///
-/// # Safety
-/// `session` must be a live pointer from `rc_session_new`, not used again.
-#[no_mangle]
-pub unsafe extern "C" fn rc_finalize(session: *mut Session) -> i32 {
-    if session.is_null() {
-        return -1;
-    }
-    let session = unsafe { Box::from_raw(session) };
-    let mut inner = session.inner.lock().unwrap();
-    let flush = inner.cache.flush();
-    inner.counters.dram_bytes_load = inner
-        .counters
-        .dram_bytes_load
-        .saturating_add(flush.bytes_load);
-    inner.counters.dram_bytes_store = inner
-        .counters
-        .dram_bytes_store
-        .saturating_add(flush.bytes_store);
-
-    let output = inner.output.clone();
-    artifacts::write_counts(&output, &inner.counters);
-    artifacts::write_cfg(
-        &output.with_extension("cfg"),
-        Some(CacheDescription {
-            line_size: inner.cache.line_size(),
-            capacity: inner.cache.capacity(),
-            associativity: inner.cache.associativity(),
-        }),
-        inner.image,
-        &inner.cfg,
-    );
-    if let Some(memory) = inner.memory.as_ref() {
-        artifacts::write_memory(&output.with_extension("memory.json"), &memory.artifact());
-    }
-    0
 }

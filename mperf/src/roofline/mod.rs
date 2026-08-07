@@ -4,8 +4,8 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -643,10 +643,10 @@ async fn profile_command(
             });
         }
     }))?;
-    if let Some(counter) = instruction_counter.as_mut() {
-        if counter.start().is_err() {
-            instruction_counter = None;
-        }
+    if let Some(counter) = instruction_counter.as_mut()
+        && counter.start().is_err()
+    {
+        instruction_counter = None;
     }
 
     let start_ns = monotonic_timestamp()?;
@@ -702,32 +702,31 @@ fn sample_memory_timeline(
         .transpose()
         .with_context(|| format!("create bandwidth timeline '{}'", bandwidth_path.display()))?;
     while !stop.load(Ordering::Relaxed) {
-        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
-            if let Some(kbytes) = status
+        if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            && let Some(kbytes) = status
                 .lines()
                 .find_map(|line| line.strip_prefix("VmRSS:"))
                 .and_then(|value| value.split_whitespace().next())
                 .and_then(|value| value.parse::<u64>().ok())
-            {
-                let timestamp = monotonic_timestamp()?;
-                writeln!(file, "{} {}", timestamp, kbytes.saturating_mul(1024))?;
-                if let Some(monitor) = memory_controller.as_ref() {
-                    match monitor.sample() {
-                        Ok(sample) => {
-                            if let Some(bandwidth_file) = bandwidth_file.as_mut() {
-                                writeln!(
-                                    bandwidth_file,
-                                    "{} {} {}",
-                                    timestamp, sample.read_bytes, sample.write_bytes
-                                )?;
-                            }
+        {
+            let timestamp = monotonic_timestamp()?;
+            writeln!(file, "{} {}", timestamp, kbytes.saturating_mul(1024))?;
+            if let Some(monitor) = memory_controller.as_ref() {
+                match monitor.sample() {
+                    Ok(sample) => {
+                        if let Some(bandwidth_file) = bandwidth_file.as_mut() {
+                            writeln!(
+                                bandwidth_file,
+                                "{} {} {}",
+                                timestamp, sample.read_bytes, sample.write_bytes
+                            )?;
                         }
-                        Err(error) => {
-                            eprintln!("Warning: memory-controller sampling stopped: {error}");
-                            memory_controller = None;
-                            bandwidth_file = None;
-                            let _ = std::fs::remove_file(&bandwidth_path);
-                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Warning: memory-controller sampling stopped: {error}");
+                        memory_controller = None;
+                        bandwidth_file = None;
+                        let _ = std::fs::remove_file(&bandwidth_path);
                     }
                 }
             }
