@@ -4,8 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
-use mperf_data::{scenario_ui, RecordInfo, ScenarioInfo};
+use anyhow::{Context, Result, bail};
+use mperf_data::{RecordInfo, ScenarioInfo, scenario_ui};
 use num_format::{Locale, ToFormattedString};
 use pmu_data::{TabSpec, TmaMetric};
 use sqlite::{Connection, Value};
@@ -534,10 +534,12 @@ mod tests {
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].value, None);
         assert!(!summary.rows[0].dominant);
-        assert!(summary
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("tma_summary")));
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("tma_summary"))
+        );
 
         let snapshot = ScenarioInfo::Snapshot(SnapshotInfo {
             pid: 1,

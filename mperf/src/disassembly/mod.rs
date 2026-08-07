@@ -4,7 +4,7 @@ use std::process::Command;
 
 #[cfg(target_os = "linux")]
 use anyhow::Context;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(
@@ -200,14 +200,14 @@ fn parse_objdump(output: &str, _load_bias: i64, owner: Option<&str>) -> Result<V
             continue;
         }
 
-        if let Some(idx) = trimmed.find(" <") {
-            if trimmed.ends_with(":") {
-                let symbol = trimmed[idx + 2..trimmed.len() - 2].trim();
-                if !symbol.is_empty() {
-                    current_symbol = Some(symbol.to_string());
-                }
-                continue;
+        if let Some(idx) = trimmed.find(" <")
+            && trimmed.ends_with(":")
+        {
+            let symbol = trimmed[idx + 2..trimmed.len() - 2].trim();
+            if !symbol.is_empty() {
+                current_symbol = Some(symbol.to_string());
             }
+            continue;
         }
 
         if let Some(pos) = trimmed.rfind(':') {
@@ -221,21 +221,22 @@ fn parse_objdump(output: &str, _load_bias: i64, owner: Option<&str>) -> Result<V
         }
 
         let mut parts = trimmed.splitn(2, ':');
-        if let (Some(addr_part), Some(rest)) = (parts.next(), parts.next()) {
-            if addr_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                if let Ok(rel_addr) = u64::from_str_radix(addr_part, 16) {
-                    let instruction = rest.trim().to_string();
-                    if instruction.is_empty() {
-                        continue;
-                    }
-                    lines.push(AssemblyLine {
-                        rel_address: rel_addr,
-                        symbol: owner.map(str::to_owned).or_else(|| current_symbol.clone()),
-                        instruction,
-                    });
-                }
+        if let (Some(addr_part), Some(rest)) = (parts.next(), parts.next())
+            && addr_part.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            let Ok(rel_addr) = u64::from_str_radix(addr_part, 16) else {
+                continue;
+            };
+            let instruction = rest.trim().to_string();
+            if instruction.is_empty() {
                 continue;
             }
+            lines.push(AssemblyLine {
+                rel_address: rel_addr,
+                symbol: owner.map(str::to_owned).or_else(|| current_symbol.clone()),
+                instruction,
+            });
+            continue;
         }
     }
 
@@ -289,11 +290,15 @@ mod tests {
             .unwrap();
 
         assert!(!lines.is_empty());
-        assert!(lines
-            .iter()
-            .all(|line| line.symbol.as_deref() == Some(owner_symbol.as_str())));
-        assert!(lines
-            .iter()
-            .any(|line| line.rel_address == symbol.address()));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.symbol.as_deref() == Some(owner_symbol.as_str()))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.rel_address == symbol.address())
+        );
     }
 }

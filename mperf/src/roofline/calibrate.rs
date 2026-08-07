@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use mperf_data::RooflineCalibration;
 use rayon::prelude::*;
 
@@ -281,7 +281,9 @@ unsafe fn compute_avx2(iterations: usize, worker: usize) -> f64 {
     let sum67 = _mm256_add_pd(a6, a7);
     let sum = _mm256_add_pd(_mm256_add_pd(sum01, sum23), _mm256_add_pd(sum45, sum67));
     let mut lanes = [0.0; 4];
-    _mm256_storeu_pd(lanes.as_mut_ptr(), sum);
+    // SAFETY: `lanes` provides four writable, contiguous f64 values; the
+    // unaligned store therefore writes exactly within the array.
+    unsafe { _mm256_storeu_pd(lanes.as_mut_ptr(), sum) };
     black_box(lanes).into_iter().sum()
 }
 
@@ -320,7 +322,9 @@ unsafe fn compute_avx512(iterations: usize, worker: usize) -> f64 {
     let sum67 = _mm512_add_pd(a6, a7);
     let sum = _mm512_add_pd(_mm512_add_pd(sum01, sum23), _mm512_add_pd(sum45, sum67));
     let mut lanes = [0.0; 8];
-    _mm512_storeu_pd(lanes.as_mut_ptr(), sum);
+    // SAFETY: `lanes` provides eight writable, contiguous f64 values; the
+    // unaligned store therefore writes exactly within the array.
+    unsafe { _mm512_storeu_pd(lanes.as_mut_ptr(), sum) };
     black_box(lanes).into_iter().sum()
 }
 

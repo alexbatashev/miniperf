@@ -1,13 +1,13 @@
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, Bounds, Context, Div, FontWeight,
-    MouseButton, MouseDownEvent, ScrollHandle, SharedString,
+    Bounds, Context, Div, FontWeight, MouseButton, MouseDownEvent, ScrollHandle, SharedString,
+    canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 
 use crate::{
+    MperfGui,
     profile::{CpuObservationSource, TimeRange},
     profile_analysis::CpuUtilizationHeatmap,
     theme::{ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SURFACE, TEXT, WORKSPACE},
-    MperfGui,
 };
 
 const AUTO_MAX_BUCKETS: usize = 240;
@@ -401,7 +401,7 @@ fn cpu_bucket_button(
     duration_ns: Option<u64>,
     selected: bool,
     cx: &mut Context<MperfGui>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     div()
         .id(SharedString::from(format!(
             "cpu-bucket-{}",

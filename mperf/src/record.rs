@@ -8,12 +8,12 @@ use std::{collections::HashMap, path::PathBuf};
 use pmu::{Counter, Process, Record};
 
 use crate::{
+    Scenario,
     counter_selection::{get_pmu_counters, get_tma_counter_groups},
     event_dispatcher::EventDispatcher,
     postprocess::perform_postprocessing,
     roofline,
     utils::counter_to_event_ty,
-    Scenario,
 };
 
 #[cfg(target_os = "macos")]
@@ -225,40 +225,40 @@ fn snapshot(
 
 fn publish_process_maps(dispatcher: Arc<EventDispatcher>, pid: i32) {
     #[cfg(target_os = "macos")]
-    if let Ok(images) = proc_maps::mac_maps::get_dyld_info(pid as proc_maps::Pid) {
-        if !images.is_empty() {
-            let mut link_bases = HashMap::<PathBuf, Option<u64>>::new();
-            for image in images {
-                // proc-maps exposes every LC_SEGMENT_64 command, including
-                // __PAGEZERO. It is not mapped and its multi-gigabyte virtual
-                // span would falsely claim most user addresses during symbol
-                // lookup.
-                if !macos_segment_is_executable(image.segment.vmsize, image.segment.initprot) {
-                    continue;
-                }
-                let link_base = *link_bases
-                    .entry(image.filename.clone())
-                    .or_insert_with(|| mach_o_text_address(&image.filename));
-                let link_address = link_base
-                    .and_then(|base| {
-                        let slide = (image.address as u64).checked_sub(base)?;
-                        image.segment.vmaddr.checked_sub(slide)
-                    })
-                    .unwrap_or(image.segment.fileoff);
-                let entry = ProcMapEntry {
-                    filename: image.filename.to_string_lossy().to_string(),
-                    address: image.segment.vmaddr as usize,
-                    size: image.segment.vmsize as usize,
-                    // For Mach-O, addr2line consumes link-time virtual
-                    // addresses. Store the unslid segment VM address here so
-                    // `runtime - address + offset` reconstructs that address.
-                    offset: link_address as usize,
-                    pid: pid as u32,
-                };
-                dispatcher.publish_proc_map_sync(entry);
+    if let Ok(images) = proc_maps::mac_maps::get_dyld_info(pid as proc_maps::Pid)
+        && !images.is_empty()
+    {
+        let mut link_bases = HashMap::<PathBuf, Option<u64>>::new();
+        for image in images {
+            // proc-maps exposes every LC_SEGMENT_64 command, including
+            // __PAGEZERO. It is not mapped and its multi-gigabyte virtual
+            // span would falsely claim most user addresses during symbol
+            // lookup.
+            if !macos_segment_is_executable(image.segment.vmsize, image.segment.initprot) {
+                continue;
             }
-            return;
+            let link_base = *link_bases
+                .entry(image.filename.clone())
+                .or_insert_with(|| mach_o_text_address(&image.filename));
+            let link_address = link_base
+                .and_then(|base| {
+                    let slide = (image.address as u64).checked_sub(base)?;
+                    image.segment.vmaddr.checked_sub(slide)
+                })
+                .unwrap_or(image.segment.fileoff);
+            let entry = ProcMapEntry {
+                filename: image.filename.to_string_lossy().to_string(),
+                address: image.segment.vmaddr as usize,
+                size: image.segment.vmsize as usize,
+                // For Mach-O, addr2line consumes link-time virtual
+                // addresses. Store the unslid segment VM address here so
+                // `runtime - address + offset` reconstructs that address.
+                offset: link_address as usize,
+                pid: pid as u32,
+            };
+            dispatcher.publish_proc_map_sync(entry);
         }
+        return;
     }
 
     let Ok(maps) = proc_maps::get_process_maps(pid as proc_maps::Pid) else {
@@ -393,7 +393,7 @@ fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<Scena
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{mach_o_text_address, macos_segment_is_executable, VM_PROT_EXECUTE};
+    use super::{VM_PROT_EXECUTE, mach_o_text_address, macos_segment_is_executable};
 
     #[test]
     fn finds_link_time_text_address_in_current_mach_o() {

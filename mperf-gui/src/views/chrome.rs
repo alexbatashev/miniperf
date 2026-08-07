@@ -1,16 +1,15 @@
 use gpui::{
-    div, prelude::*, px, relative, rgb, Context, Div, FontWeight, IntoElement, MouseButton,
-    SharedString,
+    Context, Div, FontWeight, IntoElement, MouseButton, SharedString, div, prelude::*, px,
+    relative, rgb,
 };
 
 use crate::{
-    result_name,
+    LeftPaneKind, MperfGui, result_name,
     theme::{
         ACCENT, BORDER, CHROME, DOCUMENT_BAR_HEIGHT, HOVER, MUTED_TEXT, STATUS_BAR,
         STATUS_BAR_HEIGHT, SURFACE, TEXT, TITLE_BAR, TITLE_BAR_HEIGHT, TRAFFIC_LIGHT_SPACE,
         WORKSPACE,
     },
-    LeftPaneKind, MperfGui,
 };
 
 impl MperfGui {

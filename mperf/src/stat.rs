@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use comfy_table::{Cell, CellAlignment, Color, Table};
 use num_format::{Locale, ToFormattedString};
 use pmu::{Counter, CounterValue, Metric, Process};
@@ -49,7 +49,9 @@ pub fn do_stat(
 
     let capabilities = pmu::capabilities();
     if !capabilities.hardware_counters {
-        eprintln!("notice: no hardware PMU detected (VM/container or permissions); hardware counters may be unavailable");
+        eprintln!(
+            "notice: no hardware PMU detected (VM/container or permissions); hardware counters may be unavailable"
+        );
     }
 
     let supported = pmu::list_supported_counters(pmu::DriverKind::Default);

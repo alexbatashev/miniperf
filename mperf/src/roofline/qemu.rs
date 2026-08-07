@@ -11,7 +11,7 @@ use pmu::Process;
 use smallvec::smallvec;
 
 use super::{
-    monotonic_timestamp, profile_command, BackendFuture, Options, ProfiledRun, RooflineBackend,
+    BackendFuture, Options, ProfiledRun, RooflineBackend, monotonic_timestamp, profile_command,
 };
 use crate::event_dispatcher::EventDispatcher;
 

@@ -3,8 +3,8 @@ use std::time::Duration;
 use std::{
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -19,9 +19,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Offset, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::block::Position;
 use ratatui::widgets::StatefulWidget;
 use ratatui::widgets::Widget;
+use ratatui::widgets::block::Position;
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
 
 #[derive(Clone)]
@@ -342,7 +342,7 @@ impl<'a> FlamelensWidget<'a> {
                     None
                 }
             });
-        let has_more_rows_to_render = self.render_stacks(
+        self.render_stacks(
             self.app.flamegraph().root(),
             buf,
             area.x,
@@ -351,8 +351,7 @@ impl<'a> FlamelensWidget<'a> {
             area.bottom(),
             &zoom_state,
             &re,
-        );
-        has_more_rows_to_render
+        )
     }
 
     fn render_table(&self, area: Rect, buf: &mut Buffer) {
@@ -588,12 +587,12 @@ impl<'a> FlamelensWidget<'a> {
         } else {
             unreachable!();
         }
-        if let Some(zoom_state) = zoom_state {
-            if zoom_state.ancestors.contains(&stack.id) {
-                r = (r as f64 / 2.5) as u8;
-                g = (g as f64 / 2.5) as u8;
-                b = (b as f64 / 2.5) as u8;
-            }
+        if let Some(zoom_state) = zoom_state
+            && zoom_state.ancestors.contains(&stack.id)
+        {
+            r = (r as f64 / 2.5) as u8;
+            g = (g as f64 / 2.5) as u8;
+            b = (b as f64 / 2.5) as u8;
         }
         Color::Rgb(r, g, b)
     }
@@ -701,32 +700,31 @@ impl<'a> FlamelensWidget<'a> {
                     .as_ref()
                     .and_then(|zoom| self.app.flamegraph().get_stack(&zoom.stack_id))
                     .map(|stack| stack.total_count);
-                if let Some(p) = &self.app.flamegraph_state().search_pattern {
-                    if let (true, Some(hit_coverage_count)) =
+                if let Some(p) = &self.app.flamegraph_state().search_pattern
+                    && let (true, Some(hit_coverage_count)) =
                         (p.is_manual, self.app.flamegraph().hit_coverage_count())
+                {
+                    let mut match_text = format!(
+                        "\"{}\" {}",
+                        p.re.as_str(),
+                        FlamelensWidget::get_count_stats_str(
+                            None,
+                            hit_coverage_count,
+                            root_total_count,
+                            zoom_total_count,
+                        )
+                    );
+                    if self.is_table_view()
+                        && self
+                            .app
+                            .flamegraph()
+                            .ordered_stacks
+                            .search_pattern_ignored_because_of_no_match
                     {
-                        let mut match_text = format!(
-                            "\"{}\" {}",
-                            p.re.as_str(),
-                            FlamelensWidget::get_count_stats_str(
-                                None,
-                                hit_coverage_count,
-                                root_total_count,
-                                zoom_total_count,
-                            )
-                        );
-                        if self.is_table_view()
-                            && self
-                                .app
-                                .flamegraph()
-                                .ordered_stacks
-                                .search_pattern_ignored_because_of_no_match
-                        {
-                            match_text += " (no match; showing all)";
-                        }
-                        let match_text = format!("{:width$}", match_text, width = width as usize,);
-                        lines.push(("Match", Line::from(match_text)));
+                        match_text += " (no match; showing all)";
                     }
+                    let match_text = format!("{:width$}", match_text, width = width as usize,);
+                    lines.push(("Match", Line::from(match_text)));
                 }
                 let selected_text = format!(
                     "{} {}",

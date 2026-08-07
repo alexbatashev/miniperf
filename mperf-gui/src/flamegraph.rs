@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 #[cfg(test)]
 use std::collections::HashSet;
 
-use flamelens::flame::{FlameGraph, StackIdentifier, ROOT_ID};
+use flamelens::flame::{FlameGraph, ROOT_ID, StackIdentifier};
 
 #[derive(Debug)]
 pub struct FlamegraphData {

@@ -1,14 +1,14 @@
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, Bounds, Context, Div, FontWeight,
-    MouseButton, MouseDownEvent, PathBuilder, SharedString,
+    Bounds, Context, Div, FontWeight, MouseButton, MouseDownEvent, PathBuilder, SharedString,
+    canvas, div, fill, point, prelude::*, px, rgb, size,
 };
 
 use crate::{
+    MperfGui,
     roofline::{RooflineData, RooflineLoop},
     theme::{
         ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED, SURFACE, WORKSPACE,
     },
-    MperfGui,
 };
 
 const HEADER_HEIGHT: f32 = 38.0;
@@ -350,7 +350,7 @@ impl MperfGui {
         data: &RooflineData,
         selected: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let function_name = loop_data.function_name.clone();
         let location = loop_location(loop_data);
         let gflops = loop_data

@@ -68,16 +68,16 @@ impl PostHocUnwinder {
         if event.user_regs.is_some() {
             if let Some(stack) = self.unwind(event) {
                 event.callstack = stack.into_iter().map(CallFrame::IP).collect();
-            } else if event.callstack.is_empty() {
-                if let Some(ip) = event.user_regs.as_ref().and_then(instruction_pointer) {
-                    event.callstack.push(CallFrame::IP(ip));
-                }
+            } else if event.callstack.is_empty()
+                && let Some(ip) = event.user_regs.as_ref().and_then(instruction_pointer)
+            {
+                event.callstack.push(CallFrame::IP(ip));
             }
             self.last_stack = Some((event.correlation_id, event.callstack.clone()));
-        } else if let Some((correlation_id, stack)) = &self.last_stack {
-            if *correlation_id == event.correlation_id {
-                event.callstack.clone_from(stack);
-            }
+        } else if let Some((correlation_id, stack)) = &self.last_stack
+            && *correlation_id == event.correlation_id
+        {
+            event.callstack.clone_from(stack);
         }
     }
 

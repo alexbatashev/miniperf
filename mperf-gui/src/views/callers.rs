@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
-use gpui::{div, prelude::*, px, rgb, Context, Div, FontWeight, SharedString};
+use gpui::{Context, Div, FontWeight, SharedString, div, prelude::*, px, rgb};
 
 use crate::{
+    MperfGui,
     profile::{CounterMetric, ProfileFrame},
     profile_analysis::{
         FunctionAnalysis, FunctionDetails, FunctionRelation, FunctionStat, SampleFilter,
@@ -10,7 +11,6 @@ use crate::{
     theme::{
         ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED, SURFACE, TEXT, WORKSPACE,
     },
-    MperfGui,
 };
 
 const HEADER_HEIGHT: f32 = 30.0;
@@ -241,7 +241,7 @@ impl MperfGui {
         function: &FunctionStat,
         selected: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let frame_id = function.frame_id;
         let label = function.label.clone();
         let samples = format!(
@@ -385,7 +385,7 @@ impl MperfGui {
         relation: FunctionRelation,
         direction: &'static str,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let frame_id = relation.frame_id;
         div()
             .id(SharedString::from(format!("{section}-relation-{index}")))
@@ -432,15 +432,14 @@ fn selected_frame_id(
     filter: &SampleFilter,
     selected_function: Option<&str>,
 ) -> Option<usize> {
-    if let Some(frame_ids) = filter.frame_ids.as_ref() {
-        if let Some(frame_id) = analysis
+    if let Some(frame_ids) = filter.frame_ids.as_ref()
+        && let Some(frame_id) = analysis
             .functions
             .iter()
             .find(|function| frame_ids.contains(&function.frame_id))
             .map(|function| function.frame_id)
-        {
-            return Some(frame_id);
-        }
+    {
+        return Some(frame_id);
     }
     selected_function.and_then(|selected| {
         analysis

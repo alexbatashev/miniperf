@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sqlite::{Connection, Value};
 
 #[derive(Debug, Clone, Default)]
@@ -945,11 +945,13 @@ mod tests {
         let missing = sqlite::open(":memory:").unwrap();
         let missing_profile = ProfileData::load(&missing);
         assert!(missing_profile.samples.is_empty());
-        assert!(missing_profile
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("pmu_counters"));
+        assert!(
+            missing_profile
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("pmu_counters")
+        );
 
         let legacy = sqlite::open(":memory:").unwrap();
         legacy
@@ -967,10 +969,12 @@ mod tests {
             .unwrap();
         let legacy_profile = ProfileData::load(&legacy);
         assert!(legacy_profile.samples.is_empty());
-        assert!(legacy_profile
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("call_stack"));
+        assert!(
+            legacy_profile
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("call_stack")
+        );
     }
 }

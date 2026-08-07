@@ -16,11 +16,11 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use flamelens::flame::{StackIdentifier, ROOT_ID};
+use flamelens::flame::{ROOT_ID, StackIdentifier};
 use gpui::{
-    div, point, prelude::*, px, size, App, Application, Bounds, Context, MouseButton,
-    MouseMoveEvent, PathPromptOptions, ScrollHandle, TitlebarOptions, Window, WindowBounds,
-    WindowOptions,
+    App, Application, Bounds, Context, MouseButton, MouseMoveEvent, PathPromptOptions,
+    ScrollHandle, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px,
+    size,
 };
 
 use flamegraph::FlamegraphData;
@@ -510,10 +510,8 @@ impl MperfGui {
         self.selected_roofline_loop = Some(index);
         self.roofline_loop_scroll_handle.scroll_to_item(index);
         self.active_source = None;
-        if open_source {
-            if let Some(source) = source {
-                self.open_source(source);
-            }
+        if open_source && let Some(source) = source {
+            self.open_source(source);
         }
     }
 
@@ -708,7 +706,7 @@ fn main() -> Result<()> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{Cli, HotspotFilter, MperfGui, VisualizationKind, ROOT_ID};
+    use super::{Cli, HotspotFilter, MperfGui, ROOT_ID, VisualizationKind};
     use clap::Parser;
 
     #[test]

@@ -1,13 +1,13 @@
-use gpui::{div, prelude::*, px, relative, rgb, Context, Div, FontWeight, SharedString};
+use gpui::{Context, Div, FontWeight, SharedString, div, prelude::*, px, relative, rgb};
 
 use crate::{
+    MperfGui,
     profile::TimeRange,
     profile_analysis::CallTree,
     theme::{
-        flame_frame_color, ACCENT, BORDER, ERROR, FLAME_FRAME_HEIGHT, HOVER, MUTED_TEXT, SELECTION,
-        SURFACE, TEXT, WORKSPACE,
+        ACCENT, BORDER, ERROR, FLAME_FRAME_HEIGHT, HOVER, MUTED_TEXT, SELECTION, SURFACE, TEXT,
+        WORKSPACE, flame_frame_color,
     },
-    MperfGui,
 };
 
 impl MperfGui {

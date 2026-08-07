@@ -26,7 +26,7 @@ use clap::{Parser, Subcommand};
 
 use events_export::do_events_export;
 use mperf_data::Scenario;
-use query::{do_query, QueryFormat};
+use query::{QueryFormat, do_query};
 use record::do_record;
 use stat::do_stat;
 

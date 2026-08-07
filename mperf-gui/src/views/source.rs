@@ -1,8 +1,8 @@
-use gpui::{div, prelude::*, px, rgb, Context, Div};
+use gpui::{Context, Div, div, prelude::*, px, rgb};
 
 use crate::{
-    theme::{ACCENT, BORDER, CHROME, ERROR, MUTED_TEXT, SELECTION_MUTED, SURFACE, TEXT},
     MperfGui,
+    theme::{ACCENT, BORDER, CHROME, ERROR, MUTED_TEXT, SELECTION_MUTED, SURFACE, TEXT},
 };
 
 impl MperfGui {
