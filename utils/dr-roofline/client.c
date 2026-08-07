@@ -411,21 +411,27 @@ progress_thread(void *arg)
     for (;;) {
         uint64_t instructions = rc_instruction_count(progress_session);
 #ifdef X86
-        uint64_t aggregate = 0;
-        dr_mutex_lock(bb_list_lock);
-        for (bb_data_t *data = bb_list; data != NULL; data = data->next) {
-            uint64_t executions = (uint64_t)dr_atomic_load64(
-                (volatile int64 *)&data->executions);
-            uint64_t block_instructions = executions > 0 &&
-                    data->instructions > UINT64_MAX / executions
-                ? UINT64_MAX
-                : executions * data->instructions;
-            aggregate = UINT64_MAX - aggregate < block_instructions
-                ? UINT64_MAX
-                : aggregate + block_instructions;
+        /* Roofline mode uses inline aggregate counters, while memory mode
+         * emits block records and advances the session count as buffers are
+         * consumed. Reading the aggregate counters in memory mode kept the
+         * progress bar pinned at zero because those counters are not emitted. */
+        if (!memory_profile) {
+            uint64_t aggregate = 0;
+            dr_mutex_lock(bb_list_lock);
+            for (bb_data_t *data = bb_list; data != NULL; data = data->next) {
+                uint64_t executions = (uint64_t)dr_atomic_load64(
+                    (volatile int64 *)&data->executions);
+                uint64_t block_instructions = executions > 0 &&
+                        data->instructions > UINT64_MAX / executions
+                    ? UINT64_MAX
+                    : executions * data->instructions;
+                aggregate = UINT64_MAX - aggregate < block_instructions
+                    ? UINT64_MAX
+                    : aggregate + block_instructions;
+            }
+            dr_mutex_unlock(bb_list_lock);
+            instructions = aggregate;
         }
-        dr_mutex_unlock(bb_list_lock);
-        instructions = aggregate;
 #endif
         dr_fprintf(progress_file, "%llu\n", instructions);
         dr_sleep(100);

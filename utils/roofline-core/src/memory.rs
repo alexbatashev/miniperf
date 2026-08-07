@@ -2,19 +2,40 @@
 //! the QEMU plugin and the DynamoRIO client.
 
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 pub const WORKING_SET_WINDOWS: [u64; 6] = [1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576];
 
 #[derive(Default)]
 struct LineFootprint {
     bytes: [u64; 4],
+    last_touch: u64,
 }
 
 impl LineFootprint {
     fn touch(&mut self, offset: u64, length: u64, line_size: u64) {
-        for byte in offset..offset.saturating_add(length).min(line_size).min(256) {
-            self.bytes[(byte / 64) as usize] |= 1_u64 << (byte % 64);
+        let start = offset.min(line_size).min(256);
+        let end = offset.saturating_add(length).min(line_size).min(256);
+        if start >= end {
+            return;
+        }
+        let first_word = (start / 64) as usize;
+        let last_word = ((end - 1) / 64) as usize;
+        for word in first_word..=last_word {
+            let word_start = (word as u64).saturating_mul(64);
+            let first_bit = start.saturating_sub(word_start).min(64) as u32;
+            let last_bit = end.saturating_sub(word_start).min(64) as u32;
+            let below_last = if last_bit == 64 {
+                u64::MAX
+            } else {
+                (1_u64 << last_bit) - 1
+            };
+            let below_first = if first_bit == 0 {
+                0
+            } else {
+                (1_u64 << first_bit) - 1
+            };
+            self.bytes[word] |= below_last & !below_first;
         }
     }
 
@@ -27,7 +48,8 @@ impl LineFootprint {
 struct WindowAccumulator {
     width: u64,
     references: u64,
-    lines: HashSet<u64>,
+    window_start: u64,
+    unique_lines: u64,
     samples: Vec<u64>,
 }
 
@@ -39,15 +61,20 @@ impl WindowAccumulator {
         }
     }
 
-    fn observe(&mut self, line: u64) {
+    fn observe(&mut self, previous_touch: u64, reference: u64) {
+        if self.references == 0 {
+            self.window_start = reference;
+        }
         self.references += 1;
-        self.lines.insert(line);
+        if previous_touch < self.window_start {
+            self.unique_lines += 1;
+        }
         if self.references == self.width {
             if self.samples.len() < 1_000_000 {
-                self.samples.push(self.lines.len() as u64);
+                self.samples.push(self.unique_lines);
             }
             self.references = 0;
-            self.lines.clear();
+            self.unique_lines = 0;
         }
     }
 }
@@ -110,21 +137,41 @@ pub(crate) fn insert(root: Option<Box<OrderNode>>, node: Box<OrderNode>) -> Opti
     merge(merge(left, Some(node)), right)
 }
 
-pub(crate) fn remove(root: Option<Box<OrderNode>>, key: u64) -> Option<Box<OrderNode>> {
-    let mut root = root?;
+/// Removes `key` while returning its allocation for reuse at the new recency
+/// position. A hot line used to allocate and free one tree node on every
+/// access, which dominated address-heavy profiles.
+fn remove_and_retain(
+    root: Option<Box<OrderNode>>,
+    key: u64,
+) -> (Option<Box<OrderNode>>, Option<Box<OrderNode>>, u64) {
+    let Some(mut root) = root else {
+        return (None, None, 0);
+    };
     if root.key == key {
-        return merge(root.left.take(), root.right.take());
+        let newer = node_size(&root.right);
+        let merged = merge(root.left.take(), root.right.take());
+        root.size = 1;
+        return (merged, Some(root), newer);
     }
+    let (removed, newer);
     if key < root.key {
-        root.left = remove(root.left.take(), key);
+        let right_size = node_size(&root.right);
+        let (left, found, below) = remove_and_retain(root.left.take(), key);
+        root.left = left;
+        removed = found;
+        newer = below.saturating_add(1).saturating_add(right_size);
     } else {
-        root.right = remove(root.right.take(), key);
+        let (right, found, below) = remove_and_retain(root.right.take(), key);
+        root.right = right;
+        removed = found;
+        newer = below;
     }
     refresh(&mut root);
-    Some(root)
+    (Some(root), removed, newer)
 }
 
-pub(crate) fn count_greater(root: &Option<Box<OrderNode>>, key: u64) -> u64 {
+#[cfg(test)]
+fn count_greater(root: &Option<Box<OrderNode>>, key: u64) -> u64 {
     let Some(root) = root else { return 0 };
     if root.key > key {
         1 + node_size(&root.right) + count_greater(&root.left, key)
@@ -147,11 +194,10 @@ pub struct MemoryAnalysis {
     store_bytes: u64,
     cold_references: u64,
     footprints: HashMap<u64, LineFootprint>,
-    last_touch: HashMap<u64, u64>,
     recency: Option<Box<OrderNode>>,
-    reuse_distance: BTreeMap<u32, u64>,
+    reuse_distance: [u64; 65],
     last_line_by_vcpu: Vec<Option<u64>>,
-    strides: BTreeMap<i32, u64>,
+    strides: [u64; 129],
     windows: Vec<WindowAccumulator>,
 }
 
@@ -164,11 +210,10 @@ impl MemoryAnalysis {
             store_bytes: 0,
             cold_references: 0,
             footprints: HashMap::new(),
-            last_touch: HashMap::new(),
             recency: None,
-            reuse_distance: BTreeMap::new(),
+            reuse_distance: [0; 65],
             last_line_by_vcpu: Vec::new(),
-            strides: BTreeMap::new(),
+            strides: [0; 129],
             windows: WORKING_SET_WINDOWS
                 .into_iter()
                 .map(WindowAccumulator::new)
@@ -194,38 +239,42 @@ impl MemoryAnalysis {
             let end = address
                 .saturating_add(size)
                 .min(line_start.saturating_add(self.line_size));
-            self.footprints.entry(line).or_default().touch(
-                start - line_start,
-                end - start,
-                self.line_size,
-            );
+            let footprint = self.footprints.entry(line).or_default();
+            footprint.touch(start - line_start, end - start, self.line_size);
+            let previous = footprint.last_touch;
+            footprint.last_touch = self.references;
             for window in &mut self.windows {
-                window.observe(line);
+                window.observe(previous, self.references);
             }
-
-            if let Some(previous) = self.last_touch.insert(line, self.references) {
-                let distance = count_greater(&self.recency, previous);
+            let mut node = None;
+            if previous != 0 {
+                let distance;
+                (self.recency, node, distance) = remove_and_retain(self.recency.take(), previous);
                 let bucket = if distance == 0 {
                     0
                 } else {
                     64 - distance.leading_zeros()
                 };
-                *self.reuse_distance.entry(bucket).or_default() += 1;
-                self.recency = remove(self.recency.take(), previous);
+                self.reuse_distance[bucket as usize] += 1;
             } else {
                 self.cold_references += 1;
             }
             let key = self.references;
-            self.recency = insert(
-                self.recency.take(),
+            let mut node = node.unwrap_or_else(|| {
                 Box::new(OrderNode {
                     key,
                     priority: priority(key),
                     size: 1,
                     left: None,
                     right: None,
-                }),
-            );
+                })
+            });
+            node.key = key;
+            node.priority = priority(key);
+            node.size = 1;
+            node.left = None;
+            node.right = None;
+            self.recency = insert(self.recency.take(), node);
 
             if self.last_line_by_vcpu.len() <= vcpu {
                 self.last_line_by_vcpu.resize(vcpu + 1, None);
@@ -239,7 +288,7 @@ impl MemoryAnalysis {
                     64 - magnitude.leading_zeros() as i32
                 };
                 let bucket = if delta < 0 { -log } else { log };
-                *self.strides.entry(bucket).or_default() += 1;
+                self.strides[(bucket + 64) as usize] += 1;
             }
             self.last_line_by_vcpu[vcpu] = Some(line);
         }
@@ -260,7 +309,7 @@ impl MemoryAnalysis {
             .map(|window| {
                 let mut samples = window.samples.clone();
                 if window.references != 0 {
-                    samples.push(window.lines.len() as u64);
+                    samples.push(window.unique_lines);
                 }
                 samples.sort_unstable();
                 let mean = if samples.is_empty() {
@@ -280,6 +329,20 @@ impl MemoryAnalysis {
                 }
             })
             .collect();
+        let reuse_distance = self
+            .reuse_distance
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(bucket, count)| (bucket as u32, *count))
+            .collect();
+        let strides = self
+            .strides
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count != 0)
+            .map(|(bucket, count)| (bucket as i32 - 64, *count))
+            .collect();
         MemoryArtifact {
             format_version: 1,
             line_size: self.line_size,
@@ -289,9 +352,9 @@ impl MemoryAnalysis {
             unique_lines: self.footprints.len() as u64,
             distinct_bytes,
             cold_references: self.cold_references,
-            reuse_distance_log2: self.reuse_distance.clone(),
+            reuse_distance_log2: reuse_distance,
             spatial_utilization_percent: utilization,
-            stride_lines_log2: self.strides.clone(),
+            stride_lines_log2: strides,
             working_set,
         }
     }
@@ -361,8 +424,39 @@ mod tests {
             );
         }
         assert_eq!(count_greater(&root, 20), 2);
-        root = remove(root, 30);
+        let (new_root, removed, newer) = remove_and_retain(root, 30);
+        root = new_root;
+        assert_eq!(removed.unwrap().key, 30);
+        assert_eq!(newer, 1);
         assert_eq!(count_greater(&root, 20), 1);
         assert_eq!(node_size(&root), 3);
+    }
+
+    #[test]
+    fn footprint_marks_ranges_without_a_per_byte_loop() {
+        let mut footprint = LineFootprint::default();
+        footprint.touch(60, 8, 128);
+        footprint.touch(126, 2, 128);
+        assert_eq!(footprint.count(), 10);
+    }
+
+    #[test]
+    fn working_set_windows_remain_exact_without_per_window_hash_sets() {
+        let mut analysis = MemoryAnalysis::new(64);
+        for index in 0..512 {
+            analysis.access(0, (index % 2) * 64, 8, false);
+        }
+        for line in 2..514 {
+            analysis.access(0, line * 64, 8, false);
+        }
+        for _ in 0..1_024 {
+            analysis.access(0, 0, 8, false);
+        }
+
+        let artifact = analysis.artifact();
+        let first_window = &artifact.working_set[0];
+        assert_eq!(first_window.window_references, 1_024);
+        assert_eq!(first_window.mean_lines, 257.5);
+        assert_eq!(first_window.max_lines, 514);
     }
 }
