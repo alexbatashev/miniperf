@@ -459,7 +459,7 @@ pub(crate) fn calibrate_host() -> Result<mperf_data::RooflineCalibration> {
 }
 
 pub(crate) fn calibrate_memory_host() -> Result<mperf_data::MemoryBandwidthCalibration> {
-    calibrate::measure_memory()
+    calibrate::measure_memory_hierarchy()
 }
 
 pub(crate) fn uses_native_performance(options: &Options, command: &[String]) -> Result<bool> {

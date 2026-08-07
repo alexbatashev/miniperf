@@ -157,6 +157,10 @@ pub struct MemoryBandwidthCalibration {
     pub working_set_bytes: u64,
     /// `effective_stream` until a supported memory-controller PMU is used.
     pub source: String,
+    /// Measured bandwidth roofs and detected capacities for the source host's
+    /// cache hierarchy, innermost first. Older recordings contain no levels.
+    #[serde(default)]
+    pub memory_levels: Vec<MemoryLevelCalibration>,
 }
 
 impl From<&RooflineCalibration> for MemoryBandwidthCalibration {
@@ -169,6 +173,7 @@ impl From<&RooflineCalibration> for MemoryBandwidthCalibration {
             gbytes_per_second_samples: value.memory_gbytes_per_second_samples.clone(),
             working_set_bytes: value.memory_working_set_bytes,
             source: "effective_stream".to_string(),
+            memory_levels: value.memory_levels.clone(),
         }
     }
 }
@@ -216,6 +221,13 @@ pub struct MemoryLevelCalibration {
     pub gbytes_per_second_samples: Vec<f64>,
     /// Total bytes touched across all threads by this level's kernel.
     pub working_set_bytes: u64,
+    /// Total detected capacity of this cache level on the source host. DRAM
+    /// has no cache capacity and stores zero. Missing in older recordings.
+    #[serde(default)]
+    pub capacity_bytes: u64,
+    /// Number of logical CPUs sharing the detected cache. Zero means unknown.
+    #[serde(default)]
+    pub shared_by: usize,
 }
 
 /// How `os_cpu_clock` observations should be interpreted by time-based views.
@@ -382,6 +394,7 @@ mod tests {
             memory_gbytes_per_second_samples: vec![50.0],
             ridge_point_flops_per_byte: 2.0,
             memory_working_set_bytes: 1024,
+            memory_levels: Vec::new(),
         };
         let cpu_info = CpuInfo {
             memory_calibration: None,

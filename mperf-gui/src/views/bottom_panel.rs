@@ -21,9 +21,14 @@ use crate::{
 const PANEL_HEADER_HEIGHT: f32 = 28.0;
 const TABLE_HEADER_HEIGHT: f32 = 24.0;
 const TABLE_ROW_HEIGHT: f32 = 24.0;
-const SELF_SAMPLES_WIDTH: f32 = 116.0;
-const PERCENT_WIDTH: f32 = 88.0;
-const INCLUSIVE_SAMPLES_WIDTH: f32 = 136.0;
+const HOTSPOTS_TABLE_WIDTH: f32 = 1_230.0;
+const SHARE_WIDTH: f32 = 124.0;
+const CPU_TIME_WIDTH: f32 = 100.0;
+const IPC_WIDTH: f32 = 72.0;
+const LLC_MPKI_WIDTH: f32 = 92.0;
+const LLC_MISS_WIDTH: f32 = 92.0;
+const BACKEND_STALL_WIDTH: f32 = 108.0;
+const BRANCH_MPKI_WIDTH: f32 = 102.0;
 
 impl MperfGui {
     pub(crate) fn render_bottom_resizer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -119,6 +124,14 @@ impl MperfGui {
                     .text_color(rgb(TEXT))
                     .child(panel.title()),
             )
+            .when(matches!(panel, BottomPanelKind::Hotspots), |element| {
+                element.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED_TEXT))
+                        .child("leaf-attributed PMU metrics · horizontal scroll"),
+                )
+            })
             .when_some(filter_summary, |element, summary| {
                 element
                     .child(
@@ -310,30 +323,38 @@ impl MperfGui {
             return empty_message("No functions were resolved for the matching samples.");
         }
 
-        div()
-            .size_full()
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .bg(rgb(WORKSPACE))
-            .child(hotspots_header())
-            .child(
-                div()
-                    .id("hotspots-function-scroll")
-                    .min_h(px(0.0))
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(analysis.functions.iter().enumerate().map(
-                        |(row_index, function)| {
-                            self.render_hotspot_row(
-                                row_index,
-                                function,
-                                selected_frames.contains(&function.frame_id),
-                                cx,
-                            )
-                        },
-                    )),
-            )
+        div().size_full().min_h(px(0.0)).bg(rgb(WORKSPACE)).child(
+            div()
+                .id("hotspots-horizontal-scroll")
+                .size_full()
+                .overflow_x_scroll()
+                .child(
+                    div()
+                        .w(px(HOTSPOTS_TABLE_WIDTH))
+                        .min_w(px(HOTSPOTS_TABLE_WIDTH))
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(hotspots_header())
+                        .child(
+                            div()
+                                .id("hotspots-function-scroll")
+                                .min_h(px(0.0))
+                                .flex_1()
+                                .overflow_y_scroll()
+                                .children(analysis.functions.iter().enumerate().map(
+                                    |(row_index, function)| {
+                                        self.render_hotspot_row(
+                                            row_index,
+                                            function,
+                                            selected_frames.contains(&function.frame_id),
+                                            cx,
+                                        )
+                                    },
+                                )),
+                        ),
+                ),
+        )
     }
 
     fn render_hotspot_row(
@@ -345,10 +366,14 @@ impl MperfGui {
     ) -> impl IntoElement + use<> {
         let frame_id = function.frame_id;
         let label = function.label.clone();
-        let self_samples = function.self_samples.to_string();
-        let self_percent = format_percent(function.self_fraction);
-        let inclusive_samples = function.inclusive_samples.to_string();
-        let inclusive_percent = format_percent(function.inclusive_fraction);
+        let self_share = format_share(function.self_fraction, function.self_samples);
+        let inclusive_share = format_share(function.inclusive_fraction, function.inclusive_samples);
+        let cpu_time = format_cpu_time(function.metrics.cpu_time_ns);
+        let ipc = format_metric(function.metrics.ipc, 2);
+        let llc_mpki = format_metric(function.metrics.llc_mpki, 2);
+        let llc_miss = format_optional_percent(function.metrics.llc_miss_rate);
+        let backend_stall = format_optional_percent(function.metrics.backend_stall_fraction);
+        let branch_mpki = format_metric(function.metrics.branch_mpki, 2);
 
         div()
             .id(SharedString::from(format!("hotspot-row-{row_index}")))
@@ -389,10 +414,14 @@ impl MperfGui {
                     .px_3()
                     .child(label),
             )
-            .child(numeric_cell(self_samples, SELF_SAMPLES_WIDTH))
-            .child(numeric_cell(self_percent, PERCENT_WIDTH))
-            .child(numeric_cell(inclusive_samples, INCLUSIVE_SAMPLES_WIDTH))
-            .child(numeric_cell(inclusive_percent, PERCENT_WIDTH))
+            .child(numeric_cell(self_share, SHARE_WIDTH))
+            .child(numeric_cell(inclusive_share, SHARE_WIDTH))
+            .child(numeric_cell(cpu_time, CPU_TIME_WIDTH))
+            .child(numeric_cell(ipc, IPC_WIDTH))
+            .child(numeric_cell(llc_mpki, LLC_MPKI_WIDTH))
+            .child(numeric_cell(llc_miss, LLC_MISS_WIDTH))
+            .child(numeric_cell(backend_stall, BACKEND_STALL_WIDTH))
+            .child(numeric_cell(branch_mpki, BRANCH_MPKI_WIDTH))
     }
 
     fn open_profile_frame_source(&mut self, frame_id: usize) {
@@ -882,10 +911,14 @@ fn hotspots_header() -> Div {
                 .px_3()
                 .child("Function"),
         )
-        .child(header_cell("Self samples", SELF_SAMPLES_WIDTH))
-        .child(header_cell("Self %", PERCENT_WIDTH))
-        .child(header_cell("Inclusive samples", INCLUSIVE_SAMPLES_WIDTH))
-        .child(header_cell("Inclusive %", PERCENT_WIDTH))
+        .child(header_cell("Self % · samples", SHARE_WIDTH))
+        .child(header_cell("Total % · samples", SHARE_WIDTH))
+        .child(header_cell("CPU time", CPU_TIME_WIDTH))
+        .child(header_cell("IPC", IPC_WIDTH))
+        .child(header_cell("LLC MPKI", LLC_MPKI_WIDTH))
+        .child(header_cell("LLC miss", LLC_MISS_WIDTH))
+        .child(header_cell("Backend stall", BACKEND_STALL_WIDTH))
+        .child(header_cell("Branch MPKI", BRANCH_MPKI_WIDTH))
 }
 
 fn header_cell(label: &'static str, width: f32) -> Div {
@@ -919,6 +952,39 @@ fn numeric_cell(value: String, width: f32) -> Div {
 
 fn format_percent(fraction: f64) -> String {
     format!("{:.2}%", fraction * 100.0)
+}
+
+fn format_share(fraction: f64, samples: u64) -> String {
+    format!("{} · {samples}", format_percent(fraction))
+}
+
+fn format_metric(value: Option<f64>, precision: usize) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.precision$}"))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_optional_percent(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(format_percent)
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_cpu_time(value: Option<f64>) -> String {
+    let Some(nanoseconds) = value.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return "—".to_string();
+    };
+    if nanoseconds >= 1_000_000_000.0 {
+        format!("{:.2} s", nanoseconds / 1_000_000_000.0)
+    } else if nanoseconds >= 1_000_000.0 {
+        format!("{:.2} ms", nanoseconds / 1_000_000.0)
+    } else if nanoseconds >= 1_000.0 {
+        format!("{:.1} µs", nanoseconds / 1_000.0)
+    } else {
+        format!("{nanoseconds:.0} ns")
+    }
 }
 
 fn empty_message(message: &'static str) -> Div {

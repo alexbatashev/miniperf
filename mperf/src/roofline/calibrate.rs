@@ -75,7 +75,7 @@ fn measure_memory_levels(
     let mut levels = Vec::new();
     let cache_levels = detect_cache_levels();
     for index in 0..cache_levels.len() {
-        let (level, _, _) = cache_levels[index];
+        let (level, capacity, sharers) = cache_levels[index];
         let Some(elements) = level_elements(&cache_levels, index, threads) else {
             continue;
         };
@@ -92,6 +92,8 @@ fn measure_memory_levels(
             gbytes_per_second,
             gbytes_per_second_samples: samples,
             working_set_bytes: (elements * threads.max(1) * 3 * size_of::<f64>()) as u64,
+            capacity_bytes: capacity,
+            shared_by: sharers,
         });
     }
     levels.push(MemoryLevelCalibration {
@@ -99,6 +101,8 @@ fn measure_memory_levels(
         gbytes_per_second: dram.gbytes_per_second,
         gbytes_per_second_samples: dram.gbytes_per_second_samples.clone(),
         working_set_bytes: dram.working_set_bytes,
+        capacity_bytes: 0,
+        shared_by: threads,
     });
     // Bandwidth must not increase as the working set grows; if the host is
     // noisy enough to invert two levels the roofs would be misleading.
@@ -313,7 +317,14 @@ pub(super) fn measure_memory() -> Result<MemoryBandwidthCalibration> {
         gbytes_per_second_samples: memory_samples,
         working_set_bytes: memory_working_set_bytes,
         source: "effective_stream".to_string(),
+        memory_levels: Vec::new(),
     })
+}
+
+pub(super) fn measure_memory_hierarchy() -> Result<MemoryBandwidthCalibration> {
+    let mut memory = measure_memory()?;
+    memory.memory_levels = measure_memory_levels(memory.threads, &memory);
+    Ok(memory)
 }
 
 fn allocate_vector(elements: usize) -> Result<Vec<f64>> {

@@ -226,7 +226,15 @@ impl GuiTab {
                     _ => None,
                 },
             ))),
-            TabSpec::Memory => Self::Memory(Box::new(MemoryData::load(connection))),
+            TabSpec::Memory => Self::Memory(Box::new(MemoryData::load(
+                connection,
+                record_info
+                    .cpu_info
+                    .memory_calibration
+                    .as_deref()
+                    .map(|calibration| calibration.memory_levels.clone())
+                    .unwrap_or_default(),
+            ))),
             TabSpec::Flamegraph => {
                 Self::Flamegraph(Box::new(FlamegraphData::load(result_directory)))
             }

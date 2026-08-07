@@ -286,12 +286,16 @@ mod tests {
                     gbytes_per_second: 400.0,
                     gbytes_per_second_samples: vec![400.0],
                     working_set_bytes: 64,
+                    capacity_bytes: 32 * 1024,
+                    shared_by: 1,
                 },
                 MemoryLevelCalibration {
                     level: "DRAM".to_string(),
                     gbytes_per_second: 50.0,
                     gbytes_per_second_samples: vec![50.0],
                     working_set_bytes: 1024,
+                    capacity_bytes: 0,
+                    shared_by: 4,
                 },
             ],
         }
