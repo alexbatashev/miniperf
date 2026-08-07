@@ -6,6 +6,28 @@ use sqlite::{Connection, Value};
 
 use crate::source::SourceLocation;
 
+const LABEL_ASSET_PREFIX: &str = "roofline-label:";
+
+pub(crate) fn roofline_label_asset(text: &str) -> String {
+    format!("{LABEL_ASSET_PREFIX}{text}")
+}
+
+pub(crate) fn roofline_label_svg(path: &str) -> Option<Vec<u8>> {
+    let text = path.strip_prefix(LABEL_ASSET_PREFIX)?;
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;");
+    Some(
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176 18"><text x="88" y="13" text-anchor="middle" font-family="sans-serif" font-size="11" font-weight="500" fill="black">{escaped}</text></svg>"#,
+        )
+        .into_bytes(),
+    )
+}
+
 #[derive(Debug)]
 pub struct RooflineData {
     pub loops: Vec<RooflineLoop>,
@@ -60,22 +82,58 @@ impl RooflineData {
         }
     }
 
-    /// Whether the loop byte denominator and calibrated memory ceiling refer
-    /// to the same hierarchy level. The current calibration is a DRAM-sized
-    /// streaming roof, so either measured DRAM traffic or the explicit shared-
-    /// LLC DRAM model is compatible; architectural instruction bytes are not.
+    /// Calibrated bandwidth roofs that match this recording's intensity axis.
+    /// Architectural traffic uses the complete cache-aware hierarchy, while
+    /// DRAM traffic uses only the DRAM-sized streaming roof.
+    pub fn bandwidth_roofs(&self) -> Vec<(&str, f64)> {
+        let Some(calibration) = self.calibration.as_ref() else {
+            return Vec::new();
+        };
+        let Some(method) = self.method.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut roofs = match method.traffic.as_str() {
+            "architectural" => calibration
+                .memory_levels
+                .iter()
+                .map(|level| (level.level.as_str(), level.gbytes_per_second))
+                .collect::<Vec<_>>(),
+            "dram" | "dram-model" => vec![("DRAM", calibration.memory_gbytes_per_second)],
+            _ => Vec::new(),
+        };
+        roofs.retain(|(_, bandwidth)| bandwidth.is_finite() && *bandwidth > 0.0);
+        roofs.sort_by(|left, right| right.1.total_cmp(&left.1));
+        roofs
+    }
+
     pub fn has_compatible_memory_roof(&self) -> bool {
-        self.calibration.is_some()
-            && self
-                .method
-                .as_ref()
-                .is_some_and(|method| matches!(method.traffic.as_str(), "dram" | "dram-model"))
+        !self.bandwidth_roofs().is_empty()
+    }
+
+    pub fn uses_architectural_traffic(&self) -> bool {
+        self.method
+            .as_ref()
+            .is_some_and(|method| method.traffic == "architectural")
     }
 
     pub fn uses_modeled_traffic(&self) -> bool {
         self.method
             .as_ref()
             .is_some_and(|method| method.traffic == "dram-model")
+    }
+
+    pub fn efficiency(&self, loop_data: &RooflineLoop) -> Option<f64> {
+        let calibration = self.calibration.as_ref()?;
+        let bandwidth = self
+            .bandwidth_roofs()
+            .into_iter()
+            .map(|(_, bandwidth)| bandwidth)
+            .max_by(f64::total_cmp)?;
+        let observed = loop_data.fp64_gflops()?;
+        let intensity = loop_data.fp64_arithmetic_intensity()?;
+        let roof = finite_positive(calibration.fp64_gflops.min(bandwidth * intensity))?;
+        (observed / roof).is_finite().then_some(observed / roof)
     }
 }
 
@@ -95,23 +153,6 @@ impl RooflineLoop {
             path: PathBuf::from(&self.file_name),
             line: self.line,
         })
-    }
-
-    pub fn relevant_roof_gflops(&self, calibration: &RooflineCalibration) -> Option<f64> {
-        let intensity = self.fp64_arithmetic_intensity()?;
-        finite_positive(
-            calibration
-                .fp64_gflops
-                .min(calibration.memory_gbytes_per_second * intensity),
-        )
-    }
-
-    pub fn efficiency(&self, calibration: &RooflineCalibration) -> Option<f64> {
-        let observed = self.fp64_gflops()?;
-        let roof = self.relevant_roof_gflops(calibration)?;
-        (roof > 0.0)
-            .then_some(observed / roof)
-            .filter(|value| value.is_finite())
     }
 }
 
@@ -225,6 +266,7 @@ fn sum_optional(left: Option<f64>, right: Option<f64>) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mperf_data::MemoryLevelCalibration;
 
     fn calibration() -> RooflineCalibration {
         RooflineCalibration {
@@ -238,6 +280,32 @@ mod tests {
             memory_gbytes_per_second_samples: vec![50.0],
             ridge_point_flops_per_byte: 4.0,
             memory_working_set_bytes: 1024,
+            memory_levels: vec![
+                MemoryLevelCalibration {
+                    level: "L1".to_string(),
+                    gbytes_per_second: 400.0,
+                    gbytes_per_second_samples: vec![400.0],
+                    working_set_bytes: 64,
+                },
+                MemoryLevelCalibration {
+                    level: "DRAM".to_string(),
+                    gbytes_per_second: 50.0,
+                    gbytes_per_second_samples: vec![50.0],
+                    working_set_bytes: 1024,
+                },
+            ],
+        }
+    }
+
+    fn method(traffic: &str) -> RooflineMethodInfo {
+        RooflineMethodInfo {
+            selection: "auto".to_string(),
+            accounting: "qemu".to_string(),
+            performance: "native".to_string(),
+            traffic: traffic.to_string(),
+            quality: "test".to_string(),
+            reason: "test".to_string(),
+            warnings: Vec::new(),
         }
     }
 
@@ -292,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn computes_memory_and_compute_bound_efficiency_against_calibration() {
+    fn computes_memory_and_compute_bound_efficiency_against_selected_roofs() {
         let mut loop_data = RooflineLoop {
             function_name: "loop".to_string(),
             file_name: String::new(),
@@ -315,15 +383,26 @@ mod tests {
             module_offset: None,
             trip_count: None,
         };
-        let calibration = calibration();
+        let architectural = RooflineData {
+            loops: Vec::new(),
+            calibration: Some(calibration()),
+            method: Some(method("architectural")),
+            error: None,
+        };
+        let dram = RooflineData {
+            loops: Vec::new(),
+            calibration: Some(calibration()),
+            method: Some(method("dram")),
+            error: None,
+        };
 
-        assert_eq!(loop_data.relevant_roof_gflops(&calibration), Some(50.0));
-        assert_eq!(loop_data.efficiency(&calibration), Some(0.5));
+        assert_eq!(architectural.efficiency(&loop_data), Some(0.125));
+        assert_eq!(dram.efficiency(&loop_data), Some(0.5));
 
         loop_data.scalar_double_ops = Some(100_000_000_000.0);
         loop_data.scalar_double_ai = Some(8.0);
-        assert_eq!(loop_data.relevant_roof_gflops(&calibration), Some(200.0));
-        assert_eq!(loop_data.efficiency(&calibration), Some(0.5));
+        assert_eq!(architectural.efficiency(&loop_data), Some(0.5));
+        assert_eq!(dram.efficiency(&loop_data), Some(0.5));
     }
 
     #[test]
@@ -341,31 +420,42 @@ mod tests {
     }
 
     #[test]
-    fn memory_roof_requires_explicitly_compatible_traffic() {
+    fn selects_cache_hierarchy_for_carm_and_dram_roof_for_dram_intensity() {
         let connection = sqlite::open(":memory:").unwrap();
-        let method = |traffic: &str| RooflineMethodInfo {
-            selection: "auto".to_string(),
-            accounting: "qemu".to_string(),
-            performance: "native".to_string(),
-            traffic: traffic.to_string(),
-            quality: "test".to_string(),
-            reason: "test".to_string(),
-            warnings: Vec::new(),
-        };
 
         let architectural = RooflineData::load(
             &connection,
             Some(calibration()),
             Some(method("architectural")),
         );
-        assert!(!architectural.has_compatible_memory_roof());
+        assert!(architectural.has_compatible_memory_roof());
+        assert!(architectural.uses_architectural_traffic());
+        assert_eq!(
+            architectural.bandwidth_roofs(),
+            vec![("L1", 400.0), ("DRAM", 50.0)]
+        );
 
         let dram = RooflineData::load(&connection, Some(calibration()), Some(method("dram")));
         assert!(dram.has_compatible_memory_roof());
+        assert_eq!(dram.bandwidth_roofs(), vec![("DRAM", 50.0)]);
 
         let modeled =
             RooflineData::load(&connection, Some(calibration()), Some(method("dram-model")));
         assert!(modeled.has_compatible_memory_roof());
         assert!(modeled.uses_modeled_traffic());
+        assert_eq!(modeled.bandwidth_roofs(), vec![("DRAM", 50.0)]);
+
+        let unknown = RooflineData::load(&connection, Some(calibration()), Some(method("unknown")));
+        assert!(!unknown.has_compatible_memory_roof());
+        assert!(unknown.bandwidth_roofs().is_empty());
+    }
+
+    #[test]
+    fn roofline_label_asset_escapes_recorded_level_names() {
+        let path = roofline_label_asset("L<&> · 1.00 GB/s");
+        let svg = String::from_utf8(roofline_label_svg(&path).unwrap()).unwrap();
+
+        assert!(svg.contains("L&lt;&amp;&gt; · 1.00 GB/s"));
+        assert!(!svg.contains("L<&>"));
     }
 }
