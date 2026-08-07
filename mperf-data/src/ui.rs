@@ -9,11 +9,18 @@ use crate::{RecordInfo, Scenario, ScenarioInfo};
 pub fn scenario_ui(record: &RecordInfo) -> ScenarioUi {
     match record.scenario {
         Scenario::Snapshot => snapshot_ui(),
-        Scenario::Roofline => roofline_ui(),
+        Scenario::Mem => memory_ui(),
+        Scenario::Roofline => roofline_ui(record),
         Scenario::TMA => match &record.scenario_info {
             ScenarioInfo::TMA(tma) => tma.ui.clone().unwrap_or_else(|| tma_fallback_ui(tma)),
             _ => snapshot_ui(),
         },
+    }
+}
+
+fn memory_ui() -> ScenarioUi {
+    ScenarioUi {
+        tabs: vec![TabSpec::Summary, TabSpec::Memory, TabSpec::Flamegraph],
     }
 }
 
@@ -73,10 +80,22 @@ fn snapshot_ui() -> ScenarioUi {
     }
 }
 
-fn roofline_ui() -> ScenarioUi {
-    ScenarioUi {
-        tabs: vec![TabSpec::Summary, TabSpec::Loops, TabSpec::Flamegraph],
+fn roofline_ui(record: &RecordInfo) -> ScenarioUi {
+    let has_memory = match &record.scenario_info {
+        ScenarioInfo::Roofline(info) => {
+            info.method
+                .as_deref()
+                .is_some_and(|method| method.accounting == "qemu")
+                || info.backend.contains("qemu")
+        }
+        _ => false,
+    };
+    let mut tabs = vec![TabSpec::Summary, TabSpec::Loops];
+    if has_memory {
+        tabs.push(TabSpec::Memory);
     }
+    tabs.push(TabSpec::Flamegraph);
+    ScenarioUi { tabs }
 }
 
 fn tma_fallback_ui(tma: &crate::TMAInfo) -> ScenarioUi {

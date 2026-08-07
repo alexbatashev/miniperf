@@ -20,6 +20,7 @@ pub const CURRENT_FORMAT_VERSION: u32 = 2;
 #[derive(Clone, Debug, Copy, ValueEnum, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scenario {
     Snapshot,
+    Mem,
     Roofline,
     TMA,
 }
@@ -31,16 +32,72 @@ pub struct SnapshotInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryInfo {
+    /// PID of the native, timed process.
+    pub perf_pid: i32,
+    /// PID of the QEMU accounting process.
+    pub accounting_pid: i32,
+    pub counters: Vec<(EventType, String)>,
+    /// Complete address accounting is process-specific and modeled; hardware
+    /// memory-controller counters, when present, are system-scoped.
+    pub method: MemoryMethodInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryMethodInfo {
+    pub selection: String,
+    pub accounting: String,
+    pub performance: String,
+    pub bandwidth: String,
+    pub quality: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RooflineInfo {
     #[serde(default = "default_roofline_backend")]
     pub backend: String,
     pub perf_pid: i32,
     pub counters: Vec<(EventType, String)>,
     pub inst_pid: i32,
+    /// How the profiler selected and composed this Roofline measurement.
+    /// Absent in recordings produced before automatic method selection.
+    #[serde(default)]
+    pub method: Option<Box<RooflineMethodInfo>>,
 }
 
 fn default_roofline_backend() -> String {
     "compiler".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RooflineMethodInfo {
+    /// `auto` for capability-based selection, otherwise `explicit`.
+    pub selection: String,
+    /// Source of operation and byte accounting, such as `qemu` or `compiler`.
+    pub accounting: String,
+    /// Source of elapsed time: `native` or `qemu`.
+    pub performance: String,
+    /// Meaning of the byte denominator, such as `architectural`, `dram`, or
+    /// `dram-model` for deterministic last-level-cache modeling.
+    ///
+    /// A memory-bandwidth roof is compatible only with traffic measured at the
+    /// same hierarchy level. Recordings predating this field deserialize as
+    /// `unknown` and must not silently use a DRAM roof.
+    #[serde(default = "default_roofline_traffic")]
+    pub traffic: String,
+    /// Short machine-readable quality classification.
+    pub quality: String,
+    /// Human-readable explanation of why this method was selected.
+    pub reason: String,
+    /// Limitations which must remain visible to result consumers.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+fn default_roofline_traffic() -> String {
+    "unknown".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +118,7 @@ pub struct TMAInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ScenarioInfo {
     Snapshot(SnapshotInfo),
+    Mem(MemoryInfo),
     Roofline(RooflineInfo),
     TMA(TMAInfo),
 }
@@ -79,9 +137,45 @@ pub struct CoreCluster {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CpuInfo {
+    /// Sustainable host memory bandwidth, shared by memory and Roofline analyses.
+    #[serde(default)]
+    pub memory_calibration: Option<Box<MemoryBandwidthCalibration>>,
     /// Host ceilings measured immediately before a Roofline recording.
     #[serde(default)]
     pub roofline_calibration: Option<Box<RooflineCalibration>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryBandwidthCalibration {
+    pub threads: usize,
+    #[serde(default)]
+    pub cpu_affinity: Option<String>,
+    pub samples: usize,
+    pub gbytes_per_second: f64,
+    #[serde(default)]
+    pub gbytes_per_second_samples: Vec<f64>,
+    pub working_set_bytes: u64,
+    /// `effective_stream` until a supported memory-controller PMU is used.
+    pub source: String,
+    /// Measured bandwidth roofs and detected capacities for the source host's
+    /// cache hierarchy, innermost first. Older recordings contain no levels.
+    #[serde(default)]
+    pub memory_levels: Vec<MemoryLevelCalibration>,
+}
+
+impl From<&RooflineCalibration> for MemoryBandwidthCalibration {
+    fn from(value: &RooflineCalibration) -> Self {
+        Self {
+            threads: value.threads,
+            cpu_affinity: value.cpu_affinity.clone(),
+            samples: value.samples,
+            gbytes_per_second: value.memory_gbytes_per_second,
+            gbytes_per_second_samples: value.memory_gbytes_per_second_samples.clone(),
+            working_set_bytes: value.memory_working_set_bytes,
+            source: "effective_stream".to_string(),
+            memory_levels: value.memory_levels.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +203,31 @@ pub struct RooflineCalibration {
     pub ridge_point_flops_per_byte: f64,
     /// Bytes in all three buffers used by the memory calibration.
     pub memory_working_set_bytes: u64,
+    /// Bandwidth roofs per memory hierarchy level, innermost first. The
+    /// cache-aware roofline plots loops against architectural traffic, so one
+    /// DRAM roof is not enough: a cache-resident loop is served far above DRAM
+    /// bandwidth and needs the cache-level roofs to be read correctly.
+    #[serde(default)]
+    pub memory_levels: Vec<MemoryLevelCalibration>,
+}
+
+/// One measured bandwidth roof of the memory hierarchy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct MemoryLevelCalibration {
+    /// `L1`, `L2`, `L3` or `DRAM`.
+    pub level: String,
+    pub gbytes_per_second: f64,
+    #[serde(default)]
+    pub gbytes_per_second_samples: Vec<f64>,
+    /// Total bytes touched across all threads by this level's kernel.
+    pub working_set_bytes: u64,
+    /// Total detected capacity of this cache level on the source host. DRAM
+    /// has no cache capacity and stores zero. Missing in older recordings.
+    #[serde(default)]
+    pub capacity_bytes: u64,
+    /// Number of logical CPUs sharing the detected cache. Zero means unknown.
+    #[serde(default)]
+    pub shared_by: usize,
 }
 
 /// How `os_cpu_clock` observations should be interpreted by time-based views.
@@ -199,6 +318,7 @@ impl Scenario {
     pub fn name(&self) -> &'static str {
         match self {
             Scenario::Snapshot => "Snapshot",
+            Scenario::Mem => "Memory",
             Scenario::Roofline => "Roofline",
             Scenario::TMA => "Top-Down",
         }
@@ -242,6 +362,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_roofline_method_does_not_assume_a_traffic_level() {
+        let method: RooflineMethodInfo = serde_json::from_str(
+            r#"{"selection":"auto","accounting":"qemu","performance":"native","quality":"test","reason":"test","warnings":[]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(method.traffic, "unknown");
+    }
+
+    #[test]
     fn rejects_newer_results_with_actionable_message() {
         let info: RecordInfo =
             serde_json::from_str(&record_info_json(Some(CURRENT_FORMAT_VERSION + 1))).unwrap();
@@ -264,8 +394,10 @@ mod tests {
             memory_gbytes_per_second_samples: vec![50.0],
             ridge_point_flops_per_byte: 2.0,
             memory_working_set_bytes: 1024,
+            memory_levels: Vec::new(),
         };
         let cpu_info = CpuInfo {
+            memory_calibration: None,
             roofline_calibration: Some(Box::new(calibration)),
         };
 

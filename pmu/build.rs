@@ -216,6 +216,7 @@ fn tab_tokens(tab: &TabSpec) -> TokenStream {
         TabSpec::Summary => quote! { pmu_data::TabSpec::Summary },
         TabSpec::Flamegraph => quote! { pmu_data::TabSpec::Flamegraph },
         TabSpec::Loops => quote! { pmu_data::TabSpec::Loops },
+        TabSpec::Memory => quote! { pmu_data::TabSpec::Memory },
         TabSpec::MetricsTable(spec) => {
             let spec = metrics_table_tokens(spec);
             quote! { pmu_data::TabSpec::MetricsTable(#spec) }

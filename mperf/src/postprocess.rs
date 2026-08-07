@@ -1,17 +1,18 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kdam::BarExt;
 use memmap2::{Advice, Mmap};
 use mperf_data::{
     CallFrame, CpuClockSource, Event, EventType, IString, ProcMapEntry, RecordInfo, Scenario,
     ScenarioInfo,
 };
-use object::{Object, ObjectSymbol, SymbolKind};
+use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
+use serde::Deserialize;
 use smallvec::SmallVec;
 use tokio::{
     fs::{self, File},
@@ -55,8 +56,18 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
         }
+        Scenario::Mem => {
+            process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
+            process_memory_artifact(&connection, &info, res_dir)?;
+            process_disassembly(&connection, res_dir, &mut pb).await?;
+            create_hotspots_view(&connection).await?;
+        }
         Scenario::Roofline => {
             process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
+            if res_dir.join("qemu-roofline.memory.json").exists() {
+                process_memory_artifact(&connection, &info, res_dir)?;
+            }
+            process_binary_roofline_loops(&connection, &info, res_dir)?;
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
             create_roofline_view(&connection).await?;
@@ -70,6 +81,529 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
 
     persist_derived_metrics(&connection)?;
 
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct MemoryArtifact {
+    format_version: u32,
+    line_size: u64,
+    references: u64,
+    architectural_load_bytes: u64,
+    architectural_store_bytes: u64,
+    unique_lines: u64,
+    distinct_bytes: u64,
+    cold_references: u64,
+    reuse_distance_log2: BTreeMap<u32, u64>,
+    spatial_utilization_percent: BTreeMap<u32, u64>,
+    stride_lines_log2: BTreeMap<i32, u64>,
+    working_set: Vec<MemoryWorkingSetArtifact>,
+}
+
+#[derive(Deserialize)]
+struct MemoryWorkingSetArtifact {
+    window_references: u64,
+    mean_lines: f64,
+    p95_lines: u64,
+    max_lines: u64,
+}
+
+#[derive(Deserialize)]
+struct NativeTimingArtifact {
+    pid: i32,
+    start_ns: u64,
+    end_ns: u64,
+}
+
+fn process_memory_artifact(
+    connection: &sqlite::Connection,
+    record_info: &RecordInfo,
+    res_dir: &Path,
+) -> Result<()> {
+    let artifact_path = res_dir.join("qemu-roofline.memory.json");
+    let artifact: MemoryArtifact = serde_json::from_reader(
+        std::fs::File::open(&artifact_path)
+            .with_context(|| format!("open memory artifact '{}'", artifact_path.display()))?,
+    )
+    .with_context(|| format!("parse memory artifact '{}'", artifact_path.display()))?;
+    if artifact.format_version != 1 {
+        anyhow::bail!(
+            "unsupported memory artifact version {}",
+            artifact.format_version
+        );
+    }
+    let timing: NativeTimingArtifact = serde_json::from_reader(
+        std::fs::File::open(res_dir.join("memory-native.json"))
+            .context("open native memory timing artifact")?,
+    )
+    .context("parse native memory timing artifact")?;
+    let duration_ns = timing.end_ns.saturating_sub(timing.start_ns);
+    let counts = parse_counter_file(&res_dir.join("qemu-roofline.counts"))?;
+    let modeled_load = counts.get("dram_bytes_load").copied().unwrap_or(0);
+    let modeled_store = counts.get("dram_bytes_store").copied().unwrap_or(0);
+    let modeled_total = modeled_load.saturating_add(modeled_store);
+    let bandwidth_samples = parse_bandwidth_samples(&res_dir.join("memory-bandwidth.txt"))?;
+    let hardware_total = bandwidth_samples
+        .last()
+        .map(|sample| sample.read_bytes.saturating_add(sample.write_bytes));
+    let primary_total = hardware_total.unwrap_or(modeled_total);
+    let (bandwidth_source, bandwidth_scope) = if hardware_total.is_some() {
+        ("hardware_memory_controller", "system_during_target")
+    } else {
+        ("process_modeled", "process")
+    };
+    let achieved_gbytes_per_second =
+        (duration_ns != 0).then(|| primary_total as f64 / duration_ns as f64);
+    let calibration = record_info.cpu_info.memory_calibration.as_deref();
+    let peak = calibration.map(|value| value.gbytes_per_second);
+    let utilization = achieved_gbytes_per_second
+        .zip(peak)
+        .filter(|(_, peak)| *peak > 0.0)
+        .map(|(achieved, peak)| achieved / peak);
+    let cold_fraction = (artifact.references != 0)
+        .then(|| artifact.cold_references as f64 / artifact.references as f64);
+
+    connection.execute(
+        "CREATE TABLE memory_summary (
+            format_version INTEGER NOT NULL,
+            process_id INTEGER NOT NULL,
+            line_size INTEGER NOT NULL,
+            reference_count INTEGER NOT NULL,
+            architectural_load_bytes INTEGER NOT NULL,
+            architectural_store_bytes INTEGER NOT NULL,
+            unique_lines INTEGER NOT NULL,
+            accessed_footprint_bytes INTEGER NOT NULL,
+            cold_references INTEGER NOT NULL,
+            cold_fraction REAL,
+            modeled_dram_read_bytes INTEGER NOT NULL,
+            modeled_dram_write_bytes INTEGER NOT NULL,
+            native_duration_ns INTEGER NOT NULL,
+            achieved_gbytes_per_second REAL,
+            peak_gbytes_per_second REAL,
+            bandwidth_utilization REAL,
+            bandwidth_source TEXT NOT NULL,
+            bandwidth_scope TEXT NOT NULL,
+            live_allocated_bytes INTEGER,
+            peak_allocated_bytes INTEGER,
+            live_mapped_bytes INTEGER,
+            peak_rss_bytes INTEGER,
+            quality TEXT NOT NULL
+        );
+        CREATE TABLE memory_timeline (
+            timestamp_ns INTEGER NOT NULL,
+            live_allocated_bytes INTEGER,
+            live_mapped_bytes INTEGER,
+            rss_bytes INTEGER,
+            dram_read_gbytes_per_second REAL,
+            dram_write_gbytes_per_second REAL,
+            bandwidth_source TEXT
+        );
+        CREATE TABLE memory_working_set (
+            window_references INTEGER NOT NULL,
+            mean_bytes REAL NOT NULL,
+            p95_bytes INTEGER NOT NULL,
+            max_bytes INTEGER NOT NULL
+        );
+        CREATE TABLE memory_spatial_utilization (
+            utilization_percent INTEGER NOT NULL,
+            lines INTEGER NOT NULL
+        );
+        CREATE TABLE memory_strides (
+            stride_log2_lines INTEGER NOT NULL,
+            reference_count INTEGER NOT NULL
+        );
+        CREATE TABLE memory_reuse_distance (
+            distance_log2_lines INTEGER NOT NULL,
+            reference_count INTEGER NOT NULL
+        );
+        CREATE TABLE memory_miss_ratio (
+            cache_lines INTEGER NOT NULL,
+            cache_bytes INTEGER NOT NULL,
+            miss_ratio REAL NOT NULL
+        );",
+    )?;
+
+    let quality = match &record_info.scenario_info {
+        ScenarioInfo::Mem(info) => info.method.quality.as_str(),
+        ScenarioInfo::Roofline(info) => info
+            .method
+            .as_deref()
+            .map_or("legacy", |method| method.quality.as_str()),
+        _ => "unknown",
+    };
+    let mut insert = connection.prepare(
+        "INSERT INTO memory_summary (
+            format_version, process_id, line_size, reference_count,
+            architectural_load_bytes, architectural_store_bytes, unique_lines,
+            accessed_footprint_bytes, cold_references, cold_fraction,
+            modeled_dram_read_bytes, modeled_dram_write_bytes, native_duration_ns,
+            achieved_gbytes_per_second, peak_gbytes_per_second,
+            bandwidth_utilization, bandwidth_source, bandwidth_scope, quality
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+    )?;
+    insert.bind((1, artifact.format_version as i64))?;
+    insert.bind((2, timing.pid as i64))?;
+    insert.bind((3, sqlite_u64(artifact.line_size)))?;
+    insert.bind((4, sqlite_u64(artifact.references)))?;
+    insert.bind((5, sqlite_u64(artifact.architectural_load_bytes)))?;
+    insert.bind((6, sqlite_u64(artifact.architectural_store_bytes)))?;
+    insert.bind((7, sqlite_u64(artifact.unique_lines)))?;
+    insert.bind((8, sqlite_u64(artifact.distinct_bytes)))?;
+    insert.bind((9, sqlite_u64(artifact.cold_references)))?;
+    insert.bind((10, cold_fraction))?;
+    insert.bind((11, sqlite_u64(modeled_load)))?;
+    insert.bind((12, sqlite_u64(modeled_store)))?;
+    insert.bind((13, sqlite_u64(duration_ns)))?;
+    insert.bind((14, achieved_gbytes_per_second))?;
+    insert.bind((15, peak))?;
+    insert.bind((16, utilization))?;
+    insert.bind((17, bandwidth_source))?;
+    insert.bind((18, bandwidth_scope))?;
+    insert.bind((19, quality))?;
+    insert.next()?;
+
+    let rss_samples = parse_rss_samples(&res_dir.join("memory-rss.txt"))?;
+    let peak_rss = rss_samples.iter().map(|(_, rss)| *rss).max();
+    if let Some(peak_rss) = peak_rss {
+        let mut update = connection.prepare("UPDATE memory_summary SET peak_rss_bytes = ?;")?;
+        update.bind((1, sqlite_u64(peak_rss)))?;
+        update.next()?;
+    }
+    let mut timeline = connection.prepare(
+        "INSERT INTO memory_timeline (
+            timestamp_ns, live_allocated_bytes, live_mapped_bytes, rss_bytes,
+            dram_read_gbytes_per_second, dram_write_gbytes_per_second, bandwidth_source
+         ) VALUES (?, NULL, NULL, ?, NULL, NULL, NULL);",
+    )?;
+    for (timestamp, rss) in rss_samples {
+        timeline.reset()?;
+        timeline.bind((1, sqlite_u64(timestamp)))?;
+        timeline.bind((2, sqlite_u64(rss)))?;
+        timeline.next()?;
+    }
+    let mut bandwidth_timeline = connection.prepare(
+        "INSERT INTO memory_timeline (
+            timestamp_ns, live_allocated_bytes, live_mapped_bytes, rss_bytes,
+            dram_read_gbytes_per_second, dram_write_gbytes_per_second, bandwidth_source
+         ) VALUES (?, NULL, NULL, NULL, ?, ?, 'hardware_memory_controller');",
+    )?;
+    for pair in bandwidth_samples.windows(2) {
+        let elapsed = pair[1].timestamp.saturating_sub(pair[0].timestamp);
+        if elapsed == 0 {
+            continue;
+        }
+        let read = pair[1].read_bytes.saturating_sub(pair[0].read_bytes) as f64 / elapsed as f64;
+        let write = pair[1].write_bytes.saturating_sub(pair[0].write_bytes) as f64 / elapsed as f64;
+        bandwidth_timeline.reset()?;
+        bandwidth_timeline.bind((1, sqlite_u64(pair[1].timestamp)))?;
+        bandwidth_timeline.bind((2, read))?;
+        bandwidth_timeline.bind((3, write))?;
+        bandwidth_timeline.next()?;
+    }
+    if let Some(allocations) = parse_allocation_samples(&res_dir.join("memory-allocations.txt"))? {
+        let mut update = connection.prepare(
+            "UPDATE memory_summary SET
+                live_allocated_bytes = ?, peak_allocated_bytes = ?, live_mapped_bytes = ?;",
+        )?;
+        update.bind((1, sqlite_u64(allocations.live_allocated)))?;
+        update.bind((2, sqlite_u64(allocations.peak_allocated)))?;
+        update.bind((3, sqlite_u64(allocations.live_mapped)))?;
+        update.next()?;
+        if allocations.child_seen {
+            connection
+                .execute("UPDATE memory_summary SET quality = quality || '+children-excluded';")?;
+        }
+        let mut allocation_timeline = connection.prepare(
+            "INSERT INTO memory_timeline (
+                timestamp_ns, live_allocated_bytes, live_mapped_bytes, rss_bytes,
+                dram_read_gbytes_per_second, dram_write_gbytes_per_second, bandwidth_source
+             ) VALUES (?, ?, ?, NULL, NULL, NULL, NULL);",
+        )?;
+        for point in allocations.points {
+            allocation_timeline.reset()?;
+            allocation_timeline.bind((1, sqlite_u64(point.timestamp)))?;
+            allocation_timeline.bind((2, sqlite_u64(point.live_allocated)))?;
+            allocation_timeline.bind((3, sqlite_u64(point.live_mapped)))?;
+            allocation_timeline.next()?;
+        }
+    }
+
+    let mut statement =
+        connection.prepare("INSERT INTO memory_working_set VALUES (?, ?, ?, ?);")?;
+    for window in artifact.working_set {
+        statement.reset()?;
+        statement.bind((1, sqlite_u64(window.window_references)))?;
+        statement.bind((2, window.mean_lines * artifact.line_size as f64))?;
+        statement.bind((
+            3,
+            sqlite_u64(window.p95_lines.saturating_mul(artifact.line_size)),
+        ))?;
+        statement.bind((
+            4,
+            sqlite_u64(window.max_lines.saturating_mul(artifact.line_size)),
+        ))?;
+        statement.next()?;
+    }
+    insert_histogram(
+        connection,
+        "memory_spatial_utilization",
+        artifact.spatial_utilization_percent,
+    )?;
+    insert_histogram(connection, "memory_strides", artifact.stride_lines_log2)?;
+    insert_histogram(
+        connection,
+        "memory_reuse_distance",
+        artifact.reuse_distance_log2.clone(),
+    )?;
+
+    let mut miss = connection.prepare("INSERT INTO memory_miss_ratio VALUES (?, ?, ?);")?;
+    for power in 0..=30_u32 {
+        let lines = 1_u64 << power;
+        let hits = artifact
+            .reuse_distance_log2
+            .iter()
+            .filter(|(bucket, _)| **bucket <= power)
+            .map(|(_, count)| *count)
+            .sum::<u64>();
+        let ratio = if artifact.references == 0 {
+            0.0
+        } else {
+            1.0 - hits as f64 / artifact.references as f64
+        };
+        miss.reset()?;
+        miss.bind((1, sqlite_u64(lines)))?;
+        miss.bind((2, sqlite_u64(lines.saturating_mul(artifact.line_size))))?;
+        miss.bind((3, ratio))?;
+        miss.next()?;
+    }
+    Ok(())
+}
+
+fn parse_rss_samples(path: &Path) -> Result<Vec<(u64, u64)>> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    contents
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let timestamp = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("RSS sample has no timestamp"))?
+                .parse()?;
+            let rss = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("RSS sample has no value"))?
+                .parse()?;
+            Ok((timestamp, rss))
+        })
+        .collect()
+}
+
+struct BandwidthSample {
+    timestamp: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+fn parse_bandwidth_samples(path: &Path) -> Result<Vec<BandwidthSample>> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(Vec::new());
+    };
+    contents
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            Ok(BandwidthSample {
+                timestamp: fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("bandwidth sample has no timestamp"))?
+                    .parse()?,
+                read_bytes: fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("bandwidth sample has no read count"))?
+                    .parse()?,
+                write_bytes: fields
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("bandwidth sample has no write count"))?
+                    .parse()?,
+            })
+        })
+        .collect()
+}
+
+struct AllocationPoint {
+    timestamp: u64,
+    live_allocated: u64,
+    live_mapped: u64,
+}
+
+struct AllocationSummary {
+    live_allocated: u64,
+    peak_allocated: u64,
+    live_mapped: u64,
+    points: Vec<AllocationPoint>,
+    child_seen: bool,
+}
+
+fn parse_allocation_samples(path: &Path) -> Result<Option<AllocationSummary>> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let mut heap = HashMap::<u64, u64>::new();
+    let mut mappings = BTreeMap::<u64, u64>::new();
+    let mut live_allocated = 0_u64;
+    let mut peak_allocated = 0_u64;
+    let mut live_mapped = 0_u64;
+    let mut points = Vec::new();
+    let mut child_seen = false;
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let operation = fields
+            .next()
+            .and_then(|value| value.as_bytes().first())
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid allocation event '{line}'"))?;
+        let timestamp = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("allocation event has no timestamp"))?
+            .parse::<u64>()?;
+        let first = u64::from_str_radix(
+            fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("allocation event has no address"))?,
+            16,
+        )?;
+        let second = u64::from_str_radix(
+            fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("allocation event has no second address"))?,
+            16,
+        )?;
+        let size = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("allocation event has no size"))?
+            .parse::<u64>()?;
+        match operation {
+            b'A' if first != 0 => {
+                if let Some(old) = heap.insert(first, size) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+                live_allocated = live_allocated.saturating_add(size);
+            }
+            b'F' => {
+                if let Some(old) = heap.remove(&first) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+            }
+            b'R' if second != 0 => {
+                if let Some(old) = heap.remove(&first) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+                if let Some(old) = heap.insert(second, size) {
+                    live_allocated = live_allocated.saturating_sub(old);
+                }
+                live_allocated = live_allocated.saturating_add(size);
+            }
+            b'M' if first != 0 => {
+                if let Some(old) = mappings.insert(first, size) {
+                    live_mapped = live_mapped.saturating_sub(old);
+                }
+                live_mapped = live_mapped.saturating_add(size);
+            }
+            b'U' => unmap_range(&mut mappings, first, size, &mut live_mapped),
+            b'C' => child_seen = true,
+            _ => {}
+        }
+        peak_allocated = peak_allocated.max(live_allocated);
+        points.push(AllocationPoint {
+            timestamp,
+            live_allocated,
+            live_mapped,
+        });
+    }
+    Ok(Some(AllocationSummary {
+        live_allocated,
+        peak_allocated,
+        live_mapped,
+        points,
+        child_seen,
+    }))
+}
+
+fn unmap_range(mappings: &mut BTreeMap<u64, u64>, start: u64, size: u64, live: &mut u64) {
+    let end = start.saturating_add(size);
+    let overlaps = mappings
+        .range(..end)
+        .filter_map(|(&base, &length)| {
+            (base.saturating_add(length) > start).then_some((base, length))
+        })
+        .collect::<Vec<_>>();
+    for (base, length) in overlaps {
+        mappings.remove(&base);
+        let mapping_end = base.saturating_add(length);
+        let removed_start = base.max(start);
+        let removed_end = mapping_end.min(end);
+        *live = live.saturating_sub(removed_end.saturating_sub(removed_start));
+        if base < start {
+            mappings.insert(base, start - base);
+        }
+        if mapping_end > end {
+            mappings.insert(end, mapping_end - end);
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_profile_tests {
+    use super::*;
+
+    #[test]
+    fn allocation_replay_tracks_realloc_free_and_partial_unmap() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("allocations.txt");
+        std::fs::write(
+            &path,
+            "A 1 1000 0 64\nA 2 2000 0 32\nR 3 1000 3000 128\nF 4 2000 0 0\nM 5 4000 0 4096\nU 6 4400 0 1024\n",
+        )
+        .unwrap();
+        let summary = parse_allocation_samples(&path).unwrap().unwrap();
+        assert_eq!(summary.live_allocated, 128);
+        assert_eq!(summary.peak_allocated, 160);
+        assert_eq!(summary.live_mapped, 3072);
+        assert_eq!(summary.points.len(), 6);
+    }
+}
+
+fn parse_counter_file(path: &Path) -> Result<HashMap<String, u64>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("read counter artifact '{}'", path.display()))?;
+    contents
+        .lines()
+        .map(|line| {
+            let (name, value) = line
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("invalid counter line '{line}'"))?;
+            Ok((name.to_string(), value.parse::<u64>()?))
+        })
+        .collect()
+}
+
+fn insert_histogram<K>(
+    connection: &sqlite::Connection,
+    table: &str,
+    values: BTreeMap<K, u64>,
+) -> Result<()>
+where
+    K: Into<i64> + Copy,
+{
+    let mut statement = connection.prepare(format!("INSERT INTO {table} VALUES (?, ?);"))?;
+    for (bucket, count) in values {
+        statement.reset()?;
+        statement.bind((1, bucket.into()))?;
+        statement.bind((2, sqlite_u64(count)))?;
+        statement.next()?;
+    }
     Ok(())
 }
 
@@ -254,6 +788,56 @@ struct RooflineData {
     ops: Vec<RooflineLoopInfo>,
 }
 
+#[derive(Deserialize)]
+struct BinaryLoopFile {
+    format_version: u32,
+    executable: String,
+    loops: Vec<BinaryLoop>,
+}
+
+#[derive(Deserialize)]
+struct BinaryLoop {
+    module_offset: String,
+    function: Option<String>,
+    file: Option<String>,
+    line: Option<u32>,
+    trip_count: u64,
+    block_ranges: Vec<BinaryBlockRange>,
+    inclusive: BinaryLoopCounts,
+}
+
+#[derive(Deserialize)]
+struct BinaryBlockRange {
+    module_start: String,
+    module_end: String,
+}
+
+#[derive(Default, Deserialize)]
+struct BinaryLoopCounts {
+    scalar_int_ops: u64,
+    scalar_float_ops: u64,
+    scalar_double_ops: u64,
+    vector_int_ops: u64,
+    vector_float_ops: u64,
+    vector_double_ops: u64,
+    bytes_load: u64,
+    bytes_store: u64,
+    arch_bytes_load: u64,
+    arch_bytes_store: u64,
+    unclassified_instructions: u64,
+}
+
+struct ModuleMapping {
+    runtime_start: u64,
+    runtime_end: u64,
+    svma_start: u64,
+}
+
+struct BinaryTimingSample {
+    timestamp: u64,
+    module_address: u64,
+}
+
 impl RooflineData {
     fn new(info: &ScenarioInfo) -> Option<Self> {
         let ScenarioInfo::Roofline(info) = info else {
@@ -351,6 +935,7 @@ async fn process_pmu_counters(
     let info = &record_info.scenario_info;
     let events = match info {
         ScenarioInfo::Snapshot(s) => &s.counters,
+        ScenarioInfo::Mem(m) => &m.counters,
         ScenarioInfo::Roofline(r) => &r.counters,
         ScenarioInfo::TMA(t) => &t.counters,
     };
@@ -760,6 +1345,27 @@ fn create_roofline_tables(connection: &sqlite::Connection) -> Result<()> {
             unique_id BINARY(128), process_id INTEGER NOT NULL, thread_id INTEGER NOT NULL,
             file_name BINARY(128) NOT NULL, function_name BINARY(128) NOT NULL,
             line INTEGER NOT NULL, loop_start_ts INTEGER NOT NULL, loop_end_ts INTEGER NOT NULL
+        );
+        CREATE TABLE roofline_binary_loops(
+            module_offset TEXT PRIMARY KEY,
+            function_name TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            trip_count INTEGER NOT NULL,
+            duration_ns INTEGER,
+            timing_samples INTEGER NOT NULL,
+            timing_relative_error REAL,
+            timing_quality TEXT NOT NULL,
+            bytes_load INTEGER NOT NULL,
+            bytes_store INTEGER NOT NULL,
+            arch_bytes_load INTEGER NOT NULL,
+            arch_bytes_store INTEGER NOT NULL,
+            scalar_int_ops INTEGER NOT NULL,
+            scalar_float_ops INTEGER NOT NULL,
+            scalar_double_ops INTEGER NOT NULL,
+            vector_int_ops INTEGER NOT NULL,
+            vector_float_ops INTEGER NOT NULL,
+            vector_double_ops INTEGER NOT NULL
         );",
     )?;
     Ok(())
@@ -818,6 +1424,361 @@ fn persist_roofline_data(connection: &sqlite::Connection, data: RooflineData) ->
         ops_stmt.next()?;
     }
     Ok(())
+}
+
+fn process_binary_roofline_loops(
+    connection: &sqlite::Connection,
+    record_info: &RecordInfo,
+    res_dir: &Path,
+) -> Result<()> {
+    use sqlite::State;
+
+    let ScenarioInfo::Roofline(roofline_info) = &record_info.scenario_info else {
+        return Ok(());
+    };
+    let Some(method) = roofline_info.method.as_deref() else {
+        return Ok(());
+    };
+    if !matches!(method.accounting.as_str(), "qemu" | "dynamorio") || method.performance != "native"
+    {
+        return Ok(());
+    }
+    let artifact_path = res_dir.join("qemu-roofline.loops.json");
+    if !artifact_path.is_file() {
+        anyhow::bail!(
+            "native QEMU Roofline recording is missing '{}'",
+            artifact_path.display()
+        );
+    }
+    let artifact: BinaryLoopFile = serde_json::from_reader(
+        std::fs::File::open(&artifact_path)
+            .with_context(|| format!("open binary loop artifact '{}'", artifact_path.display()))?,
+    )
+    .with_context(|| format!("parse binary loop artifact '{}'", artifact_path.display()))?;
+    if artifact.format_version != 3 {
+        anyhow::bail!(
+            "unsupported binary loop artifact version {}",
+            artifact.format_version
+        );
+    }
+
+    let executable = Path::new(&artifact.executable);
+    let object_data = std::fs::read(executable)
+        .with_context(|| format!("read Roofline executable '{}'", executable.display()))?;
+    let object = object::File::parse(object_data.as_slice())
+        .with_context(|| format!("parse Roofline executable '{}'", executable.display()))?;
+    let proc_maps: Vec<ProcMapEntry> =
+        serde_json::from_reader(std::fs::File::open(res_dir.join("proc_map.json"))?)?;
+    let mappings = executable_mappings(
+        &proc_maps,
+        roofline_info.perf_pid as u32,
+        executable,
+        &object,
+    );
+    if mappings.is_empty() {
+        anyhow::bail!(
+            "native Roofline samples have no executable mapping for '{}'",
+            executable.display()
+        );
+    }
+
+    let mut sample_statement = connection.prepare(
+        "SELECT timestamp, ip FROM pmu_counters
+         WHERE process_id = ? AND os_cpu_clock > 0 AND ip != 0
+         ORDER BY timestamp;",
+    )?;
+    sample_statement.bind((1, roofline_info.perf_pid as i64))?;
+    let mut samples = Vec::new();
+    while sample_statement.next()? == State::Row {
+        let timestamp = sample_statement.read::<i64, _>(0)? as u64;
+        let ip = sample_statement.read::<i64, _>(1)? as u64;
+        if let Some(module_address) = normalize_sample_ip(ip, &mappings) {
+            samples.push(BinaryTimingSample {
+                timestamp,
+                module_address,
+            });
+        }
+    }
+
+    let sample_period_ns = 1_000_000_000_u64
+        .checked_div(record_info.sampling_frequency_hz.unwrap_or(1_000).max(1))
+        .unwrap_or(1_000_000);
+    let mut insert = connection.prepare(
+        "INSERT INTO roofline_binary_loops (
+            module_offset, function_name, file_name, line, trip_count,
+            duration_ns, timing_samples, timing_relative_error, timing_quality,
+            bytes_load, bytes_store, arch_bytes_load, arch_bytes_store,
+            scalar_int_ops, scalar_float_ops,
+            scalar_double_ops, vector_int_ops, vector_float_ops, vector_double_ops
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+    )?;
+
+    connection.execute("BEGIN IMMEDIATE TRANSACTION;")?;
+    let result = (|| -> Result<()> {
+        for loop_info in artifact.loops {
+            let ranges = loop_info
+                .block_ranges
+                .iter()
+                .map(|range| {
+                    Ok((
+                        parse_hex_address(&range.module_start)?,
+                        parse_hex_address(&range.module_end)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let timestamps = samples
+                .iter()
+                .filter(|sample| {
+                    ranges.iter().any(|(start, end)| {
+                        sample.module_address >= *start && sample.module_address < *end
+                    })
+                })
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>();
+            let timing_samples = timestamps.len() as u64;
+            // Treat samples as independent occupancy observations. The 95%
+            // relative sampling error is approximately 1.96/sqrt(N). Only
+            // rows at or below 10% are allowed to produce a throughput point.
+            let relative_error =
+                (timing_samples > 0).then(|| 1.96 / (timing_samples as f64).sqrt());
+            let timing_quality = match (counts_are_classified(&loop_info.inclusive), relative_error)
+            {
+                (false, _) => "unclassified-instructions",
+                (true, Some(error)) if error <= 0.10 => "advisor-grade",
+                (true, Some(error)) if error <= 0.20 => "low-confidence",
+                _ => "insufficient-samples",
+            };
+            let duration_ns = (timing_quality == "advisor-grade")
+                .then(|| sampled_active_duration(&timestamps, sample_period_ns));
+            let counts = loop_info.inclusive;
+
+            insert.reset()?;
+            insert.bind((1, loop_info.module_offset.as_str()))?;
+            insert.bind((2, loop_info.function.as_deref().unwrap_or("[unknown loop]")))?;
+            insert.bind((3, loop_info.file.as_deref().unwrap_or("")))?;
+            insert.bind((4, loop_info.line.unwrap_or_default() as i64))?;
+            insert.bind((5, sqlite_u64(loop_info.trip_count)))?;
+            insert.bind((6, duration_ns.map(sqlite_u64)))?;
+            insert.bind((7, sqlite_u64(timing_samples)))?;
+            insert.bind((8, relative_error))?;
+            insert.bind((9, timing_quality))?;
+            for (index, value) in [
+                counts.bytes_load,
+                counts.bytes_store,
+                counts.arch_bytes_load,
+                counts.arch_bytes_store,
+                counts.scalar_int_ops,
+                counts.scalar_float_ops,
+                counts.scalar_double_ops,
+                counts.vector_int_ops,
+                counts.vector_float_ops,
+                counts.vector_double_ops,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                insert.bind((10 + index, sqlite_u64(value)))?;
+            }
+            insert.next()?;
+        }
+        Ok(())
+    })();
+    drop(insert);
+    finish_transaction(connection, result)
+}
+
+fn executable_mappings<'data>(
+    proc_maps: &[ProcMapEntry],
+    pid: u32,
+    executable: &Path,
+    object: &object::File<'data>,
+) -> Vec<ModuleMapping> {
+    proc_maps
+        .iter()
+        .filter(|mapping| mapping.pid == pid)
+        .filter(|mapping| paths_refer_to_same_file(Path::new(&mapping.filename), executable))
+        .filter_map(|mapping| {
+            let mapping_offset = mapping.offset as u64;
+            let segment = object
+                .segments()
+                .filter(|segment| {
+                    let (file_offset, file_size) = segment.file_range();
+                    mapping_offset >= (file_offset & !0xfff)
+                        && mapping_offset < file_offset.saturating_add(file_size)
+                })
+                .min_by_key(|segment| segment.file_range().0.abs_diff(mapping_offset))?;
+            let (file_offset, _) = segment.file_range();
+            Some(ModuleMapping {
+                runtime_start: mapping.address as u64,
+                runtime_end: mapping.address.saturating_add(mapping.size) as u64,
+                svma_start: segment
+                    .address()
+                    .saturating_add(mapping_offset)
+                    .saturating_sub(file_offset),
+            })
+        })
+        .collect()
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    let left_text = left.to_string_lossy();
+    let left = Path::new(
+        left_text
+            .strip_suffix(" (deleted)")
+            .unwrap_or(left_text.as_ref()),
+    );
+    left == right
+        || std::fs::canonicalize(left)
+            .ok()
+            .zip(std::fs::canonicalize(right).ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn normalize_sample_ip(ip: u64, mappings: &[ModuleMapping]) -> Option<u64> {
+    mappings
+        .iter()
+        .find(|mapping| ip >= mapping.runtime_start && ip < mapping.runtime_end)
+        .map(|mapping| {
+            mapping
+                .svma_start
+                .saturating_add(ip.saturating_sub(mapping.runtime_start))
+        })
+}
+
+fn sampled_active_duration(timestamps: &[u64], period_ns: u64) -> u64 {
+    let mut intervals = timestamps
+        .iter()
+        .map(|timestamp| (timestamp.saturating_sub(period_ns), *timestamp))
+        .collect::<Vec<_>>();
+    intervals.sort_unstable();
+    let mut duration = 0_u64;
+    let mut current: Option<(u64, u64)> = None;
+    for (start, end) in intervals {
+        match current {
+            Some((current_start, current_end)) if start <= current_end => {
+                current = Some((current_start, current_end.max(end)));
+            }
+            Some((current_start, current_end)) => {
+                duration = duration.saturating_add(current_end.saturating_sub(current_start));
+                current = Some((start, end));
+            }
+            None => current = Some((start, end)),
+        }
+    }
+    if let Some((start, end)) = current {
+        duration = duration.saturating_add(end.saturating_sub(start));
+    }
+    duration
+}
+
+fn parse_hex_address(value: &str) -> Result<u64> {
+    let value = value
+        .strip_prefix("0x")
+        .with_context(|| format!("binary loop address is not hexadecimal: '{value}'"))?;
+    u64::from_str_radix(value, 16)
+        .with_context(|| format!("invalid binary loop address '0x{value}'"))
+}
+
+fn sqlite_u64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn counts_are_classified(counts: &BinaryLoopCounts) -> bool {
+    counts.unclassified_instructions == 0
+}
+
+#[cfg(test)]
+mod binary_roofline_tests {
+    use super::*;
+    use sqlite::State;
+
+    #[test]
+    fn sampled_duration_unions_parallel_and_separated_observations() {
+        assert_eq!(sampled_active_duration(&[1_000, 1_500], 1_000), 1_500);
+        assert_eq!(sampled_active_duration(&[1_000, 3_000], 1_000), 2_000);
+        assert_eq!(sampled_active_duration(&[], 1_000), 0);
+    }
+
+    #[test]
+    fn requires_complete_operation_classification() {
+        assert!(counts_are_classified(&BinaryLoopCounts::default()));
+        assert!(!counts_are_classified(&BinaryLoopCounts {
+            unclassified_instructions: 1,
+            ..BinaryLoopCounts::default()
+        }));
+    }
+
+    #[tokio::test]
+    async fn binary_loops_replace_the_whole_process_placeholder() {
+        let connection = sqlite::open(":memory:").unwrap();
+        connection
+            .execute(
+                "CREATE TABLE strings (id BLOB, string TEXT);
+                 CREATE TABLE roofline_ops(
+                    unique_id BLOB, process_id INTEGER, thread_id INTEGER,
+                    file_name BLOB, function_name BLOB, line INTEGER,
+                    bytes_load INTEGER, bytes_store INTEGER,
+                    scalar_int_ops INTEGER, scalar_float_ops INTEGER,
+                    scalar_double_ops INTEGER, vector_int_ops INTEGER,
+                    vector_float_ops INTEGER, vector_double_ops INTEGER
+                 );
+                 CREATE TABLE roofline_loop_runs(
+                    unique_id BLOB, process_id INTEGER, thread_id INTEGER,
+                    file_name BLOB, function_name BLOB, line INTEGER,
+                    loop_start_ts INTEGER, loop_end_ts INTEGER
+                 );
+                 CREATE TABLE roofline_binary_loops(
+                    module_offset TEXT PRIMARY KEY, function_name TEXT, file_name TEXT,
+                    line INTEGER, trip_count INTEGER, duration_ns INTEGER,
+                    timing_samples INTEGER, timing_relative_error REAL, timing_quality TEXT,
+                    bytes_load INTEGER, bytes_store INTEGER,
+                    arch_bytes_load INTEGER, arch_bytes_store INTEGER, scalar_int_ops INTEGER,
+                    scalar_float_ops INTEGER, scalar_double_ops INTEGER, vector_int_ops INTEGER,
+                    vector_float_ops INTEGER, vector_double_ops INTEGER
+                 );
+                 INSERT INTO roofline_binary_loops VALUES (
+                    '0x100', 'kernel', 'kernel.c', 7, 100, 1000000000,
+                    400, 0.098, 'advisor-grade', 800, 200, 4000, 1000,
+                    0, 0, 2000000000, 0, 0, 6000000000
+                 );
+                 -- A cache-resident loop: zero modeled DRAM traffic, so its
+                 -- arithmetic intensity must come from architectural traffic
+                 -- instead of dropping the loop off the chart entirely.
+                 INSERT INTO roofline_binary_loops VALUES (
+                    '0x200', 'resident', 'kernel.c', 20, 100, 1000000000,
+                    400, 0.098, 'advisor-grade', 0, 0, 1000, 1000,
+                    0, 0, 0, 0, 0, 8000000000
+                 );",
+            )
+            .unwrap();
+        create_roofline_view(&connection).await.unwrap();
+
+        let mut statement = connection
+            .prepare(
+                "SELECT function_name, scalar_double_ops, vector_double_ops,
+                        scalar_double_ai, vector_double_ai, timing_quality, module_offset
+                 FROM roofline;",
+            )
+            .unwrap();
+        assert_eq!(statement.next().unwrap(), State::Row);
+        assert_eq!(statement.read::<String, _>(0).unwrap(), "kernel");
+        assert_eq!(statement.read::<f64, _>(1).unwrap(), 2_000_000_000.0);
+        assert_eq!(statement.read::<f64, _>(2).unwrap(), 6_000_000_000.0);
+        // Arithmetic intensity is architectural (cache-aware roofline), so
+        // this divides by 4000 + 1000 architectural bytes, not by the 800 +
+        // 200 bytes that happened to reach DRAM.
+        assert_eq!(statement.read::<f64, _>(3).unwrap(), 400_000.0);
+        assert_eq!(statement.read::<f64, _>(4).unwrap(), 1_200_000.0);
+        assert_eq!(statement.read::<String, _>(5).unwrap(), "advisor-grade");
+        assert_eq!(statement.read::<String, _>(6).unwrap(), "0x100");
+
+        // A cache-resident loop has zero DRAM traffic but the same kind of
+        // finite architectural intensity: 8e9 ops / 2000 bytes.
+        assert_eq!(statement.next().unwrap(), State::Row);
+        assert_eq!(statement.read::<String, _>(0).unwrap(), "resident");
+        assert_eq!(statement.read::<f64, _>(4).unwrap(), 4_000_000.0);
+        assert_eq!(statement.next().unwrap(), State::Done);
+    }
 }
 
 fn flamegraph_sample_weight(counter_delta: u64) -> Option<u64> {
@@ -1762,6 +2723,7 @@ mod optimized_postprocessing_tests {
             perf_pid: 10,
             counters: Vec::new(),
             inst_pid: 20,
+            method: None,
         });
         let mut data = RooflineData::new(&info).unwrap();
         let mut start = event(EventType::RooflineLoopStart, 10);
@@ -1882,7 +2844,14 @@ SELECT
   CAST(ops.vector_float_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_float_ai,
 
   CAST(ops.vector_double_ops AS REAL) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_double_ops,
-  CAST(ops.vector_double_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_double_ai
+  CAST(ops.vector_double_ops AS REAL) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_double_ai,
+  NULL AS timing_samples,
+  NULL AS timing_relative_error,
+  'legacy' AS timing_quality,
+  NULL AS module_offset,
+  NULL AS trip_count,
+  ops.bytes_load + ops.bytes_store AS arch_bytes,
+  NULL AS dram_bytes
 
 FROM runs
 LEFT JOIN ops
@@ -1890,7 +2859,41 @@ LEFT JOIN ops
   AND runs.function_name = ops.function_name
   AND runs.line = ops.line
 LEFT JOIN strings s_file ON runs.file_name = s_file.id
-LEFT JOIN strings s_func ON runs.function_name = s_func.id;
+LEFT JOIN strings s_func ON runs.function_name = s_func.id
+WHERE NOT EXISTS (SELECT 1 FROM roofline_binary_loops)
+
+UNION ALL
+
+SELECT
+  file_name,
+  function_name,
+  line,
+
+  CAST(scalar_int_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(scalar_int_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+
+  CAST(scalar_float_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(scalar_float_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+
+  CAST(scalar_double_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(scalar_double_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+
+  CAST(vector_int_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(vector_int_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+
+  CAST(vector_float_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(vector_float_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+
+  CAST(vector_double_ops AS REAL) * 1000000000.0 / NULLIF(duration_ns, 0),
+  CAST(vector_double_ops AS REAL) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+  timing_samples,
+  timing_relative_error,
+  timing_quality,
+  module_offset,
+  trip_count,
+  arch_bytes_load + arch_bytes_store,
+  bytes_load + bytes_store
+FROM roofline_binary_loops;
     ").expect("failed to create a view");
     Ok(())
 }

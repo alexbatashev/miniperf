@@ -46,6 +46,7 @@ pub struct PerfSamplingDriver {
     page_size: usize,
     mmap_pages: usize,
     running: Arc<AtomicBool>,
+    lost_samples: Arc<std::sync::atomic::AtomicU64>,
     thread_handle: Option<thread::JoinHandle<()>>,
     enable_on_start: bool,
     sample_regs_user: u64,
@@ -339,6 +340,7 @@ impl SamplingDriver for PerfSamplingDriver {
         self.running.store(true, Ordering::SeqCst);
 
         let running = self.running.clone();
+        let lost_samples = self.lost_samples.clone();
         let mmaps = self.mmaps.clone();
         let native_handles = self.native_handles.clone();
         let sample_regs_user = self.sample_regs_user;
@@ -442,6 +444,9 @@ impl SamplingDriver for PerfSamplingDriver {
                                     filename,
                                 }));
                             }
+                            mmap::MmapRecord::Lost { count } => {
+                                lost_samples.fetch_add(count, Ordering::Relaxed);
+                            }
                             mmap::MmapRecord::Unknown => {}
                         }
                     }
@@ -479,6 +484,11 @@ impl SamplingDriver for PerfSamplingDriver {
             handle.join().map_err(|_| Error::WorkerPanicked)?;
         }
 
+        let lost = self.lost_samples.load(Ordering::Relaxed);
+        if lost != 0 {
+            return Err(Error::SamplesLost { count: lost });
+        }
+
         Ok(())
     }
 }
@@ -495,7 +505,10 @@ fn apply_sampling_flags(
     attr.set_exclude_kernel(1);
     attr.set_exclude_user(0);
     attr.set_exclusive(0);
-    attr.set_inherit(0);
+    // Process profiles must include worker threads created after exec. Without
+    // inheritance, OpenMP/Rayon/pthread work silently disappears and any
+    // loop-level timing or counter attribution is fundamentally incomplete.
+    attr.set_inherit(1);
     attr.set_enable_on_exec(enable_on_exec.into());
     if precise_ip {
         attr.set_precise_ip(2);
@@ -569,12 +582,9 @@ impl PerfSamplingDriver {
             );
         }
 
-        let native_handles = if pid.is_none() {
-            binding::grouped_all(counters, &mut attrs, pid)?
-        } else if counters.contains(&Counter::Cycles) {
-            binding::grouped(counters, &mut attrs, pid)?
-        } else {
-            binding::grouped_software(counters, &mut attrs, pid)?
+        let native_handles = match pid {
+            None => binding::grouped_all(counters, &mut attrs, None)?,
+            Some(pid) => open_inherited_target_groups(counters, &attrs, pid)?,
         };
 
         Self::from_handles(
@@ -622,10 +632,18 @@ impl PerfSamplingDriver {
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
 
-            let mut handles = if pid.is_none() {
-                binding::grouped_all(counters, &mut attrs, pid)?
+            let mut handles = if let Some(pid) = pid {
+                let cluster_cpus = parse_cpu_list(&pmu.cpus);
+                let cpus = target_allowed_cpus(pid)?
+                    .into_iter()
+                    .filter(|cpu| cluster_cpus.contains(cpu))
+                    .collect::<Vec<_>>();
+                if cpus.is_empty() {
+                    continue;
+                }
+                open_inherited_target_groups_on_cpus(counters, &attrs, pid, &cpus)?
             } else {
-                binding::grouped(counters, &mut attrs, pid)?
+                binding::grouped_all(counters, &mut attrs, None)?
             };
             for handle in &mut handles {
                 handle.core = Some(core.clone());
@@ -650,7 +668,10 @@ impl PerfSamplingDriver {
         enable_on_start: bool,
     ) -> Result<PerfSamplingDriver, Error> {
         let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
-        let mmap_pages = 512;
+        let perf_mlock_kb = std::fs::read_to_string("/proc/sys/kernel/perf_event_mlock_kb")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok());
+        let mmap_pages = sampling_ring_pages(page_size, perf_mlock_kb);
 
         let length = page_size * (mmap_pages + 1);
         let mut mmaps: Vec<UnsafeMmap> = Vec::new();
@@ -689,12 +710,122 @@ impl PerfSamplingDriver {
             page_size,
             mmap_pages,
             running: Arc::new(AtomicBool::new(false)),
+            lost_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             thread_handle: None,
             sample_regs_user,
             sample_branch_stack,
             enable_on_start,
         })
     }
+}
+
+/// Open one inherited task group on every CPU where the target may run.
+///
+/// `perf_event_open(pid, -1, ...)` follows a task across CPUs, but Linux
+/// explicitly disallows mmap sampling for that combination when `inherit` is
+/// enabled. Pairing the target PID with each allowed CPU provides equivalent
+/// process-wide coverage and gives every group a valid sampling ring.
+fn open_inherited_target_groups(
+    counters: &[Counter],
+    attrs: &[perf_event_attr],
+    pid: i32,
+) -> Result<Vec<NativeCounterHandle>, Error> {
+    let cpus = target_allowed_cpus(pid)?;
+    open_inherited_target_groups_on_cpus(counters, attrs, pid, &cpus)
+}
+
+fn open_inherited_target_groups_on_cpus(
+    counters: &[Counter],
+    attrs: &[perf_event_attr],
+    pid: i32,
+    cpus: &[i32],
+) -> Result<Vec<NativeCounterHandle>, Error> {
+    if cpus.is_empty() {
+        return Err(Error::InvalidConfiguration(format!(
+            "no profiled CPUs are available for target PID {pid}"
+        )));
+    }
+    let mut handles = Vec::new();
+
+    for &cpu in cpus {
+        let mut cpu_attrs = attrs.to_vec();
+        let opened = if counters.contains(&Counter::Cycles) {
+            binding::grouped_on_cpu(counters, &mut cpu_attrs, pid, cpu)
+        } else {
+            binding::grouped_software_on_cpu(counters, &mut cpu_attrs, pid, cpu)
+        };
+
+        match opened {
+            Ok(mut cpu_handles) => handles.append(&mut cpu_handles),
+            Err(error) => {
+                for handle in &handles {
+                    unsafe { close(handle.fd) };
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Ok(handles)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn parse_cpu_list(mask: &str) -> std::collections::BTreeSet<i32> {
+    let mut cpus = std::collections::BTreeSet::new();
+    for range in mask.trim().split(',') {
+        let mut bounds = range.splitn(2, '-');
+        let Some(start) = bounds.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let end = bounds
+            .next()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(start);
+        if end >= start {
+            cpus.extend(start..=end);
+        }
+    }
+    cpus
+}
+
+fn target_allowed_cpus(pid: i32) -> Result<Vec<i32>, Error> {
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    let result =
+        unsafe { libc::sched_getaffinity(pid, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    if result != 0 {
+        return Err(Error::InvalidConfiguration(format!(
+            "cannot read CPU affinity for target PID {pid}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let cpus = (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
+        .map(|cpu| cpu as i32)
+        .collect::<Vec<_>>();
+    if cpus.is_empty() {
+        return Err(Error::InvalidConfiguration(format!(
+            "target PID {pid} has an empty CPU affinity mask"
+        )));
+    }
+    Ok(cpus)
+}
+
+/// Select a power-of-two perf data ring which fits the kernel's per-CPU
+/// `perf_event_mlock_kb` allowance, including its metadata page. A larger ring
+/// reduces loss during bursts, but asking for more than the host allowance can
+/// make `mmap` fail with `EINVAL` before recording starts.
+fn sampling_ring_pages(page_size: usize, perf_mlock_kb: Option<usize>) -> usize {
+    const DESIRED_DATA_PAGES: usize = 512;
+    const CONSERVATIVE_DATA_PAGES: usize = 128;
+
+    let Some(limit_kb) = perf_mlock_kb else {
+        return CONSERVATIVE_DATA_PAGES;
+    };
+    let total_pages = limit_kb.saturating_mul(1024) / page_size.max(1);
+    let available_data_pages = total_pages.saturating_sub(1).max(1);
+    let exponent = (usize::BITS - 1) - available_data_pages.leading_zeros();
+    (1_usize << exponent).min(DESIRED_DATA_PAGES)
 }
 
 fn dwarf_mask_for_mode(mode: UnwindMode) -> u64 {
@@ -905,4 +1036,17 @@ fn aarch64_hw_event_code(config: u64) -> Option<u64> {
         _ => return None,
     };
     Some(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampling_ring_pages;
+
+    #[test]
+    fn sampling_ring_respects_perf_locked_memory_allowance() {
+        assert_eq!(sampling_ring_pages(4096, Some(516)), 128);
+        assert_eq!(sampling_ring_pages(4096, Some(64)), 8);
+        assert_eq!(sampling_ring_pages(4096, Some(4096)), 512);
+        assert_eq!(sampling_ring_pages(4096, None), 128);
+    }
 }

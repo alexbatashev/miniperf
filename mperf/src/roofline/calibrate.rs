@@ -1,10 +1,11 @@
 use std::{
     hint::black_box,
+    sync::Barrier,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use mperf_data::RooflineCalibration;
+use mperf_data::{MemoryBandwidthCalibration, MemoryLevelCalibration, RooflineCalibration};
 use rayon::prelude::*;
 
 const SAMPLES: usize = 5;
@@ -24,7 +25,264 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         .map(|_| measure_compute_sample(kernel, threads, COMPUTE_ITERATIONS))
         .collect::<Vec<_>>();
 
-    let mut a = allocate_vector(MEMORY_ELEMENTS).context("allocate roofline triad input A")?;
+    let memory = measure_memory()?;
+
+    let fp64_gflops = median(&compute_samples);
+    if !fp64_gflops.is_finite() || fp64_gflops <= 0.0 {
+        bail!("FP64 roof calibration produced an invalid result: {fp64_gflops}");
+    }
+
+    let memory_levels = measure_memory_levels(threads, &memory);
+
+    Ok(RooflineCalibration {
+        threads,
+        cpu_affinity: memory.cpu_affinity,
+        samples: SAMPLES,
+        compute_kernel: kernel.name.to_string(),
+        fp64_gflops,
+        fp64_gflops_samples: compute_samples,
+        memory_gbytes_per_second: memory.gbytes_per_second,
+        memory_gbytes_per_second_samples: memory.gbytes_per_second_samples,
+        ridge_point_flops_per_byte: fp64_gflops / memory.gbytes_per_second,
+        memory_working_set_bytes: memory.working_set_bytes,
+        memory_levels,
+    })
+}
+
+/// Per-thread fraction of a cache level the triad's three buffers are sized to
+/// occupy. Staying well under capacity keeps the kernel resident once the
+/// buffers, stack and Rayon metadata share the level.
+const LEVEL_OCCUPANCY: f64 = 0.5;
+
+/// A level's working set must be larger than the cache immediately inside it,
+/// otherwise (for example) a nominal L3 run can remain resident in the sum of
+/// the private L2 caches. Sequential traversal needs only a modest excess to
+/// make every reuse distance larger than the inner cache.
+const INNER_LEVEL_SPILL_FACTOR: f64 = 1.1;
+
+/// Leave room for code, stacks, allocator metadata and imperfect associativity
+/// in the cache being measured. If the inner caches are too large to satisfy
+/// this bound, that hierarchy level cannot be isolated reliably and is skipped.
+const MAX_LEVEL_OCCUPANCY: f64 = 0.85;
+
+/// Measures a bandwidth roof per cache level plus the already-measured DRAM
+/// roof. Levels whose geometry cannot be detected, or that are too small to
+/// hold three usefully sized buffers, are skipped rather than guessed at.
+fn measure_memory_levels(
+    threads: usize,
+    dram: &MemoryBandwidthCalibration,
+) -> Vec<MemoryLevelCalibration> {
+    let mut levels = Vec::new();
+    let cache_levels = detect_cache_levels();
+    for index in 0..cache_levels.len() {
+        let (level, capacity, sharers) = cache_levels[index];
+        let Some(elements) = level_elements(&cache_levels, index, threads) else {
+            continue;
+        };
+        // Below a few hundred elements the loop is dominated by parallel
+        // dispatch rather than by the level's bandwidth.
+        if elements < 512 {
+            continue;
+        }
+        let Some((gbytes_per_second, samples)) = measure_level_bandwidth(threads, elements) else {
+            continue;
+        };
+        levels.push(MemoryLevelCalibration {
+            level: format!("L{level}"),
+            gbytes_per_second,
+            gbytes_per_second_samples: samples,
+            working_set_bytes: (elements * threads.max(1) * 3 * size_of::<f64>()) as u64,
+            capacity_bytes: capacity,
+            shared_by: sharers,
+        });
+    }
+    levels.push(MemoryLevelCalibration {
+        level: "DRAM".to_string(),
+        gbytes_per_second: dram.gbytes_per_second,
+        gbytes_per_second_samples: dram.gbytes_per_second_samples.clone(),
+        working_set_bytes: dram.working_set_bytes,
+        capacity_bytes: 0,
+        shared_by: threads,
+    });
+    // Bandwidth must not increase as the working set grows; if the host is
+    // noisy enough to invert two levels the roofs would be misleading.
+    levels.dedup_by(|later, earlier| later.gbytes_per_second >= earlier.gbytes_per_second);
+    levels
+}
+
+/// Chooses an equal per-worker allocation that fits in `levels[index]` but
+/// exceeds every inner cache after accounting for SMT/cache sharing.
+fn level_elements(levels: &[(u32, u64, usize)], index: usize, threads: usize) -> Option<usize> {
+    let (level, capacity, sharers) = *levels.get(index)?;
+    let threads = threads.max(1);
+    let contenders = sharers.clamp(1, threads) as f64;
+    let target_bytes = capacity as f64 * LEVEL_OCCUPANCY / contenders;
+    let inner_bytes = levels[..index]
+        .iter()
+        .filter(|(inner_level, _, _)| *inner_level < level)
+        .map(|(_, inner_capacity, inner_sharers)| {
+            *inner_capacity as f64 / (*inner_sharers).clamp(1, threads) as f64
+        })
+        .fold(0.0_f64, f64::max);
+    let per_thread_bytes = target_bytes.max(inner_bytes * INNER_LEVEL_SPILL_FACTOR);
+
+    if per_thread_bytes * contenders > capacity as f64 * MAX_LEVEL_OCCUPANCY {
+        return None;
+    }
+
+    Some((per_thread_bytes / (3.0 * size_of::<f64>() as f64)) as usize)
+}
+
+/// Runs the triad entirely within per-thread buffers so the traffic is served
+/// by the level those buffers fit in.
+fn measure_level_bandwidth(threads: usize, elements: usize) -> Option<(f64, Vec<f64>)> {
+    // Enough repetitions that a resident kernel runs for a measurable time.
+    let repetitions = (MEMORY_ELEMENTS * MEMORY_REPETITIONS / elements.max(1)).clamp(64, 1 << 20);
+    let affinity = affinity_cpus();
+    let run = || -> f64 {
+        let ready = Barrier::new(threads);
+        let finished = Barrier::new(threads);
+        rayon::broadcast(|context| {
+            // Keep each private working set on the same logical CPU for
+            // the whole sample. This makes the cache-sharing arithmetic
+            // above describe the workers that actually execute it.
+            let _affinity_guard = affinity.as_ref().and_then(|cpus| {
+                cpus.get(context.index() % cpus.len())
+                    .and_then(|cpu| pin_current_thread(*cpu))
+            });
+            let a = vec![1.0_f64; elements];
+            let b = vec![2.0_f64; elements];
+            let mut c = vec![0.0_f64; elements];
+            let kernel = |scale: f64, c: &mut [f64]| triad(&a, &b, c, scale);
+            // Warm the buffers into the level under test.
+            kernel(1.0, &mut c);
+            ready.wait();
+            let start = Instant::now();
+            for repetition in 0..repetitions {
+                // Vary the scalar so the loop cannot be hoisted.
+                kernel(1.0 + repetition as f64 * 1.0e-12, &mut c);
+                black_box(&c[..]);
+            }
+            // Include imbalance between workers in the aggregate result.
+            finished.wait();
+            let elapsed = nonzero_elapsed(start.elapsed());
+            let bytes = repetitions as f64 * elements as f64 * 3.0 * size_of::<f64>() as f64;
+            bytes / elapsed.as_secs_f64() / 1.0e9
+        })
+        .into_iter()
+        .sum::<f64>()
+    };
+    let _ = run();
+    let samples = (0..SAMPLES).map(|_| run()).collect::<Vec<_>>();
+    let median = median(&samples);
+    (median.is_finite() && median > 0.0).then_some((median, samples))
+}
+
+/// Bandwidth kernel for the cache-level roofs. Three details decide whether it
+/// measures bandwidth or just its own issue rate: it must use the widest
+/// vectors the host has (the crate is built for the x86-64 baseline, so without
+/// an explicit `target_feature` this stays scalar and every level reports the
+/// same wrong number); it must avoid `f64::mul_add`, which lowers to a libm
+/// call without `+fma`; and it must zip rather than index, so no bounds check
+/// blocks vectorization.
+#[inline(always)]
+fn triad_body(a: &[f64], b: &[f64], c: &mut [f64], scale: f64) {
+    for ((out, a), b) in c.iter_mut().zip(a.iter()).zip(b.iter()) {
+        *out = *a + *b * scale;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn triad_avx(a: &[f64], b: &[f64], c: &mut [f64], scale: f64) {
+    triad_body(a, b, c, scale);
+}
+
+fn triad(a: &[f64], b: &[f64], c: &mut [f64], scale: f64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx") {
+            // SAFETY: guarded by the runtime feature check above.
+            unsafe { triad_avx(a, b, c, scale) };
+            return;
+        }
+    }
+    triad_body(a, b, c, scale);
+}
+
+/// Data/unified cache levels of cpu0 as `(level, capacity, sharing CPUs)`,
+/// innermost first.
+#[cfg(target_os = "linux")]
+fn detect_cache_levels() -> Vec<(u32, u64, usize)> {
+    let Ok(indices) = std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache") else {
+        return Vec::new();
+    };
+    let mut levels = Vec::new();
+    for index in indices.flatten() {
+        let path = index.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(path.join(name))
+                .ok()
+                .map(|value| value.trim().to_owned())
+        };
+        if !matches!(read("type").as_deref(), Some("Unified" | "Data")) {
+            continue;
+        }
+        let Some(level) = read("level").and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(capacity) = read("size").and_then(|value| parse_cache_size(&value)) else {
+            continue;
+        };
+        let sharers = read("shared_cpu_list")
+            .map(|list| count_cpu_list(&list))
+            .unwrap_or(1);
+        levels.push((level, capacity, sharers));
+    }
+    levels.sort_by_key(|(level, capacity, _)| (*level, *capacity));
+    levels.dedup_by_key(|(level, _, _)| *level);
+    levels
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_cache_levels() -> Vec<(u32, u64, usize)> {
+    Vec::new()
+}
+
+/// Counts CPUs in a sysfs list such as `0,4` or `0-7`.
+#[cfg(target_os = "linux")]
+fn count_cpu_list(list: &str) -> usize {
+    let count = list
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            match part.split_once('-') {
+                Some((first, last)) => {
+                    let first = first.trim().parse::<usize>().ok()?;
+                    let last = last.trim().parse::<usize>().ok()?;
+                    Some(last.saturating_sub(first) + 1)
+                }
+                None => part.parse::<usize>().ok().map(|_| 1),
+            }
+        })
+        .sum();
+    usize::max(count, 1)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cache_size(value: &str) -> Option<u64> {
+    let (number, multiplier) = match value.as_bytes().last().copied()? {
+        b'K' | b'k' => (&value[..value.len() - 1], 1024_u64),
+        b'M' | b'm' => (&value[..value.len() - 1], 1024_u64 * 1024),
+        b'G' | b'g' => (&value[..value.len() - 1], 1024_u64 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    number.trim().parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
+pub(super) fn measure_memory() -> Result<MemoryBandwidthCalibration> {
+    let threads = rayon::current_num_threads();
+    let mut a = allocate_vector(MEMORY_ELEMENTS).context("allocate memory triad input A")?;
     let mut b = allocate_vector(MEMORY_ELEMENTS).context("allocate roofline triad input B")?;
     let mut c = allocate_vector(MEMORY_ELEMENTS).context("allocate roofline triad output")?;
     a.par_iter_mut()
@@ -40,11 +298,7 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         .map(|_| measure_memory_sample(&a, &b, &mut c, MEMORY_REPETITIONS))
         .collect::<Vec<_>>();
 
-    let fp64_gflops = median(&compute_samples);
     let memory_gbytes_per_second = median(&memory_samples);
-    if !fp64_gflops.is_finite() || fp64_gflops <= 0.0 {
-        bail!("FP64 roof calibration produced an invalid result: {fp64_gflops}");
-    }
     if !memory_gbytes_per_second.is_finite() || memory_gbytes_per_second <= 0.0 {
         bail!(
             "memory roof calibration produced an invalid result: \
@@ -55,18 +309,22 @@ pub(super) fn measure() -> Result<RooflineCalibration> {
         .saturating_mul(MEMORY_ELEMENTS as u64)
         .saturating_mul(size_of::<f64>() as u64);
 
-    Ok(RooflineCalibration {
+    Ok(MemoryBandwidthCalibration {
         threads,
         cpu_affinity: cpu_affinity(),
         samples: SAMPLES,
-        compute_kernel: kernel.name.to_string(),
-        fp64_gflops,
-        fp64_gflops_samples: compute_samples,
-        memory_gbytes_per_second,
-        memory_gbytes_per_second_samples: memory_samples,
-        ridge_point_flops_per_byte: fp64_gflops / memory_gbytes_per_second,
-        memory_working_set_bytes,
+        gbytes_per_second: memory_gbytes_per_second,
+        gbytes_per_second_samples: memory_samples,
+        working_set_bytes: memory_working_set_bytes,
+        source: "effective_stream".to_string(),
+        memory_levels: Vec::new(),
     })
+}
+
+pub(super) fn measure_memory_hierarchy() -> Result<MemoryBandwidthCalibration> {
+    let mut memory = measure_memory()?;
+    memory.memory_levels = measure_memory_levels(memory.threads, &memory);
+    Ok(memory)
 }
 
 fn allocate_vector(elements: usize) -> Result<Vec<f64>> {
@@ -187,7 +445,7 @@ fn median(values: &[f64]) -> f64 {
 }
 
 #[cfg(target_os = "linux")]
-fn cpu_affinity() -> Option<String> {
+fn affinity_cpus() -> Option<Vec<usize>> {
     let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
     if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
         return None;
@@ -195,15 +453,57 @@ fn cpu_affinity() -> Option<String> {
     let cpus = (0..libc::CPU_SETSIZE as usize)
         .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
         .collect::<Vec<_>>();
-    (!cpus.is_empty()).then(|| format_cpu_list(&cpus))
+    (!cpus.is_empty()).then_some(cpus)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn cpu_affinity() -> Option<String> {
+fn affinity_cpus() -> Option<Vec<usize>> {
     None
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
+struct ThreadAffinityGuard {
+    previous: libc::cpu_set_t,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ThreadAffinityGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &self.previous);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread(cpu: usize) -> Option<ThreadAffinityGuard> {
+    if cpu >= libc::CPU_SETSIZE as usize {
+        return None;
+    }
+    let mut previous = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    if unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut previous) } != 0 {
+        return None;
+    }
+    let mut pinned = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    unsafe { libc::CPU_SET(cpu, &mut pinned) };
+    if unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &pinned) } != 0 {
+        return None;
+    }
+    Some(ThreadAffinityGuard { previous })
+}
+
+#[cfg(not(target_os = "linux"))]
+struct ThreadAffinityGuard;
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_cpu: usize) -> Option<ThreadAffinityGuard> {
+    None
+}
+
+fn cpu_affinity() -> Option<String> {
+    affinity_cpus().map(|cpus| format_cpu_list(&cpus))
+}
+
 fn format_cpu_list(cpus: &[usize]) -> String {
     let mut ranges = Vec::new();
     let mut start = *cpus.first().unwrap_or(&0);
@@ -330,7 +630,7 @@ unsafe fn compute_avx512(iterations: usize, worker: usize) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_cpu_list, measure, median};
+    use super::{format_cpu_list, level_elements, measure, median};
 
     #[test]
     fn median_selects_middle_sample() {
@@ -341,6 +641,30 @@ mod tests {
     #[test]
     fn formats_cpu_affinity_ranges() {
         assert_eq!(format_cpu_list(&[0, 1, 2, 4, 6, 7]), "0-2,4,6-7");
+    }
+
+    #[test]
+    fn shared_cache_working_set_spills_private_caches() {
+        // i5-1135G7 geometry: four 1.25 MiB private L2s feed one 8 MiB L3.
+        let levels = [
+            (1, 48 * 1024, 2),
+            (2, 1280 * 1024, 2),
+            (3, 8 * 1024 * 1024, 8),
+        ];
+        let threads = 8;
+        let elements = level_elements(&levels, 2, threads).unwrap();
+        let working_set = elements * threads * 3 * size_of::<f64>();
+        let aggregate_l2_capacity = 4 * 1280 * 1024;
+
+        assert!(working_set > aggregate_l2_capacity);
+        assert!(working_set < 8 * 1024 * 1024);
+        assert_eq!(working_set, 5_767_104);
+    }
+
+    #[test]
+    fn skips_level_that_cannot_spill_inner_cache_safely() {
+        let levels = [(1, 80 * 1024, 1), (2, 100 * 1024, 1)];
+        assert_eq!(level_elements(&levels, 1, 1), None);
     }
 
     #[test]

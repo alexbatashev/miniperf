@@ -1,0 +1,67 @@
+name: DynamoRIO release artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag to receive the bundle; leave empty to only upload an Actions artifact
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install DynamoRIO build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            zlib1g-dev \
+            zstd
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build DynamoRIO bundle with miniperf client
+        run: utils/build-dynamorio-bundle.sh dist
+      - name: Smoke-test roofline accounting under DynamoRIO
+        run: |
+          bundle="$(find dist -maxdepth 1 -name '*.tar.zst' -print -quit)"
+          mkdir extracted
+          tar -xf "${bundle}" -C extracted
+          root="$(find extracted -maxdepth 1 -mindepth 1 -type d -print -quit)"
+
+          cat > "${RUNNER_TEMP}/flops.c" <<'EOF'
+          int main(void) {
+              volatile double a = 1.5, b = 2.5, c = 0.0;
+              for (int i = 0; i < 1000; i++)
+                  c += a * b;
+              return c > 0 ? 0 : 1;
+          }
+          EOF
+          gcc -O0 "${RUNNER_TEMP}/flops.c" -o "${RUNNER_TEMP}/flops"
+
+          counts="${RUNNER_TEMP}/dr-counts"
+          "${root}/dynamorio/bin64/drrun" -disable_traces -max_bb_instrs 32 \
+            -c "${root}/libdr_roofline.so" \
+            "output=${counts}" memory-profile=on -- "${RUNNER_TEMP}/flops"
+          grep -E '^instructions=[1-9][0-9]*$' "${counts}"
+          grep -E '^scalar_double_ops=[1-9][0-9]*$' "${counts}"
+          grep -E '^bytes_load=[1-9][0-9]*$' "${counts}"
+          test -s "${RUNNER_TEMP}/dr-counts" || exit 1
+          test -s "$(dirname "${counts}")/dr-counts.cfg" || ls "${RUNNER_TEMP}"
+          test -s "${RUNNER_TEMP}/dr-counts.memory.json"
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miniperf-dynamorio-bundle
+          path: dist/
+      - name: Attach bundle to release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" dist/*

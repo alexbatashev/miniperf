@@ -275,6 +275,9 @@ impl TabsWidget {
                         write_tabs.push(Tab::Loops(LoopsTab::new(connection.clone())));
                     }
                 }
+                pmu_data::TabSpec::Memory => write_tabs.push(Tab::MetricsTable(
+                    MetricsTableTab::new(memory_table_spec(), connection.clone()),
+                )),
                 pmu_data::TabSpec::MetricsTable(spec) => write_tabs.push(Tab::MetricsTable(
                     MetricsTableTab::new(spec.clone(), connection.clone()),
                 )),
@@ -313,6 +316,57 @@ impl TabsWidget {
             Tab::Flamegraph(tab) => tab.handle_event(code),
             _ => {}
         }
+    }
+}
+
+fn memory_table_spec() -> pmu_data::MetricsTableSpec {
+    use pmu_data::{MetricColumnSpec, ValueFormat};
+    let column = |key: &str, label: &str, format| MetricColumnSpec {
+        key: key.to_string(),
+        label: Some(label.to_string()),
+        format,
+        width: Some(22),
+        sticky: false,
+        optional: true,
+    };
+    pmu_data::MetricsTableSpec {
+        view: "memory_summary".to_string(),
+        title: Some(" Memory ".to_string()),
+        include_default_columns: false,
+        columns: vec![
+            column(
+                "accessed_footprint_bytes",
+                "Accessed footprint (B)",
+                ValueFormat::Integer,
+            ),
+            column(
+                "peak_allocated_bytes",
+                "Peak allocation (B)",
+                ValueFormat::Integer,
+            ),
+            column("peak_rss_bytes", "Peak RSS (B)", ValueFormat::Integer),
+            column("cold_fraction", "Cold references", ValueFormat::Percent2),
+            column(
+                "achieved_gbytes_per_second",
+                "Achieved GB/s",
+                ValueFormat::Float2,
+            ),
+            column(
+                "peak_gbytes_per_second",
+                "Sustainable GB/s",
+                ValueFormat::Float2,
+            ),
+            column(
+                "bandwidth_utilization",
+                "Bandwidth utilization",
+                ValueFormat::Percent2,
+            ),
+        ],
+        order_by: None,
+        limit: Some(1),
+        sticky_columns: None,
+        function_column: None,
+        enable_assembly: false,
     }
 }
 

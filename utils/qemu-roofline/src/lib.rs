@@ -1,7 +1,14 @@
+//! QEMU TCG plugin for roofline/memory accounting. All analysis and artifact
+//! writing lives in `miniperf-roofline-core`; this crate is the QEMU plugin
+//! API adapter.
+
+use roofline_core::{
+    active_elements, artifacts, classify_flow, classify_riscv, classify_x86, is_masked, mnemonic,
+    rvv_sew, BlockCost, CacheDescription, CacheModel, CounterSnapshot, DynamicCfg, ImageInfo,
+    MemoryAnalysis, RiscvClassification, RiscvKind, RvvKind, Target, VectorClass,
+};
 use std::{
     ffi::{c_char, c_int, c_uint, c_void, CStr},
-    fs::File,
-    io::Write,
     path::PathBuf,
     ptr,
     sync::{
@@ -75,7 +82,10 @@ const REQUIRED_QEMU_PLUGIN_API: c_int = 6;
 unsafe extern "C" {
     fn qemu_plugin_register_vcpu_tb_trans_cb(id: PluginId, callback: TranslationCallback);
     fn qemu_plugin_tb_n_insns(tb: *const TranslationBlock) -> usize;
+    fn qemu_plugin_tb_vaddr(tb: *const TranslationBlock) -> u64;
     fn qemu_plugin_tb_get_insn(tb: *const TranslationBlock, index: usize) -> *mut Instruction;
+    fn qemu_plugin_insn_vaddr(instruction: *const Instruction) -> u64;
+    fn qemu_plugin_insn_size(instruction: *const Instruction) -> usize;
     fn qemu_plugin_insn_disas(instruction: *const Instruction) -> *mut c_char;
     fn qemu_plugin_register_vcpu_tb_exec_cb(
         tb: *mut TranslationBlock,
@@ -97,6 +107,9 @@ unsafe extern "C" {
         userdata: *mut c_void,
     );
     fn qemu_plugin_register_vcpu_init_cb(id: PluginId, callback: VcpuInitCallback);
+    fn qemu_plugin_start_code() -> u64;
+    fn qemu_plugin_end_code() -> u64;
+    fn qemu_plugin_entry_code() -> u64;
     fn qemu_plugin_get_registers() -> *mut GArray;
     fn qemu_plugin_read_register(handle: *mut QemuRegister, buffer: *mut GByteArray) -> bool;
     fn qemu_plugin_mem_size_shift(info: MemInfo) -> c_uint;
@@ -115,6 +128,7 @@ pub static qemu_plugin_version: c_int = REQUIRED_QEMU_PLUGIN_API;
 
 static OUTPUT: OnceLock<PathBuf> = OnceLock::new();
 static TARGET: OnceLock<Target> = OnceLock::new();
+static IMAGE: OnceLock<ImageInfo> = OnceLock::new();
 static BLOCK_COSTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static RVV_COSTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static RVV_REGISTERS: Mutex<Vec<RvvRegisters>> = Mutex::new(Vec::new());
@@ -126,16 +140,22 @@ static VECTOR_FLOAT_OPS: AtomicU64 = AtomicU64::new(0);
 static VECTOR_DOUBLE_OPS: AtomicU64 = AtomicU64::new(0);
 static BYTES_LOAD: AtomicU64 = AtomicU64::new(0);
 static BYTES_STORE: AtomicU64 = AtomicU64::new(0);
+static DRAM_BYTES_LOAD: AtomicU64 = AtomicU64::new(0);
+static DRAM_BYTES_STORE: AtomicU64 = AtomicU64::new(0);
 static RVV_STATE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static UNCLASSIFIED_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+static RETIRED_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+static CHILD_PROCESS_SEEN: AtomicBool = AtomicBool::new(false);
+static ROOT_PID: OnceLock<libc::pid_t> = OnceLock::new();
 static RVV_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 static UNCLASSIFIED_MNEMONICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CACHE_MODEL: OnceLock<Mutex<CacheModel>> = OnceLock::new();
+static MEMORY_ANALYSIS: OnceLock<Mutex<MemoryAnalysis>> = OnceLock::new();
+static DYNAMIC_CFG: Mutex<DynamicCfg> = Mutex::new(DynamicCfg::new());
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Target {
-    Riscv,
-    X86,
-}
+const DEFAULT_CACHE_LINE_SIZE: u64 = 64;
+const DEFAULT_LLC_SIZE: u64 = 8 * 1024 * 1024;
+const DEFAULT_LLC_ASSOCIATIVITY: usize = 16;
 
 #[derive(Clone, Copy, Default)]
 struct RvvRegisters {
@@ -172,97 +192,101 @@ thread_local! {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RvvKind {
-    Integer,
-    Float,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RiscvKind {
-    ScalarInteger,
-    ScalarFloat,
-    ScalarDouble,
-    VectorInteger,
-    VectorFloat,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RiscvCost {
-    kind: RiscvKind,
-    factor: u64,
-    sew_scale: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RiscvClassification {
-    Counted(RiscvCost),
-    NonCompute,
-    Unclassified,
-}
-
-struct RiscvOperationSpec {
-    mnemonic: &'static str,
-    masked: bool,
-    classification: RiscvClassification,
-}
-
-include!(concat!(env!("OUT_DIR"), "/riscv_operations.rs"));
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RvvCost {
+    block: u64,
     kind: RvvKind,
     factor: u64,
     masked: bool,
     sew_scale: u64,
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
-struct BlockCost {
-    scalar_int: u64,
-    scalar_float: u64,
-    scalar_double: u64,
-    vector_int: u64,
-    vector_float: u64,
-    vector_double: u64,
-}
-
-impl BlockCost {
-    fn add(&mut self, other: Self) {
-        self.scalar_int += other.scalar_int;
-        self.scalar_float += other.scalar_float;
-        self.scalar_double += other.scalar_double;
-        self.vector_int += other.vector_int;
-        self.vector_float += other.vector_float;
-        self.vector_double += other.vector_double;
+extern "C" fn execute_block(vcpu: c_uint, userdata: *mut c_void) {
+    if ROOT_PID
+        .get()
+        .is_some_and(|pid| *pid != unsafe { libc::getpid() })
+    {
+        CHILD_PROCESS_SEEN.store(true, Ordering::Relaxed);
+        return;
     }
-}
-
-extern "C" fn execute_block(_vcpu: c_uint, userdata: *mut c_void) {
     let cost = unsafe { &*(userdata.cast::<BlockCost>()) };
+    RETIRED_INSTRUCTIONS.fetch_add(cost.instructions, Ordering::Relaxed);
     SCALAR_INT_OPS.fetch_add(cost.scalar_int, Ordering::Relaxed);
     SCALAR_FLOAT_OPS.fetch_add(cost.scalar_float, Ordering::Relaxed);
     SCALAR_DOUBLE_OPS.fetch_add(cost.scalar_double, Ordering::Relaxed);
     VECTOR_INT_OPS.fetch_add(cost.vector_int, Ordering::Relaxed);
     VECTOR_FLOAT_OPS.fetch_add(cost.vector_float, Ordering::Relaxed);
     VECTOR_DOUBLE_OPS.fetch_add(cost.vector_double, Ordering::Relaxed);
+
+    DYNAMIC_CFG
+        .lock()
+        .unwrap()
+        .record_block(vcpu as usize, cost);
 }
 
-extern "C" fn execute_unclassified(_vcpu: c_uint, _userdata: *mut c_void) {
+extern "C" fn execute_unclassified(_vcpu: c_uint, userdata: *mut c_void) {
+    if ROOT_PID
+        .get()
+        .is_some_and(|pid| *pid != unsafe { libc::getpid() })
+    {
+        CHILD_PROCESS_SEEN.store(true, Ordering::Relaxed);
+        return;
+    }
     UNCLASSIFIED_INSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+    let block_address = userdata as usize as u64;
+    DYNAMIC_CFG
+        .lock()
+        .unwrap()
+        .attribute_unclassified(block_address);
 }
 
-extern "C" fn memory_access(_vcpu: c_uint, info: MemInfo, _address: u64, _userdata: *mut c_void) {
+extern "C" fn memory_access(vcpu: c_uint, info: MemInfo, address: u64, userdata: *mut c_void) {
+    if ROOT_PID
+        .get()
+        .is_some_and(|pid| *pid != unsafe { libc::getpid() })
+    {
+        CHILD_PROCESS_SEEN.store(true, Ordering::Relaxed);
+        return;
+    }
     let shift = unsafe { qemu_plugin_mem_size_shift(info) };
     let bytes = 1_u64.checked_shl(shift).unwrap_or_default();
-    let counter = if unsafe { qemu_plugin_mem_is_store(info) } {
-        &BYTES_STORE
-    } else {
-        &BYTES_LOAD
-    };
+    let store = unsafe { qemu_plugin_mem_is_store(info) };
+    if let Some(analysis) = MEMORY_ANALYSIS.get() {
+        analysis
+            .lock()
+            .unwrap()
+            .access(vcpu as usize, address, bytes, store);
+    }
+    let counter = if store { &BYTES_STORE } else { &BYTES_LOAD };
     counter.fetch_add(bytes, Ordering::Relaxed);
+    let traffic = CACHE_MODEL
+        .get()
+        .expect("cache model initialized before translation")
+        .lock()
+        .unwrap()
+        .access(address, bytes, store);
+    DRAM_BYTES_LOAD.fetch_add(traffic.bytes_load, Ordering::Relaxed);
+    DRAM_BYTES_STORE.fetch_add(traffic.bytes_store, Ordering::Relaxed);
+    let block_address = userdata as usize as u64;
+    let (arch_load, arch_store) = if store { (0, bytes) } else { (bytes, 0) };
+    DYNAMIC_CFG.lock().unwrap().attribute_memory(
+        block_address,
+        arch_load,
+        arch_store,
+        traffic.bytes_load,
+        traffic.bytes_store,
+    );
 }
 
 extern "C" fn initialize_vcpu(_id: PluginId, vcpu: c_uint) {
+    IMAGE.get_or_init(|| ImageInfo {
+        start: unsafe { qemu_plugin_start_code() },
+        end: unsafe { qemu_plugin_end_code() },
+        entry: unsafe { qemu_plugin_entry_code() },
+    });
+    if TARGET.get() != Some(&Target::Riscv) {
+        return;
+    }
+
     let array = unsafe { qemu_plugin_get_registers() };
     if array.is_null() {
         return;
@@ -312,6 +336,13 @@ extern "C" fn initialize_vcpu(_id: PluginId, vcpu: c_uint) {
 }
 
 extern "C" fn execute_rvv(vcpu: c_uint, userdata: *mut c_void) {
+    if ROOT_PID
+        .get()
+        .is_some_and(|pid| *pid != unsafe { libc::getpid() })
+    {
+        CHILD_PROCESS_SEEN.store(true, Ordering::Relaxed);
+        return;
+    }
     let cost = unsafe { &*(userdata.cast::<RvvCost>()) };
     let registers = {
         let registers = RVV_REGISTERS.lock().unwrap();
@@ -359,17 +390,24 @@ extern "C" fn execute_rvv(vcpu: c_uint, userdata: *mut c_void) {
         active_elements(vstart, vl, None).unwrap()
     };
     let operations = elements.saturating_mul(cost.factor);
-    match cost.kind {
+    let class = match cost.kind {
         RvvKind::Integer => {
             VECTOR_INT_OPS.fetch_add(operations, Ordering::Relaxed);
+            VectorClass::Integer
         }
         RvvKind::Float if sew == 64 => {
             VECTOR_DOUBLE_OPS.fetch_add(operations, Ordering::Relaxed);
+            VectorClass::Double
         }
         RvvKind::Float => {
             VECTOR_FLOAT_OPS.fetch_add(operations, Ordering::Relaxed);
+            VectorClass::Float
         }
-    }
+    };
+    DYNAMIC_CFG
+        .lock()
+        .unwrap()
+        .attribute_vector(cost.block, class, operations);
 }
 
 fn rvv_state_error(message: &str) {
@@ -416,41 +454,33 @@ fn read_mask_elements(handle: usize, start: u64, end: u64) -> Option<u64> {
     })
 }
 
-fn active_elements(start: u64, end: u64, mask: Option<&[u8]>) -> Option<u64> {
-    let Some(mask) = mask else {
-        return Some(end.saturating_sub(start));
-    };
-    if end > mask.len() as u64 * 8 {
-        return None;
-    }
-    Some(
-        (start..end)
-            .filter(|bit| mask[(bit / 8) as usize] & (1 << (bit % 8)) != 0)
-            .count() as u64,
-    )
-}
-
-fn rvv_sew(vtype: u64, xlen: u32) -> Option<u64> {
-    if xlen == 0 || xlen > 64 || vtype & (1_u64 << (xlen - 1)) != 0 {
-        return None;
-    }
-    8_u64.checked_shl(((vtype >> 3) & 0x7) as u32)
-}
-
 extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
-    let mut cost = BlockCost::default();
+    let block_address = unsafe { qemu_plugin_tb_vaddr(tb) };
     let instruction_count = unsafe { qemu_plugin_tb_n_insns(tb) };
+    let mut cost = BlockCost {
+        vaddr: block_address,
+        instructions: instruction_count as u64,
+        ..BlockCost::default()
+    };
 
     for index in 0..instruction_count {
         let instruction = unsafe { qemu_plugin_tb_get_insn(tb, index) };
+        if index + 1 == instruction_count {
+            cost.end_vaddr = unsafe { qemu_plugin_insn_vaddr(instruction) }
+                .saturating_add(unsafe { qemu_plugin_insn_size(instruction) } as u64);
+        }
         let disassembly = unsafe { qemu_plugin_insn_disas(instruction) };
         if !disassembly.is_null() {
             let text = unsafe { CStr::from_ptr(disassembly) }.to_string_lossy();
+            if index + 1 == instruction_count {
+                cost.flow = classify_flow(TARGET.get().copied(), &text);
+            }
             if TARGET.get() == Some(&Target::Riscv) {
                 match classify_riscv(&text) {
                     RiscvClassification::Counted(riscv_cost) => match riscv_cost.kind {
                         RiscvKind::VectorInteger | RiscvKind::VectorFloat => {
                             let rvv_cost = Box::into_raw(Box::new(RvvCost {
+                                block: block_address,
                                 kind: if riscv_cost.kind == RiscvKind::VectorFloat {
                                     RvvKind::Float
                                 } else {
@@ -488,7 +518,7 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
                                 instruction,
                                 execute_unclassified,
                                 CALLBACK_NO_REGS,
-                                ptr::null_mut(),
+                                block_address as usize as *mut c_void,
                             )
                         };
                     }
@@ -504,7 +534,7 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
                 memory_access,
                 CALLBACK_NO_REGS,
                 MEMORY_READ_WRITE,
-                ptr::null_mut(),
+                block_address as usize as *mut c_void,
             )
         };
     }
@@ -514,37 +544,6 @@ extern "C" fn translate_block(_id: PluginId, tb: *mut TranslationBlock) {
     unsafe {
         qemu_plugin_register_vcpu_tb_exec_cb(tb, execute_block, CALLBACK_NO_REGS, cost.cast())
     };
-}
-
-fn mnemonic(disassembly: &str) -> String {
-    disassembly
-        .split_whitespace()
-        .find(|part| {
-            part.chars().any(|c| c.is_ascii_alphabetic())
-                && !part.trim_end_matches(':').starts_with("0x")
-        })
-        .unwrap_or_default()
-        .trim_matches(|c: char| c == ':' || c == ',')
-        .to_ascii_lowercase()
-}
-
-fn classify_riscv(disassembly: &str) -> RiscvClassification {
-    let mnemonic = mnemonic(disassembly);
-    let masked = is_masked(disassembly);
-    RISCV_OPERATIONS
-        .binary_search_by(|operation| {
-            operation
-                .mnemonic
-                .cmp(mnemonic.as_str())
-                .then_with(|| operation.masked.cmp(&masked))
-        })
-        .ok()
-        .map(|index| RISCV_OPERATIONS[index].classification)
-        .unwrap_or(RiscvClassification::Unclassified)
-}
-
-fn is_masked(disassembly: &str) -> bool {
-    disassembly.to_ascii_lowercase().contains("v0.t")
 }
 
 fn report_unclassified(disassembly: &str) {
@@ -563,117 +562,56 @@ fn report_unclassified(disassembly: &str) {
     }
 }
 
-fn classify_x86(mnemonic: &str, disassembly: &str) -> BlockCost {
-    let mut cost = BlockCost::default();
-    let opcode = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
-    let fused = is_x86_fused(opcode);
-    let operations = if fused { 2 } else { 1 };
-
-    if is_x86_float_arithmetic(opcode) {
-        if opcode.ends_with("ss") {
-            cost.scalar_float = operations;
-        } else if opcode.ends_with("sd") {
-            cost.scalar_double = operations;
-        } else if opcode.ends_with("ps") {
-            cost.vector_float = operations * x86_vector_bits(disassembly) / 32;
-        } else if opcode.ends_with("pd") {
-            cost.vector_double = operations * x86_vector_bits(disassembly) / 64;
-        } else if opcode.starts_with('f') {
-            // x87 uses extended precision internally. Keep it in the closest
-            // existing bucket until the event schema has an explicit type.
-            cost.scalar_double = operations;
-        }
-    } else if let Some(element_bits) = x86_vector_integer_element_bits(opcode) {
-        cost.vector_int = operations * x86_vector_bits(disassembly) / element_bits;
-    } else if is_x86_scalar_integer(opcode) {
-        cost.scalar_int = 1;
-    }
-
-    cost
-}
-
-fn is_x86_fused(opcode: &str) -> bool {
-    ["fmadd", "fmsub", "fnmadd", "fnmsub"]
-        .iter()
-        .any(|prefix| opcode.starts_with(prefix))
-}
-
-fn is_x86_float_arithmetic(opcode: &str) -> bool {
-    [
-        "add", "sub", "mul", "div", "sqrt", "min", "max", "cmp", "comi", "ucomi", "fmadd", "fmsub",
-        "fnmadd", "fnmsub",
-    ]
-    .iter()
-    .any(|prefix| opcode.starts_with(prefix))
-        && ["ss", "sd", "ps", "pd"]
-            .iter()
-            .any(|suffix| opcode.ends_with(suffix))
-        || [
-            "fadd", "faddp", "fsub", "fsubp", "fsubr", "fmul", "fdiv", "fdivp", "fdivr", "fsqrt",
-            "fcom", "fcomp", "fucom", "fucomp",
-        ]
-        .contains(&opcode)
-}
-
-fn x86_vector_bits(disassembly: &str) -> u64 {
-    if disassembly.contains("zmm") {
-        512
-    } else if disassembly.contains("ymm") {
-        256
-    } else {
-        128
-    }
-}
-
-fn x86_vector_integer_element_bits(opcode: &str) -> Option<u64> {
-    let vector_integer = [
-        "padd", "psub", "pmul", "pmadd", "pavg", "pmin", "pmax", "pcmpeq", "pcmpgt", "psll",
-        "psrl", "psra",
-    ]
-    .iter()
-    .any(|prefix| opcode.starts_with(prefix));
-    if !vector_integer {
-        return None;
-    }
-
-    match opcode.chars().last()? {
-        'b' => Some(8),
-        'w' => Some(16),
-        'd' => Some(32),
-        'q' => Some(64),
-        _ => None,
-    }
-}
-
-fn is_x86_scalar_integer(opcode: &str) -> bool {
-    let opcodes = [
-        "add", "adc", "sub", "sbb", "imul", "mul", "idiv", "div", "inc", "dec", "neg", "shl",
-        "shr", "sar", "sal", "and", "or", "xor", "cmp", "test",
-    ];
-    opcodes.contains(&opcode)
-        || opcode
-            .strip_suffix(['b', 'w', 'l', 'q'])
-            .is_some_and(|opcode| opcodes.contains(&opcode))
-}
-
 extern "C" fn plugin_exit(_id: PluginId, _userdata: *mut c_void) {
+    if ROOT_PID
+        .get()
+        .is_some_and(|pid| *pid != unsafe { libc::getpid() })
+    {
+        CHILD_PROCESS_SEEN.store(true, Ordering::Relaxed);
+        return;
+    }
     if let Some(path) = OUTPUT.get() {
-        if let Ok(mut file) = File::create(path) {
-            let counters = [
-                ("scalar_int_ops", &SCALAR_INT_OPS),
-                ("scalar_float_ops", &SCALAR_FLOAT_OPS),
-                ("scalar_double_ops", &SCALAR_DOUBLE_OPS),
-                ("vector_int_ops", &VECTOR_INT_OPS),
-                ("vector_float_ops", &VECTOR_FLOAT_OPS),
-                ("vector_double_ops", &VECTOR_DOUBLE_OPS),
-                ("bytes_load", &BYTES_LOAD),
-                ("bytes_store", &BYTES_STORE),
-                ("rvv_state_errors", &RVV_STATE_ERRORS),
-                ("unclassified_instructions", &UNCLASSIFIED_INSTRUCTIONS),
-            ];
-            for (name, counter) in counters {
-                let _ = writeln!(file, "{name}={}", counter.load(Ordering::Relaxed));
+        if let Some(cache) = CACHE_MODEL.get() {
+            let traffic = cache.lock().unwrap().flush();
+            DRAM_BYTES_LOAD.fetch_add(traffic.bytes_load, Ordering::Relaxed);
+            DRAM_BYTES_STORE.fetch_add(traffic.bytes_store, Ordering::Relaxed);
+        }
+        let counters = CounterSnapshot {
+            scalar_int_ops: SCALAR_INT_OPS.load(Ordering::Relaxed),
+            scalar_float_ops: SCALAR_FLOAT_OPS.load(Ordering::Relaxed),
+            scalar_double_ops: SCALAR_DOUBLE_OPS.load(Ordering::Relaxed),
+            vector_int_ops: VECTOR_INT_OPS.load(Ordering::Relaxed),
+            vector_float_ops: VECTOR_FLOAT_OPS.load(Ordering::Relaxed),
+            vector_double_ops: VECTOR_DOUBLE_OPS.load(Ordering::Relaxed),
+            bytes_load: BYTES_LOAD.load(Ordering::Relaxed),
+            bytes_store: BYTES_STORE.load(Ordering::Relaxed),
+            dram_bytes_load: DRAM_BYTES_LOAD.load(Ordering::Relaxed),
+            dram_bytes_store: DRAM_BYTES_STORE.load(Ordering::Relaxed),
+            rvv_state_errors: RVV_STATE_ERRORS.load(Ordering::Relaxed),
+            unclassified_instructions: UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed),
+            instructions: RETIRED_INSTRUCTIONS.load(Ordering::Relaxed),
+            child_process_seen: CHILD_PROCESS_SEEN.load(Ordering::Relaxed),
+        };
+        artifacts::write_counts(path, &counters);
+        let cache = CACHE_MODEL.get().map(|cache| {
+            let cache = cache.lock().unwrap();
+            CacheDescription {
+                line_size: cache.line_size(),
+                capacity: cache.capacity(),
+                associativity: cache.associativity(),
             }
+        });
+        artifacts::write_cfg(
+            &path.with_extension("cfg"),
+            cache,
+            IMAGE.get().copied(),
+            &DYNAMIC_CFG.lock().unwrap(),
+        );
+        if let Some(analysis) = MEMORY_ANALYSIS.get() {
+            artifacts::write_memory(
+                &path.with_extension("memory.json"),
+                &analysis.lock().unwrap().artifact(),
+            );
         }
     }
 
@@ -698,6 +636,7 @@ pub unsafe extern "C" fn qemu_plugin_install(
     argc: c_int,
     argv: *const *const c_char,
 ) -> c_int {
+    let _ = ROOT_PID.set(unsafe { libc::getpid() });
     if info.is_null() {
         return -1;
     }
@@ -717,16 +656,22 @@ pub unsafe extern "C" fn qemu_plugin_install(
     if TARGET.set(target).is_err() {
         return -1;
     }
-
     let args = if argc <= 0 || argv.is_null() {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(argv, argc as usize) }
     };
-    let output = args.iter().find_map(|arg| {
-        let arg = unsafe { CStr::from_ptr(*arg) }.to_string_lossy();
-        arg.strip_prefix("output=").map(PathBuf::from)
-    });
+    let arguments = args
+        .iter()
+        .map(|arg| {
+            unsafe { CStr::from_ptr(*arg) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    let output = arguments
+        .iter()
+        .find_map(|arg| arg.strip_prefix("output=").map(PathBuf::from));
     let Some(output) = output else {
         unsafe { qemu_plugin_outs(c"miniperf roofline: missing output=<path>\n".as_ptr()) };
         return -1;
@@ -734,11 +679,68 @@ pub unsafe extern "C" fn qemu_plugin_install(
     if OUTPUT.set(output).is_err() {
         return -1;
     }
+    let parse_u64 = |name: &str, default: u64| {
+        arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix(&format!("{name}=")))
+            .map(str::parse::<u64>)
+            .transpose()
+            .map(|value| value.unwrap_or(default))
+    };
+    let cache_line = parse_u64("cache-line", DEFAULT_CACHE_LINE_SIZE);
+    let cache_size = parse_u64("llc-size", DEFAULT_LLC_SIZE);
+    let cache_associativity = parse_u64("llc-assoc", DEFAULT_LLC_ASSOCIATIVITY as u64)
+        .ok()
+        .and_then(|value| usize::try_from(value).ok());
+    let memory_profile = arguments
+        .iter()
+        .find_map(|argument| argument.strip_prefix("memory-profile="))
+        .map(|value| match value {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            _ => Err(()),
+        })
+        .transpose();
+    let memory_profile = match memory_profile {
+        Ok(value) => value.unwrap_or(true),
+        Err(()) => {
+            unsafe {
+                qemu_plugin_outs(
+                    c"miniperf roofline: memory-profile must be 'on' or 'off'\n".as_ptr(),
+                )
+            };
+            return -1;
+        }
+    };
+    let cache = match (cache_line.ok(), cache_size.ok(), cache_associativity) {
+        (Some(line), Some(size), Some(associativity)) => CacheModel::new(line, size, associativity),
+        _ => None,
+    };
+    let Some(cache) = cache else {
+        unsafe {
+            qemu_plugin_outs(
+                c"miniperf roofline: invalid cache-line, llc-size, or llc-assoc option\n".as_ptr(),
+            )
+        };
+        return -1;
+    };
+    if CACHE_MODEL.set(Mutex::new(cache)).is_err() {
+        return -1;
+    }
+    let line_size = CACHE_MODEL
+        .get()
+        .map(|cache| cache.lock().unwrap().line_size())
+        .unwrap_or(DEFAULT_CACHE_LINE_SIZE);
+    if memory_profile
+        && MEMORY_ANALYSIS
+            .set(Mutex::new(MemoryAnalysis::new(line_size)))
+            .is_err()
+    {
+        return -1;
+    }
 
     unsafe {
-        if target == Target::Riscv {
-            qemu_plugin_register_vcpu_init_cb(id, initialize_vcpu);
-        }
+        qemu_plugin_register_vcpu_init_cb(id, initialize_vcpu);
         qemu_plugin_register_vcpu_tb_trans_cb(id, translate_block);
         qemu_plugin_register_atexit_cb(id, plugin_exit, ptr::null_mut());
     }
@@ -750,140 +752,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_tmdl_scalar_and_compressed_operations() {
-        assert_eq!(
-            classify_riscv("fadd.d fa0,fa1,fa2"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::ScalarDouble,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-        assert_eq!(
-            classify_riscv("c.add a0,a1"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::ScalarInteger,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn classifies_tmdl_vector_arithmetic() {
-        assert_eq!(
-            classify_riscv("vfmacc.vv v8,v9,v10,v0.t"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorFloat,
-                factor: 2,
-                sew_scale: 1,
-            })
-        );
-        assert_eq!(
-            classify_riscv("vfwadd.vv v8,v9,v10"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorFloat,
-                factor: 1,
-                sew_scale: 2,
-            })
-        );
-        assert_eq!(
-            classify_riscv("vfredusum.vs v8,v9,v10"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorFloat,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-        assert_eq!(
-            classify_riscv("vmacc.vv v8,v9,v10"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::VectorInteger,
-                factor: 2,
-                sew_scale: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn does_not_count_control_flow_or_expand_integer_remainder() {
-        for instruction in ["auipc a0,0x10", "jal ra,0x20", "jalr ra,a0,0"] {
-            assert_eq!(
-                classify_riscv(instruction),
-                RiscvClassification::NonCompute,
-                "{instruction}"
-            );
-        }
-        assert_eq!(
-            classify_riscv("rem a0,a1,a2"),
-            RiscvClassification::Counted(RiscvCost {
-                kind: RiscvKind::ScalarInteger,
-                factor: 1,
-                sew_scale: 1,
-            })
-        );
-    }
-
-    #[test]
-    fn treats_non_arithmetic_float_behavior_as_non_compute() {
-        for instruction in [
-            "vmfeq.vv v1,v2,v3",
-            "vfcvt.x.f.v v1,v2",
-            "vfsgnj.vv v1,v2,v3",
-        ] {
-            assert_eq!(
-                classify_riscv(instruction),
-                RiscvClassification::NonCompute,
-                "{instruction}"
-            );
-        }
-    }
-
-    #[test]
-    fn leaves_missing_and_todo_operations_unclassified() {
-        assert_eq!(
-            classify_riscv("vfrsqrt7.v v1,v2"),
-            RiscvClassification::Unclassified
-        );
-        assert_eq!(
-            classify_riscv("madeup a0,a1"),
-            RiscvClassification::Unclassified
-        );
-
+    fn unclassified_callback_counts_and_attributes() {
         let before = UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed);
         execute_unclassified(0, ptr::null_mut());
         assert_eq!(
             UNCLASSIFIED_INSTRUCTIONS.load(Ordering::Relaxed),
             before + 1
         );
-    }
-
-    #[test]
-    fn applies_rvv_mask_vstart_and_sew() {
-        assert_eq!(active_elements(2, 7, Some(&[0b0110_1100])), Some(4));
-        assert_eq!(active_elements(2, 7, None), Some(5));
-        assert_eq!(active_elements(9, 7, None), Some(0));
-        assert_eq!(active_elements(0, 9, Some(&[0xff])), None);
-        assert_eq!(rvv_sew(2 << 3, 64), Some(32));
-        assert_eq!(rvv_sew(3 << 3, 64), Some(64));
-        assert_eq!(rvv_sew(1_u64 << 63, 64), None);
-    }
-
-    #[test]
-    fn classifies_x86_scalar_and_vector_operations() {
-        let scalar = classify_x86("mulsd", "mulsd 0x8(%rax),%xmm0");
-        assert_eq!(scalar.scalar_double, 1);
-
-        let vector = classify_x86("vfmadd132ps", "vfmadd132ps %ymm1,%ymm2,%ymm3");
-        assert_eq!(vector.vector_float, 16);
-
-        let integer = classify_x86("vpaddd", "vpaddd %zmm1,%zmm2,%zmm3");
-        assert_eq!(integer.vector_int, 16);
-    }
-
-    #[test]
-    fn does_not_treat_x86_simd_logic_as_scalar_integer_work() {
-        let cost = classify_x86("orpd", "orpd %xmm1,%xmm0");
-        assert_eq!(cost.scalar_int, 0);
     }
 }

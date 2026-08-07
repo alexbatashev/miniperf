@@ -12,9 +12,16 @@ members = [
     "truth",
     "utils/event-import",
     "utils/qemu-roofline",
+    "utils/roofline-core",
 ]
 
 [profile.dev.package]
 insta.opt-level = 3
 similar.opt-level = 3
 mperf.opt-level = 3
+
+# roofline-core sits on the instrumentation hot path (billions of calls per
+# profiled run); a single codegen unit lets the batch loop inline the cache
+# model and CFG accounting across modules.
+[profile.release.package.miniperf-roofline-core]
+codegen-units = 1

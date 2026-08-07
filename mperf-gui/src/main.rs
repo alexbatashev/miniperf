@@ -1,4 +1,5 @@
 mod flamegraph;
+mod memory;
 mod metrics;
 mod model;
 mod profile;
@@ -10,6 +11,7 @@ mod theme;
 mod views;
 
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     path::{Path, PathBuf},
 };
@@ -18,9 +20,9 @@ use anyhow::Result;
 use clap::Parser;
 use flamelens::flame::{ROOT_ID, StackIdentifier};
 use gpui::{
-    App, Application, Bounds, Context, MouseButton, MouseMoveEvent, PathPromptOptions,
-    ScrollHandle, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point, prelude::*, px,
-    size,
+    App, Application, AssetSource, Bounds, Context, MouseButton, MouseMoveEvent, PathPromptOptions,
+    ScrollHandle, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point,
+    prelude::*, px, size,
 };
 
 use flamegraph::FlamegraphData;
@@ -30,6 +32,7 @@ use theme::*;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VisualizationKind {
+    Memory,
     Roofline,
     #[default]
     Flamegraph,
@@ -42,7 +45,8 @@ enum VisualizationKind {
 }
 
 impl VisualizationKind {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
+        Self::Memory,
         Self::Roofline,
         Self::Flamegraph,
         Self::FlameScope,
@@ -55,6 +59,7 @@ impl VisualizationKind {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Memory => "Memory",
             Self::Roofline => "Roofline",
             Self::Flamegraph => "Flamegraph",
             Self::FlameScope => "FlameScope",
@@ -68,6 +73,7 @@ impl VisualizationKind {
 
     fn id(self) -> &'static str {
         match self {
+            Self::Memory => "memory",
             Self::Roofline => "roofline",
             Self::Flamegraph => "flamegraph",
             Self::FlameScope => "flamescope",
@@ -159,6 +165,9 @@ struct MperfGui {
     icicle_focus_path: Vec<usize>,
     cpu_heatmap_bucket_ns: Option<u64>,
     selected_roofline_loop: Option<usize>,
+    hovered_roofline_roof: Option<usize>,
+    roofline_labels_always_visible: bool,
+    roofline_chart_size: Option<(f32, f32)>,
     roofline_loop_scroll_handle: ScrollHandle,
 
     source_documents: Vec<SourceDocument>,
@@ -195,6 +204,9 @@ impl MperfGui {
             icicle_focus_path: Vec::new(),
             cpu_heatmap_bucket_ns: None,
             selected_roofline_loop: None,
+            hovered_roofline_roof: None,
+            roofline_labels_always_visible: false,
+            roofline_chart_size: None,
             roofline_loop_scroll_handle: ScrollHandle::new(),
             source_documents: Vec::new(),
             active_source: None,
@@ -215,6 +227,13 @@ impl MperfGui {
     fn roofline_data(&self) -> Option<&roofline::RooflineData> {
         self.model.as_ref()?.tabs.iter().find_map(|tab| match tab {
             GuiTab::Loops(data) => Some(data.as_ref()),
+            _ => None,
+        })
+    }
+
+    fn memory_data(&self) -> Option<&memory::MemoryData> {
+        self.model.as_ref()?.tabs.iter().find_map(|tab| match tab {
+            GuiTab::Memory(data) => Some(data.as_ref()),
             _ => None,
         })
     }
@@ -313,9 +332,19 @@ impl MperfGui {
         self.bottom_panel_collapsed = true;
         self.open_visualizations.clear();
         self.active_visualization = None;
-        if self.visualization_available(VisualizationKind::Roofline) {
+        let memory_scenario = self
+            .model
+            .as_ref()
+            .is_some_and(|model| model.record_info.scenario == mperf_data::Scenario::Mem);
+        if memory_scenario && self.visualization_available(VisualizationKind::Memory) {
+            self.open_visualizations.push(VisualizationKind::Memory);
+            self.active_visualization = Some(VisualizationKind::Memory);
+        } else if self.visualization_available(VisualizationKind::Roofline) {
             self.open_visualizations.push(VisualizationKind::Roofline);
             self.active_visualization = Some(VisualizationKind::Roofline);
+        } else if self.visualization_available(VisualizationKind::Memory) {
+            self.open_visualizations.push(VisualizationKind::Memory);
+            self.active_visualization = Some(VisualizationKind::Memory);
         } else if self.visualization_available(VisualizationKind::Flamegraph) {
             self.open_visualizations.push(VisualizationKind::Flamegraph);
             self.active_visualization = Some(VisualizationKind::Flamegraph);
@@ -324,6 +353,8 @@ impl MperfGui {
         self.icicle_focus_path.clear();
         self.cpu_heatmap_bucket_ns = None;
         self.selected_roofline_loop = None;
+        self.hovered_roofline_roof = None;
+        self.roofline_chart_size = None;
         self.roofline_loop_scroll_handle
             .set_offset(point(px(0.0), px(0.0)));
         self.source_documents.clear();
@@ -409,6 +440,7 @@ impl MperfGui {
             return false;
         };
         match visualization {
+            VisualizationKind::Memory => return self.memory_data().is_some(),
             VisualizationKind::Roofline => return self.roofline_data().is_some(),
             VisualizationKind::Flamegraph => {
                 return self.flamegraph_data().is_some_and(|flamegraph| {
@@ -431,7 +463,9 @@ impl MperfGui {
             .iter()
             .any(|sample| !sample.stack.is_empty());
         match visualization {
-            VisualizationKind::Roofline | VisualizationKind::Flamegraph => unreachable!(),
+            VisualizationKind::Memory
+            | VisualizationKind::Roofline
+            | VisualizationKind::Flamegraph => unreachable!(),
             VisualizationKind::FlameScope => has_samples,
             VisualizationKind::Icicle
             | VisualizationKind::StackTimeline
@@ -662,6 +696,18 @@ fn result_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+struct MperfAssets;
+
+impl AssetSource for MperfAssets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        Ok(roofline::roofline_label_svg(path).map(Cow::Owned))
+    }
+
+    fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let model = cli.result_directory.map(ResultsModel::load).transpose()?;
@@ -671,33 +717,35 @@ fn main() -> Result<()> {
     }
     let should_select = model.is_none();
 
-    Application::new().run(move |cx: &mut App| {
-        cx.init_colors();
-        let bounds = Bounds::centered(None, size(px(1120.0), px(720.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                titlebar: Some(TitlebarOptions {
-                    title: Some("mperf".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(10.0), px(11.0))),
-                }),
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(760.0), px(520.0))),
-                ..Default::default()
-            },
-            |_, cx| {
-                cx.new(|cx| {
-                    let mut view = MperfGui::new(model, recent_results);
-                    if should_select {
-                        view.select_result_directory(cx);
-                    }
-                    view
-                })
-            },
-        )
-        .expect("failed to open mperf GUI window");
-        cx.activate(true);
-    });
+    Application::new()
+        .with_assets(MperfAssets)
+        .run(move |cx: &mut App| {
+            cx.init_colors();
+            let bounds = Bounds::centered(None, size(px(1120.0), px(720.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("mperf".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(10.0), px(11.0))),
+                    }),
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(760.0), px(520.0))),
+                    ..Default::default()
+                },
+                |_, cx| {
+                    cx.new(|cx| {
+                        let mut view = MperfGui::new(model, recent_results);
+                        if should_select {
+                            view.select_result_directory(cx);
+                        }
+                        view
+                    })
+                },
+            )
+            .expect("failed to open mperf GUI window");
+            cx.activate(true);
+        });
 
     Ok(())
 }

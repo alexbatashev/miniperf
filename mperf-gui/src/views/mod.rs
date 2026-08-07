@@ -5,6 +5,7 @@ mod cpu_heatmap;
 mod flamegraph;
 mod flamescope;
 mod icicle;
+mod memory;
 mod metrics_timeline;
 mod roofline;
 mod sidebar;

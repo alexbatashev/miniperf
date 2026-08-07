@@ -7,8 +7,6 @@ edition = "2021"
 name = "miniperf_qemu_roofline"
 crate-type = ["cdylib"]
 
-[build-dependencies]
-serde_json = "1.0"
-
-[dev-dependencies]
-serde_json = "1.0"
+[dependencies]
+miniperf-roofline-core = { path = "../roofline-core" }
+libc = "0.2"

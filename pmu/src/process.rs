@@ -13,6 +13,7 @@ pub struct Process {
     /// driver's `stop()` even though the child has already finished.
     exited: Cell<bool>,
     reaped: Cell<bool>,
+    exit_code: Cell<Option<i32>>,
 }
 
 impl Process {
@@ -53,6 +54,7 @@ impl Process {
         c_arg_ptrs.push(std::ptr::null_mut());
 
         let c_env: Vec<CString> = std::env::vars()
+            .filter(|(key, _)| !env.iter().any(|(override_key, _)| override_key == key))
             .chain(env.iter().cloned())
             .map(|(key, val)| CString::new(format!("{key}={val}")))
             .collect::<Result<_, _>>()?;
@@ -95,6 +97,7 @@ impl Process {
             pid,
             exited: Cell::new(false),
             reaped: Cell::new(false),
+            exit_code: Cell::new(None),
         })
     }
 
@@ -120,10 +123,17 @@ impl Process {
                 c_args.iter().map(|arg| arg.as_ptr()).collect();
             c_arg_ptrs.push(std::ptr::null());
 
-            let c_env: Vec<CString> = std::env::vars()
+            let mut c_env: Vec<CString> = std::env::vars()
+                .filter(|(key, _)| !env.iter().any(|(override_key, _)| override_key == key))
                 .chain(env.iter().cloned())
                 .map(|(key, val)| CString::new(format!("{}={}", key, val)).unwrap())
                 .collect();
+            c_env.push(
+                CString::new(format!("MPERF_PROFILE_ROOT_PID={}", unsafe {
+                    libc::getpid()
+                }))
+                .unwrap(),
+            );
             let mut c_env_ptrs: Vec<*const libc::c_char> =
                 c_env.iter().map(|env| env.as_ptr()).collect();
             c_env_ptrs.push(std::ptr::null());
@@ -149,6 +159,7 @@ impl Process {
             write_fd: pipe_fds[1],
             exited: Cell::new(false),
             reaped: Cell::new(false),
+            exit_code: Cell::new(None),
         })
     }
 
@@ -185,9 +196,22 @@ impl Process {
             {
                 return Err(std::io::Error::last_os_error());
             }
+            let status = info.si_status();
+            self.exit_code
+                .set(Some(if info.si_code == libc::CLD_EXITED {
+                    status
+                } else {
+                    128_i32.saturating_add(status)
+                }));
         }
         self.exited.set(true);
         Ok(())
+    }
+
+    /// Returns the conventional process exit code after [`Process::wait`].
+    /// Signal termination is represented as `128 + signal`.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code.get()
     }
 
     /// Reap the child if it has exited, releasing the zombie. Idempotent.

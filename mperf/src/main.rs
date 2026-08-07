@@ -57,8 +57,8 @@ enum Commands {
     Record {
         #[arg(short, long)]
         scenario: Scenario,
-        /// Roofline accounting implementation.
-        #[arg(long, value_enum, default_value_t = roofline::BackendKind::Compiler)]
+        /// Roofline accounting implementation. The default probes the workload and host.
+        #[arg(long, value_enum, default_value_t = roofline::BackendKind::Auto)]
         roofline_backend: roofline::BackendKind,
         /// QEMU user-mode binary; auto-detected from the guest ELF when omitted.
         #[arg(long)]
@@ -69,6 +69,12 @@ enum Commands {
         /// Extra argument passed to QEMU before the guest executable.
         #[arg(long, allow_hyphen_values = true)]
         qemu_arg: Vec<String>,
+        /// DynamoRIO drrun launcher or build/bundle directory; defaults to the bundle next to mperf or PATH.
+        #[arg(long)]
+        dynamorio: Option<PathBuf>,
+        /// miniperf DynamoRIO client shared library; normally discovered automatically.
+        #[arg(long)]
+        dynamorio_client: Option<PathBuf>,
         #[arg(short, long)]
         output_directory: String,
         #[arg(short, long)]
@@ -124,6 +130,8 @@ async fn main() -> Result<()> {
             qemu,
             qemu_plugin,
             qemu_arg,
+            dynamorio,
+            dynamorio_client,
             output_directory,
             pid,
             command,
@@ -133,6 +141,8 @@ async fn main() -> Result<()> {
                 qemu,
                 qemu_plugin,
                 qemu_args: qemu_arg,
+                dynamorio,
+                dynamorio_client,
             };
             roofline.validate_for(scenario)?;
 

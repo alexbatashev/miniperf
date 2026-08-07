@@ -29,6 +29,9 @@ pub(crate) struct ProfileSample {
     pub(crate) process_id: u32,
     pub(crate) thread_id: u32,
     pub(crate) cpu: Option<u32>,
+    /// Fraction of the requested PMU group time that was actually scheduled.
+    /// Legacy recordings without multiplexing metadata use 1.0.
+    pub(crate) confidence: f64,
     /// Interned frame IDs ordered from the root to the sampled leaf.
     pub(crate) stack: Vec<usize>,
     /// Values aligned with [`ProfileData::counter_metrics`].
@@ -170,6 +173,7 @@ fn load_profile(connection: &Connection) -> Result<ProfileData> {
     let thread_column = required_column(&sample_columns, "thread_id")?;
     let call_stack_column = required_column(&sample_columns, "call_stack")?;
     let cpu_column = find_column(&sample_columns, "cpu");
+    let confidence_column = find_column(&sample_columns, "confidence");
 
     let dynamic_columns = sample_columns
         .iter()
@@ -199,6 +203,11 @@ fn load_profile(connection: &Connection) -> Result<ProfileData> {
             .map(quoted)
             .unwrap_or_else(|| "NULL AS cpu".to_string()),
     );
+    selected_columns.push(
+        confidence_column
+            .map(quoted)
+            .unwrap_or_else(|| "1.0 AS confidence".to_string()),
+    );
     selected_columns.extend(dynamic_columns.iter().map(|column| quoted(&column.name)));
 
     let query = format!(
@@ -218,12 +227,13 @@ fn load_profile(connection: &Connection) -> Result<ProfileData> {
         let thread_id = required_u32(&row[2], "pmu_counters.thread_id")?;
         let raw_stack = parse_call_stack(&row[3], "pmu_counters.call_stack")?;
         let cpu = optional_cpu(&row[4]);
+        let confidence = positive_f64(&row[5]).unwrap_or(1.0);
         let stack = intern_stack(raw_stack, &resolved_frames, &mut frames, &mut frame_ids);
 
         let counters = dynamic_columns
             .iter()
             .enumerate()
-            .map(|(offset, column)| numeric_counter(&row[5 + offset], &column.name))
+            .map(|(offset, column)| numeric_counter(&row[6 + offset], &column.name))
             .collect::<Result<Vec<_>>>()?;
 
         samples.push(ProfileSample {
@@ -231,6 +241,7 @@ fn load_profile(connection: &Connection) -> Result<ProfileData> {
             process_id,
             thread_id,
             cpu,
+            confidence,
             stack,
             counters,
         });
@@ -645,6 +656,15 @@ fn optional_cpu(value: &Value) -> Option<u32> {
     }
 }
 
+fn positive_f64(value: &Value) -> Option<f64> {
+    let value = match value {
+        Value::Integer(value) => *value as f64,
+        Value::Float(value) => *value,
+        _ => return None,
+    };
+    (value.is_finite() && value > 0.0).then_some(value)
+}
+
 fn numeric_counter(value: &Value, column: &str) -> Result<Option<f64>> {
     match value {
         Value::Null => Ok(None),
@@ -705,14 +725,15 @@ mod tests {
                     thread_id INTEGER NOT NULL,
                     call_stack TEXT,
                     cpu INTEGER,
+                    confidence REAL,
                     pmu_cycles INTEGER,
                     custom_rate REAL,
                     annotation TEXT
                 );
                 INSERT INTO pmu_counters
-                    VALUES (100, 7, 9, '[16, 32]', 3, 10, NULL, 'first');
+                    VALUES (100, 7, 9, '[16, 32]', 3, 0.5, 10, NULL, 'first');
                 INSERT INTO pmu_counters
-                    VALUES (200, 7, 9, '[17, 32]', 4, NULL, 2.5, 'second');
+                    VALUES (200, 7, 9, '[17, 32]', 4, 1.0, NULL, 2.5, 'second');
                 ",
             )
             .unwrap();
@@ -745,6 +766,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first_names, ["root", "leaf"]);
         assert_eq!(profile.samples[0].stack, profile.samples[1].stack);
+        assert_eq!(profile.samples[0].confidence, 0.5);
+        assert_eq!(profile.samples[1].confidence, 1.0);
 
         let leaf = profile
             .frames

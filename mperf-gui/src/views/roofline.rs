@@ -1,13 +1,14 @@
 use gpui::{
-    Bounds, Context, Div, FontWeight, MouseButton, MouseDownEvent, PathBuilder, SharedString,
-    canvas, div, fill, point, prelude::*, px, rgb, size,
+    Bounds, Context, Div, FontWeight, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder,
+    SharedString, Transformation, canvas, div, fill, point, prelude::*, px, radians, relative, rgb,
+    size, svg,
 };
 
 use crate::{
     MperfGui,
-    roofline::{RooflineData, RooflineLoop},
+    roofline::{RooflineData, RooflineLoop, roofline_label_asset},
     theme::{
-        ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED, SURFACE, WORKSPACE,
+        ACCENT, BORDER, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED, SURFACE, TEXT, WORKSPACE,
     },
 };
 
@@ -21,6 +22,8 @@ const EFFICIENCY_WIDTH: f32 = 68.0;
 const POINT: u32 = 0x6f9ca5;
 const GRID: u32 = 0x353538;
 const TICK_COUNT: usize = 5;
+const ROOF_LABEL_WIDTH: f32 = 176.0;
+const ROOF_LABEL_HEIGHT: f32 = 18.0;
 
 impl MperfGui {
     pub(crate) fn render_roofline_workspace(&self, cx: &mut Context<Self>) -> Div {
@@ -70,30 +73,29 @@ impl MperfGui {
             .border_b_1()
             .border_color(rgb(BORDER))
             .bg(rgb(SURFACE))
-            .child(
-                div()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("FP64 Roofline"),
-            )
+            .child(div().font_weight(FontWeight::SEMIBOLD).child(
+                if data.uses_architectural_traffic() && data.has_compatible_memory_roof() {
+                    "FP64 Cache-Aware Roofline"
+                } else if data.has_compatible_memory_roof() {
+                    if data.uses_modeled_traffic() {
+                        "FP64 Roofline · modeled LLC traffic"
+                    } else {
+                        "FP64 Roofline"
+                    }
+                } else {
+                    "FP64 Architectural-Intensity Analysis"
+                },
+            ))
             .child(div().text_xs().text_color(rgb(MUTED_TEXT)).child(format!(
                 "{plotted_count} plotted · {loop_count} recorded loops"
             )))
-            .child(div().flex_1())
-            .when_some(data.calibration.as_ref(), |element, calibration| {
-                element
-                    .child(metric_chip(
-                        "Compute",
-                        format!("{:.2} GFLOP/s", calibration.fp64_gflops),
-                    ))
-                    .child(metric_chip(
-                        "Memory",
-                        format!("{:.2} GB/s", calibration.memory_gbytes_per_second),
-                    ))
-                    .child(metric_chip(
-                        "Ridge",
-                        format!("{:.3} FLOP/B", calibration.ridge_point_flops_per_byte),
-                    ))
+            .when_some(data.method.as_ref(), |element, method| {
+                element.child(metric_chip(
+                    "Method",
+                    format!("{} · {}", method.performance, method.quality),
+                ))
             })
+            .child(div().flex_1())
             .when(data.calibration.is_none(), |element| {
                 element.child(
                     div()
@@ -134,6 +136,15 @@ impl MperfGui {
         }
 
         let selected = self.selected_roofline_loop;
+        let plot_labels = plot
+            .labels(self.roofline_chart_size)
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                self.roofline_labels_always_visible || self.hovered_roofline_roof == Some(*index)
+            })
+            .map(|(_, label)| label)
+            .collect::<Vec<_>>();
         let plot_for_paint = plot.clone();
         let plot_for_click = plot.clone();
         let entity = cx.entity();
@@ -142,18 +153,37 @@ impl MperfGui {
             move |bounds, _, window, _| {
                 paint_roofline(bounds, &plot_for_paint, selected, window);
 
-                let plot = plot_for_click.clone();
-                let entity = entity.clone();
+                let click_plot = plot_for_click.clone();
+                let click_entity = entity.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
                     if event.button != MouseButton::Left || !bounds.contains(&event.position) {
                         return;
                     }
-                    let Some(index) = nearest_point(bounds, &plot, event.position) else {
+                    let Some(index) = nearest_point(bounds, &click_plot, event.position) else {
                         return;
                     };
-                    entity.update(cx, |view, cx| {
+                    click_entity.update(cx, |view, cx| {
                         view.select_roofline_loop(index, event.click_count >= 2);
                         cx.notify();
+                    });
+                });
+
+                let hover_plot = plot_for_click.clone();
+                let hover_entity = entity.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                    let hovered = bounds
+                        .contains(&event.position)
+                        .then(|| nearest_roof(bounds, &hover_plot, event.position))
+                        .flatten();
+                    let chart_size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                    hover_entity.update(cx, |view, cx| {
+                        if view.hovered_roofline_roof != hovered
+                            || view.roofline_chart_size != Some(chart_size)
+                        {
+                            view.hovered_roofline_roof = hovered;
+                            view.roofline_chart_size = Some(chart_size);
+                            cx.notify();
+                        }
                     });
                 });
             },
@@ -192,9 +222,22 @@ impl MperfGui {
                     .bg(rgb(CHROME))
                     .text_xs()
                     .text_color(rgb(MUTED_TEXT))
-                    .child(legend_item(ACCENT, "Calibrated attainable roof"))
+                    .child(legend_item(
+                        ACCENT,
+                        if data.uses_architectural_traffic() && data.has_compatible_memory_roof() {
+                            "Calibrated cache hierarchy roofs"
+                        } else if data.has_compatible_memory_roof() {
+                            "Calibrated attainable roof"
+                        } else {
+                            "Calibrated FP64 compute ceiling"
+                        },
+                    ))
                     .child(legend_item(POINT, "Recorded FP64 loop"))
                     .child(div().flex_1())
+                    .child(roofline_label_toggle(
+                        self.roofline_labels_always_visible,
+                        cx,
+                    ))
                     .child("Double-click a point to open source"),
             )
             .child(
@@ -252,7 +295,22 @@ impl MperfGui {
                                     .min_h(px(180.0))
                                     .flex_1()
                                     .cursor_pointer()
-                                    .child(graph),
+                                    .child(graph)
+                                    .children(plot_labels.into_iter().map(|label| {
+                                        svg()
+                                            .absolute()
+                                            .left(relative(label.x_fraction))
+                                            .top(relative(1.0 - label.y_fraction))
+                                            .ml(px(-ROOF_LABEL_WIDTH / 2.0))
+                                            .mt(px(-ROOF_LABEL_HEIGHT))
+                                            .w(px(ROOF_LABEL_WIDTH))
+                                            .h(px(ROOF_LABEL_HEIGHT))
+                                            .path(roofline_label_asset(&label.text))
+                                            .text_color(rgb(label.color))
+                                            .with_transformation(Transformation::rotate(radians(
+                                                label.rotation_radians,
+                                            )))
+                                    })),
                             )
                             .child(
                                 div()
@@ -273,7 +331,17 @@ impl MperfGui {
                                     .justify_center()
                                     .text_xs()
                                     .text_color(rgb(MUTED_TEXT))
-                                    .child("Arithmetic intensity (FLOP / byte)"),
+                                    .child(if data.uses_architectural_traffic() {
+                                        "Architectural intensity (FLOP / architectural byte)"
+                                    } else if data.has_compatible_memory_roof() {
+                                        if data.uses_modeled_traffic() {
+                                            "Modeled DRAM intensity (FLOP / byte)"
+                                        } else {
+                                            "Arithmetic intensity (FLOP / byte)"
+                                        }
+                                    } else {
+                                        "Architectural intensity (FLOP / architectural byte)"
+                                    }),
                             ),
                     ),
             )
@@ -362,9 +430,7 @@ impl MperfGui {
             .map(format_metric)
             .unwrap_or_else(|| "—".to_string());
         let efficiency = data
-            .calibration
-            .as_ref()
-            .and_then(|calibration| loop_data.efficiency(calibration))
+            .efficiency(loop_data)
             .map(|value| format!("{:.1}%", value * 100.0))
             .unwrap_or_else(|| "—".to_string());
         let has_source = loop_data.source().is_some();
@@ -439,6 +505,11 @@ impl MperfGui {
 struct RooflinePlot {
     points: Vec<RooflinePoint>,
     calibration: Option<mperf_data::RooflineCalibration>,
+    /// One bandwidth roof per memory hierarchy level, fastest first. Loops are
+    /// plotted against architectural traffic (cache-aware roofline), so a
+    /// cache-resident loop sits above the DRAM roof and is bounded by whichever
+    /// level actually serves it.
+    roofs: Vec<(String, f64)>,
     x_min_log: f64,
     x_max_log: f64,
     y_min_log: f64,
@@ -450,6 +521,15 @@ struct RooflinePoint {
     loop_index: usize,
     intensity: f64,
     gflops: f64,
+}
+
+#[derive(Debug, PartialEq)]
+struct RooflineLabel {
+    text: String,
+    x_fraction: f32,
+    y_fraction: f32,
+    color: u32,
+    rotation_radians: f32,
 }
 
 impl RooflinePlot {
@@ -472,25 +552,43 @@ impl RooflinePlot {
             .map(|point| point.intensity)
             .collect::<Vec<_>>();
         let mut y_values = points.iter().map(|point| point.gflops).collect::<Vec<_>>();
-        if let Some(calibration) = data.calibration.as_ref() {
+        if data.has_compatible_memory_roof() {
+            let calibration = data.calibration.as_ref().expect("checked above");
             x_values.push(calibration.ridge_point_flops_per_byte);
+            y_values.push(calibration.fp64_gflops);
+        } else if let Some(calibration) = data.calibration.as_ref() {
             y_values.push(calibration.fp64_gflops);
         }
 
+        let roofs = data
+            .bandwidth_roofs()
+            .into_iter()
+            .map(|(level, bandwidth)| (level.to_string(), bandwidth))
+            .collect::<Vec<_>>();
+        // Every roof's ridge point has to be inside the x extent, otherwise the
+        // fastest level's knee is clipped off the chart.
+        if let Some(calibration) = data.calibration.as_ref() {
+            for (_, bandwidth) in &roofs {
+                let ridge = calibration.fp64_gflops / bandwidth;
+                if ridge.is_finite() && ridge > 0.0 {
+                    x_values.push(ridge);
+                }
+            }
+        }
+
         let (x_min_log, x_max_log) = log_extent(&x_values, -2.0, 2.0);
-        let memory_at_left = data
-            .calibration
-            .as_ref()
-            .map(|calibration| calibration.memory_gbytes_per_second * 10.0_f64.powf(x_min_log))
-            .filter(|value| value.is_finite() && *value > 0.0);
-        if let Some(value) = memory_at_left {
-            y_values.push(value);
+        for (_, bandwidth) in &roofs {
+            let value = bandwidth * 10.0_f64.powf(x_min_log);
+            if value.is_finite() && value > 0.0 {
+                y_values.push(value);
+            }
         }
         let (y_min_log, y_max_log) = log_extent(&y_values, -1.0, 3.0);
 
         Self {
             points,
             calibration: data.calibration.clone(),
+            roofs,
             x_min_log,
             x_max_log,
             y_min_log,
@@ -512,6 +610,49 @@ impl RooflinePlot {
 
     fn y_fraction(&self, value: f64) -> f32 {
         log_fraction(value, self.y_min_log, self.y_max_log)
+    }
+
+    fn labels(&self, chart_size: Option<(f32, f32)>) -> Vec<RooflineLabel> {
+        let Some(calibration) = self.calibration.as_ref() else {
+            return Vec::new();
+        };
+
+        let (chart_width, chart_height) = chart_size.unwrap_or((1.0, 1.0));
+        let roof_slope = ((chart_height / chart_width)
+            * ((self.x_max_log - self.x_min_log) / (self.y_max_log - self.y_min_log)) as f32)
+            .atan();
+        let mut labels = self
+            .roofs
+            .iter()
+            .enumerate()
+            .map(|(index, (level, bandwidth))| {
+                // Stagger labels along the parallel sloped roofs. Keeping each
+                // one below its ridge places the value directly on its line
+                // without stacking the close L2/L3 labels on top of each other.
+                let desired_fraction = 0.14 + index as f64 * 0.14;
+                let desired_log =
+                    self.x_min_log + desired_fraction * (self.x_max_log - self.x_min_log);
+                let ridge_log = (calibration.fp64_gflops / bandwidth).log10();
+                let intensity = 10.0_f64.powf(desired_log.min(ridge_log - 0.08));
+                let gflops = bandwidth * intensity;
+                RooflineLabel {
+                    text: format!("{level} · {bandwidth:.2} GB/s"),
+                    x_fraction: self.x_fraction(intensity),
+                    y_fraction: self.y_fraction(gflops),
+                    color: if index == 0 { ACCENT } else { MUTED_TEXT },
+                    rotation_radians: -roof_slope,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        labels.push(RooflineLabel {
+            text: format!("FP64 · {:.2} GFLOP/s", calibration.fp64_gflops),
+            x_fraction: 0.72,
+            y_fraction: self.y_fraction(calibration.fp64_gflops),
+            color: ACCENT,
+            rotation_radians: 0.0,
+        });
+        labels
     }
 }
 
@@ -543,23 +684,46 @@ fn paint_roofline(
     }
 
     if let Some(calibration) = plot.calibration.as_ref() {
-        let mut path = PathBuilder::stroke(px(2.0));
-        for step in 0..=64 {
-            let fraction = step as f64 / 64.0;
-            let log_x = plot.x_min_log + fraction * (plot.x_max_log - plot.x_min_log);
-            let intensity = 10.0_f64.powf(log_x);
-            let gflops = calibration
-                .fp64_gflops
-                .min(calibration.memory_gbytes_per_second * intensity);
-            let position = plot_position(bounds, plot, intensity, gflops);
-            if step == 0 {
-                path.move_to(position);
-            } else {
-                path.line_to(position);
+        // Without usable bandwidth roofs only the compute ceiling is known.
+        if plot.roofs.is_empty() {
+            let mut path = PathBuilder::stroke(px(2.0));
+            path.move_to(plot_position(
+                bounds,
+                plot,
+                10.0_f64.powf(plot.x_min_log),
+                calibration.fp64_gflops,
+            ));
+            path.line_to(plot_position(
+                bounds,
+                plot,
+                10.0_f64.powf(plot.x_max_log),
+                calibration.fp64_gflops,
+            ));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(ACCENT));
             }
-        }
-        if let Ok(path) = path.build() {
-            window.paint_path(path, rgb(ACCENT));
+        } else {
+            // Draw the slowest level first so the fastest, which is the roof a
+            // cache-resident loop is actually bounded by, ends up on top.
+            for (index, (_, bandwidth)) in plot.roofs.iter().enumerate().rev() {
+                let binding = index == 0;
+                let mut path = PathBuilder::stroke(px(if binding { 2.0 } else { 1.0 }));
+                for (point_index, (intensity, gflops)) in
+                    roof_path_points(plot, calibration.fp64_gflops, *bandwidth)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let position = plot_position(bounds, plot, intensity, gflops);
+                    if point_index == 0 {
+                        path.move_to(position);
+                    } else {
+                        path.line_to(position);
+                    }
+                }
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, rgb(if binding { ACCENT } else { MUTED_TEXT }));
+                }
+            }
         }
     }
 
@@ -589,6 +753,28 @@ fn paint_roofline(
     }
 }
 
+fn roof_path_points(
+    plot: &RooflinePlot,
+    compute_gflops: f64,
+    bandwidth_gbytes_per_second: f64,
+) -> Vec<(f64, f64)> {
+    let x_min = 10.0_f64.powf(plot.x_min_log);
+    let x_max = 10.0_f64.powf(plot.x_max_log);
+    let ridge = compute_gflops / bandwidth_gbytes_per_second;
+    let mut points = vec![(
+        x_min,
+        compute_gflops.min(bandwidth_gbytes_per_second * x_min),
+    )];
+    if ridge > x_min && ridge < x_max {
+        points.push((ridge, compute_gflops));
+    }
+    points.push((
+        x_max,
+        compute_gflops.min(bandwidth_gbytes_per_second * x_max),
+    ));
+    points
+}
+
 fn nearest_point(
     bounds: Bounds<gpui::Pixels>,
     plot: &RooflinePlot,
@@ -605,6 +791,72 @@ fn nearest_point(
         })
         .min_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(index, _)| index)
+}
+
+fn nearest_roof(
+    bounds: Bounds<gpui::Pixels>,
+    plot: &RooflinePlot,
+    position: gpui::Point<gpui::Pixels>,
+) -> Option<usize> {
+    let calibration = plot.calibration.as_ref()?;
+    let x_min = 10.0_f64.powf(plot.x_min_log);
+    let x_max = 10.0_f64.powf(plot.x_max_log);
+    let mut candidates = plot
+        .roofs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, bandwidth))| {
+            let ridge = calibration.fp64_gflops / bandwidth;
+            (ridge > x_min).then(|| {
+                let start = plot_position(bounds, plot, x_min, bandwidth * x_min);
+                let end_intensity = ridge.min(x_max);
+                let end = plot_position(bounds, plot, end_intensity, bandwidth * end_intensity);
+                (index, point_segment_distance_squared(position, start, end))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let compute_start = plot
+        .roofs
+        .iter()
+        .map(|(_, bandwidth)| calibration.fp64_gflops / bandwidth)
+        .filter(|ridge| ridge.is_finite() && *ridge > 0.0)
+        .min_by(f64::total_cmp)
+        .unwrap_or(x_min)
+        .clamp(x_min, x_max);
+    candidates.push((
+        plot.roofs.len(),
+        point_segment_distance_squared(
+            position,
+            plot_position(bounds, plot, compute_start, calibration.fp64_gflops),
+            plot_position(bounds, plot, x_max, calibration.fp64_gflops),
+        ),
+    ));
+
+    candidates
+        .into_iter()
+        .filter(|(_, distance_squared)| *distance_squared <= 10.0 * 10.0)
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(index, _)| index)
+}
+
+fn point_segment_distance_squared(
+    point: gpui::Point<gpui::Pixels>,
+    start: gpui::Point<gpui::Pixels>,
+    end: gpui::Point<gpui::Pixels>,
+) -> f32 {
+    let segment_x = f32::from(end.x - start.x);
+    let segment_y = f32::from(end.y - start.y);
+    let point_x = f32::from(point.x - start.x);
+    let point_y = f32::from(point.y - start.y);
+    let length_squared = segment_x * segment_x + segment_y * segment_y;
+    if length_squared <= f32::EPSILON {
+        return point_x * point_x + point_y * point_y;
+    }
+    let fraction = ((point_x * segment_x + point_y * segment_y) / length_squared).clamp(0.0, 1.0);
+    let dx = point_x - fraction * segment_x;
+    let dy = point_y - fraction * segment_y;
+    dx * dx + dy * dy
 }
 
 fn plot_position(
@@ -632,12 +884,12 @@ fn log_extent(values: &[f64], default_min: f64, default_max: f64) -> (f64, f64) 
         minimum = minimum.min(value);
         maximum = maximum.max(value);
     }
-    minimum = minimum.floor() - 1.0;
-    maximum = maximum.ceil() + 1.0;
-    if maximum - minimum < 4.0 {
+    minimum -= 0.35;
+    maximum += 0.35;
+    if maximum - minimum < 3.0 {
         let center = (minimum + maximum) / 2.0;
-        minimum = center - 2.0;
-        maximum = center + 2.0;
+        minimum = center - 1.5;
+        maximum = center + 1.5;
     }
     (minimum, maximum)
 }
@@ -681,6 +933,40 @@ fn legend_item(color: u32, label: &'static str) -> Div {
         .child(label)
 }
 
+fn roofline_label_toggle(selected: bool, cx: &mut Context<MperfGui>) -> impl IntoElement {
+    div()
+        .id("roofline-show-labels")
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .gap_1()
+        .cursor_pointer()
+        .text_color(rgb(if selected { TEXT } else { MUTED_TEXT }))
+        .on_click(cx.listener(|view, _, _, cx| {
+            view.roofline_labels_always_visible = !view.roofline_labels_always_visible;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .w(px(24.0))
+                .h(px(14.0))
+                .flex()
+                .items_center()
+                .rounded_full()
+                .px(px(2.0))
+                .bg(rgb(if selected { ACCENT } else { BORDER }))
+                .child(
+                    div()
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .rounded_full()
+                        .bg(rgb(if selected { WORKSPACE } else { MUTED_TEXT }))
+                        .when(selected, |element| element.ml(px(10.0))),
+                ),
+        )
+        .child("Show labels")
+}
+
 fn roofline_loop_table_header() -> Div {
     div()
         .h(px(LOOP_HEADER_HEIGHT))
@@ -719,11 +1005,35 @@ fn numeric_cell(value: String, width: f32) -> Div {
 }
 
 fn loop_location(loop_data: &RooflineLoop) -> String {
-    match (loop_data.file_name.trim().is_empty(), loop_data.line > 0) {
+    let location = match (loop_data.file_name.trim().is_empty(), loop_data.line > 0) {
         (false, true) => format!("{}:{}", loop_data.file_name, loop_data.line),
         (false, false) => loop_data.file_name.clone(),
         (true, true) => format!("Line {}", loop_data.line),
-        (true, false) => "No source location".to_string(),
+        (true, false) => loop_data
+            .module_offset
+            .as_ref()
+            .map(|offset| format!("Binary {offset}"))
+            .unwrap_or_else(|| "No source location".to_string()),
+    };
+    if let Some(quality) = &loop_data.timing_quality {
+        let quality = match quality.as_str() {
+            "advisor-grade" => "Advisor-grade",
+            "low-confidence" => "Low confidence",
+            "insufficient-samples" => "Insufficient samples",
+            "unclassified-instructions" => "Unclassified instructions",
+            other => other,
+        };
+        let samples = loop_data
+            .timing_samples
+            .map(|samples| format!(" · {samples} samples"))
+            .unwrap_or_default();
+        let error = loop_data
+            .timing_relative_error
+            .map(|error| format!(" · ±{:.1}%", error * 100.0))
+            .unwrap_or_default();
+        format!("{location} · {quality}{samples}{error}")
+    } else {
+        location
     }
 }
 
@@ -772,6 +1082,7 @@ fn roofline_message(message: impl Into<String>, error: bool) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mperf_data::{MemoryLevelCalibration, RooflineCalibration, RooflineMethodInfo};
 
     fn loop_data(name: &str, gflops: f64, intensity: f64) -> RooflineLoop {
         RooflineLoop {
@@ -790,7 +1101,135 @@ mod tests {
             vector_float_ai: None,
             vector_double_ops: None,
             vector_double_ai: None,
+            timing_samples: None,
+            timing_relative_error: None,
+            timing_quality: None,
+            module_offset: None,
+            trip_count: None,
         }
+    }
+
+    fn carm_data() -> RooflineData {
+        RooflineData {
+            loops: vec![loop_data("matmul", 19.29, 0.083)],
+            calibration: Some(RooflineCalibration {
+                threads: 8,
+                cpu_affinity: Some("0-7".to_string()),
+                samples: 5,
+                compute_kernel: "x86-avx512-fma-f64".to_string(),
+                fp64_gflops: 234.22,
+                fp64_gflops_samples: vec![234.22],
+                memory_gbytes_per_second: 31.71,
+                memory_gbytes_per_second_samples: vec![31.71],
+                ridge_point_flops_per_byte: 7.39,
+                memory_working_set_bytes: 201_326_592,
+                memory_levels: vec![
+                    MemoryLevelCalibration {
+                        level: "L1".to_string(),
+                        gbytes_per_second: 773.43,
+                        gbytes_per_second_samples: vec![773.43],
+                        working_set_bytes: 98_304,
+                        capacity_bytes: 32 * 1024,
+                        shared_by: 1,
+                    },
+                    MemoryLevelCalibration {
+                        level: "L2".to_string(),
+                        gbytes_per_second: 395.96,
+                        gbytes_per_second_samples: vec![395.96],
+                        working_set_bytes: 2_621_376,
+                        capacity_bytes: 1_280 * 1024,
+                        shared_by: 1,
+                    },
+                    MemoryLevelCalibration {
+                        level: "L3".to_string(),
+                        gbytes_per_second: 292.20,
+                        gbytes_per_second_samples: vec![292.20],
+                        working_set_bytes: 5_767_104,
+                        capacity_bytes: 12 * 1024 * 1024,
+                        shared_by: 8,
+                    },
+                    MemoryLevelCalibration {
+                        level: "DRAM".to_string(),
+                        gbytes_per_second: 31.71,
+                        gbytes_per_second_samples: vec![31.71],
+                        working_set_bytes: 201_326_592,
+                        capacity_bytes: 0,
+                        shared_by: 8,
+                    },
+                ],
+            }),
+            method: Some(RooflineMethodInfo {
+                selection: "auto".to_string(),
+                accounting: "dynamorio".to_string(),
+                performance: "native".to_string(),
+                traffic: "architectural".to_string(),
+                quality: "hybrid-binary-aggregate-blocks".to_string(),
+                reason: "test".to_string(),
+                warnings: Vec::new(),
+            }),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn carm_plot_contains_every_calibrated_hierarchy_roof() {
+        let plot = RooflinePlot::build(&carm_data());
+
+        assert_eq!(
+            plot.roofs
+                .iter()
+                .map(|(level, _)| level.as_str())
+                .collect::<Vec<_>>(),
+            vec!["L1", "L2", "L3", "DRAM"]
+        );
+        for (_, bandwidth) in &plot.roofs {
+            let ridge = plot.calibration.as_ref().unwrap().fp64_gflops / bandwidth;
+            assert!(plot.x_fraction(ridge) > 0.0);
+            assert!(plot.x_fraction(ridge) < 1.0);
+        }
+    }
+
+    #[test]
+    fn roof_path_uses_the_exact_ridge_without_an_interpolated_kink() {
+        let plot = RooflinePlot::build(&carm_data());
+        let calibration = plot.calibration.as_ref().unwrap();
+        let bandwidth = plot.roofs[0].1;
+        let points = roof_path_points(&plot, calibration.fp64_gflops, bandwidth);
+
+        assert_eq!(points.len(), 3);
+        assert_eq!(
+            points[1],
+            (calibration.fp64_gflops / bandwidth, calibration.fp64_gflops)
+        );
+        assert_eq!(points[2].1, calibration.fp64_gflops);
+    }
+
+    #[test]
+    fn carm_labels_follow_the_roof_slope_and_keep_compute_horizontal() {
+        let labels = RooflinePlot::build(&carm_data()).labels(Some((600.0, 500.0)));
+
+        assert_eq!(labels.len(), 5);
+        assert_eq!(labels[0].text, "L1 · 773.43 GB/s");
+        assert!(labels[..4].iter().all(|label| label.rotation_radians < 0.0));
+        assert_eq!(labels[4].text, "FP64 · 234.22 GFLOP/s");
+        assert_eq!(labels[4].rotation_radians, 0.0);
+    }
+
+    #[test]
+    fn roof_hover_targets_bandwidth_and_compute_segments_separately() {
+        let plot = RooflinePlot::build(&carm_data());
+        let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(600.0), px(500.0)));
+        let calibration = plot.calibration.as_ref().unwrap();
+        let l1_bandwidth = plot.roofs[0].1;
+        let l1_intensity = calibration.fp64_gflops / l1_bandwidth / 2.0;
+        let l1_position = plot_position(bounds, &plot, l1_intensity, l1_bandwidth * l1_intensity);
+        let compute_position = plot_position(bounds, &plot, 4.0, calibration.fp64_gflops);
+
+        assert_eq!(nearest_roof(bounds, &plot, l1_position), Some(0));
+        assert_eq!(
+            nearest_roof(bounds, &plot, compute_position),
+            Some(plot.roofs.len())
+        );
     }
 
     #[test]
@@ -798,6 +1237,7 @@ mod tests {
         let data = RooflineData {
             loops: vec![loop_data("low", 1.0, 0.1), loop_data("high", 100.0, 10.0)],
             calibration: None,
+            method: None,
             error: None,
         };
         let plot = RooflinePlot::build(&data);
@@ -817,6 +1257,7 @@ mod tests {
         let data = RooflineData {
             loops: vec![loop_data("fp64", 10.0, 2.0), integer_only],
             calibration: None,
+            method: None,
             error: None,
         };
 

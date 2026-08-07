@@ -10,6 +10,7 @@ mod cpu_family;
 mod criterion_measurement;
 mod driver;
 mod event_timer;
+mod platform_memory;
 mod process;
 mod quick;
 
@@ -28,6 +29,7 @@ pub use event_timer::{
     CounterStatistics, EventTimer, Measurement, MeasurementSpan, MeasurementStatistics,
     Measurements, ReadCost, ReadMethod,
 };
+pub use platform_memory::{MemoryControllerMonitor, MemoryControllerSample};
 pub use pmu_data::{Metric, MetricError, MetricExpression};
 pub use process::Process;
 #[cfg(feature = "symbolize")]
@@ -176,6 +178,12 @@ pub enum Error {
     /// A sampling reader thread panicked.
     #[error("sampling worker thread panicked")]
     WorkerPanicked,
+    /// The kernel dropped sampling records because a perf ring overflowed.
+    #[error("perf sampling lost {count} records; reduce sampling frequency or increase the perf ring allowance")]
+    SamplesLost {
+        /// Number of records reported lost by the kernel.
+        count: u64,
+    },
     /// A grouped counter read failed.
     #[error("failed to read perf counter group: {source}")]
     PerfRead {

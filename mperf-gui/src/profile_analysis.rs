@@ -427,6 +427,19 @@ pub(crate) struct FunctionStat {
     pub self_samples: u64,
     pub inclusive_fraction: f64,
     pub self_fraction: f64,
+    pub metrics: FunctionMetrics,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct FunctionMetrics {
+    pub cpu_time_ns: Option<f64>,
+    pub cycles: Option<f64>,
+    pub instructions: Option<f64>,
+    pub ipc: Option<f64>,
+    pub llc_miss_rate: Option<f64>,
+    pub llc_mpki: Option<f64>,
+    pub backend_stall_fraction: Option<f64>,
+    pub branch_mpki: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -459,6 +472,7 @@ impl FunctionAnalysis {
         let mut inclusive = BTreeMap::<usize, u64>::new();
         let mut self_counts = BTreeMap::<usize, u64>::new();
         let mut edges = BTreeMap::<(usize, usize), u64>::new();
+        let mut counter_sums = BTreeMap::<usize, Vec<Option<f64>>>::new();
         let mut total_samples = 0u64;
 
         for sample in profile
@@ -472,6 +486,23 @@ impl FunctionAnalysis {
             }
             if let Some(frame_id) = sample.stack.last() {
                 *self_counts.entry(*frame_id).or_default() += 1;
+                let sums = counter_sums
+                    .entry(*frame_id)
+                    .or_insert_with(|| vec![None; profile.counter_metrics.len()]);
+                for ((sum, value), metric) in sums
+                    .iter_mut()
+                    .zip(&sample.counters)
+                    .zip(&profile.counter_metrics)
+                {
+                    if let Some(value) = value.filter(|value| value.is_finite()) {
+                        let value = if confidence_scaled_metric(&metric.key) {
+                            value / sample.confidence
+                        } else {
+                            value
+                        };
+                        *sum = Some(sum.unwrap_or_default() + value);
+                    }
+                }
             }
             for edge in sample
                 .stack
@@ -497,6 +528,10 @@ impl FunctionAnalysis {
                     self_samples,
                     inclusive_fraction: fraction(inclusive_samples, total_samples),
                     self_fraction: fraction(self_samples, total_samples),
+                    metrics: function_metrics(
+                        counter_sums.get(&frame_id).map(Vec::as_slice),
+                        &profile.counter_metrics,
+                    ),
                 }
             })
             .collect::<Vec<_>>();
@@ -556,6 +591,56 @@ impl FunctionAnalysis {
             fraction_of_function: fraction(samples, denominator),
         }
     }
+}
+
+fn function_metrics(
+    sums: Option<&[Option<f64>]>,
+    counter_metrics: &[CounterMetric],
+) -> FunctionMetrics {
+    let Some(sums) = sums else {
+        return FunctionMetrics::default();
+    };
+    let value = |candidates: &[&str]| {
+        find_metric(counter_metrics, candidates)
+            .and_then(|index| sums.get(index).copied().flatten())
+    };
+    let cycles = value(&["cycles", "pmu_cycles"]);
+    let instructions = value(&["instructions", "pmu_instructions"]);
+    let llc_misses = value(&["llc_misses", "pmu_llc_misses"]);
+    let llc_references = value(&["llc_references", "pmu_llc_references"]);
+    let backend_stalls = value(&["stalled_cycles_backend", "pmu_stalled_cycles_backend"]);
+    let branch_misses = value(&["branch_misses", "pmu_branch_misses"]);
+    let ratio = |numerator: Option<f64>, denominator: Option<f64>| {
+        numerator
+            .zip(denominator)
+            .filter(|(_, denominator)| *denominator > 0.0)
+            .map(|(numerator, denominator)| numerator / denominator)
+            .filter(|value| value.is_finite())
+    };
+
+    FunctionMetrics {
+        cpu_time_ns: value(&["os_cpu_clock", "cpu_clock"]),
+        cycles,
+        instructions,
+        ipc: ratio(instructions, cycles),
+        llc_miss_rate: ratio(
+            llc_misses,
+            llc_misses
+                .zip(llc_references)
+                .map(|(misses, references)| misses + references),
+        ),
+        llc_mpki: ratio(llc_misses.map(|value| value * 1_000.0), instructions),
+        backend_stall_fraction: ratio(backend_stalls, cycles),
+        branch_mpki: ratio(branch_misses.map(|value| value * 1_000.0), instructions),
+    }
+}
+
+fn confidence_scaled_metric(key: &str) -> bool {
+    let key = normalized_metric_key(key);
+    key.contains("llc")
+        || key.contains("branch")
+        || key.contains("stalledcycles")
+        || key.contains("cachemiss")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1187,6 +1272,7 @@ mod tests {
             process_id: 7,
             thread_id,
             cpu,
+            confidence: 1.0,
             stack: stack.to_vec(),
             counters: counters.to_vec(),
         }
@@ -1422,6 +1508,77 @@ mod tests {
             [("C", 2), ("D", 1)]
         );
         assert_close(details.callers[0].fraction_of_function, 0.8);
+    }
+
+    #[test]
+    fn function_analysis_attributes_useful_counter_metrics_to_the_sampled_leaf() {
+        let mut profile = profile(
+            vec![frame(0, "caller"), frame(1, "leaf")],
+            vec![
+                sample(
+                    0,
+                    1,
+                    None,
+                    &[0, 1],
+                    &[
+                        Some(10.0),
+                        Some(100.0),
+                        Some(200.0),
+                        Some(4.0),
+                        Some(16.0),
+                        Some(25.0),
+                        Some(2.0),
+                    ],
+                ),
+                sample(
+                    1,
+                    1,
+                    None,
+                    &[0, 1],
+                    &[
+                        Some(20.0),
+                        Some(300.0),
+                        Some(300.0),
+                        Some(6.0),
+                        Some(24.0),
+                        Some(75.0),
+                        Some(3.0),
+                    ],
+                ),
+            ],
+            vec![
+                metric("os_cpu_clock"),
+                metric("pmu_cycles"),
+                metric("pmu_instructions"),
+                metric("pmu_llc_misses"),
+                metric("pmu_llc_references"),
+                metric("pmu_stalled_cycles_backend"),
+                metric("pmu_branch_misses"),
+            ],
+        );
+        profile.samples[1].confidence = 0.5;
+
+        let analysis = FunctionAnalysis::build(&profile, &SampleFilter::default());
+        let caller = analysis
+            .functions
+            .iter()
+            .find(|row| row.frame_id == 0)
+            .unwrap();
+        let leaf = analysis
+            .functions
+            .iter()
+            .find(|row| row.frame_id == 1)
+            .unwrap();
+
+        assert_eq!(caller.metrics, FunctionMetrics::default());
+        assert_close(leaf.metrics.cpu_time_ns.unwrap(), 30.0);
+        assert_close(leaf.metrics.cycles.unwrap(), 400.0);
+        assert_close(leaf.metrics.instructions.unwrap(), 500.0);
+        assert_close(leaf.metrics.ipc.unwrap(), 1.25);
+        assert_close(leaf.metrics.llc_miss_rate.unwrap(), 0.2);
+        assert_close(leaf.metrics.llc_mpki.unwrap(), 32.0);
+        assert_close(leaf.metrics.backend_stall_fraction.unwrap(), 0.4375);
+        assert_close(leaf.metrics.branch_mpki.unwrap(), 16.0);
     }
 
     #[test]

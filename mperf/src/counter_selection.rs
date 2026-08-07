@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 pub fn get_pmu_counters(scenario: Scenario) -> Vec<Counter> {
     match scenario {
-        Scenario::Snapshot | Scenario::Roofline => vec![
+        Scenario::Snapshot | Scenario::Mem | Scenario::Roofline => vec![
             Counter::Cycles,
             Counter::Instructions,
             Counter::LLCReferences,
