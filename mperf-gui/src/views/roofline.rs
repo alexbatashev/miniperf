@@ -1132,15 +1132,15 @@ mod tests {
                     },
                     MemoryLevelCalibration {
                         level: "L2".to_string(),
-                        gbytes_per_second: 461.74,
-                        gbytes_per_second_samples: vec![461.74],
+                        gbytes_per_second: 395.96,
+                        gbytes_per_second_samples: vec![395.96],
                         working_set_bytes: 2_621_376,
                     },
                     MemoryLevelCalibration {
                         level: "L3".to_string(),
-                        gbytes_per_second: 418.34,
-                        gbytes_per_second_samples: vec![418.34],
-                        working_set_bytes: 4_194_240,
+                        gbytes_per_second: 292.20,
+                        gbytes_per_second_samples: vec![292.20],
+                        working_set_bytes: 5_767_104,
                     },
                     MemoryLevelCalibration {
                         level: "DRAM".to_string(),
