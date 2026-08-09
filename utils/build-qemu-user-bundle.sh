@@ -79,8 +79,27 @@ for binary in qemu-x86_64 qemu-riscv32 qemu-riscv64; do
     install -m 0755 "${install_directory}/usr/bin/${binary}" "${bundle_directory}/bin/${binary}"
     strip "${bundle_directory}/bin/${binary}"
 done
-capstone_library="$(pkg-config --variable=libdir capstone)/libcapstone.so.5"
-install -m 0755 "$(realpath "${capstone_library}")" "${bundle_directory}/lib/libcapstone.so.5"
+capstone_soname="$(
+    readelf -d "${bundle_directory}/bin/qemu-riscv64" |
+        awk '$2 == "(NEEDED)" && $5 ~ /\[libcapstone\.so\./ {
+            gsub(/\[|\]/, "", $5)
+            print $5
+            exit
+        }'
+)"
+if [[ -z "${capstone_soname}" ]]; then
+    printf 'Bundled QEMU does not declare a shared Capstone dependency\n' >&2
+    exit 1
+fi
+capstone_library="$(pkg-config --variable=libdir capstone)/${capstone_soname}"
+if [[ ! -e "${capstone_library}" ]]; then
+    printf 'QEMU requires %s, but pkg-config resolved no such Capstone library at %s\n' \
+        "${capstone_soname}" "${capstone_library}" >&2
+    exit 1
+fi
+install -m 0755 \
+    "$(realpath "${capstone_library}")" \
+    "${bundle_directory}/lib/${capstone_soname}"
 install -m 0644 \
     "${install_directory}/usr/include/qemu-plugin.h" \
     "${bundle_directory}/include/qemu-plugin.h"
