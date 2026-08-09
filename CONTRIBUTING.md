@@ -17,6 +17,6 @@ test must exercise its assertion independently of hardware access; when useful,
 include mutation-style evidence that a representative collector error fails.
 
 Hardware-backed tests belong in the `truth` crate as ignored, privilege-aware
-integration tests. The privileged CI job runs them with
-`kernel.perf_event_paranoid=-1`; local instructions are in `truth/README.md`.
+integration tests. Run them on controlled hardware using the instructions in
+`truth/README.md`; GitHub-hosted runners do not provide a reliable hardware PMU.
 Do not weaken or silently skip an assertion after recording has started.

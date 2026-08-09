@@ -5,7 +5,11 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         let out_dir = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
         let output = out_dir.join("libmperf_memory_preload.so");
-        let status = std::process::Command::new("cc")
+        let target = std::env::var("TARGET").unwrap();
+        let host = std::env::var("HOST").unwrap();
+        let compiler = cc::Build::new().target(&target).host(&host).get_compiler();
+        let status = std::process::Command::new(compiler.path())
+            .args(compiler.args())
             .args(["-shared", "-fPIC", "-O2", "-o"])
             .arg(&output)
             .arg("src/memory_preload.c")
@@ -16,7 +20,10 @@ fn main() {
             status.success(),
             "compile memory allocation preload collector"
         );
-        println!("cargo:rustc-env=MPERF_MEMORY_PRELOAD={}", output.display());
+        println!(
+            "cargo:rustc-env=MPERF_BUILD_MEMORY_PRELOAD={}",
+            output.display()
+        );
     }
 
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv64") {

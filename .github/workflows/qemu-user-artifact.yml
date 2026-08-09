@@ -1,16 +1,13 @@
 name: QEMU user-mode release artifact
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       release_tag:
-        description: Existing GitHub Release tag to receive the bundle; leave empty to only upload an Actions artifact
+        description: Existing GitHub Release tag to receive the bundle
         required: false
+        default: ''
         type: string
-
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -76,7 +73,7 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
       - name: Attach bundle to an existing GitHub Release
-        if: ${{ inputs.release_tag != '' }}
+        if: inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ inputs.release_tag }}" dist/*.tar.xz dist/*.sha256 --clobber
