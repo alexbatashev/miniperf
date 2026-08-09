@@ -87,19 +87,17 @@ capstone_soname="$(
             exit
         }'
 )"
-if [[ -z "${capstone_soname}" ]]; then
-    printf 'Bundled QEMU does not declare a shared Capstone dependency\n' >&2
-    exit 1
+if [[ -n "${capstone_soname}" ]]; then
+    capstone_library="$(pkg-config --variable=libdir capstone)/${capstone_soname}"
+    if [[ ! -e "${capstone_library}" ]]; then
+        printf 'QEMU requires %s, but pkg-config resolved no such Capstone library at %s\n' \
+            "${capstone_soname}" "${capstone_library}" >&2
+        exit 1
+    fi
+    install -m 0755 \
+        "$(realpath "${capstone_library}")" \
+        "${bundle_directory}/lib/${capstone_soname}"
 fi
-capstone_library="$(pkg-config --variable=libdir capstone)/${capstone_soname}"
-if [[ ! -e "${capstone_library}" ]]; then
-    printf 'QEMU requires %s, but pkg-config resolved no such Capstone library at %s\n' \
-        "${capstone_soname}" "${capstone_library}" >&2
-    exit 1
-fi
-install -m 0755 \
-    "$(realpath "${capstone_library}")" \
-    "${bundle_directory}/lib/${capstone_soname}"
 install -m 0644 \
     "${install_directory}/usr/include/qemu-plugin.h" \
     "${bundle_directory}/include/qemu-plugin.h"
