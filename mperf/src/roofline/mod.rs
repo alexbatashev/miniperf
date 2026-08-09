@@ -560,10 +560,10 @@ async fn profile_command(
             "MPERF_MEMORY_ALLOCATIONS".to_string(),
             allocation_path.to_string_lossy().into_owned(),
         ));
-        if let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD") {
+        if let Some(preload) = memory_preload_path() {
             let preload = std::env::var("LD_PRELOAD")
-                .map(|current| format!("{preload}:{current}"))
-                .unwrap_or_else(|_| preload.to_string());
+                .map(|current| format!("{}:{current}", preload.display()))
+                .unwrap_or_else(|_| preload.to_string_lossy().into_owned());
             env.push(("LD_PRELOAD".to_string(), preload));
         }
     }
@@ -791,6 +791,26 @@ fn executable_directory() -> std::io::Result<PathBuf> {
     let mut path = std::env::current_exe()?;
     path.pop();
     Ok(path)
+}
+
+#[cfg(target_os = "linux")]
+fn installed_library(name: &str) -> Option<PathBuf> {
+    let executable_directory = executable_directory().ok()?;
+    [
+        executable_directory.join(name),
+        executable_directory.join("../lib/miniperf").join(name),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+#[cfg(target_os = "linux")]
+fn memory_preload_path() -> Option<PathBuf> {
+    installed_library("libmperf_memory_preload.so").or_else(|| {
+        option_env!("MPERF_BUILD_MEMORY_PRELOAD")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+    })
 }
 
 fn command_name(command: &[String]) -> &str {

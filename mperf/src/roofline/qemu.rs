@@ -324,10 +324,10 @@ impl QemuBackend {
                 if self.memory_profile { "on" } else { "off" }
             ));
             if self.memory_profile
-                && let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD")
+                && let Some(preload) = super::memory_preload_path()
             {
                 command.push("-E".to_string());
-                command.push(format!("LD_PRELOAD={preload}"));
+                command.push(format!("LD_PRELOAD={}", preload.display()));
                 command.push("-E".to_string());
                 command.push("MPERF_MEMORY_ALLOCATIONS=/dev/null".to_string());
             }
@@ -378,9 +378,12 @@ impl QemuBackend {
                 command.extend(guest.iter().cloned());
                 let mut env = Vec::new();
                 if self.memory_profile
-                    && let Some(preload) = option_env!("MPERF_MEMORY_PRELOAD")
+                    && let Some(preload) = super::memory_preload_path()
                 {
-                    env.push(("LD_PRELOAD".to_string(), preload.to_string()));
+                    env.push((
+                        "LD_PRELOAD".to_string(),
+                        preload.to_string_lossy().into_owned(),
+                    ));
                     env.push((
                         "MPERF_MEMORY_ALLOCATIONS".to_string(),
                         "/dev/null".to_string(),
@@ -1652,9 +1655,11 @@ fn hex(address: u64) -> String {
 
 #[cfg(target_os = "linux")]
 fn default_plugin_path() -> PathBuf {
-    super::executable_directory()
-        .unwrap_or_default()
-        .join("libminiperf_qemu_roofline.so")
+    super::installed_library("libminiperf_qemu_roofline.so").unwrap_or_else(|| {
+        super::executable_directory()
+            .unwrap_or_default()
+            .join("libminiperf_qemu_roofline.so")
+    })
 }
 
 fn qemu_binary_for_architecture(architecture: object::Architecture) -> Option<&'static str> {

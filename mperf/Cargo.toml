@@ -3,6 +3,18 @@ name = "mperf"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+description = "Cross-platform sampling profiler and performance analysis toolkit"
+repository = "https://github.com/alexbatashev/miniperf"
+readme = "../README.md"
+default-run = "mperf"
+
+[lib]
+name = "mperf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mperf"
+path = "src/bin/mperf.rs"
 
 [dependencies]
 clap = { version = "4.5.23", features = ["derive"] }

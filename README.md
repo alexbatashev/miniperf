@@ -39,6 +39,14 @@ cd miniperf
 cargo build --release
 ```
 
+To create the same relocatable package produced by CI, choose a Rust target and
+run the packaging helper. Linux packages contain the CLI plus the Roofline and
+memory-preload shared libraries under `lib/miniperf`.
+
+```sh
+utils/package-miniperf.sh "$(rustc -vV | sed -n 's/^host: //p')" dist
+```
+
 #### Building Clang plugins
 
 Compiler-based source-loop instrumentation is an optional Roofline fallback:

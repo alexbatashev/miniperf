@@ -1,0 +1,88 @@
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Release tag that receives the packages; empty for CI artifacts only
+        required: false
+        default: ''
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install workspace dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-targets
+      - name: Check PMU feature combinations and docs
+        run: |
+          cargo check -p miniperf-pmu --no-default-features
+          cargo clippy -p miniperf-pmu --all-features --all-targets -- -D warnings
+          RUSTDOCFLAGS="-D warnings" cargo doc -p miniperf-pmu -p miniperf-pmu-data --all-features --no-deps
+
+  package:
+    name: Package (${{ matrix.platform }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: linux-riscv64
+            runner: ubuntu-24.04
+            target: riscv64gc-unknown-linux-gnu
+          - platform: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install RISC-V cross compiler
+        if: matrix.target == 'riscv64gc-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-${{ matrix.target }}
+      - name: Build package
+        env:
+          CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+          CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+        run: utils/package-miniperf.sh "${{ matrix.target }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miniperf-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+      - name: Attach package to release
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" dist/* --clobber

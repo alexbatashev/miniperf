@@ -106,8 +106,8 @@ enum Commands {
     },
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> Result<()> {
+/// Parse the command line and run the miniperf application.
+pub async fn run() -> Result<()> {
     let args = Cli::parse();
 
     match args.command {
@@ -117,12 +117,13 @@ async fn main() -> Result<()> {
             topdown,
             level,
             command,
-        } => return do_stat(pid, command, events, topdown.then_some(level)),
+        } => do_stat(pid, command, events, topdown.then_some(level)),
         Commands::List => {
             let events = pmu::list_supported_counters(pmu::DriverKind::Default);
             for event in events {
                 println!("{} - {}", event.name(), event.description());
             }
+            Ok(())
         }
         Commands::Record {
             scenario,
@@ -154,28 +155,19 @@ async fn main() -> Result<()> {
                 .context("profiling results must be put in different directories"));
             }
             std::fs::create_dir_all(&output_directory)?;
-
             let output_directory = PathBuf::from_str(&output_directory)?;
-
-            return do_record(scenario, &output_directory, pid, command, roofline).await;
+            do_record(scenario, &output_directory, pid, command, roofline).await
         }
-        Commands::Show { result_directory } => {
-            let path = Path::new(&result_directory);
-            return tui::tui_main(path).await;
-        }
+        Commands::Show { result_directory } => tui::tui_main(Path::new(&result_directory)).await,
         Commands::EventsExport { result_directory } => {
-            let path = Path::new(&result_directory);
-            do_events_export(path);
+            do_events_export(Path::new(&result_directory));
+            Ok(())
         }
         Commands::Query {
             arguments,
             format,
             file,
             max_rows,
-        } => {
-            return do_query(arguments, file, format, max_rows);
-        }
+        } => do_query(arguments, file, format, max_rows),
     }
-
-    Ok(())
 }
