@@ -17,12 +17,17 @@ staging_root="$(mktemp -d "${TMPDIR:-/tmp}/miniperf-package.XXXXXX")"
 trap 'rm -rf "${staging_root}"' EXIT
 package_root="${staging_root}/${package_name}"
 
+package_crates=(-p mperf -p collector)
+if [[ "${target}" != riscv64gc-unknown-linux-gnu ]]; then
+    package_crates+=(-p mperf-gui)
+fi
+
 cargo build \
     --locked \
     --release \
     --target "${target}" \
     --manifest-path "${repository_root}/Cargo.toml" \
-    -p mperf
+    "${package_crates[@]}"
 
 mkdir -p \
     "${package_root}/bin" \
@@ -33,6 +38,9 @@ install -m 0644 "${repository_root}/README.md" "${package_root}/share/doc/minipe
 install -m 0644 "${repository_root}/LICENSE" "${package_root}/share/doc/miniperf/LICENSE"
 
 if [[ "${target}" == *-linux-* ]]; then
+    install -m 0755 \
+        "${target_directory}/${target}/release/libcollector.so" \
+        "${package_root}/lib/miniperf/libcollector.so"
     cargo build \
         --locked \
         --release \
@@ -54,6 +62,16 @@ if [[ "${target}" == *-linux-* ]]; then
     install -m 0755 \
         "${preload_library}" \
         "${package_root}/lib/miniperf/libmperf_memory_preload.so"
+else
+    install -m 0755 \
+        "${target_directory}/${target}/release/libcollector.dylib" \
+        "${package_root}/lib/miniperf/libcollector.dylib"
+fi
+
+if [[ "${target}" != riscv64gc-unknown-linux-gnu ]]; then
+    install -m 0755 \
+        "${target_directory}/${target}/release/mperf-gui" \
+        "${package_root}/bin/mperf-gui"
 fi
 
 {

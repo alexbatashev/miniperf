@@ -13,34 +13,107 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  quality:
-    name: Quality gates
-    runs-on: ubuntu-24.04
+  verify:
+    name: ${{ matrix.task }} (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            task: build
+            command: cargo build --workspace --all-targets
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            task: test
+            command: cargo test --workspace --all-targets
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            task: clippy
+            command: cargo clippy --workspace --all-targets -- -D warnings
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            task: fmt
+            command: cargo fmt --all -- --check
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            task: pmu-features
+            command: cargo check -p miniperf-pmu --no-default-features && cargo clippy -p miniperf-pmu --all-features --all-targets -- -D warnings
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            task: pmu-docs
+            command: RUSTDOCFLAGS="-D warnings" cargo doc -p miniperf-pmu -p miniperf-pmu-data --all-features --no-deps
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            task: build
+            command: cargo build --workspace --all-targets
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            task: test
+            command: cargo test --workspace --all-targets
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            task: clippy
+            command: cargo clippy --workspace --all-targets -- -D warnings
+          - platform: linux-riscv64
+            runner: ubuntu-24.04
+            target: riscv64gc-unknown-linux-gnu
+            task: build
+            command: CC=riscv64-linux-gnu-gcc cargo build --workspace --exclude mperf-gui --all-targets --target riscv64gc-unknown-linux-gnu
+          - platform: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            task: build
+            command: cargo build --workspace --all-targets
+          - platform: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            task: test
+            command: cargo test --workspace --all-targets
+          - platform: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            task: clippy
+            command: cargo clippy --workspace --all-targets -- -D warnings
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install workspace dependencies
+      - name: Install GPUI Linux dependencies
+        if: runner.os == 'Linux' && matrix.target != 'riscv64gc-unknown-linux-gnu' && (matrix.task == 'build' || matrix.task == 'test')
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install RISC-V cross compiler
+        if: matrix.target == 'riscv64gc-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Lint workspace
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test workspace
-        run: cargo test --workspace --all-targets
-      - name: Check PMU feature combinations and docs
-        run: |
-          cargo check -p miniperf-pmu --no-default-features
-          cargo clippy -p miniperf-pmu --all-features --all-targets -- -D warnings
-          RUSTDOCFLAGS="-D warnings" cargo doc -p miniperf-pmu -p miniperf-pmu-data --all-features --no-deps
+        with:
+          key: verify-${{ matrix.platform }}-${{ matrix.task }}
+      - name: Run ${{ matrix.task }}
+        env:
+          CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
+          CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER: riscv64-linux-gnu-gcc
+        run: ${{ matrix.command }}
 
   package:
     name: Package (${{ matrix.platform }})
-    needs: quality
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +133,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: Install GPUI Linux dependencies
+        if: runner.os == 'Linux' && matrix.target != 'riscv64gc-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       - name: Install RISC-V cross compiler
         if: matrix.target == 'riscv64gc-unknown-linux-gnu'
         run: |
@@ -86,3 +164,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ inputs.release_tag }}" dist/* --clobber
+
+  dynamorio:
+    name: DynamoRIO bundle
+    needs: verify
+    uses: ./.github/workflows/dynamorio-artifact.yml
+    with:
+      release_tag: ${{ inputs.release_tag }}
+
+  qemu-user:
+    name: QEMU user-mode bundle
+    needs: verify
+    uses: ./.github/workflows/qemu-user-artifact.yml
+    with:
+      release_tag: ${{ inputs.release_tag }}
