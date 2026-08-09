@@ -8,16 +8,6 @@ on:
         required: false
         default: ''
         type: string
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Existing GitHub Release tag to receive the bundle; leave empty to only upload an Actions artifact
-        required: false
-        type: string
-
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-22.04
