@@ -813,6 +813,11 @@ fn memory_preload_path() -> Option<PathBuf> {
     })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn memory_preload_path() -> Option<PathBuf> {
+    None
+}
+
 fn command_name(command: &[String]) -> &str {
     Path::new(&command[0])
         .file_name()
