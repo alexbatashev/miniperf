@@ -94,11 +94,13 @@ validate_capture() {
             "${architecture}" "${counters[rvv_state_errors]}" "${counters[unclassified_instructions]}" >&2
         return 1
     fi
-    if [[ "$(head -n 1 "${cfg_path}")" != 'miniperf-qemu-cfg=3' ]]; then
-        printf '%s capture has an unsupported CFG format\n' "${architecture}" >&2
+    local cfg_header
+    cfg_header="$(head -n 1 "${cfg_path}")"
+    if [[ "${cfg_header}" != 'miniperf-qemu-cfg=4' ]]; then
+        printf '%s capture has an unsupported CFG format: %s\n' "${architecture}" "${cfg_header}" >&2
         return 1
     fi
-    if ! grep -Eq '^cache [1-9][0-9]* [1-9][0-9]* [1-9][0-9]* write-back-no-rfo$' "${cfg_path}" || \
+    if ! grep -Eq '^cache [1-9][0-9]* [1-9][0-9]* [1-9][0-9]* write-back-write-allocate$' "${cfg_path}" || \
         ! grep -Eq '^image 0x[0-9a-f]+ 0x[0-9a-f]+ 0x[0-9a-f]+$' "${cfg_path}" || \
         ! grep -Eq '^block 0x[0-9a-f]+ 0x[0-9a-f]+ [1-9][0-9]* ' "${cfg_path}"; then
         printf '%s capture is missing image metadata or executed block ranges\n' "${architecture}" >&2
