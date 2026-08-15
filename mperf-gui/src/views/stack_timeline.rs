@@ -40,7 +40,7 @@ impl MperfGui {
 
         let filter = self.profile_sample_filter();
         let selected_frames = filter.frame_ids.clone().unwrap_or_default();
-        let Some(timeline) = TimeOrderTimeline::build(profile, &filter, MAX_BINS) else {
+        let Some(timeline) = self.cached_timeline(MAX_BINS) else {
             return timeline_message(
                 "The matching samples do not span a measurable time range.",
                 false,

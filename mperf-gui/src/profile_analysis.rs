@@ -469,11 +469,18 @@ pub(crate) struct FunctionAnalysis {
 impl FunctionAnalysis {
     pub fn build(profile: &ProfileData, filter: &SampleFilter) -> Self {
         let labels = frame_labels(&profile.frames);
+        let confidence_scaled = profile
+            .counter_metrics
+            .iter()
+            .map(|metric| confidence_scaled_metric(&metric.key))
+            .collect::<Vec<_>>();
         let mut inclusive = BTreeMap::<usize, u64>::new();
         let mut self_counts = BTreeMap::<usize, u64>::new();
         let mut edges = BTreeMap::<(usize, usize), u64>::new();
         let mut counter_sums = BTreeMap::<usize, Vec<Option<f64>>>::new();
         let mut total_samples = 0u64;
+        let mut unique_frames = Vec::new();
+        let mut unique_edges = Vec::new();
 
         for sample in profile
             .samples
@@ -481,21 +488,25 @@ impl FunctionAnalysis {
             .filter(|sample| filter.matches(sample))
         {
             total_samples = total_samples.saturating_add(1);
-            for frame_id in sample.stack.iter().copied().collect::<BTreeSet<_>>() {
-                *inclusive.entry(frame_id).or_default() += 1;
+            unique_frames.clear();
+            unique_frames.extend_from_slice(&sample.stack);
+            unique_frames.sort_unstable();
+            unique_frames.dedup();
+            for frame_id in &unique_frames {
+                *inclusive.entry(*frame_id).or_default() += 1;
             }
             if let Some(frame_id) = sample.stack.last() {
                 *self_counts.entry(*frame_id).or_default() += 1;
                 let sums = counter_sums
                     .entry(*frame_id)
                     .or_insert_with(|| vec![None; profile.counter_metrics.len()]);
-                for ((sum, value), metric) in sums
+                for ((sum, value), scaled) in sums
                     .iter_mut()
                     .zip(&sample.counters)
-                    .zip(&profile.counter_metrics)
+                    .zip(&confidence_scaled)
                 {
                     if let Some(value) = value.filter(|value| value.is_finite()) {
-                        let value = if confidence_scaled_metric(&metric.key) {
+                        let value = if *scaled {
                             value / sample.confidence
                         } else {
                             value
@@ -504,16 +515,16 @@ impl FunctionAnalysis {
                     }
                 }
             }
-            for edge in sample
-                .stack
-                .windows(2)
-                .map(|frames| (frames[0], frames[1]))
-                .collect::<BTreeSet<_>>()
-            {
-                *edges.entry(edge).or_default() += 1;
+            unique_edges.clear();
+            unique_edges.extend(sample.stack.windows(2).map(|frames| (frames[0], frames[1])));
+            unique_edges.sort_unstable();
+            unique_edges.dedup();
+            for edge in &unique_edges {
+                *edges.entry(*edge).or_default() += 1;
             }
         }
 
+        let metric_indices = MetricIndices::resolve(&profile.counter_metrics);
         let mut functions = inclusive
             .into_iter()
             .map(|(frame_id, inclusive_samples)| {
@@ -530,7 +541,7 @@ impl FunctionAnalysis {
                     self_fraction: fraction(self_samples, total_samples),
                     metrics: function_metrics(
                         counter_sums.get(&frame_id).map(Vec::as_slice),
-                        &profile.counter_metrics,
+                        metric_indices,
                     ),
                 }
             })
@@ -593,23 +604,46 @@ impl FunctionAnalysis {
     }
 }
 
-fn function_metrics(
-    sums: Option<&[Option<f64>]>,
-    counter_metrics: &[CounterMetric],
-) -> FunctionMetrics {
+/// Counter column positions, resolved once per analysis instead of per function.
+#[derive(Clone, Copy, Debug, Default)]
+struct MetricIndices {
+    cpu_time: Option<usize>,
+    cycles: Option<usize>,
+    instructions: Option<usize>,
+    llc_misses: Option<usize>,
+    llc_references: Option<usize>,
+    backend_stalls: Option<usize>,
+    branch_misses: Option<usize>,
+}
+
+impl MetricIndices {
+    fn resolve(metrics: &[CounterMetric]) -> Self {
+        Self {
+            cpu_time: find_metric(metrics, &["os_cpu_clock", "cpu_clock"]),
+            cycles: find_metric(metrics, &["cycles", "pmu_cycles"]),
+            instructions: find_metric(metrics, &["instructions", "pmu_instructions"]),
+            llc_misses: find_metric(metrics, &["llc_misses", "pmu_llc_misses"]),
+            llc_references: find_metric(metrics, &["llc_references", "pmu_llc_references"]),
+            backend_stalls: find_metric(
+                metrics,
+                &["stalled_cycles_backend", "pmu_stalled_cycles_backend"],
+            ),
+            branch_misses: find_metric(metrics, &["branch_misses", "pmu_branch_misses"]),
+        }
+    }
+}
+
+fn function_metrics(sums: Option<&[Option<f64>]>, indices: MetricIndices) -> FunctionMetrics {
     let Some(sums) = sums else {
         return FunctionMetrics::default();
     };
-    let value = |candidates: &[&str]| {
-        find_metric(counter_metrics, candidates)
-            .and_then(|index| sums.get(index).copied().flatten())
-    };
-    let cycles = value(&["cycles", "pmu_cycles"]);
-    let instructions = value(&["instructions", "pmu_instructions"]);
-    let llc_misses = value(&["llc_misses", "pmu_llc_misses"]);
-    let llc_references = value(&["llc_references", "pmu_llc_references"]);
-    let backend_stalls = value(&["stalled_cycles_backend", "pmu_stalled_cycles_backend"]);
-    let branch_misses = value(&["branch_misses", "pmu_branch_misses"]);
+    let value = |index: Option<usize>| index.and_then(|index| sums.get(index).copied().flatten());
+    let cycles = value(indices.cycles);
+    let instructions = value(indices.instructions);
+    let llc_misses = value(indices.llc_misses);
+    let llc_references = value(indices.llc_references);
+    let backend_stalls = value(indices.backend_stalls);
+    let branch_misses = value(indices.branch_misses);
     let ratio = |numerator: Option<f64>, denominator: Option<f64>| {
         numerator
             .zip(denominator)
@@ -619,7 +653,7 @@ fn function_metrics(
     };
 
     FunctionMetrics {
-        cpu_time_ns: value(&["os_cpu_clock", "cpu_clock"]),
+        cpu_time_ns: value(indices.cpu_time),
         cycles,
         instructions,
         ipc: ratio(instructions, cycles),
@@ -853,6 +887,7 @@ pub(crate) struct CpuUtilizationHeatmap {
 }
 
 impl CpuUtilizationHeatmap {
+    #[cfg(test)]
     pub fn build(profile: &ProfileData, filter: &SampleFilter, max_buckets: usize) -> Option<Self> {
         Self::build_with_bucket_duration(profile, filter, max_buckets, None)
     }

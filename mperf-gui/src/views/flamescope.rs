@@ -30,9 +30,7 @@ impl MperfGui {
 
         // Keep the folded time domain visible while a time range is selected,
         // but apply every other global constraint so all central views agree.
-        let mut filter = self.profile_sample_filter();
-        filter.range = None;
-        let Some(heatmap) = FlameScopeHeatmap::build(profile, &filter, MAX_COLUMNS) else {
+        let Some(heatmap) = self.cached_flamescope(MAX_COLUMNS) else {
             return flamescope_message(
                 "This recording has no timestamped samples for FlameScope.",
                 false,

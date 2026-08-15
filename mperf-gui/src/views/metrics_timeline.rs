@@ -26,8 +26,7 @@ impl MperfGui {
             return metrics_message(error, true);
         }
 
-        let filter = self.profile_sample_filter();
-        let Some(tracks) = CounterTracks::build(&model.profile, &filter, MAX_BINS) else {
+        let Some(tracks) = self.cached_counter_tracks(MAX_BINS) else {
             return metrics_message(
                 "This recording has no timestamped counter samples for a metrics timeline.",
                 false,
