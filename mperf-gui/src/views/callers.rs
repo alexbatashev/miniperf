@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use gpui::{Context, Div, FontWeight, SharedString, div, prelude::*, px, rgb};
+use std::rc::Rc;
+
+use gpui::{Context, Div, FontWeight, SharedString, div, prelude::*, px, rgb, uniform_list};
 
 use crate::{
     MperfGui,
@@ -46,7 +48,14 @@ impl MperfGui {
 
         let filter = self.profile_sample_filter();
         let filter_active = sample_filter_is_active(&filter);
-        let analysis = FunctionAnalysis::build(&model.profile, &filter);
+        let Some(analysis) = self.cached_function_analysis() else {
+            return callers_message(
+                "This recording has no timestamped call-stack samples.",
+                false,
+                false,
+                cx,
+            );
+        };
         if analysis.total_samples == 0 {
             return callers_message(
                 "No call-stack samples match the active filter.",
@@ -101,7 +110,7 @@ impl MperfGui {
                     .min_h(px(0.0))
                     .flex_1()
                     .flex()
-                    .child(self.render_ranked_functions(&analysis, selected_frame, cx))
+                    .child(self.render_ranked_functions(analysis.clone(), selected_frame, cx))
                     .child(self.render_sandwich(details, cx)),
             )
     }
@@ -177,7 +186,7 @@ impl MperfGui {
 
     fn render_ranked_functions(
         &self,
-        analysis: &FunctionAnalysis,
+        analysis: Rc<FunctionAnalysis>,
         selected_frame: usize,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -212,105 +221,111 @@ impl MperfGui {
                     .child(div().flex_1().child("FUNCTION"))
                     .child(div().w(px(68.0)).text_right().child("INCL %")),
             )
-            .child(
-                div()
-                    .id("callers-ranked-functions-scroll")
-                    .min_h(px(0.0))
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(
-                        analysis
-                            .functions
-                            .iter()
-                            .enumerate()
-                            .map(|(index, function)| {
-                                self.render_ranked_function_row(
+            .child({
+                let entity = cx.entity();
+                uniform_list(
+                    "callers-ranked-functions-scroll",
+                    analysis.functions.len(),
+                    move |range, _, _| {
+                        range
+                            .map(|index| {
+                                let function = &analysis.functions[index];
+                                ranked_function_row(
                                     index,
                                     function,
                                     function.frame_id == selected_frame,
-                                    cx,
+                                    entity.clone(),
                                 )
-                            }),
-                    ),
-            )
+                            })
+                            .collect()
+                    },
+                )
+                .min_h(px(0.0))
+                .flex_1()
+            })
     }
+}
 
-    fn render_ranked_function_row(
-        &self,
-        index: usize,
-        function: &FunctionStat,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let frame_id = function.frame_id;
-        let label = function.label.clone();
-        let samples = format!(
-            "{} self · {} incl",
-            function.self_samples, function.inclusive_samples
-        );
+fn ranked_function_row(
+    index: usize,
+    function: &FunctionStat,
+    selected: bool,
+    entity: gpui::Entity<MperfGui>,
+) -> impl IntoElement + use<> {
+    let frame_id = function.frame_id;
+    let label = function.label.clone();
+    let samples = format!(
+        "{} self · {} incl",
+        function.self_samples, function.inclusive_samples
+    );
 
-        div()
-            .id(SharedString::from(format!(
-                "callers-ranked-function-{index}"
-            )))
-            .h(px(FUNCTION_ROW_HEIGHT))
-            .min_h(px(FUNCTION_ROW_HEIGHT))
-            .flex()
-            .items_center()
-            .overflow_hidden()
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .cursor_pointer()
-            .when(selected, |element| {
-                element
-                    .bg(rgb(SELECTION_MUTED))
-                    .border_l_2()
-                    .border_color(rgb(ACCENT))
-            })
-            .when(!selected, |element| {
-                element.hover(|element| element.bg(rgb(HOVER)))
-            })
-            .on_click(cx.listener(move |view, _, _, cx| {
+    div()
+        .id(SharedString::from(format!(
+            "callers-ranked-function-{index}"
+        )))
+        // uniform_list lays rows out as roots, so they must claim the width.
+        .w_full()
+        .h(px(FUNCTION_ROW_HEIGHT))
+        .min_h(px(FUNCTION_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .border_b_1()
+        .border_color(rgb(BORDER))
+        .cursor_pointer()
+        .when(selected, |element| {
+            element
+                .bg(rgb(SELECTION_MUTED))
+                .border_l_2()
+                .border_color(rgb(ACCENT))
+        })
+        .when(!selected, |element| {
+            element.hover(|element| element.bg(rgb(HOVER)))
+        })
+        .on_click(move |_, _, cx| {
+            entity.update(cx, |view, cx| {
                 view.select_profile_function(frame_id);
                 cx.notify();
-            }))
-            .child(
-                div()
-                    .w(px(RANK_WIDTH))
-                    .min_w(px(RANK_WIDTH))
-                    .pl_3()
-                    .text_xs()
-                    .text_color(rgb(MUTED_TEXT))
-                    .child(format!("{}", index + 1)),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .justify_center()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(div().line_height(px(18.0)).text_sm().child(label))
-                    .child(
-                        div()
-                            .line_height(px(16.0))
-                            .text_xs()
-                            .text_color(rgb(MUTED_TEXT))
-                            .child(samples),
-                    ),
-            )
-            .child(
-                div()
-                    .w(px(72.0))
-                    .pr_3()
-                    .text_right()
-                    .text_sm()
-                    .child(format_percent(function.inclusive_fraction)),
-            )
-    }
+            })
+        })
+        .child(
+            div()
+                .w(px(RANK_WIDTH))
+                .min_w(px(RANK_WIDTH))
+                .pl_3()
+                .text_xs()
+                .text_color(rgb(MUTED_TEXT))
+                .child(format!("{}", index + 1)),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(div().line_height(px(18.0)).text_sm().child(label))
+                .child(
+                    div()
+                        .line_height(px(16.0))
+                        .text_xs()
+                        .text_color(rgb(MUTED_TEXT))
+                        .child(samples),
+                ),
+        )
+        .child(
+            div()
+                .w(px(72.0))
+                .pr_3()
+                .text_right()
+                .text_sm()
+                .child(format_percent(function.inclusive_fraction)),
+        )
+}
 
+impl MperfGui {
     fn render_sandwich(&self, details: FunctionDetails, cx: &mut Context<Self>) -> Div {
         let current = details.function;
         div()

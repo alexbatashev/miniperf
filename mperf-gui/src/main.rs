@@ -1,3 +1,4 @@
+mod analysis_cache;
 mod flamegraph;
 mod memory;
 mod metrics;
@@ -6,6 +7,7 @@ mod profile;
 mod profile_analysis;
 mod recent;
 mod roofline;
+mod snapshot;
 mod source;
 mod theme;
 mod views;
@@ -32,6 +34,7 @@ use theme::*;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum VisualizationKind {
+    Resources,
     Memory,
     Roofline,
     #[default]
@@ -45,7 +48,8 @@ enum VisualizationKind {
 }
 
 impl VisualizationKind {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
+        Self::Resources,
         Self::Memory,
         Self::Roofline,
         Self::Flamegraph,
@@ -59,6 +63,7 @@ impl VisualizationKind {
 
     fn title(self) -> &'static str {
         match self {
+            Self::Resources => "Resources (USE)",
             Self::Memory => "Memory",
             Self::Roofline => "Roofline",
             Self::Flamegraph => "Flamegraph",
@@ -73,6 +78,7 @@ impl VisualizationKind {
 
     fn id(self) -> &'static str {
         match self {
+            Self::Resources => "resources-use",
             Self::Memory => "memory",
             Self::Roofline => "roofline",
             Self::Flamegraph => "flamegraph",
@@ -138,6 +144,7 @@ impl BottomPanelKind {
 
 struct MperfGui {
     model: Option<ResultsModel>,
+    caches: analysis_cache::AnalysisCaches,
     recent_results: Vec<PathBuf>,
     picking_directory: bool,
     load_error: Option<String>,
@@ -151,9 +158,15 @@ struct MperfGui {
     bottom_panel_collapsed: bool,
     bottom_panel_resizing: bool,
     active_bottom_panel: BottomPanelKind,
+    /// Overrides for hotspot table column widths; empty means defaults.
+    hotspot_column_widths: Vec<f32>,
+    /// Active header drag as (column, start x, starting width).
+    hotspot_column_drag: Option<(usize, f32, f32)>,
 
     flamegraph_instructions: bool,
     flamegraph_zoom: StackIdentifier,
+    flamegraph_scroll_handle: ScrollHandle,
+    filtered_flamegraph_scroll_handle: ScrollHandle,
     selected_stack: Option<StackIdentifier>,
     selected_function: Option<String>,
     hotspot_filter: Option<HotspotFilter>,
@@ -161,6 +174,7 @@ struct MperfGui {
 
     open_visualizations: Vec<VisualizationKind>,
     active_visualization: Option<VisualizationKind>,
+    snapshot_resource: Option<String>,
     selected_time_range: Option<profile::TimeRange>,
     icicle_focus_path: Vec<usize>,
     cpu_heatmap_bucket_ns: Option<u64>,
@@ -181,6 +195,7 @@ impl MperfGui {
     fn new(model: Option<ResultsModel>, recent_results: Vec<PathBuf>) -> Self {
         let mut view = Self {
             model,
+            caches: analysis_cache::AnalysisCaches::default(),
             recent_results,
             picking_directory: false,
             load_error: None,
@@ -192,14 +207,19 @@ impl MperfGui {
             bottom_panel_collapsed: true,
             bottom_panel_resizing: false,
             active_bottom_panel: BottomPanelKind::default(),
+            hotspot_column_widths: Vec::new(),
+            hotspot_column_drag: None,
             flamegraph_instructions: false,
             flamegraph_zoom: ROOT_ID,
+            flamegraph_scroll_handle: ScrollHandle::new(),
+            filtered_flamegraph_scroll_handle: ScrollHandle::new(),
             selected_stack: None,
             selected_function: None,
             hotspot_filter: None,
             hovered_frame: None,
             open_visualizations: Vec::new(),
             active_visualization: None,
+            snapshot_resource: None,
             selected_time_range: None,
             icicle_focus_path: Vec::new(),
             cpu_heatmap_bucket_ns: None,
@@ -322,6 +342,7 @@ impl MperfGui {
     }
 
     fn reset_workspace(&mut self) {
+        self.caches.clear();
         self.flamegraph_instructions = false;
         self.flamegraph_zoom = ROOT_ID;
         self.selected_stack = None;
@@ -332,11 +353,19 @@ impl MperfGui {
         self.bottom_panel_collapsed = true;
         self.open_visualizations.clear();
         self.active_visualization = None;
+        self.snapshot_resource = None;
+        let snapshot_scenario = self
+            .model
+            .as_ref()
+            .is_some_and(|model| model.record_info.scenario == mperf_data::Scenario::Snapshot);
         let memory_scenario = self
             .model
             .as_ref()
             .is_some_and(|model| model.record_info.scenario == mperf_data::Scenario::Mem);
-        if memory_scenario && self.visualization_available(VisualizationKind::Memory) {
+        if snapshot_scenario && self.visualization_available(VisualizationKind::Resources) {
+            self.open_visualizations.push(VisualizationKind::Resources);
+            self.active_visualization = Some(VisualizationKind::Resources);
+        } else if memory_scenario && self.visualization_available(VisualizationKind::Memory) {
             self.open_visualizations.push(VisualizationKind::Memory);
             self.active_visualization = Some(VisualizationKind::Memory);
         } else if self.visualization_available(VisualizationKind::Roofline) {
@@ -440,6 +469,7 @@ impl MperfGui {
             return false;
         };
         match visualization {
+            VisualizationKind::Resources => return model.snapshot.is_some(),
             VisualizationKind::Memory => return self.memory_data().is_some(),
             VisualizationKind::Roofline => return self.roofline_data().is_some(),
             VisualizationKind::Flamegraph => {
@@ -463,7 +493,8 @@ impl MperfGui {
             .iter()
             .any(|sample| !sample.stack.is_empty());
         match visualization {
-            VisualizationKind::Memory
+            VisualizationKind::Resources
+            | VisualizationKind::Memory
             | VisualizationKind::Roofline
             | VisualizationKind::Flamegraph => unreachable!(),
             VisualizationKind::FlameScope => has_samples,
@@ -668,12 +699,16 @@ impl Render for MperfGui {
                             .clamp(BOTTOM_PANEL_MIN_HEIGHT, BOTTOM_PANEL_MAX_HEIGHT);
                     cx.notify();
                 }
+                if event.dragging() && view.drag_hotspot_column(f32::from(event.position.x)) {
+                    cx.notify();
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, _, _, cx| {
                     view.sidebar_resizing = false;
                     view.bottom_panel_resizing = false;
+                    view.hotspot_column_drag = None;
                     cx.notify();
                 }),
             )
@@ -710,12 +745,8 @@ impl AssetSource for MperfAssets {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let model = cli.result_directory.map(ResultsModel::load).transpose()?;
-    let mut recent_results = recent::load();
-    if let Some(model) = model.as_ref() {
-        let _ = recent::remember(&mut recent_results, &model.result_directory);
-    }
-    let should_select = model.is_none();
+    let initial_directory = cli.result_directory;
+    let recent_results = recent::load();
 
     Application::new()
         .with_assets(MperfAssets)
@@ -735,9 +766,10 @@ fn main() -> Result<()> {
                 },
                 |_, cx| {
                     cx.new(|cx| {
-                        let mut view = MperfGui::new(model, recent_results);
-                        if should_select {
-                            view.select_result_directory(cx);
+                        let mut view = MperfGui::new(None, recent_results);
+                        match initial_directory {
+                            Some(path) => view.load_result_directory(path, cx),
+                            None => view.select_result_directory(cx),
                         }
                         view
                     })

@@ -267,6 +267,9 @@ impl TabsWidget {
                 pmu_data::TabSpec::Summary => write_tabs.push(Tab::Summary(Box::new(
                     SummaryTab::new(info.clone(), connection.clone()),
                 ))),
+                pmu_data::TabSpec::Resources => write_tabs.push(Tab::MetricsTable(
+                    MetricsTableTab::new(mperf_data::resources_table_spec(), connection.clone()),
+                )),
                 pmu_data::TabSpec::Flamegraph => {
                     write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())))
                 }

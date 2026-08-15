@@ -8,7 +8,7 @@ mod ui;
 
 pub use event::{CallFrame, Event, EventType, IString, Location, ProcMapEntry, UserRegs};
 pub use ipc::{IPCMessage, IPCString};
-pub use ui::scenario_ui;
+pub use ui::{resources_table_spec, scenario_ui};
 
 /// Version of the on-disk results format written by this build.
 ///
@@ -29,6 +29,68 @@ pub enum Scenario {
 pub struct SnapshotInfo {
     pub pid: i32,
     pub counters: Vec<(EventType, String)>,
+    /// How completely the process tree was observed.
+    #[serde(default = "default_snapshot_scope")]
+    pub scope: String,
+    /// Coarse resource sampling period.
+    #[serde(default = "default_snapshot_interval_ms")]
+    pub interval_ms: u64,
+    /// Why collection stopped, when known.
+    #[serde(default)]
+    pub stop_reason: String,
+    /// Collector capability and degradation records.
+    #[serde(default)]
+    pub collectors: Vec<SnapshotCollectorStatus>,
+    /// Limitations which result consumers must keep visible.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+fn default_snapshot_scope() -> String {
+    "legacy_root_only".to_string()
+}
+
+const fn default_snapshot_interval_ms() -> u64 {
+    1_000
+}
+
+/// Availability and provenance for one snapshot data source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotCollectorStatus {
+    pub name: String,
+    pub status: String,
+    pub source: String,
+    pub quality: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+/// One normalized coarse resource observation from a snapshot recording.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SnapshotResourceSample {
+    pub timestamp_ns: u64,
+    pub resource: String,
+    #[serde(default)]
+    pub resource_id: String,
+    pub category: String,
+    pub metric: String,
+    pub value: f64,
+    pub unit: String,
+    pub scope: String,
+    pub source: String,
+    pub quality: String,
+}
+
+/// One member of the process tree observed during a snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub start_ticks: u64,
+    pub first_seen_ns: u64,
+    pub last_seen_ns: u64,
+    pub command: String,
+    pub quality: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

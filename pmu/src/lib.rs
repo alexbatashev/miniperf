@@ -20,8 +20,8 @@ pub use cpu_family::{host_cpu_description, host_metrics};
 pub use criterion_measurement::CriterionCounter;
 pub use driver::{
     list_supported_counters, CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver,
-    CountingDriverBuilder, DriverKind, MeasurementQuality, Record, Sample, SamplingDriver,
-    SamplingDriverBuilder, UnwindMode, UserRegs,
+    CountingDriverBuilder, DriverKind, MeasurementQuality, Record, Sample, SamplingCallback,
+    SamplingDriver, SamplingDriverBuilder, UnwindMode, UserRegs,
 };
 #[cfg(feature = "criterion")]
 pub use event_timer::CounterCheckpoint;

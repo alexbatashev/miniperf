@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use gpui::{
     Context, Div, FontWeight, IntoElement, MouseButton, SharedString, div, prelude::*, px,
-    relative, rgb,
+    relative, rgb, uniform_list,
 };
 
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
     metrics::{MetricsColumn, MetricsTableData},
     model::{CounterRow, GuiTab, ResultsModel, TmaSummaryData, TmaSummaryRow},
     profile::{CounterMetric, ProfileFrame, TimeRange},
-    profile_analysis::{FunctionAnalysis, FunctionStat, SampleFilter},
+    profile_analysis::{FunctionStat, SampleFilter},
     source::SourceLocation,
     theme::{
         ACCENT, BORDER, BOTTOM_PANEL_MIN_HEIGHT, CHROME, ERROR, HOVER, MUTED_TEXT, SELECTION_MUTED,
@@ -21,14 +21,22 @@ use crate::{
 const PANEL_HEADER_HEIGHT: f32 = 28.0;
 const TABLE_HEADER_HEIGHT: f32 = 24.0;
 const TABLE_ROW_HEIGHT: f32 = 24.0;
-const HOTSPOTS_TABLE_WIDTH: f32 = 1_230.0;
-const SHARE_WIDTH: f32 = 124.0;
-const CPU_TIME_WIDTH: f32 = 100.0;
-const IPC_WIDTH: f32 = 72.0;
-const LLC_MPKI_WIDTH: f32 = 92.0;
-const LLC_MISS_WIDTH: f32 = 92.0;
-const BACKEND_STALL_WIDTH: f32 = 108.0;
-const BRANCH_MPKI_WIDTH: f32 = 102.0;
+/// Function column first, then the numeric metric columns in display order.
+pub(crate) const HOTSPOT_COLUMN_COUNT: usize = 9;
+const DEFAULT_HOTSPOT_COLUMN_WIDTHS: [f32; HOTSPOT_COLUMN_COUNT] =
+    [416.0, 124.0, 124.0, 100.0, 72.0, 92.0, 92.0, 108.0, 102.0];
+const HOTSPOT_METRIC_HEADERS: [&str; HOTSPOT_COLUMN_COUNT - 1] = [
+    "Self % · samples",
+    "Total % · samples",
+    "CPU time",
+    "IPC",
+    "LLC MPKI",
+    "LLC miss",
+    "Backend stall",
+    "Branch MPKI",
+];
+const MIN_HOTSPOT_COLUMN_WIDTH: f32 = 48.0;
+const MAX_HOTSPOT_COLUMN_WIDTH: f32 = 1_200.0;
 
 impl MperfGui {
     pub(crate) fn render_bottom_resizer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -315,7 +323,9 @@ impl MperfGui {
 
         let filter = self.profile_sample_filter();
         let selected_frames = filter.frame_ids.clone().unwrap_or_default();
-        let analysis = FunctionAnalysis::build(&model.profile, &filter);
+        let Some(analysis) = self.cached_function_analysis() else {
+            return empty_message("This recording has no timestamped profile samples.");
+        };
         if analysis.total_samples == 0 {
             return empty_message("No profile samples match the active filter.");
         }
@@ -323,6 +333,8 @@ impl MperfGui {
             return empty_message("No functions were resolved for the matching samples.");
         }
 
+        let widths = self.hotspot_column_widths();
+        let table_width: f32 = widths.iter().sum();
         div().size_full().min_h(px(0.0)).bg(rgb(WORKSPACE)).child(
             div()
                 .id("hotspots-horizontal-scroll")
@@ -330,98 +342,108 @@ impl MperfGui {
                 .overflow_x_scroll()
                 .child(
                     div()
-                        .w(px(HOTSPOTS_TABLE_WIDTH))
-                        .min_w(px(HOTSPOTS_TABLE_WIDTH))
+                        .w(px(table_width))
+                        .min_w(px(table_width))
                         .h_full()
                         .flex()
                         .flex_col()
-                        .child(hotspots_header())
-                        .child(
-                            div()
-                                .id("hotspots-function-scroll")
-                                .min_h(px(0.0))
-                                .flex_1()
-                                .overflow_y_scroll()
-                                .children(analysis.functions.iter().enumerate().map(
-                                    |(row_index, function)| {
-                                        self.render_hotspot_row(
-                                            row_index,
-                                            function,
-                                            selected_frames.contains(&function.frame_id),
-                                            cx,
-                                        )
-                                    },
-                                )),
-                        ),
+                        .child(self.render_hotspots_header(widths, cx))
+                        .child({
+                            let entity = cx.entity();
+                            let functions = analysis.clone();
+                            uniform_list(
+                                "hotspots-function-scroll",
+                                analysis.functions.len(),
+                                move |range, _, _| {
+                                    range
+                                        .map(|row_index| {
+                                            let function = &functions.functions[row_index];
+                                            hotspot_row(
+                                                row_index,
+                                                function,
+                                                selected_frames.contains(&function.frame_id),
+                                                widths,
+                                                entity.clone(),
+                                            )
+                                        })
+                                        .collect()
+                                },
+                            )
+                            .min_h(px(0.0))
+                            .flex_1()
+                        }),
                 ),
         )
     }
 
-    fn render_hotspot_row(
-        &self,
-        row_index: usize,
-        function: &FunctionStat,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let frame_id = function.frame_id;
-        let label = function.label.clone();
-        let self_share = format_share(function.self_fraction, function.self_samples);
-        let inclusive_share = format_share(function.inclusive_fraction, function.inclusive_samples);
-        let cpu_time = format_cpu_time(function.metrics.cpu_time_ns);
-        let ipc = format_metric(function.metrics.ipc, 2);
-        let llc_mpki = format_metric(function.metrics.llc_mpki, 2);
-        let llc_miss = format_optional_percent(function.metrics.llc_miss_rate);
-        let backend_stall = format_optional_percent(function.metrics.backend_stall_fraction);
-        let branch_mpki = format_metric(function.metrics.branch_mpki, 2);
+    fn hotspot_column_widths(&self) -> [f32; HOTSPOT_COLUMN_COUNT] {
+        let mut widths = DEFAULT_HOTSPOT_COLUMN_WIDTHS;
+        for (width, stored) in widths.iter_mut().zip(&self.hotspot_column_widths) {
+            *width = *stored;
+        }
+        widths
+    }
 
+    fn start_hotspot_column_drag(&mut self, column: usize, start_x: f32) {
+        if self.hotspot_column_widths.is_empty() {
+            self.hotspot_column_widths = DEFAULT_HOTSPOT_COLUMN_WIDTHS.to_vec();
+        }
+        self.hotspot_column_drag = Some((column, start_x, self.hotspot_column_widths[column]));
+    }
+
+    /// Applies an in-progress header drag; returns whether a width changed.
+    pub(crate) fn drag_hotspot_column(&mut self, x: f32) -> bool {
+        let Some((column, start_x, start_width)) = self.hotspot_column_drag else {
+            return false;
+        };
+        let width =
+            (start_width + x - start_x).clamp(MIN_HOTSPOT_COLUMN_WIDTH, MAX_HOTSPOT_COLUMN_WIDTH);
+        if self.hotspot_column_widths[column] == width {
+            return false;
+        }
+        self.hotspot_column_widths[column] = width;
+        true
+    }
+
+    fn render_hotspots_header(
+        &self,
+        widths: [f32; HOTSPOT_COLUMN_COUNT],
+        cx: &mut Context<Self>,
+    ) -> Div {
         div()
-            .id(SharedString::from(format!("hotspot-row-{row_index}")))
-            .h(px(TABLE_ROW_HEIGHT))
-            .min_h(px(TABLE_ROW_HEIGHT))
+            .h(px(TABLE_HEADER_HEIGHT))
+            .min_h(px(TABLE_HEADER_HEIGHT))
             .flex()
             .items_center()
+            .bg(rgb(CHROME))
             .border_b_1()
             .border_color(rgb(BORDER))
-            .cursor_pointer()
-            .text_sm()
-            .when(selected, |element| {
-                element
-                    .bg(rgb(SELECTION_MUTED))
-                    .border_l_2()
-                    .border_color(rgb(ACCENT))
-            })
-            .when(!selected, |element| {
-                element.hover(|element| element.bg(rgb(HOVER)))
-            })
-            .on_click(cx.listener(move |view, event: &gpui::ClickEvent, _, cx| {
-                view.select_profile_function(frame_id);
-                if event.click_count() >= 2 {
-                    view.open_profile_frame_source(frame_id);
-                }
-                cx.notify();
-            }))
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(MUTED_TEXT))
             .child(
                 div()
-                    .min_w(px(240.0))
-                    .min_w_0()
-                    .flex_1()
+                    .relative()
+                    .w(px(widths[0]))
+                    .min_w(px(widths[0]))
                     .h_full()
                     .flex()
                     .items_center()
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .px_3()
-                    .child(label),
+                    .child("Function")
+                    .child(column_resize_handle(0, cx)),
             )
-            .child(numeric_cell(self_share, SHARE_WIDTH))
-            .child(numeric_cell(inclusive_share, SHARE_WIDTH))
-            .child(numeric_cell(cpu_time, CPU_TIME_WIDTH))
-            .child(numeric_cell(ipc, IPC_WIDTH))
-            .child(numeric_cell(llc_mpki, LLC_MPKI_WIDTH))
-            .child(numeric_cell(llc_miss, LLC_MISS_WIDTH))
-            .child(numeric_cell(backend_stall, BACKEND_STALL_WIDTH))
-            .child(numeric_cell(branch_mpki, BRANCH_MPKI_WIDTH))
+            .children(
+                HOTSPOT_METRIC_HEADERS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        header_cell(label, widths[index + 1])
+                            .child(column_resize_handle(index + 1, cx))
+                    }),
+            )
     }
 
     fn open_profile_frame_source(&mut self, frame_id: usize) {
@@ -443,6 +465,97 @@ impl MperfGui {
                 Some("No source location was recorded for this function.".to_string());
         }
     }
+}
+
+fn hotspot_row(
+    row_index: usize,
+    function: &FunctionStat,
+    selected: bool,
+    widths: [f32; HOTSPOT_COLUMN_COUNT],
+    entity: gpui::Entity<MperfGui>,
+) -> impl IntoElement + use<> {
+    let frame_id = function.frame_id;
+    let label = function.label.clone();
+    let self_share = format_share(function.self_fraction, function.self_samples);
+    let inclusive_share = format_share(function.inclusive_fraction, function.inclusive_samples);
+    let cpu_time = format_cpu_time(function.metrics.cpu_time_ns);
+    let ipc = format_metric(function.metrics.ipc, 2);
+    let llc_mpki = format_metric(function.metrics.llc_mpki, 2);
+    let llc_miss = format_optional_percent(function.metrics.llc_miss_rate);
+    let backend_stall = format_optional_percent(function.metrics.backend_stall_fraction);
+    let branch_mpki = format_metric(function.metrics.branch_mpki, 2);
+
+    div()
+        .id(SharedString::from(format!("hotspot-row-{row_index}")))
+        // uniform_list lays rows out as roots, so they must claim the width.
+        .w_full()
+        .h(px(TABLE_ROW_HEIGHT))
+        .min_h(px(TABLE_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .border_b_1()
+        .border_color(rgb(BORDER))
+        .cursor_pointer()
+        .text_sm()
+        .when(selected, |element| {
+            element
+                .bg(rgb(SELECTION_MUTED))
+                .border_l_2()
+                .border_color(rgb(ACCENT))
+        })
+        .when(!selected, |element| {
+            element.hover(|element| element.bg(rgb(HOVER)))
+        })
+        .on_click(move |event: &gpui::ClickEvent, _, cx| {
+            entity.update(cx, |view, cx| {
+                view.select_profile_function(frame_id);
+                if event.click_count() >= 2 {
+                    view.open_profile_frame_source(frame_id);
+                }
+                cx.notify();
+            })
+        })
+        .child(
+            div()
+                .w(px(widths[0]))
+                .min_w(px(widths[0]))
+                .h_full()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .px_3()
+                .child(label),
+        )
+        .child(numeric_cell(self_share, widths[1]))
+        .child(numeric_cell(inclusive_share, widths[2]))
+        .child(numeric_cell(cpu_time, widths[3]))
+        .child(numeric_cell(ipc, widths[4]))
+        .child(numeric_cell(llc_mpki, widths[5]))
+        .child(numeric_cell(llc_miss, widths[6]))
+        .child(numeric_cell(backend_stall, widths[7]))
+        .child(numeric_cell(branch_mpki, widths[8]))
+}
+
+fn column_resize_handle(column: usize, cx: &mut Context<MperfGui>) -> impl IntoElement {
+    div()
+        .id(SharedString::from(format!(
+            "hotspot-column-resize-{column}"
+        )))
+        .absolute()
+        .right_0()
+        .top_0()
+        .h_full()
+        .w(px(6.0))
+        .cursor_col_resize()
+        .hover(|element| element.bg(rgb(ACCENT)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                view.start_hotspot_column_drag(column, f32::from(event.position.x));
+                cx.notify();
+            }),
+        )
 }
 
 fn active_filter_summary(
@@ -891,44 +1004,17 @@ fn static_metric_cell(column: &MetricsColumn, value: &str) -> Div {
         .child(value.to_string())
 }
 
-fn hotspots_header() -> Div {
-    div()
-        .h(px(TABLE_HEADER_HEIGHT))
-        .min_h(px(TABLE_HEADER_HEIGHT))
-        .flex()
-        .items_center()
-        .bg(rgb(CHROME))
-        .border_b_1()
-        .border_color(rgb(BORDER))
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(MUTED_TEXT))
-        .child(
-            div()
-                .min_w(px(240.0))
-                .min_w_0()
-                .flex_1()
-                .px_3()
-                .child("Function"),
-        )
-        .child(header_cell("Self % · samples", SHARE_WIDTH))
-        .child(header_cell("Total % · samples", SHARE_WIDTH))
-        .child(header_cell("CPU time", CPU_TIME_WIDTH))
-        .child(header_cell("IPC", IPC_WIDTH))
-        .child(header_cell("LLC MPKI", LLC_MPKI_WIDTH))
-        .child(header_cell("LLC miss", LLC_MISS_WIDTH))
-        .child(header_cell("Backend stall", BACKEND_STALL_WIDTH))
-        .child(header_cell("Branch MPKI", BRANCH_MPKI_WIDTH))
-}
-
 fn header_cell(label: &'static str, width: f32) -> Div {
     div()
+        .relative()
         .w(px(width))
         .min_w(px(width))
         .h_full()
         .flex()
         .items_center()
         .justify_end()
+        .overflow_hidden()
+        .whitespace_nowrap()
         .px_3()
         .border_l_1()
         .border_color(rgb(BORDER))
@@ -1016,6 +1102,29 @@ fn error_message(message: String) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hotspot_column_drag_resizes_and_clamps() {
+        let mut view = MperfGui::new(None, Vec::new());
+        assert!(!view.drag_hotspot_column(500.0));
+
+        view.start_hotspot_column_drag(0, 100.0);
+        assert!(view.drag_hotspot_column(160.0));
+        assert_eq!(
+            view.hotspot_column_widths()[0],
+            DEFAULT_HOTSPOT_COLUMN_WIDTHS[0] + 60.0
+        );
+
+        assert!(view.drag_hotspot_column(-10_000.0));
+        assert_eq!(view.hotspot_column_widths()[0], MIN_HOTSPOT_COLUMN_WIDTH);
+        assert_eq!(
+            view.hotspot_column_widths()[1..],
+            DEFAULT_HOTSPOT_COLUMN_WIDTHS[1..]
+        );
+
+        view.hotspot_column_drag = None;
+        assert!(!view.drag_hotspot_column(300.0));
+    }
 
     #[test]
     fn hotspot_time_filter_is_relative_to_profile_start() {

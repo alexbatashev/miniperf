@@ -25,6 +25,7 @@ pub async fn do_record(
     pid: Option<u32>,
     command: Vec<String>,
     roofline_options: roofline::Options,
+    duration: Option<std::time::Duration>,
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
 
@@ -66,7 +67,13 @@ pub async fn do_record(
     let (dispatcher, join_handle) = EventDispatcher::new(output_directory);
 
     let info = match scenario {
-        Scenario::Snapshot => snapshot(dispatcher.clone(), pid, &command)?,
+        Scenario::Snapshot => snapshot(
+            dispatcher.clone(),
+            pid,
+            &command,
+            output_directory,
+            duration,
+        )?,
         Scenario::Mem => {
             if pid.is_some() {
                 anyhow::bail!("record mem requires a command and does not support --pid");
@@ -118,7 +125,11 @@ pub async fn do_record(
         command: json_command,
         cpu_model,
         cpu_vendor,
-        sampling_frequency_hz: Some(pmu::DEFAULT_SAMPLE_FREQUENCY_HZ),
+        sampling_frequency_hz: Some(if scenario == Scenario::Snapshot {
+            99
+        } else {
+            pmu::DEFAULT_SAMPLE_FREQUENCY_HZ
+        }),
         cpu_clock_source: Some(if cfg!(any(target_os = "macos", target_os = "linux")) {
             CpuClockSource::SampledOccupancy
         } else {
@@ -154,10 +165,13 @@ fn host_logical_cpu_count() -> Option<u32> {
         .flatten()
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn snapshot(
     dispatcher: Arc<EventDispatcher>,
     pid: Option<u32>,
     command: &[String],
+    output_directory: &Path,
+    duration: Option<std::time::Duration>,
 ) -> Result<ScenarioInfo> {
     if pid.is_none() && command.is_empty() {
         anyhow::bail!("record snapshot requires a command or --pid");
@@ -171,15 +185,51 @@ fn snapshot(
 
     let counters = get_pmu_counters(Scenario::Snapshot);
 
-    let mut builder = pmu::SamplingDriverBuilder::new().counters(&counters);
-    if let Some(process) = &process {
-        builder = builder.process(process);
-    } else if let Some(pid) = pid {
-        builder = builder.pid(pid as i32);
-    }
-    let mut driver = builder.build()?;
-    let recorded_counters = driver.counters();
     let recorded_pid = pid.unwrap_or_else(|| process.as_ref().unwrap().pid() as u32) as i32;
+    #[cfg(target_os = "linux")]
+    let target_pids = if let Some(pid) = pid {
+        let tree = crate::snapshot_resources::process_tree(pid);
+        if tree.is_empty() {
+            vec![pid]
+        } else {
+            tree.into_iter().map(|member| member.pid).collect()
+        }
+    } else {
+        vec![recorded_pid as u32]
+    };
+    #[cfg(not(target_os = "linux"))]
+    let target_pids = vec![recorded_pid as u32];
+    let mut drivers = Vec::with_capacity(target_pids.len());
+    for target_pid in target_pids {
+        let builder = pmu::SamplingDriverBuilder::new().counters(&counters);
+        #[cfg(target_os = "linux")]
+        let mut builder = builder.sample_freq(99).stack_dump_size(2 * 1024);
+        #[cfg(not(target_os = "linux"))]
+        let mut builder = builder;
+        if let Some(process) = &process {
+            builder = builder.process(process);
+        } else {
+            builder = builder.pid(target_pid as i32);
+        }
+        drivers.push(builder.build()?);
+    }
+    let recorded_counters = drivers
+        .first()
+        .map(|driver| driver.counters())
+        .unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let cgroup_scope =
+        crate::snapshot_resources::CgroupScope::create(recorded_pid as u32, pid.is_none());
+    #[cfg(target_os = "linux")]
+    let resource_monitor = crate::snapshot_resources::ResourceMonitor::start(
+        recorded_pid as u32,
+        pid.is_none(),
+        cgroup_scope.path(),
+        output_directory,
+    )?;
+    #[cfg(target_os = "linux")]
+    let bpf_monitor =
+        crate::snapshot_resources::BpfMonitor::start(recorded_pid as u32, output_directory);
     // On macOS Process::new returns an already-exec'd, suspended child, so its
     // dyld mappings are available before the first instruction is profiled.
     // Attached processes are already live on every platform.
@@ -187,72 +237,131 @@ fn snapshot(
         publish_process_maps(dispatcher.clone(), recorded_pid);
     }
 
-    let sample_dispatcher = dispatcher.clone();
-    driver.start(Arc::new(move |record| {
-        match record {
-            Record::Sample(sample) => {
-                let unique_id = uuid::Uuid::now_v7().as_u128();
-                let mut callstack = smallvec::smallvec![CallFrame::IP(sample.ip)];
-                callstack.extend(
-                    sample
-                        .callstack
-                        .into_iter()
-                        .filter(|address| *address != sample.ip)
-                        .map(CallFrame::IP),
-                );
-                let name = if let Counter::Custom(name) = &sample.counter {
-                    sample_dispatcher.string_id(name)
-                } else {
-                    0
-                };
-                let event = Event {
-                    unique_id,
-                    correlation_id: sample.event_id,
-                    parent_id: 0,
-                    ty: counter_to_event_ty(&sample.counter),
-                    thread_id: sample.tid,
-                    process_id: sample.pid,
-                    cpu: sample.cpu,
-                    time_enabled: sample.time_enabled,
-                    time_running: sample.time_running,
-                    value: sample.value,
-                    timestamp: sample.time,
-                    name,
-                    callstack,
-                    user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
-                        abi: regs.abi,
-                        mask: regs.mask,
-                        values: regs.values,
-                    }),
-                    user_stack: sample.user_stack,
-                };
-
-                sample_dispatcher.publish_event_sync(event);
+    for driver in &mut drivers {
+        driver.start(snapshot_callback(dispatcher.clone()))?;
+    }
+    #[cfg(target_os = "linux")]
+    let stop_reason = {
+        let started = std::time::Instant::now();
+        let mut known_pids = std::collections::HashSet::new();
+        let mut root_waited = false;
+        let stop_reason;
+        if let Some(process) = &process {
+            process.cont();
+            loop {
+                let tree = crate::snapshot_resources::process_tree(recorded_pid as u32);
+                for member in &tree {
+                    if known_pids.insert((member.pid, member.start_ticks)) {
+                        publish_process_maps(dispatcher.clone(), member.pid as i32);
+                    }
+                }
+                if !root_waited
+                    && tree
+                        .iter()
+                        .find(|member| member.pid == recorded_pid as u32)
+                        .is_none_or(|member| member.state == b'Z')
+                {
+                    process.wait()?;
+                    root_waited = true;
+                }
+                let live = tree.iter().any(|member| member.state != b'Z');
+                if root_waited && !live {
+                    stop_reason = "tree_exit".to_string();
+                    break;
+                }
+                if duration.is_some_and(|limit| started.elapsed() >= limit) {
+                    // A launched command belongs to this recording. Terminate every
+                    // currently observed member so a bounded snapshot cannot leave
+                    // an unexpected orphan workload behind.
+                    for member in tree.iter().filter(|member| member.state != b'Z') {
+                        unsafe { libc::kill(member.pid as i32, libc::SIGTERM) };
+                    }
+                    if !root_waited {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        while std::time::Instant::now() < deadline {
+                            if crate::snapshot_resources::process_tree(recorded_pid as u32)
+                                .iter()
+                                .find(|member| member.pid == recorded_pid as u32)
+                                .is_none_or(|member| member.state == b'Z')
+                            {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        for member in crate::snapshot_resources::process_tree(recorded_pid as u32)
+                            .iter()
+                            .filter(|member| member.state != b'Z')
+                        {
+                            unsafe { libc::kill(member.pid as i32, libc::SIGKILL) };
+                        }
+                        process.wait()?;
+                    }
+                    stop_reason = "duration".to_string();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Record::ProcAddr(addr) => {
-                let entry = ProcMapEntry {
-                    filename: addr.filename,
-                    address: addr.addr as usize,
-                    size: addr.len as usize,
-                    offset: addr.pgoff as usize,
-                    pid: addr.pid,
-                };
-
-                sample_dispatcher.publish_proc_map_sync(entry);
+        } else if let Some(pid) = pid {
+            loop {
+                let tree = crate::snapshot_resources::process_tree(pid);
+                for member in &tree {
+                    if known_pids.insert((member.pid, member.start_ticks)) {
+                        publish_process_maps(dispatcher.clone(), member.pid as i32);
+                    }
+                }
+                if !tree.iter().any(|member| member.state != b'Z') {
+                    stop_reason = "tree_exit".to_string();
+                    break;
+                }
+                if duration.is_some_and(|limit| started.elapsed() >= limit) {
+                    stop_reason = "duration".to_string();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-        };
-    }))?;
-    if let Some(process) = &process {
+        } else {
+            unreachable!("snapshot requires a command or PID")
+        }
+        stop_reason
+    };
+    #[cfg(not(target_os = "linux"))]
+    let stop_reason = if let Some(process) = &process {
         process.cont();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        publish_process_maps(dispatcher.clone(), recorded_pid);
         process.wait()?;
+        "root_exit".to_string()
     } else if let Some(pid) = pid {
-        while unsafe { libc::kill(pid as i32, 0) } == 0 {
+        let started = std::time::Instant::now();
+        while unsafe { libc::kill(pid as i32, 0) } == 0
+            && duration.is_none_or(|limit| started.elapsed() < limit)
+        {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        if duration.is_some_and(|limit| started.elapsed() >= limit) {
+            "duration".to_string()
+        } else {
+            "root_exit".to_string()
+        }
+    } else {
+        unreachable!("snapshot requires a command or PID")
+    };
+    for driver in &mut drivers {
+        driver.stop()?;
     }
-    driver.stop()?;
+    #[cfg(target_os = "linux")]
+    let mut collectors = resource_monitor.stop();
+    #[cfg(target_os = "linux")]
+    collectors.push(bpf_monitor.stop());
+    #[cfg(target_os = "linux")]
+    collectors.push(cgroup_scope.status());
+    #[cfg(not(target_os = "linux"))]
+    let collectors: Vec<mperf_data::SnapshotCollectorStatus> = Vec::new();
+
+    let warnings = collectors
+        .iter()
+        .filter(|collector| collector.status != "available")
+        .map(|collector| format!("{}: {}", collector.name, collector.message))
+        .collect();
 
     Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
         pid: recorded_pid,
@@ -260,7 +369,70 @@ fn snapshot(
             .iter()
             .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
             .collect(),
+        scope: if cfg!(target_os = "linux") {
+            if pid.is_some() {
+                "attached_tree_best_effort"
+            } else {
+                "launched_tree_inherited"
+            }
+        } else {
+            "legacy_root_only"
+        }
+        .to_string(),
+        interval_ms: if cfg!(target_os = "linux") { 1_000 } else { 0 },
+        stop_reason,
+        collectors,
+        warnings,
     }))
+}
+
+fn snapshot_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingCallback> {
+    Arc::new(move |record| match record {
+        Record::Sample(sample) => {
+            let unique_id = uuid::Uuid::now_v7().as_u128();
+            let mut callstack = smallvec::smallvec![CallFrame::IP(sample.ip)];
+            callstack.extend(
+                sample
+                    .callstack
+                    .into_iter()
+                    .filter(|address| *address != sample.ip)
+                    .map(CallFrame::IP),
+            );
+            let name = if let Counter::Custom(name) = &sample.counter {
+                dispatcher.string_id(name)
+            } else {
+                0
+            };
+            dispatcher.publish_event_sync(Event {
+                unique_id,
+                correlation_id: sample.event_id,
+                parent_id: 0,
+                ty: counter_to_event_ty(&sample.counter),
+                thread_id: sample.tid,
+                process_id: sample.pid,
+                cpu: sample.cpu,
+                time_enabled: sample.time_enabled,
+                time_running: sample.time_running,
+                value: sample.value,
+                timestamp: sample.time,
+                name,
+                callstack,
+                user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
+                    abi: regs.abi,
+                    mask: regs.mask,
+                    values: regs.values,
+                }),
+                user_stack: sample.user_stack,
+            });
+        }
+        Record::ProcAddr(addr) => dispatcher.publish_proc_map_sync(ProcMapEntry {
+            filename: addr.filename,
+            address: addr.addr as usize,
+            size: addr.len as usize,
+            offset: addr.pgoff as usize,
+            pid: addr.pid,
+        }),
+    })
 }
 
 fn publish_process_maps(dispatcher: Arc<EventDispatcher>, pid: i32) {

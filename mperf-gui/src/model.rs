@@ -12,7 +12,7 @@ use sqlite::{Connection, Value};
 
 use crate::{
     flamegraph::FlamegraphData, memory::MemoryData, metrics::MetricsTableData,
-    profile::ProfileData, roofline::RooflineData,
+    profile::ProfileData, roofline::RooflineData, snapshot::SnapshotData,
 };
 
 #[derive(Debug)]
@@ -22,6 +22,7 @@ pub struct ResultsModel {
     pub summary: SummaryStats,
     pub tma_summary: Option<TmaSummaryData>,
     pub profile: ProfileData,
+    pub snapshot: Option<SnapshotData>,
     pub tabs: Vec<GuiTab>,
 }
 
@@ -92,6 +93,7 @@ impl ResultsModel {
         let tma_summary = TmaSummaryData::for_scenario(&record_info.scenario_info, &connection);
         let mut profile = ProfileData::load(&connection);
         profile.logical_cpu_count = record_info.logical_cpu_count;
+        let snapshot = SnapshotData::load(&connection, record_info.logical_cpu_count);
 
         let tabs = scenario_ui(&record_info)
             .tabs
@@ -105,6 +107,7 @@ impl ResultsModel {
             summary,
             tma_summary,
             profile,
+            snapshot,
             tabs,
         })
     }
@@ -207,6 +210,13 @@ impl GuiTab {
     ) -> Self {
         match tab {
             TabSpec::Summary => Self::Summary,
+            TabSpec::Resources => {
+                let spec = mperf_data::resources_table_spec();
+                Self::MetricsTable {
+                    title: spec.title.clone().unwrap_or_else(|| spec.view.clone()),
+                    data: MetricsTableData::load(connection, &spec),
+                }
+            }
             TabSpec::MetricsTable(spec) => {
                 let title = spec.title.clone().unwrap_or_else(|| spec.view.clone());
                 Self::MetricsTable {
@@ -558,6 +568,11 @@ mod tests {
         let snapshot = ScenarioInfo::Snapshot(SnapshotInfo {
             pid: 1,
             counters: Vec::new(),
+            scope: "legacy_root_only".to_string(),
+            interval_ms: 1_000,
+            stop_reason: String::new(),
+            collectors: Vec::new(),
+            warnings: Vec::new(),
         });
         let roofline = ScenarioInfo::Roofline(RooflineInfo {
             backend: "compiler".to_string(),
@@ -568,5 +583,85 @@ mod tests {
         });
         assert!(TmaSummaryData::for_scenario(&snapshot, &connection).is_none());
         assert!(TmaSummaryData::for_scenario(&roofline, &connection).is_none());
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_load_real_directory() {
+        let Ok(dir) = std::env::var("MPERF_BENCH_DIR") else {
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        let model = ResultsModel::load(&dir).unwrap();
+        println!("ResultsModel::load: {:?}", t0.elapsed());
+        println!(
+            "samples={} frames={} cpu_obs={}",
+            model.profile.samples.len(),
+            model.profile.frames.len(),
+            model.profile.cpu_observations.len()
+        );
+
+        let t = std::time::Instant::now();
+        let tree = crate::profile_analysis::CallTree::build(
+            &model.profile,
+            &crate::profile_analysis::SampleFilter::default(),
+        );
+        println!(
+            "CallTree::build: {:?} ({} nodes)",
+            t.elapsed(),
+            tree.nodes.len()
+        );
+
+        let t = std::time::Instant::now();
+        let layout = tree.icicle_layout(None);
+        println!(
+            "icicle_layout: {:?} ({} frames)",
+            t.elapsed(),
+            layout.frames.len()
+        );
+
+        let t = std::time::Instant::now();
+        let chart =
+            crate::views::flame_canvas::FlameChart::from_icicle_layout(&layout, &tree, true);
+        println!(
+            "FlameChart::from_icicle_layout: {:?} ({} frames)",
+            t.elapsed(),
+            chart.frames.len()
+        );
+
+        let t = std::time::Instant::now();
+        let analysis = crate::profile_analysis::FunctionAnalysis::build(
+            &model.profile,
+            &crate::profile_analysis::SampleFilter::default(),
+        );
+        println!(
+            "FunctionAnalysis::build: {:?} ({} functions)",
+            t.elapsed(),
+            analysis.functions.len()
+        );
+
+        for tab in &model.tabs {
+            if let GuiTab::Flamegraph(data) = tab {
+                let t = std::time::Instant::now();
+                let layout = data.layout(false, flamelens::flame::ROOT_ID).unwrap();
+                println!(
+                    "flame layout: {:?} ({} frames)",
+                    t.elapsed(),
+                    layout.frames.len()
+                );
+                let t = std::time::Instant::now();
+                let chart = crate::views::flame_canvas::FlameChart::from_flame_layout(&layout);
+                println!(
+                    "FlameChart::from_flame_layout: {:?} ({} frames)",
+                    t.elapsed(),
+                    chart.frames.len()
+                );
+            }
+        }
     }
 }

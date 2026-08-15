@@ -7,6 +7,8 @@ mod processing;
 mod query;
 mod record;
 mod roofline;
+#[cfg(target_os = "linux")]
+mod snapshot_resources;
 mod stat;
 mod tui;
 #[cfg(all(
@@ -79,6 +81,9 @@ enum Commands {
         output_directory: String,
         #[arg(short, long)]
         pid: Option<u32>,
+        /// Stop a snapshot after this duration (for example `10s` or `2m`).
+        #[arg(long, value_parser = parse_duration)]
+        duration: Option<std::time::Duration>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -104,6 +109,27 @@ enum Commands {
         #[arg(long, default_value_t = 50, value_parser = query::parse_max_rows)]
         max_rows: usize,
     },
+}
+
+fn parse_duration(value: &str) -> std::result::Result<std::time::Duration, String> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 0.001)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1.0)
+    } else if let Some(value) = value.strip_suffix('m') {
+        (value, 60.0)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3600.0)
+    } else {
+        (value, 1.0)
+    };
+    let number = number
+        .parse::<f64>()
+        .map_err(|_| format!("invalid duration '{value}'"))?;
+    if !number.is_finite() || number <= 0.0 {
+        return Err("duration must be a positive finite value".to_string());
+    }
+    Ok(std::time::Duration::from_secs_f64(number * multiplier))
 }
 
 /// Parse the command line and run the miniperf application.
@@ -135,6 +161,7 @@ pub async fn run() -> Result<()> {
             dynamorio_client,
             output_directory,
             pid,
+            duration,
             command,
         } => {
             let roofline = roofline::Options {
@@ -156,7 +183,15 @@ pub async fn run() -> Result<()> {
             }
             std::fs::create_dir_all(&output_directory)?;
             let output_directory = PathBuf::from_str(&output_directory)?;
-            do_record(scenario, &output_directory, pid, command, roofline).await
+            do_record(
+                scenario,
+                &output_directory,
+                pid,
+                command,
+                roofline,
+                duration,
+            )
+            .await
         }
         Commands::Show { result_directory } => tui::tui_main(Path::new(&result_directory)).await,
         Commands::EventsExport { result_directory } => {

@@ -175,6 +175,8 @@ pub struct ScenarioUi {
 pub enum TabSpec {
     /// Recording summary.
     Summary,
+    /// Linux USE-method resource overview.
+    Resources,
     /// Sample flamegraph.
     Flamegraph,
     /// Instrumented loop statistics.

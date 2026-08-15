@@ -63,16 +63,7 @@ impl MperfGui {
             }
         }
 
-        let heatmap = if let Some(bucket_duration_ns) = self.cpu_heatmap_bucket_ns {
-            CpuUtilizationHeatmap::build_with_bucket_duration(
-                profile,
-                &filter,
-                AUTO_MAX_BUCKETS,
-                Some(bucket_duration_ns),
-            )
-        } else {
-            CpuUtilizationHeatmap::build(profile, &filter, AUTO_MAX_BUCKETS)
-        };
+        let heatmap = self.cached_cpu_heatmap(AUTO_MAX_BUCKETS, self.cpu_heatmap_bucket_ns);
         let Some(heatmap) = heatmap else {
             let message = if !profile.cpu_observations.is_empty() {
                 "CPU activity has no observations matching the current global filters. \
