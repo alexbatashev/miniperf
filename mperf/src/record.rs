@@ -354,7 +354,7 @@ fn snapshot(
     #[cfg(target_os = "linux")]
     collectors.push(cgroup_scope.status());
     #[cfg(not(target_os = "linux"))]
-    let collectors = Vec::new();
+    let collectors: Vec<mperf_data::SnapshotCollectorStatus> = Vec::new();
 
     let warnings = collectors
         .iter()

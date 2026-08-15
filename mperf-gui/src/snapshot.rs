@@ -655,16 +655,22 @@ mod tests {
         connection
     }
 
-    fn insert_sample(
-        connection: &Connection,
-        timestamp_s: u64,
-        resource: &str,
-        id: &str,
-        category: &str,
-        metric: &str,
-        value: f64,
-        unit: &str,
-    ) {
+    struct Metric {
+        resource: &'static str,
+        id: &'static str,
+        category: &'static str,
+        metric: &'static str,
+        unit: &'static str,
+    }
+
+    fn insert_sample(connection: &Connection, timestamp_s: u64, m: &Metric, value: f64) {
+        let Metric {
+            resource,
+            id,
+            category,
+            metric,
+            unit,
+        } = m;
         connection
             .execute(format!(
                 "INSERT INTO snapshot_resource_samples VALUES
@@ -678,41 +684,35 @@ mod tests {
     #[test]
     fn converts_counters_to_rates_and_keeps_gauges() {
         let connection = connection();
+        const CPU: Metric = Metric {
+            resource: "cpu",
+            id: "process_tree",
+            category: "utilization",
+            metric: "cgroup_cpu_time",
+            unit: "seconds",
+        };
+        const RSS: Metric = Metric {
+            resource: "memory",
+            id: "process_tree",
+            category: "utilization",
+            metric: "rss",
+            unit: "bytes",
+        };
+        const DISK: Metric = Metric {
+            resource: "disk",
+            id: "sda",
+            category: "utilization",
+            metric: "busy_time",
+            unit: "milliseconds",
+        };
         for (t, cpu_s, rss, busy_ms) in [
             (0, 0.0, 100.0, 0.0),
             (1, 2.0, 200.0, 500.0),
             (2, 4.0, 150.0, 1500.0),
         ] {
-            insert_sample(
-                &connection,
-                t,
-                "cpu",
-                "process_tree",
-                "utilization",
-                "cgroup_cpu_time",
-                cpu_s,
-                "seconds",
-            );
-            insert_sample(
-                &connection,
-                t,
-                "memory",
-                "process_tree",
-                "utilization",
-                "rss",
-                rss,
-                "bytes",
-            );
-            insert_sample(
-                &connection,
-                t,
-                "disk",
-                "sda",
-                "utilization",
-                "busy_time",
-                busy_ms,
-                "milliseconds",
-            );
+            insert_sample(&connection, t, &CPU, cpu_s);
+            insert_sample(&connection, t, &RSS, rss);
+            insert_sample(&connection, t, &DISK, busy_ms);
         }
         connection
             .execute(
