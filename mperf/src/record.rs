@@ -165,6 +165,7 @@ fn host_logical_cpu_count() -> Option<u32> {
         .flatten()
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn snapshot(
     dispatcher: Arc<EventDispatcher>,
     pid: Option<u32>,

@@ -7,6 +7,7 @@ mod processing;
 mod query;
 mod record;
 mod roofline;
+#[cfg(target_os = "linux")]
 mod snapshot_resources;
 mod stat;
 mod tui;
