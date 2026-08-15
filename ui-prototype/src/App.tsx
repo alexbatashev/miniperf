@@ -8,6 +8,8 @@ import { VariantWorkbench } from "@/variants/VariantWorkbench"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
+import { Runner } from "@/components/runner/Runner"
+import { useRunSim } from "@/components/runner/sim"
 import { ChevronDown, Moon, Sun } from "lucide-react"
 import { fmtCount, fmtTimeS } from "@/lib/format"
 
@@ -69,6 +71,11 @@ export default function App() {
   const [dark, setDark] = useState(() =>
     urlParam("dark") !== null ? urlParam("dark") !== "0" : window.matchMedia("(prefers-color-scheme: dark)").matches
   )
+  const sim = useRunSim()
+  const openRecording = (scenario: Scenario) => {
+    const r = RECORDINGS.find((x) => x.scenario === scenario)
+    if (r) setRecId(r.id)
+  }
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
@@ -101,6 +108,7 @@ export default function App() {
               ))}
             </DropdownMenuContent>
           </DropdownMenu>
+          <Runner sim={sim} onOpenRecording={openRecording} />
           <div className="ml-auto flex items-center gap-2">
             <span className="text-[10.5px] text-muted-foreground">layout variant</span>
             <ToggleGroup type="single" value={variant} onValueChange={(v) => v && setVariant(v as VariantId)} className="h-7">
