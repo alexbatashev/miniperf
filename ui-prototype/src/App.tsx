@@ -8,6 +8,7 @@ import { VariantWorkbench } from "@/variants/VariantWorkbench"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
+import { Kbd } from "@/components/ui/kbd"
 import { Runner } from "@/components/runner/Runner"
 import { useRunSim } from "@/components/runner/sim"
 import { ChevronDown, Moon, Sun } from "lucide-react"
@@ -51,7 +52,11 @@ function StatusBar({ variant, rec }: { variant: VariantId; rec: RecordingDef }) 
         {fmtTimeS(data.meta.durationS)} · {fmtCount(data.meta.sampleCount)} samples · {data.meta.sampleFreqHz} Hz
       </span>
       <span className={filtered ? "text-[var(--series-1)]" : ""}>{filtered ? "● filtered view" : "○ unfiltered"}</span>
-      <span className="ml-auto hidden md:block">{VARIANTS.find((v) => v.id === variant)?.blurb}</span>
+      <span className="ml-auto hidden items-center gap-1 lg:flex">
+        <Kbd className="h-4 text-[10px]">⌘F</Kbd> find symbol
+        <Kbd className="ml-1.5 h-4 text-[10px]">esc</Kbd> clear
+      </span>
+      <span className="hidden md:block">{VARIANTS.find((v) => v.id === variant)?.blurb}</span>
     </div>
   )
 }

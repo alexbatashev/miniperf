@@ -10,6 +10,8 @@ use crate::profile::{
 };
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// Never fold into fewer rows than this, however sparse the recording is.
+const MIN_FOLD_BINS: u64 = 12;
 
 /// A common sample filter used by every profile analysis.
 ///
@@ -21,10 +23,14 @@ pub(crate) struct SampleFilter {
     pub range: Option<TimeRange>,
     pub process_id: Option<u32>,
     pub thread_id: Option<u32>,
+    /// Accept only samples from these threads; `None` accepts every thread.
+    pub threads: Option<BTreeSet<u32>>,
     pub cpu: Option<u32>,
     pub required_counter: Option<usize>,
     /// Accept a sample when its stack contains at least one selected frame.
     pub frame_ids: Option<BTreeSet<usize>>,
+    /// Accept a sample when its leaf frame is in this set (module scoping).
+    pub leaf_frames: Option<BTreeSet<usize>>,
 }
 
 impl SampleFilter {
@@ -50,6 +56,13 @@ impl SampleFilter {
         {
             return false;
         }
+        if self
+            .threads
+            .as_ref()
+            .is_some_and(|threads| !threads.contains(&sample.thread_id))
+        {
+            return false;
+        }
         if self.cpu.is_some_and(|cpu| sample.cpu != Some(cpu)) {
             return false;
         }
@@ -58,6 +71,14 @@ impl SampleFilter {
                 .stack
                 .iter()
                 .any(|frame_id| frame_ids.contains(frame_id))
+        }) {
+            return false;
+        }
+        if self.leaf_frames.as_ref().is_some_and(|leaf_frames| {
+            !sample
+                .stack
+                .last()
+                .is_some_and(|frame_id| leaf_frames.contains(frame_id))
         }) {
             return false;
         }
@@ -84,6 +105,13 @@ impl SampleFilter {
         {
             return false;
         }
+        if self
+            .threads
+            .as_ref()
+            .is_some_and(|threads| !threads.contains(&observation.thread_id))
+        {
+            return false;
+        }
         if self.cpu.is_some_and(|cpu| observation.cpu != Some(cpu)) {
             return false;
         }
@@ -92,6 +120,14 @@ impl SampleFilter {
                 .stack
                 .iter()
                 .any(|frame_id| frame_ids.contains(frame_id))
+        }) {
+            return false;
+        }
+        if self.leaf_frames.as_ref().is_some_and(|leaf_frames| {
+            !observation
+                .stack
+                .last()
+                .is_some_and(|frame_id| leaf_frames.contains(frame_id))
         }) {
             return false;
         }
@@ -113,6 +149,9 @@ pub(crate) struct FlameScopeBin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FlameScopeHeatmap {
     pub range: TimeRange,
+    /// Time folded into one row (classically one second, shortened for short
+    /// recordings so the grid keeps a usable number of columns).
+    pub fold_ns: u64,
     pub bin_width_ns: u64,
     pub rows: usize,
     pub columns: usize,
@@ -122,19 +161,32 @@ pub(crate) struct FlameScopeHeatmap {
 }
 
 impl FlameScopeHeatmap {
-    pub fn build(profile: &ProfileData, filter: &SampleFilter, max_columns: usize) -> Option<Self> {
+    pub fn build(profile: &ProfileData, filter: &SampleFilter, max_bins: usize) -> Option<Self> {
         let range = analysis_range(profile, filter)?;
         let duration = range.end_ns.saturating_sub(range.start_ns);
         if duration == 0 {
             return None;
         }
 
-        let target_columns = max_columns.max(1);
-        let bin_width_ns = nice_bin_width(div_ceil(NANOS_PER_SECOND, target_columns as u64)).max(1);
-        let columns = usize::try_from(div_ceil(NANOS_PER_SECOND, bin_width_ns))
+        let fold_ns = fold_period(duration);
+        let rows = usize::try_from(div_ceil(duration, fold_ns))
             .unwrap_or(usize::MAX)
             .max(1);
-        let rows = usize::try_from(div_ceil(duration, NANOS_PER_SECOND))
+
+        // Bin height follows sample density, not just time: a grid finer than
+        // the samples can fill reads as noise, not as a heatmap.
+        let accepted = profile
+            .samples
+            .iter()
+            .filter(|sample| filter.matches(sample))
+            .filter(|sample| {
+                sample.timestamp_ns >= range.start_ns && sample.timestamp_ns < range.end_ns
+            })
+            .count() as u64;
+        let cap = max_bins.max(1) as u64;
+        let target_bins = (accepted / rows as u64 / 2).clamp(MIN_FOLD_BINS.min(cap), cap);
+        let bin_width_ns = nice_bin_width(div_ceil(fold_ns, target_bins)).min(fold_ns).max(1);
+        let columns = usize::try_from(div_ceil(fold_ns, bin_width_ns))
             .unwrap_or(usize::MAX)
             .max(1);
         let cell_count = rows.checked_mul(columns)?;
@@ -150,9 +202,9 @@ impl FlameScopeHeatmap {
                 continue;
             }
             let relative = sample.timestamp_ns - range.start_ns;
-            let row = usize::try_from(relative / NANOS_PER_SECOND).ok()?;
-            let within_second = relative % NANOS_PER_SECOND;
-            let column = usize::try_from(within_second / bin_width_ns).ok()?;
+            let row = usize::try_from(relative / fold_ns).ok()?;
+            let within_fold = relative % fold_ns;
+            let column = usize::try_from(within_fold / bin_width_ns).ok()?;
             let Some(bin) = row
                 .checked_mul(columns)
                 .and_then(|index| index.checked_add(column))
@@ -167,6 +219,7 @@ impl FlameScopeHeatmap {
         let max_samples = bins.iter().map(|bin| bin.samples).max().unwrap_or(0);
         Some(Self {
             range,
+            fold_ns,
             bin_width_ns,
             rows,
             columns,
@@ -197,15 +250,15 @@ impl FlameScopeHeatmap {
 
         (row_start..row_end)
             .filter_map(|row| {
-                let second_start = self
+                let fold_start = self
                     .range
                     .start_ns
-                    .saturating_add((row as u64).saturating_mul(NANOS_PER_SECOND));
-                let start_ns = second_start
+                    .saturating_add((row as u64).saturating_mul(self.fold_ns));
+                let start_ns = fold_start
                     .saturating_add((column_start as u64).saturating_mul(self.bin_width_ns));
-                let end_ns = second_start
+                let end_ns = fold_start
                     .saturating_add((column_end as u64).saturating_mul(self.bin_width_ns))
-                    .min(second_start.saturating_add(NANOS_PER_SECOND))
+                    .min(fold_start.saturating_add(self.fold_ns))
                     .min(self.range.end_ns);
                 (start_ns < end_ns).then_some(TimeRange { start_ns, end_ns })
             })
@@ -233,8 +286,44 @@ pub(crate) struct CallTree {
     pub total_samples: u64,
 }
 
+/// How much one accepted sample contributes to a call-tree node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StackWeight {
+    /// Every sample weighs one — the cycles-proportional default.
+    Samples,
+    /// The sample's value for `counter_metrics[index]`, rounded down.
+    Counter(usize),
+}
+
+impl StackWeight {
+    fn of(self, sample: &ProfileSample) -> u64 {
+        match self {
+            Self::Samples => 1,
+            Self::Counter(index) => sample
+                .counters
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| value as u64)
+                .unwrap_or(0),
+        }
+    }
+}
+
 impl CallTree {
     pub fn build(profile: &ProfileData, filter: &SampleFilter) -> Self {
+        Self::build_weighted(profile, filter, false, StackWeight::Samples)
+    }
+
+    /// `inverted` reverses every stack, turning the tree bottom-up (leaves at
+    /// the root); `weight` scales each sample's contribution.
+    pub fn build_weighted(
+        profile: &ProfileData,
+        filter: &SampleFilter,
+        inverted: bool,
+        weight: StackWeight,
+    ) -> Self {
         let labels = frame_labels(&profile.frames);
         let mut samples = profile
             .samples
@@ -271,9 +360,18 @@ impl CallTree {
         let mut child_lookup = BTreeMap::<(usize, usize), usize>::new();
 
         for sample in samples {
-            nodes[0].inclusive_samples = nodes[0].inclusive_samples.saturating_add(1);
+            let value = weight.of(sample);
+            if value == 0 {
+                continue;
+            }
+            nodes[0].inclusive_samples = nodes[0].inclusive_samples.saturating_add(value);
             let mut parent = 0usize;
-            for (depth, frame_id) in sample.stack.iter().copied().enumerate() {
+            let stack: Vec<usize> = if inverted {
+                sample.stack.iter().rev().copied().collect()
+            } else {
+                sample.stack.clone()
+            };
+            for (depth, frame_id) in stack.into_iter().enumerate() {
                 let node_id = if let Some(node_id) = child_lookup.get(&(parent, frame_id)) {
                     *node_id
                 } else {
@@ -296,14 +394,10 @@ impl CallTree {
                     node_id
                 };
                 nodes[node_id].inclusive_samples =
-                    nodes[node_id].inclusive_samples.saturating_add(1);
+                    nodes[node_id].inclusive_samples.saturating_add(value);
                 parent = node_id;
             }
-            if parent == 0 {
-                nodes[0].self_samples = nodes[0].self_samples.saturating_add(1);
-            } else {
-                nodes[parent].self_samples = nodes[parent].self_samples.saturating_add(1);
-            }
+            nodes[parent].self_samples = nodes[parent].self_samples.saturating_add(value);
         }
 
         for node_id in 0..nodes.len() {
@@ -1223,6 +1317,11 @@ fn sort_relations(relations: &mut [FunctionRelation]) {
     });
 }
 
+/// Column of the retired-instructions counter, when the recording has one.
+pub(crate) fn instructions_metric(metrics: &[CounterMetric]) -> Option<usize> {
+    find_metric(metrics, &["instructions", "pmu_instructions"])
+}
+
 fn find_metric(metrics: &[CounterMetric], candidates: &[&str]) -> Option<usize> {
     metrics.iter().position(|metric| {
         let key = normalized_metric_key(&metric.key);
@@ -1255,6 +1354,13 @@ fn div_ceil(value: u64, divisor: u64) -> u64 {
 }
 
 /// Returns the next 1/2/5 × 10ⁿ interval at or above `minimum`.
+/// Time folded into one flame-scope row. One second is the classic choice and
+/// stays the cap; shorter recordings fold tighter so the grid keeps roughly
+/// sixty columns instead of collapsing into two.
+fn fold_period(duration_ns: u64) -> u64 {
+    nice_bin_width(div_ceil(duration_ns, 60).max(1))
+}
+
 fn nice_bin_width(minimum: u64) -> u64 {
     let minimum = minimum.max(1);
     let mut magnitude = 1u64;
@@ -1364,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn flamescope_folds_seconds_into_adaptive_sample_bins() {
+    fn flamescope_grid_follows_duration_then_sample_density() {
         let profile = profile(
             vec![frame(0, "root")],
             vec![
@@ -1378,28 +1484,45 @@ mod tests {
 
         let heatmap = FlameScopeHeatmap::build(&profile, &SampleFilter::default(), 100).unwrap();
 
-        assert_eq!(heatmap.bin_width_ns, 10_000_000);
-        assert_eq!((heatmap.rows, heatmap.columns), (2, 100));
+        // A two-second recording folds at 50ms, and four samples cannot fill a
+        // fine grid, so the bins collapse to the density floor.
+        assert_eq!(heatmap.fold_ns, 50_000_000);
+        assert_eq!((heatmap.rows, heatmap.columns), (40, 10));
+        assert_eq!(heatmap.bin_width_ns, 5_000_000);
         assert_eq!(heatmap.total_samples, 4);
         assert_eq!(heatmap.max_samples, 1);
         assert_eq!(heatmap.bin(0, 0).unwrap().samples, 1);
-        assert_eq!(heatmap.bin(0, 1).unwrap().samples, 1);
-        assert_eq!(heatmap.bin(1, 1).unwrap().samples, 1);
-        assert_eq!(heatmap.bin(1, 99).unwrap().samples, 1);
+        assert_eq!(heatmap.bin(0, 2).unwrap().samples, 1);
+        assert_eq!(heatmap.bin(20, 2).unwrap().samples, 1);
+        assert_eq!(heatmap.bin(39, 9).unwrap().samples, 1);
 
         assert_eq!(
-            heatmap.selected_ranges(0..2, 1..2),
+            heatmap.selected_ranges(0..2, 2..3),
             vec![
                 TimeRange {
                     start_ns: 10_000_000,
-                    end_ns: 20_000_000,
+                    end_ns: 15_000_000,
                 },
                 TimeRange {
-                    start_ns: 1_010_000_000,
-                    end_ns: 1_020_000_000,
+                    start_ns: 60_000_000,
+                    end_ns: 65_000_000,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn dense_recordings_get_the_full_bin_budget() {
+        let samples = (0..6_000)
+            .map(|ix| sample(ix * 200_000, 1, None, &[0], &[]))
+            .collect::<Vec<_>>();
+        let profile = profile(vec![frame(0, "root")], samples, vec![]);
+
+        let heatmap = FlameScopeHeatmap::build(&profile, &SampleFilter::default(), 50).unwrap();
+
+        assert_eq!(heatmap.fold_ns, 20_000_000);
+        assert_eq!(heatmap.columns, 40);
+        assert_eq!(heatmap.bin_width_ns, 500_000);
     }
 
     #[test]
@@ -1451,6 +1574,107 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["wanted", "root"]
         );
+    }
+
+    #[test]
+    fn thread_set_filter_accepts_only_selected_threads() {
+        let profile = profile(
+            vec![frame(0, "root")],
+            vec![
+                sample(0, 1, None, &[0], &[]),
+                sample(1, 2, None, &[0], &[]),
+                sample(2, 3, None, &[0], &[]),
+            ],
+            vec![],
+        );
+        let filter = SampleFilter {
+            threads: Some(BTreeSet::from([1, 3])),
+            ..SampleFilter::default()
+        };
+
+        let functions = FunctionAnalysis::build(&profile, &filter);
+        assert_eq!(functions.total_samples, 2);
+    }
+
+    #[test]
+    fn leaf_frame_filter_scopes_by_sampled_leaf_not_stack_contents() {
+        let profile = profile(
+            vec![frame(0, "root"), frame(1, "user_fn"), frame(2, "lib_fn")],
+            vec![
+                sample(0, 1, None, &[0, 1], &[]),
+                sample(1, 1, None, &[0, 1, 2], &[]),
+                sample(2, 1, None, &[], &[]),
+            ],
+            vec![],
+        );
+        let filter = SampleFilter {
+            leaf_frames: Some(BTreeSet::from([1])),
+            ..SampleFilter::default()
+        };
+
+        let functions = FunctionAnalysis::build(&profile, &filter);
+        assert_eq!(functions.total_samples, 1);
+        assert!(
+            functions
+                .functions
+                .iter()
+                .all(|function| function.label != "lib_fn")
+        );
+    }
+
+    #[test]
+    fn flame_scope_folds_short_recordings_tighter_than_a_second() {
+        assert_eq!(fold_period(120 * NANOS_PER_SECOND), 2 * NANOS_PER_SECOND);
+        assert_eq!(fold_period(60 * NANOS_PER_SECOND), NANOS_PER_SECOND);
+        assert_eq!(fold_period(1_160_000_000), 20_000_000);
+        assert_eq!(fold_period(100_000_000), 2_000_000);
+    }
+
+    #[test]
+    fn inverted_call_tree_roots_at_the_leaves() {
+        let profile = profile(
+            vec![frame(0, "main"), frame(1, "work"), frame(2, "memcpy")],
+            vec![
+                sample(0, 1, None, &[0, 1, 2], &[]),
+                sample(1, 1, None, &[0, 2], &[]),
+                sample(2, 1, None, &[0, 1], &[]),
+            ],
+            vec![],
+        );
+
+        let tree = CallTree::build_weighted(
+            &profile,
+            &SampleFilter::default(),
+            true,
+            StackWeight::Samples,
+        );
+
+        let roots = &tree.nodes[tree.root].children;
+        assert_eq!(tree.nodes[roots[0]].label, "memcpy");
+        assert_eq!(tree.nodes[roots[0]].inclusive_samples, 2);
+        assert_eq!(tree.nodes[roots[1]].label, "work");
+        assert_eq!(tree.nodes[roots[1]].inclusive_samples, 1);
+    }
+
+    #[test]
+    fn counter_weighted_call_tree_uses_counter_values_not_sample_counts() {
+        let profile = profile(
+            vec![frame(0, "main"), frame(1, "work")],
+            vec![
+                sample(0, 1, None, &[0, 1], &[Some(100.0)]),
+                sample(1, 1, None, &[0], &[Some(25.0)]),
+                sample(2, 1, None, &[0, 1], &[None]),
+            ],
+            vec![metric("instructions")],
+        );
+        let weight = StackWeight::Counter(instructions_metric(&profile.counter_metrics).unwrap());
+
+        let tree = CallTree::build_weighted(&profile, &SampleFilter::default(), false, weight);
+
+        assert_eq!(tree.total_samples, 125);
+        let work = tree.nodes.iter().find(|node| node.label == "work").unwrap();
+        assert_eq!(work.inclusive_samples, 100);
+        assert_eq!(work.self_samples, 100);
     }
 
     #[test]

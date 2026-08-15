@@ -1,5 +1,7 @@
 mod analysis_cache;
+mod charts;
 mod flamegraph;
+mod gallery;
 mod memory;
 mod metrics;
 mod model;
@@ -7,10 +9,12 @@ mod profile;
 mod profile_analysis;
 mod recent;
 mod roofline;
+mod shell;
 mod snapshot;
 mod source;
 mod sql;
 mod theme;
+mod ui;
 mod views;
 
 use std::{
@@ -105,6 +109,14 @@ enum LeftPaneKind {
 struct Cli {
     /// Directory containing info.json and perf.db.
     result_directory: Option<PathBuf>,
+
+    /// Open the widget gallery (design reference for the UI rebuild).
+    #[arg(long)]
+    gallery: bool,
+
+    /// Open the rebuilt Tracks shell on the given recording (or a picker).
+    #[arg(long)]
+    shell: bool,
 }
 
 #[derive(Clone)]
@@ -734,8 +746,153 @@ fn result_name(path: &Path) -> String {
 
 struct MperfAssets;
 
+static STATIC_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "fonts/geist-variable.ttf",
+        include_bytes!("../assets/fonts/geist-variable.ttf"),
+    ),
+    (
+        "icons/arrow-left.svg",
+        include_bytes!("../assets/icons/arrow-left.svg"),
+    ),
+    (
+        "icons/arrow-right.svg",
+        include_bytes!("../assets/icons/arrow-right.svg"),
+    ),
+    (
+        "icons/check.svg",
+        include_bytes!("../assets/icons/check.svg"),
+    ),
+    (
+        "icons/chevron-down.svg",
+        include_bytes!("../assets/icons/chevron-down.svg"),
+    ),
+    (
+        "icons/chevron-left.svg",
+        include_bytes!("../assets/icons/chevron-left.svg"),
+    ),
+    (
+        "icons/chevron-right.svg",
+        include_bytes!("../assets/icons/chevron-right.svg"),
+    ),
+    (
+        "icons/chevron-up.svg",
+        include_bytes!("../assets/icons/chevron-up.svg"),
+    ),
+    (
+        "icons/chevrons-up-down.svg",
+        include_bytes!("../assets/icons/chevrons-up-down.svg"),
+    ),
+    (
+        "icons/circle-dot.svg",
+        include_bytes!("../assets/icons/circle-dot.svg"),
+    ),
+    (
+        "icons/circle.svg",
+        include_bytes!("../assets/icons/circle.svg"),
+    ),
+    (
+        "icons/clock.svg",
+        include_bytes!("../assets/icons/clock.svg"),
+    ),
+    (
+        "icons/command.svg",
+        include_bytes!("../assets/icons/command.svg"),
+    ),
+    ("icons/cpu.svg", include_bytes!("../assets/icons/cpu.svg")),
+    (
+        "icons/ellipsis.svg",
+        include_bytes!("../assets/icons/ellipsis.svg"),
+    ),
+    (
+        "icons/file-code-2.svg",
+        include_bytes!("../assets/icons/file-code-2.svg"),
+    ),
+    (
+        "icons/flame.svg",
+        include_bytes!("../assets/icons/flame.svg"),
+    ),
+    (
+        "icons/folder-open.svg",
+        include_bytes!("../assets/icons/folder-open.svg"),
+    ),
+    (
+        "icons/gauge.svg",
+        include_bytes!("../assets/icons/gauge.svg"),
+    ),
+    (
+        "icons/git-fork.svg",
+        include_bytes!("../assets/icons/git-fork.svg"),
+    ),
+    (
+        "icons/grid-3x3.svg",
+        include_bytes!("../assets/icons/grid-3x3.svg"),
+    ),
+    ("icons/info.svg", include_bytes!("../assets/icons/info.svg")),
+    (
+        "icons/layers.svg",
+        include_bytes!("../assets/icons/layers.svg"),
+    ),
+    (
+        "icons/layout-dashboard.svg",
+        include_bytes!("../assets/icons/layout-dashboard.svg"),
+    ),
+    (
+        "icons/line-chart.svg",
+        include_bytes!("../assets/icons/line-chart.svg"),
+    ),
+    (
+        "icons/memory-stick.svg",
+        include_bytes!("../assets/icons/memory-stick.svg"),
+    ),
+    (
+        "icons/minus.svg",
+        include_bytes!("../assets/icons/minus.svg"),
+    ),
+    ("icons/moon.svg", include_bytes!("../assets/icons/moon.svg")),
+    (
+        "icons/mountain.svg",
+        include_bytes!("../assets/icons/mountain.svg"),
+    ),
+    (
+        "icons/panel-right-close.svg",
+        include_bytes!("../assets/icons/panel-right-close.svg"),
+    ),
+    (
+        "icons/panel-right-open.svg",
+        include_bytes!("../assets/icons/panel-right-open.svg"),
+    ),
+    ("icons/play.svg", include_bytes!("../assets/icons/play.svg")),
+    ("icons/plus.svg", include_bytes!("../assets/icons/plus.svg")),
+    (
+        "icons/search.svg",
+        include_bytes!("../assets/icons/search.svg"),
+    ),
+    (
+        "icons/server.svg",
+        include_bytes!("../assets/icons/server.svg"),
+    ),
+    (
+        "icons/square.svg",
+        include_bytes!("../assets/icons/square.svg"),
+    ),
+    ("icons/sun.svg", include_bytes!("../assets/icons/sun.svg")),
+    (
+        "icons/table-2.svg",
+        include_bytes!("../assets/icons/table-2.svg"),
+    ),
+    (
+        "icons/terminal.svg",
+        include_bytes!("../assets/icons/terminal.svg"),
+    ),
+    ("icons/x.svg", include_bytes!("../assets/icons/x.svg")),
+];
+
 impl AssetSource for MperfAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some((_, bytes)) = STATIC_ASSETS.iter().find(|(name, _)| *name == path) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         Ok(roofline::roofline_label_svg(path).map(Cow::Owned))
     }
 
@@ -746,6 +903,11 @@ impl AssetSource for MperfAssets {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.gallery || cli.shell {
+        return run_ui_v2(cli.shell, cli.result_directory);
+    }
+
     let initial_directory = cli.result_directory;
     let recent_results = recent::load();
 
@@ -777,6 +939,57 @@ fn main() -> Result<()> {
                 },
             )
             .expect("failed to open mperf GUI window");
+            cx.activate(true);
+        });
+
+    Ok(())
+}
+
+/// Boots either the widget gallery or the Tracks shell — the new UI stack
+/// (theme v2, Geist, `ui::` widget kit) behind flags while the rebuild is
+/// in progress.
+fn run_ui_v2(shell: bool, initial_directory: Option<PathBuf>) -> Result<()> {
+    Application::new()
+        .with_assets(MperfAssets)
+        .run(move |cx: &mut App| {
+            let geist = STATIC_ASSETS
+                .iter()
+                .find(|(name, _)| *name == "fonts/geist-variable.ttf")
+                .map(|(_, bytes)| Cow::Borrowed(*bytes))
+                .expect("bundled Geist font");
+            if let Err(error) = cx.text_system().add_fonts(vec![geist]) {
+                eprintln!("failed to register bundled Geist font: {error}");
+            }
+            ui::text_input::init(cx);
+            if shell {
+                shell::init(cx);
+            }
+
+            let bounds = Bounds::centered(None, size(px(1240.0), px(800.0)), cx);
+            let options = gpui::WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(if shell { "miniperf" } else { "mperf gallery" }.into()),
+                    appears_transparent: shell,
+                    traffic_light_position: Some(point(px(10.0), px(11.0))),
+                }),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(900.0), px(600.0))),
+                ..Default::default()
+            };
+            if shell {
+                let initial_directory = initial_directory.clone();
+                cx.open_window(options, |window, cx| {
+                    cx.set_global(ui::Theme::from_appearance(window.appearance()));
+                    cx.new(|cx| shell::ShellView::new(initial_directory, window, cx))
+                })
+                .expect("failed to open shell window");
+            } else {
+                cx.open_window(options, |window, cx| {
+                    cx.set_global(ui::Theme::from_appearance(window.appearance()));
+                    cx.new(|cx| gallery::Gallery::new(window, cx))
+                })
+                .expect("failed to open gallery window");
+            }
             cx.activate(true);
         });
 

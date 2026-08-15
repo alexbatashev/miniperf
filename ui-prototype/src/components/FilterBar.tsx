@@ -1,9 +1,10 @@
-import { useMemo } from "react"
+import { useEffect, useMemo, useRef } from "react"
 import type { ProfileData } from "@/lib/model"
 import { isFilterEmpty, useFilter } from "@/lib/filter"
 import { fmtCount, fmtPct } from "@/lib/format"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Kbd } from "@/components/ui/kbd"
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -43,6 +44,23 @@ function Chip({
 
 export function FilterBar({ data, className = "" }: { data: ProfileData; className?: string }) {
   const { filter, patch, clear, selectedFrame, setSelectedFrame } = useFilter()
+  const searchRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault()
+        searchRef.current?.focus()
+        searchRef.current?.select()
+      } else if (e.key === "Escape") {
+        if (document.activeElement === searchRef.current) searchRef.current?.blur()
+        else if (selectedFrame !== null) setSelectedFrame(null)
+        else clear()
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [clear, selectedFrame, setSelectedFrame])
 
   const modules = useMemo(() => [...new Set(data.frames.map((f) => f.module))], [data.frames])
 
@@ -142,11 +160,15 @@ export function FilterBar({ data, className = "" }: { data: ProfileData; classNa
       <div className="relative shrink-0">
         <Search className="pointer-events-none absolute left-1.5 top-1/2 size-3 -translate-y-1/2 text-muted-foreground" />
         <Input
+          ref={searchRef}
           value={filter.symbolQuery}
           onChange={(e) => patch({ symbolQuery: e.target.value })}
           placeholder="match symbol…"
-          className="h-6 w-40 rounded-md pl-6 text-[11px] md:text-[11px]"
+          className="h-6 w-44 rounded-md pl-6 pr-8 text-[11px] md:text-[11px]"
         />
+        {filter.symbolQuery === "" && (
+          <Kbd className="absolute right-1 top-1/2 h-4 -translate-y-1/2 text-[10px]">⌘F</Kbd>
+        )}
       </div>
 
       {selectedFrame !== null && (

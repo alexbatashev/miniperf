@@ -137,7 +137,7 @@ impl ResultsModel {
 }
 
 impl TmaSummaryData {
-    fn for_scenario(scenario: &ScenarioInfo, connection: &Connection) -> Option<Self> {
+    pub fn for_scenario(scenario: &ScenarioInfo, connection: &Connection) -> Option<Self> {
         let ScenarioInfo::TMA(info) = scenario else {
             return None;
         };
@@ -267,7 +267,7 @@ impl GuiTab {
 }
 
 impl SummaryStats {
-    fn load(connection: &Connection) -> Result<Self> {
+    pub fn load(connection: &Connection) -> Result<Self> {
         let available_columns: HashSet<String> = table_columns(connection, "pmu_counters")
             .into_iter()
             .map(|column| column.name)
