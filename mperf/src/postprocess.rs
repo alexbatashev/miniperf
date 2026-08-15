@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
+    io::BufRead,
     path::Path,
 };
 
@@ -53,6 +54,7 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
     match info.scenario {
         Scenario::Snapshot => {
             process_pmu_counters(&connection, &info, res_dir, &mut pb).await?;
+            process_snapshot_resources(&connection, &info, res_dir)?;
             process_disassembly(&connection, res_dir, &mut pb).await?;
             create_hotspots_view(&connection).await?;
         }
@@ -82,6 +84,360 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
     persist_derived_metrics(&connection)?;
 
     Ok(())
+}
+
+fn process_snapshot_resources(
+    connection: &sqlite::Connection,
+    info: &RecordInfo,
+    res_dir: &Path,
+) -> Result<()> {
+    connection.execute(
+        "CREATE TABLE snapshot_processes (
+            pid INTEGER NOT NULL, ppid INTEGER NOT NULL, start_ticks INTEGER NOT NULL,
+            first_seen_ns INTEGER NOT NULL, last_seen_ns INTEGER NOT NULL,
+            command TEXT NOT NULL, quality TEXT NOT NULL
+         );
+         CREATE TABLE snapshot_resource_samples (
+            timestamp_ns INTEGER NOT NULL, resource TEXT NOT NULL,
+            resource_id TEXT NOT NULL, category TEXT NOT NULL, metric TEXT NOT NULL,
+            value REAL NOT NULL, unit TEXT NOT NULL, scope TEXT NOT NULL,
+            source TEXT NOT NULL, quality TEXT NOT NULL
+         );
+         CREATE TABLE snapshot_summary (
+            resource TEXT NOT NULL, category TEXT NOT NULL, metric TEXT NOT NULL,
+            value REAL, unit TEXT NOT NULL, scope TEXT NOT NULL,
+            source TEXT NOT NULL, quality TEXT NOT NULL
+         );
+         CREATE TABLE snapshot_findings (
+            rank INTEGER NOT NULL, severity TEXT NOT NULL, resource TEXT NOT NULL,
+            finding TEXT NOT NULL, evidence TEXT NOT NULL,
+            recommendation TEXT NOT NULL, scope TEXT NOT NULL, quality TEXT NOT NULL
+         );
+         CREATE TABLE snapshot_collectors (
+            name TEXT NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL,
+            quality TEXT NOT NULL, message TEXT NOT NULL
+         );",
+    )?;
+
+    let resource_path = res_dir.join("snapshot-resources.jsonl");
+    if resource_path.exists() {
+        let mut insert = connection.prepare(
+            "INSERT INTO snapshot_resource_samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        )?;
+        for line in std::io::BufReader::new(std::fs::File::open(resource_path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let sample: mperf_data::SnapshotResourceSample =
+                serde_json::from_str(&line).context("parse snapshot resource JSON Lines")?;
+            insert.reset()?;
+            insert.bind((1, sqlite_u64(sample.timestamp_ns)))?;
+            insert.bind((2, sample.resource.as_str()))?;
+            insert.bind((3, sample.resource_id.as_str()))?;
+            insert.bind((4, sample.category.as_str()))?;
+            insert.bind((5, sample.metric.as_str()))?;
+            insert.bind((6, sample.value))?;
+            insert.bind((7, sample.unit.as_str()))?;
+            insert.bind((8, sample.scope.as_str()))?;
+            insert.bind((9, sample.source.as_str()))?;
+            insert.bind((10, sample.quality.as_str()))?;
+            insert.next()?;
+        }
+    }
+    let bpf_path = res_dir.join("snapshot-bpf.txt");
+    if bpf_path.exists() {
+        let values = std::fs::read_to_string(&bpf_path)?
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next()? == "MPERF").then(|| {
+                    Some((
+                        fields.next()?.to_string(),
+                        fields.next()?.parse::<f64>().ok()?,
+                    ))
+                })?
+            })
+            .collect::<HashMap<_, _>>();
+        let timestamp_ns = scalar_f64(
+            connection,
+            "SELECT COALESCE(MAX(timestamp_ns), 0) FROM snapshot_resource_samples",
+        )
+        .unwrap_or(0.0) as i64;
+        let mut insert = connection.prepare(
+            "INSERT INTO snapshot_resource_samples VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+        )?;
+        for (resource, category, metric, unit, value) in [
+            (
+                "cpu",
+                "saturation",
+                "run_queue_latency",
+                "nanoseconds",
+                values.get("runq_ns").copied().unwrap_or(0.0)
+                    / values.get("runq_count").copied().unwrap_or(0.0).max(1.0),
+            ),
+            (
+                "disk",
+                "saturation",
+                "block_latency",
+                "nanoseconds",
+                values.get("block_latency_ns").copied().unwrap_or(0.0)
+                    / values.get("block_count").copied().unwrap_or(0.0).max(1.0),
+            ),
+            (
+                "disk",
+                "utilization",
+                "block_bytes",
+                "bytes",
+                values.get("block_bytes").copied().unwrap_or(0.0),
+            ),
+            (
+                "network",
+                "errors",
+                "tcp_retransmits",
+                "events",
+                values.get("tcp_retransmits").copied().unwrap_or(0.0),
+            ),
+        ] {
+            insert.reset()?;
+            insert.bind((1, timestamp_ns))?;
+            insert.bind((2, resource))?;
+            insert.bind((3, "process_tree"))?;
+            insert.bind((4, category))?;
+            insert.bind((5, metric))?;
+            insert.bind((6, value))?;
+            insert.bind((7, unit))?;
+            insert.bind((8, "process_tree"))?;
+            insert.bind((9, "bpftrace"))?;
+            insert.bind((10, "attributed"))?;
+            insert.next()?;
+        }
+    }
+
+    let process_path = res_dir.join("snapshot-processes.jsonl");
+    if process_path.exists() {
+        let mut insert =
+            connection.prepare("INSERT INTO snapshot_processes VALUES (?, ?, ?, ?, ?, ?, ?);")?;
+        for line in std::io::BufReader::new(std::fs::File::open(process_path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let process: mperf_data::SnapshotProcessInfo =
+                serde_json::from_str(&line).context("parse snapshot process JSON Lines")?;
+            insert.reset()?;
+            insert.bind((1, process.pid as i64))?;
+            insert.bind((2, process.ppid as i64))?;
+            insert.bind((3, sqlite_u64(process.start_ticks)))?;
+            insert.bind((4, sqlite_u64(process.first_seen_ns)))?;
+            insert.bind((5, sqlite_u64(process.last_seen_ns)))?;
+            insert.bind((6, process.command.as_str()))?;
+            insert.bind((7, process.quality.as_str()))?;
+            insert.next()?;
+        }
+    }
+
+    if let ScenarioInfo::Snapshot(snapshot) = &info.scenario_info {
+        let mut insert =
+            connection.prepare("INSERT INTO snapshot_collectors VALUES (?, ?, ?, ?, ?);")?;
+        for collector in &snapshot.collectors {
+            insert.reset()?;
+            insert.bind((1, collector.name.as_str()))?;
+            insert.bind((2, collector.status.as_str()))?;
+            insert.bind((3, collector.source.as_str()))?;
+            insert.bind((4, collector.quality.as_str()))?;
+            insert.bind((5, collector.message.as_str()))?;
+            insert.next()?;
+        }
+    }
+
+    connection.execute(
+        "INSERT INTO snapshot_summary
+         SELECT resource, category, metric, MAX(value), unit, scope, source, quality
+         FROM snapshot_resource_samples
+         GROUP BY resource, category, metric, unit, scope, source, quality;",
+    )?;
+    create_snapshot_findings(connection, info)?;
+    Ok(())
+}
+
+fn create_snapshot_findings(connection: &sqlite::Connection, info: &RecordInfo) -> Result<()> {
+    let duration_ns = scalar_f64(
+        connection,
+        "SELECT MAX(timestamp_ns) FROM snapshot_resource_samples",
+    )
+    .unwrap_or(0.0)
+    .max(1.0);
+    let duration_s = duration_ns / 1_000_000_000.0;
+    let cgroup_cpu_s = max_metric(connection, "cgroup_cpu_time");
+    let cpu_s = if cgroup_cpu_s > 0.0 {
+        cgroup_cpu_s
+    } else {
+        max_metric(connection, "user_time") + max_metric(connection, "system_time")
+    };
+    let logical = info.logical_cpu_count.unwrap_or(1).max(1) as f64;
+    let cpu_percent = cpu_s / duration_s / logical * 100.0;
+    let cgroup_memory = max_metric(connection, "cgroup_memory_peak");
+    let rss = if cgroup_memory > 0.0 {
+        cgroup_memory
+    } else {
+        max_metric(connection, "pss").max(max_metric(connection, "rss"))
+    };
+    let host_total = max_metric(connection, "host_total");
+    let cgroup_limit = max_metric(connection, "cgroup_memory_limit");
+    let memory_capacity = if cgroup_limit > 0.0 {
+        if host_total > 0.0 {
+            cgroup_limit.min(host_total)
+        } else {
+            cgroup_limit
+        }
+    } else {
+        host_total
+    };
+    let memory_percent = if memory_capacity > 0.0 {
+        rss / memory_capacity * 100.0
+    } else {
+        0.0
+    };
+    let cpu_psi = max_metric(connection, "cgroup_psi_some_avg10")
+        .max(max_metric(connection, "psi_some_avg10"));
+    let major_faults = max_metric(connection, "major_faults");
+    let oom_kills = max_metric(connection, "oom_kills");
+    let read_gbps = rate_metric(connection, "dram_read_bytes", duration_s) / 1e9;
+    let write_gbps = rate_metric(connection, "dram_write_bytes", duration_s) / 1e9;
+    let network_errors = metric_delta_sum(
+        connection,
+        &[
+            "receive_errors",
+            "receive_drops",
+            "transmit_errors",
+            "transmit_drops",
+        ],
+    );
+    let tcp_retransmits = max_metric(connection, "tcp_retransmits");
+    let network_utilization = max_network_utilization(connection, duration_s)?;
+    let disk_busy = max_device_rate(connection, "busy_time", duration_s * 1_000.0) * 100.0;
+    let tree_quality = if cgroup_cpu_s > 0.0 {
+        "exact_process_tree"
+    } else {
+        "best_effort"
+    };
+
+    let mut findings = Vec::<(i64, &str, &str, String, String, String, &str, &str)>::new();
+    if cpu_percent >= 85.0 || cpu_psi >= 5.0 {
+        findings.push((1, "high", "cpu", "CPU capacity or run queue pressure is high".into(), format!("tree CPU utilization {cpu_percent:.1}%; CPU PSI {cpu_psi:.1}%"), "Inspect the Hotspots view, then run the TMA scenario or `perf sched timehist` to separate pipeline stalls from scheduling delay.".into(), "mixed", tree_quality));
+    } else {
+        findings.push((10, "info", "cpu", "CPU capacity has headroom".into(), format!("tree CPU utilization {cpu_percent:.1}%; CPU PSI {cpu_psi:.1}%"), "Use Hotspots to confirm where CPU time is spent before enabling a higher-frequency profile.".into(), "process_tree", tree_quality));
+    }
+    if memory_percent >= 85.0 || major_faults > 0.0 || oom_kills > 0.0 {
+        findings.push((2, "high", "memory", "Memory capacity or paging pressure is visible".into(), format!("peak tree memory {:.1} MiB ({memory_percent:.1}% of host); major faults {major_faults:.0}; OOM kills {oom_kills:.0}", rss / 1048576.0), "Run `mperf record --scenario mem` and inspect allocation lifetime, working set, locality, and DRAM traffic.".into(), "mixed", if cgroup_memory > 0.0 { "exact_process_tree" } else { "best_effort" }));
+    }
+    if read_gbps + write_gbps > 0.0 {
+        findings.push((20, "info", "memory", "System DRAM traffic was measurable".into(), format!("average {:.2} GB/s read and {:.2} GB/s write", read_gbps, write_gbps), "Treat this as system-scoped. Run the memory scenario when workload-specific traffic and a sustainable bandwidth comparison are needed.".into(), "system_during_target", "exact_system"));
+    }
+    if disk_busy >= 80.0 {
+        findings.push((3, "high", "disk", "A block device was highly utilized".into(), format!("maximum device busy estimate {disk_busy:.1}%"), "Use `iostat -xz 1` and BPF block latency tracing (`biolatency`/`biosnoop`) to identify the device and I/O path.".into(), "system_during_target", "exact_system"));
+    }
+    if network_utilization >= 70.0 || network_errors > 0.0 || tcp_retransmits > 0.0 {
+        findings.push((4, "medium", "network", "Network utilization or reliability needs attention".into(), format!("maximum known-link utilization {network_utilization:.1}%; {network_errors:.0} host interface errors/drops; {tcp_retransmits:.0} attributed TCP retransmits"), "Inspect `ip -s link`, `ss -ti`, retransmits, and then capture packets on the affected interface if needed.".into(), "mixed", if tcp_retransmits > 0.0 { "attributed" } else { "exact_system" }));
+    }
+
+    let mut unavailable = connection.prepare(
+        "SELECT name, status, message FROM snapshot_collectors WHERE status <> 'available';",
+    )?;
+    while unavailable.next()? == sqlite::State::Row {
+        let name = unavailable.read::<String, _>(0)?;
+        let state = unavailable.read::<String, _>(1)?;
+        let message = unavailable.read::<String, _>(2)?;
+        findings.push((90, "info", "coverage", format!("Collector {name} is {state}"), message, "Use the recorded fallback data or grant the documented kernel capabilities before repeating a latency-attributed snapshot.".into(), "collector", "unavailable"));
+    }
+    findings.sort_by_key(|finding| finding.0);
+    let mut insert =
+        connection.prepare("INSERT INTO snapshot_findings VALUES (?, ?, ?, ?, ?, ?, ?, ?);")?;
+    for (index, finding) in findings.into_iter().enumerate() {
+        insert.reset()?;
+        insert.bind((1, (index + 1) as i64))?;
+        insert.bind((2, finding.1))?;
+        insert.bind((3, finding.2))?;
+        insert.bind((4, finding.3.as_str()))?;
+        insert.bind((5, finding.4.as_str()))?;
+        insert.bind((6, finding.5.as_str()))?;
+        insert.bind((7, finding.6))?;
+        insert.bind((8, finding.7))?;
+        insert.next()?;
+    }
+    Ok(())
+}
+
+fn scalar_f64(connection: &sqlite::Connection, sql: &str) -> Option<f64> {
+    let mut statement = connection.prepare(sql).ok()?;
+    (statement.next().ok()? == sqlite::State::Row)
+        .then(|| statement.read::<f64, _>(0).ok())
+        .flatten()
+}
+
+fn max_metric(connection: &sqlite::Connection, metric: &str) -> f64 {
+    let metric = metric.replace('\'', "''");
+    scalar_f64(connection, &format!("SELECT COALESCE(MAX(value), 0) FROM snapshot_resource_samples WHERE metric = '{metric}'")).unwrap_or(0.0)
+}
+
+fn rate_metric(connection: &sqlite::Connection, metric: &str, duration_s: f64) -> f64 {
+    let metric = metric.replace('\'', "''");
+    scalar_f64(connection, &format!("SELECT COALESCE(MAX(value) - MIN(value), 0) FROM snapshot_resource_samples WHERE metric = '{metric}'")).unwrap_or(0.0) / duration_s.max(f64::EPSILON)
+}
+
+fn metric_delta_sum(connection: &sqlite::Connection, metrics: &[&str]) -> f64 {
+    metrics
+        .iter()
+        .map(|metric| {
+            let metric = metric.replace('\'', "''");
+            scalar_f64(
+                connection,
+                &format!(
+                    "SELECT COALESCE(SUM(delta), 0) FROM (
+                       SELECT MAX(value)-MIN(value) AS delta
+                       FROM snapshot_resource_samples
+                       WHERE metric='{metric}' GROUP BY resource_id
+                     )"
+                ),
+            )
+            .unwrap_or(0.0)
+        })
+        .sum()
+}
+
+fn max_device_rate(connection: &sqlite::Connection, metric: &str, duration_units: f64) -> f64 {
+    let sql = format!(
+        "SELECT COALESCE(MAX(delta), 0) FROM (SELECT MAX(value)-MIN(value) AS delta FROM snapshot_resource_samples WHERE metric='{metric}' GROUP BY resource_id)"
+    );
+    scalar_f64(connection, &sql).unwrap_or(0.0) / duration_units.max(f64::EPSILON)
+}
+
+fn max_network_utilization(connection: &sqlite::Connection, duration_s: f64) -> Result<f64> {
+    let mut statement = connection.prepare(
+        "SELECT resource_id, metric, MAX(value) AS maximum, MIN(value) AS minimum
+         FROM snapshot_resource_samples
+         WHERE resource='network' AND metric IN ('receive_bytes','transmit_bytes','link_capacity')
+         GROUP BY resource_id, metric;",
+    )?;
+    let mut devices = HashMap::<String, (f64, f64)>::new();
+    while statement.next()? == sqlite::State::Row {
+        let device = statement.read::<String, _>(0)?;
+        let metric = statement.read::<String, _>(1)?;
+        let maximum = statement.read::<f64, _>(2)?;
+        let minimum = statement.read::<f64, _>(3)?;
+        let values = devices.entry(device).or_default();
+        if metric == "link_capacity" {
+            values.1 = maximum;
+        } else {
+            values.0 += (maximum - minimum).max(0.0);
+        }
+    }
+    Ok(devices
+        .values()
+        .filter(|(_, capacity)| *capacity > 0.0)
+        .map(|(bytes, capacity)| bytes * 8.0 / duration_s.max(f64::EPSILON) / capacity * 100.0)
+        .fold(0.0, f64::max))
 }
 
 #[derive(Deserialize)]

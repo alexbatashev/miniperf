@@ -472,12 +472,26 @@ COMMON DATASETS
   roofline               Roofline loop throughput and arithmetic intensity
   assembly_address_stats Sample counts and counters by assembly address
   proc_map               Symbol and source information by instruction pointer
+  snapshot_processes     Observed process-tree membership and coverage quality
+  snapshot_resource_samples  Normalized CPU/memory/disk/network/uncore timeline
+  snapshot_summary       Recording-wide resource peaks and totals
+  snapshot_findings      Ranked USE findings and next-measurement guidance
+  snapshot_collectors    Collector availability, provenance, and remediation
 
 EXAMPLES
   # Largest function hotspots
   mperf query ./results \
     'SELECT func_name, total, cycles, instructions, ipc
      FROM hotspots ORDER BY total DESC LIMIT 20'
+
+  # Snapshot diagnosis and unavailable collectors
+  mperf query ./results \
+    'SELECT rank, severity, resource, finding, evidence, recommendation
+     FROM snapshot_findings ORDER BY rank'
+
+  mperf query ./results \
+    "SELECT name, status, source, message FROM snapshot_collectors
+     WHERE status <> 'available'"
 
   # Filter function names
   mperf query ./results \

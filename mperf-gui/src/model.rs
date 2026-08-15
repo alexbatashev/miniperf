@@ -207,6 +207,13 @@ impl GuiTab {
     ) -> Self {
         match tab {
             TabSpec::Summary => Self::Summary,
+            TabSpec::Resources => {
+                let spec = mperf_data::resources_table_spec();
+                Self::MetricsTable {
+                    title: spec.title.clone().unwrap_or_else(|| spec.view.clone()),
+                    data: MetricsTableData::load(connection, &spec),
+                }
+            }
             TabSpec::MetricsTable(spec) => {
                 let title = spec.title.clone().unwrap_or_else(|| spec.view.clone());
                 Self::MetricsTable {
@@ -558,6 +565,11 @@ mod tests {
         let snapshot = ScenarioInfo::Snapshot(SnapshotInfo {
             pid: 1,
             counters: Vec::new(),
+            scope: "legacy_root_only".to_string(),
+            interval_ms: 1_000,
+            stop_reason: String::new(),
+            collectors: Vec::new(),
+            warnings: Vec::new(),
         });
         let roofline = ScenarioInfo::Roofline(RooflineInfo {
             backend: "compiler".to_string(),

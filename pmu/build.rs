@@ -214,6 +214,7 @@ fn scenario_ui_tokens(ui: &ScenarioUi) -> TokenStream {
 fn tab_tokens(tab: &TabSpec) -> TokenStream {
     match tab {
         TabSpec::Summary => quote! { pmu_data::TabSpec::Summary },
+        TabSpec::Resources => quote! { pmu_data::TabSpec::Resources },
         TabSpec::Flamegraph => quote! { pmu_data::TabSpec::Flamegraph },
         TabSpec::Loops => quote! { pmu_data::TabSpec::Loops },
         TabSpec::Memory => quote! { pmu_data::TabSpec::Memory },

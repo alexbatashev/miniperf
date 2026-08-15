@@ -9,6 +9,10 @@ pub struct MemoryControllerSample {
     pub read_bytes: u64,
     /// Bytes written by all discovered controllers.
     pub write_bytes: u64,
+    /// Package energy consumed while the monitor was enabled.
+    pub package_joules: Option<f64>,
+    /// CPU-core energy consumed while the monitor was enabled.
+    pub core_joules: Option<f64>,
 }
 
 #[cfg(target_os = "linux")]
@@ -37,10 +41,18 @@ mod imp {
         "write",
     ];
 
+    #[derive(Clone, Copy)]
+    enum Measurement {
+        ReadBytes,
+        WriteBytes,
+        PackageJoules,
+        CoreJoules,
+    }
+
     struct Handle {
         fd: RawFd,
-        read: bool,
-        bytes_per_count: f64,
+        measurement: Measurement,
+        scale: f64,
     }
 
     /// Active system-scoped controller counters.
@@ -54,6 +66,7 @@ mod imp {
         pub fn start() -> io::Result<Option<Self>> {
             let root = Path::new("/sys/bus/event_source/devices");
             let mut handles = Vec::new();
+            let mut last_error = None;
             for entry in match fs::read_dir(root) {
                 Ok(value) => value,
                 Err(_) => return Ok(None),
@@ -64,7 +77,10 @@ mod imp {
                     continue;
                 }
                 let path = entry.path();
-                for (read, aliases) in [(true, READ_ALIASES), (false, WRITE_ALIASES)] {
+                for (measurement, aliases) in [
+                    (Measurement::ReadBytes, READ_ALIASES),
+                    (Measurement::WriteBytes, WRITE_ALIASES),
+                ] {
                     let Some((event_name, event_path)) = aliases.iter().find_map(|alias| {
                         let candidate = path.join("events").join(alias);
                         candidate
@@ -73,21 +89,36 @@ mod imp {
                     }) else {
                         continue;
                     };
-                    match open_event(&path, &event_name, &event_path, read) {
+                    match open_event(&path, &event_name, &event_path, measurement) {
                         Ok(handle) => handles.push(handle),
                         Err(error) => {
-                            for handle in handles {
-                                unsafe {
-                                    libc::close(handle.fd);
-                                }
-                            }
-                            return Err(error);
+                            // PMUs and aliases are independently exposed and
+                            // independently permissioned. Preserve every
+                            // usable channel instead of discarding a host's
+                            // read bandwidth because one write event failed.
+                            last_error = Some(error);
                         }
                     }
                 }
             }
             if handles.is_empty() {
-                return Ok(None);
+                return match last_error {
+                    Some(error) => Err(error),
+                    None => Ok(None),
+                };
+            }
+            let power = root.join("power");
+            for (measurement, event_name) in [
+                (Measurement::PackageJoules, "energy-pkg"),
+                (Measurement::CoreJoules, "energy-cores"),
+            ] {
+                let event_path = power.join("events").join(event_name);
+                if !event_path.is_file() {
+                    continue;
+                }
+                if let Ok(handle) = open_event(&power, event_name, &event_path, measurement) {
+                    handles.push(handle);
+                }
             }
             for handle in &handles {
                 unsafe {
@@ -118,13 +149,24 @@ mod imp {
                 } else {
                     values[0] as f64 * values[1] as f64 / values[2] as f64
                 };
-                let value = (scaled * handle.bytes_per_count)
-                    .max(0.0)
-                    .min(u64::MAX as f64) as u64;
-                if handle.read {
-                    result.read_bytes = result.read_bytes.saturating_add(value);
-                } else {
-                    result.write_bytes = result.write_bytes.saturating_add(value);
+                let value = (scaled * handle.scale).max(0.0);
+                match handle.measurement {
+                    Measurement::ReadBytes => {
+                        result.read_bytes = result
+                            .read_bytes
+                            .saturating_add(value.min(u64::MAX as f64) as u64)
+                    }
+                    Measurement::WriteBytes => {
+                        result.write_bytes = result
+                            .write_bytes
+                            .saturating_add(value.min(u64::MAX as f64) as u64)
+                    }
+                    Measurement::PackageJoules => {
+                        result.package_joules = Some(result.package_joules.unwrap_or(0.0) + value)
+                    }
+                    Measurement::CoreJoules => {
+                        result.core_joules = Some(result.core_joules.unwrap_or(0.0) + value)
+                    }
                 }
             }
             Ok(result)
@@ -146,7 +188,7 @@ mod imp {
         device: &Path,
         event_name: &str,
         event_path: &Path,
-        read: bool,
+        measurement: Measurement,
     ) -> io::Result<Handle> {
         let pmu_type = read_number(&device.join("type"))? as u32;
         let cpu = fs::read_to_string(device.join("cpumask"))
@@ -181,8 +223,11 @@ mod imp {
         }
         Ok(Handle {
             fd,
-            read,
-            bytes_per_count: event_scale(device, event_name).unwrap_or(64.0),
+            measurement,
+            scale: event_scale(device, event_name).unwrap_or(match measurement {
+                Measurement::ReadBytes | Measurement::WriteBytes => 64.0,
+                Measurement::PackageJoules | Measurement::CoreJoules => 1.0,
+            }),
         })
     }
 

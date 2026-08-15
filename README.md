@@ -115,8 +115,13 @@ mperf record -s <scenario_name> -o <output_directory> -- <your_command_and_argum
 
 Available Scenarios
 
-- `snapshot`: A basic performance snapshot similar to stat command but in
-  sampling mode. Useful for general performance overview.
+- `snapshot`: A lightweight Linux USE-method overview of the complete launched
+  or attached process tree. It combines coarse 99 Hz hotspots with one-second
+  CPU, memory, pressure, disk, network, and supported system-scoped uncore
+  telemetry, then ranks the measurements to run next. Use `--duration 10s` to
+  bound a recording. Missing BPF, cgroup, or PMU capabilities are recorded as
+  explicit degraded provenance rather than zero values. See the
+  [Linux snapshot plan](docs/plans/linux-snapshot-use.md).
 - `mem`: Hybrid whole-process memory analysis. A native pass records timing,
   hotspots, allocation lifetime, RSS, and supported Intel IMC/AMD data-fabric
   bandwidth counters; a QEMU pass accounts every memory reference to derive
