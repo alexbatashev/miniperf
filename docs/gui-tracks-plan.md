@@ -11,14 +11,23 @@ source/disassembly tabs. Equal priority: an architecture where adding a future v
 mechanical exercise (one derive + one view + one registry entry), and a visual standard that
 matches the prototype (dense, consistent tokens, light + dark).
 
+The GUI stays cross-platform: macOS, Linux, and Windows are all first-class. No
+platform-specific UI code outside `main.rs` boot and the paths/keymap helpers (Cmd on macOS ↔
+Ctrl elsewhere); anything platform-gated needs a reason written next to it.
+
+The GUI also stops being a pure viewer: it can launch new recordings, locally and on remote
+hosts over ssh (§8). It does so by orchestrating the `mperf` CLI, never by linking collector
+code.
+
 Non-goals for this effort: new collection capabilities (tracked separately in §10), the CLI/TUI,
-and remote/live profiling.
+and **live** view of a recording in progress — results open when the run completes.
 
 ## 2. What we are building (UX contract)
 
 Shell, top to bottom:
 
-1. **Title bar** — recording chip (name + scenario badge, switcher over recent recordings), theme toggle.
+1. **Title bar** — recording chip (name + scenario badge, switcher over recent recordings),
+   "New profile…" button (§8) with a run chip while a recording is in progress, theme toggle.
 2. **Filter bar** — time-range chip · thread multi-select · module multi-select · symbol substring
    input · selection chip · coverage stat ("18% of 33.4K samples in scope") · Clear all.
 3. **Master timeline** (collapsible) — per-thread activity lanes (92px label gutter, density = alpha,
@@ -103,6 +112,8 @@ Strict one-directional layering. Nothing above L2 knows gpui; nothing in L4 comp
                               memory/roofline/metrics), sources (lazy asm/source loader)
       analysis/               L2 — profile_analysis split by topic + new derives (§6) + hub.rs
       state/                  L3 — workspace.rs (GlobalFilter, Selection, tab/panel state, recents)
+      runner/                 profile launcher (§8): RunSpec, Target (Local|Ssh), process
+                              orchestration on the background executor; gpui-free except spawn
       theme.rs                token struct, light+dark, Global
       ui/                     widget kit: tab_bar, splitter, table, text_input, dropdown, chip,
                               meter, stat_tile, tooltip, section, badge
@@ -125,6 +136,13 @@ Strict one-directional layering. Nothing above L2 knows gpui; nothing in L4 comp
   symbol: String }`. `SampleFilter` in L2 grows `modules` + `symbol` (stack-contains-match
   semantics, matching the prototype); the existing `frame_ids` mechanism is retired in favor of
   highlight-only selection.
+- **Switching recordings** (title-bar switcher): one window, one session at a time.
+  `Workspace::open(path)` loads the new `Session` on the background executor behind a loading
+  chip in the title bar; on success it swaps the `Arc<Session>`, resets filter/selection, closes
+  source tabs, keeps static-tab choice when the new scenario still offers it, and bumps a
+  **session generation** — the hub drops every cached entry and any in-flight compute tagged
+  with the old generation is discarded on arrival. On failure the current session stays and a
+  `Dialog` shows the error; a recording that fails to load is not added to recents.
 
 ### Analysis pipeline (the biggest behavioral change)
 
@@ -148,12 +166,27 @@ are `Send + Sync`. Mechanical but touches the whole file; do it first (M0).
 
 ## 5. Foundation subsystems
 
-### 5.1 Theme v2
+### 5.1 Theme v2 — a shadcn port, not an original design
 
 A `Theme` struct registered as a gpui `Global`, with **light and dark** instances, following the
-OS via `Window::observe_window_appearance` (+ manual override persisted with recents). Tokens:
+OS via `Window::observe_window_appearance` (+ manual override persisted in config, §13). The UI
+look is a faithful port of the prototype's shadcn theme — token values are copied, not
+reinterpreted:
 
-- Surfaces/chrome/text/border/accent (semantic, as today but structured).
+- **Semantic tokens ported verbatim from `ui-prototype/src/index.css`**: `background`,
+  `foreground`, `card`, `popover`, `primary`, `secondary`, `muted`, `accent`, `destructive`,
+  `border`, `input`, `ring` (+ paired `*_foreground`), light and dark. Convert oklch → `Hsla`
+  once (build-time script or hardcoded results with the oklch source in a comment).
+- **Radius scale**: `radius = 10px` base with sm=0.6×, md=0.8×, lg=1×, xl=1.4× — widgets take
+  radii from the scale, never ad-hoc pixels.
+- **Interaction-state spec** (this is where the shadcn feel lives; every widget uses one shared
+  helper, no per-widget improvisation): hover = `muted` wash, active = 1px downward press
+  translate, focus-visible = 3px ring at `ring/50` outside the border, disabled = 50% opacity +
+  no pointer events, open/expanded menus hold their hover state.
+- **Fonts**: Geist Variable bundled through the gpui asset source as the UI font; the existing
+  monospace stays for symbols/code/numbers.
+- **Icons**: the lucide subset the prototype uses (`ui-prototype/public/icons.svg`, ~24 glyphs)
+  exported as individual SVG assets and rendered via `svg()`, tinted with `text_color`.
 - **Viz tokens ported verbatim from the prototype palette** (validated for CVD in both modes):
   `series[8]` (light: `#2a78d6 #eb6834 #1baf7a #eda100 #e87ba4 #008300 #4a3aa7 #e34948`, dark
   variants as in `ui-prototype/src/index.css`), `status {good, warn, serious, critical}`,
@@ -195,18 +228,30 @@ a lane chart paints O(visible buckets), never O(samples).
 
 ### 5.3 Widget kit (`ui/`) — gpui has none of these
 
-| Widget | Mechanics |
-|---|---|
-| `TabBar` | closable tabs; reuse the proven close pattern (`stop_propagation` on mouse-down + `on_click`, `chrome.rs:119-126`); overflow scrolls; middle-click close |
-| `Splitter` | per-widget hitbox drag (no global flags); powers selection panel + any future split |
-| `VirtualTable` | `uniform_list` + sticky header via `UniformListDecoration` (the proper hook, unused today) or the proven sibling-header-in-shared-`overflow_x` container; sortable headers; column widths + resize handles (port `bottom_panel.rs:540-559` logic); cell renderers incl. inline-bar cells; scrollbar as a list decoration |
-| `TextInput` | single-line, for the symbol filter: `FocusHandle` + `on_key_down` + IME plumbing from gpui `input.rs`; v1 scope = insert/backspace/delete/arrows/home/end/select-all |
-| `DropdownMenu` | `deferred(anchored())` popover, checkbox rows, outside-click dismiss |
-| `Chip`, `Badge`, `Meter`, `StatTile`, `InfoTooltip`, `CollapsibleSection` | small; `InfoTooltip` = `.id()`'d icon + `.tooltip(AnyView)` (the Top-Down (i) pattern from the prototype) |
+Every widget is a port of the prototype's shadcn component: same variants, same sizes, same
+states, colors and radii only from §5.1 tokens. When in doubt, open the corresponding
+`ui-prototype/src/components/ui/*.tsx` and copy its decisions. **The kit is a hard prerequisite:
+no view or shell work starts until the gallery passes parity review (M0a).**
+
+| Widget | shadcn source | Mechanics |
+|---|---|---|
+| `Button` | button.tsx | variants default/outline/ghost/destructive; sizes sm/default/icon; shared interaction states |
+| `TabBar` | tabs.tsx | closable tabs; reuse the proven close pattern (`stop_propagation` on mouse-down + `on_click`, `chrome.rs:119-126`); overflow scrolls; middle-click close |
+| `Splitter` | resizable.tsx | per-widget hitbox drag (no global flags); powers selection panel + any future split |
+| `VirtualTable` | table.tsx | `uniform_list` + sticky header via `UniformListDecoration` (the proper hook, unused today) or the proven sibling-header-in-shared-`overflow_x` container; sortable headers; column widths + resize handles (port `bottom_panel.rs:540-559` logic); cell renderers incl. inline-bar cells; scrollbar as a list decoration |
+| `TextInput`, `InputGroup` | input.tsx, input-group.tsx | single-line: `FocusHandle` + `on_key_down` + IME plumbing from gpui `input.rs`; v1 scope = insert/backspace/delete/arrows/home/end/select-all; `InputGroup` adds leading icon + clear button (the symbol filter) |
+| `DropdownMenu` | dropdown-menu.tsx | `deferred(anchored())` popover, checkbox rows, outside-click dismiss |
+| `SegmentedControl` | toggle-group.tsx | single-select group for chart toolbars (STACKS, WEIGHT) |
+| `Dialog` | dialog.tsx | modal over dimmed scrim via `deferred`; recording switcher + load errors |
+| `Scrollbar` | scroll-area.tsx | thin overlay thumb, fades when idle; used by tables and scrollable panes |
+| `EmptyState` | — | centered icon + one-line reason + optional action; the single way any view renders "no data" |
+| `Chip`, `Badge`, `Meter`, `StatTile`, `Card`, `InfoTooltip`, `CollapsibleSection` | badge/progress/card/tooltip | small; `InfoTooltip` = `.id()`'d icon + `.tooltip(AnyView)` (the Top-Down (i) pattern from the prototype) |
+| `CommandPalette` | command.tsx | M5 only; Dialog + TextInput + filtered list |
 
 A `--gallery` debug window renders every widget and chart type with fake data in both themes —
 it is where look-and-feel gets iterated without loading recordings, and it doubles as the visual
-regression checklist.
+regression checklist. Gallery acceptance = side-by-side parity with the running React prototype
+(both themes, hover/focus/disabled states, empty states).
 
 ## 6. Derived data: existing vs new
 
@@ -258,25 +303,110 @@ consumes it, which avoids a recording-format change. Adding a future view = impl
 `analysis::Foo` + `views::foo` + one registry entry; the shell, filter, caching, theming, and
 tab management come for free.
 
-## 8. Keyboard & polish (gpui actions — completely unused today)
+**Degradation rules** (recordings predating C-track data, or scenarios that never record it —
+gating is always data-presence driven, per feature, not per view):
+
+- Flame WEIGHT toggle offers only weights whose data exists (no alloc data → no "alloc" option).
+- Cores: without sched events, occupancy is sample-inferred and the view says so in its header
+  ("inferred from samples"); with them, the label disappears.
+- Source/Asm event-share chips render only for events with per-instruction attribution;
+  otherwise the heat gutter alone.
+- Uncore track group appears only when system-wide counters exist in the recording.
+- A view with zero rows after loading renders `EmptyState` with the reason ("no memory
+  observations in this recording"), never a blank pane.
+
+C-track features that add tables/event types announce themselves via feature entries in
+`info.json`, so `is_available` checks stay cheap declarations instead of probing sqlite.
+
+## 8. Profile runner — the GUI records, locally and over ssh
+
+The structural change: the GUI launches recordings instead of only opening them. It shells out
+to the `mperf` CLI (`mperf record -s <scenario> -o <dir> [--duration …] [--pid … | -- cmd]`) —
+the CLI remains the single owner of collection, permissions, and postprocessing, and the GUI
+stays buildable on platforms that cannot collect (a Windows GUI drives remote Linux hosts).
+
+### `runner/` module
+
+- `Target = Local | Ssh { host: String }` · `RunSpec { target, scenario, command | pid, cwd,
+  env, duration, output_name }` · `RunHandle { status, log_tail, cancel }`.
+- Runs execute on the background executor; `RunHandle` feeds an `Entity<ActiveRun>` (title-bar
+  run chip → expandable log panel: elapsed time, stderr tail, Stop button). Stop = SIGINT to the
+  process group (over ssh: `ssh host kill -INT`), which lets mperf finalize the recording.
+- Output lands in a managed recordings directory (platform data dir, §13) unless the user picks
+  a path. On success the recording is added to recents and opened; on failure the log panel
+  stays with the error.
+
+### Local
+
+Spawn `mperf` found next to the GUI binary or on PATH; version handshake via `mperf --version`
+before the first run. Local target is hidden on platforms where the collector does not exist
+(Windows).
+
+### Ssh
+
+- Transport is the system OpenSSH client (`ssh`/`scp` — present on macOS, Linux, Windows 10+),
+  spawned with `BatchMode=yes`. The user's `~/.ssh/config`, agents, and jump hosts work for
+  free; the GUI never touches passwords or keys — if auth needs interaction, the run fails with
+  "set up key-based auth for <host>".
+- Flow: probe remote (`uname -sm`, `mperf --version` on the remote PATH) → if mperf is missing
+  or version-mismatched, upload the matching static build from the GUI's bundled toolchain dir
+  (`scp`) → run record **and postprocess on the remote host** (symbols and target binaries live
+  there) → pull the result directory (`scp -C`; rsync when available) into the managed
+  recordings dir → open as a normal `Session`. The pulled copy notes its origin host in
+  `info.json` metadata.
+- Saved hosts (plus per-host mperf path override) live in user config (§13) and populate the
+  target picker.
+
+### UI (design approved in the prototype)
+
+- **Wizard `Dialog`, three steps** — 1 · Target (selectable cards: local, saved ssh hosts,
+  one-off `user@host`), 2 · Workload (launch-command vs attach; launch = command + cwd + env,
+  attach = a filterable process picker sorted by CPU utilization, listed from the selected
+  target via `ps`/`ssh ps`), 3 · Recording (scenario cards with blurbs, duration, and a "will
+  run" summary showing the exact `mperf record` command plus provisioning/pull notes). Per-step
+  validation gates Next; Start on the last step.
+- **Terminal-style bottom drawer** while a run is active: header = stage stepper
+  (connect → upload mperf → record → postprocess → pull results) + elapsed time, body =
+  monospace log tail, footer = spec summary + Stop / Open recording / Dismiss. The drawer is an
+  overlay — every view stays fully usable and the run continues in the background; closing the
+  drawer never cancels the run.
+- **Run chip in the title bar** (replaces the "New profile" button while a run exists) shows
+  stage + elapsed and toggles the drawer; green/red states for finished/failed.
+
+One run at a time in v1; the recording opens when the run finishes (§1 non-goal covers live
+view). The runner UI was prototyped in `ui-prototype` and signed off before R1 implements it
+in gpui.
+
+## 9. Keyboard & polish (gpui actions — completely unused today)
 
 `actions!` + `KeyBinding` + per-pane `FocusHandle`s: Cmd/Ctrl+W close tab, Ctrl+Tab / Ctrl+Shift+Tab
 cycle, Cmd/Ctrl+F focus symbol input, Esc clear selection → clear filter (two-stage), ↑/↓ + Enter in
 tables, ←/→/+/- pan/zoom time on the master timeline, Cmd/Ctrl+K command palette (port of the
 Workbench palette: views, functions, threads, clear-filters) as the last polish item.
 
-## 9. Milestones (each one PR-sized, buildable, demoable)
+## 10. Milestones
 
-- **M0 — Foundations.** Theme v2 (light+dark, viz tokens, gallery window). `charts/` core
-  (ChartFrame, BrushController, HoverModel, TextCache, painters). `ui/` kit v1. `Rc→Arc` in
-  `profile_analysis.rs`; `AnalysisHub` with background compute + LRU; `Workspace`/`GlobalFilter`
-  entities. Old GUI still boots untouched. *Accept: gallery shows all widgets/charts in both
-  themes; `cargo test` covers hub generations + brush math.*
-- **M1 — Shell cutover.** New chrome: title bar, filter bar (with TextInput + dropdowns), master
-  timeline (lanes + pinned tracks + brush), tab strip, selection panel (tiles + callers/callees),
-  status bar, Hotspots view. **Old `views/`, old `theme.rs`, chrome state, and flamelens are
-  deleted in this PR.** *Accept: open a real recording; brush/thread/module/symbol filters rescope
-  hotspots + lanes live; coverage stat correct; selection panel follows clicks.*
+All milestones land on the `gui_redesign` branch and merge to `main` **at once** when M5 is
+done — the mid-rebuild view-regression window is a non-issue by construction. Each milestone is
+still a separately reviewable, buildable, demoable unit.
+
+- **M0a — shadcn port (the hard prerequisite).** Theme v2 (§5.1: semantic tokens, radius scale,
+  interaction states, Geist, icons, viz tokens) + `ui/` widget kit (§5.3) + gallery window. No
+  data-layer dependency; starts immediately. *Accept: gallery passes side-by-side parity review
+  against the React prototype, both themes, incl. hover/focus/disabled and empty states.*
+- **M0b — chart framework.** `charts/` core: ChartFrame, BrushController, HoverModel, TextCache,
+  painters, the chart types with gallery pages. *Accept: gallery charts hit budgets (§11) on
+  dense fake data; brush math + hit-test under `cargo test`.*
+- **M0c — data plumbing.** `Rc→Arc` in `profile_analysis.rs` (own commit); `AnalysisHub` with
+  background compute + LRU + generations; `Workspace`/`GlobalFilter` entities; `session/`
+  reorganization. Old GUI still boots untouched. *Accept: `cargo test` covers hub
+  generations/staleness + filter semantics.*
+- **M1 — Shell cutover.** New chrome: title bar (incl. recording switcher + loading/error
+  states), filter bar (with TextInput + dropdowns), master timeline (lanes + pinned tracks +
+  brush), tab strip, selection panel (tiles + callers/callees), status bar, Hotspots view. **Old
+  `views/`, old `theme.rs`, chrome state, and flamelens are deleted here.** *Accept: open a real
+  recording; brush/thread/module/symbol filters rescope hotspots + lanes live; coverage stat
+  correct; selection panel follows clicks; switching recordings mid-compute is safe.*
 - **M2 — Core views.** Flame Graph (weights), Flame Scope, full Timeline view (all counter tracks,
   uncore group), Summary v1, dynamic Source/Asm tabs with dblclick-from-hotspots. *Accept: the
   prototype's flagship flow — brush a checkpoint, see flame reshape, dblclick `gather_neighbors`,
@@ -286,16 +416,24 @@ Workbench palette: views, functions, threads, clear-filters) as the last polish 
   tests against `truth` fixtures where applicable.
 - **M4 — Deep dives.** Memory, Roofline. Summary blocks for both.
 - **M5 — Polish.** Keyboard + palette, light-theme QA pass over every view, perf pass against
-  budgets (§11), docs/screenshots, dead-code sweep.
+  budgets (§11), platform QA on macOS + Windows + Linux, docs/screenshots, dead-code sweep, and
+  **`ui-prototype/` is deleted** — the gallery is the design reference from here on.
+- **R1 — Local runner.** `runner/` module, New-profile dialog, run chip + log panel, managed
+  recordings dir, config file v1 (§13). Needs M0a widgets + M1 shell; independent of M2–M4.
+  *Accept: record a local run from the GUI end-to-end and land in the open recording.*
+- **R2 — Ssh runner.** Remote probe/provision/pull flow, saved hosts in config. *Accept: record
+  on a remote Linux host from a macOS GUI end-to-end, incl. the mperf-missing path.*
 - **C-track (collector, parallel, unlocks prototype features that mock data faked):**
   1. allocation-site tracking (LD_PRELOAD) → alloc-weight flame;
   2. sched_switch/BPF occupancy → exact Cores view instead of sample-inferred;
   3. PEBS/IBS per-instruction attribution → event-share chips on asm become measured, not aggregated;
   4. uncore IMC + RAPL sampling in all scenarios → system track group everywhere.
 
-Dependency chain: M0 → M1 → {M2, M3, M4 in any order} → M5. C-track items are independent.
+Dependency chain: M0a → M0b → M1; M0c → M1; M1 → {M2, M3, M4, R1 in any order} → M5; R1 → R2.
+C-track items are independent of the GUI chain and never block it (§7 degradation rules cover
+their absence); start item 2 around M2 so Cores in M3 can render real occupancy.
 
-## 10. Performance budgets
+## 11. Performance budgets
 
 - Load: 1M-sample recording fully materialized < 2s on the background executor (today's loader
   already qualifies; keep it).
@@ -306,7 +444,7 @@ Dependency chain: M0 → M1 → {M2, M3, M4 in any order} → M5. C-track items 
 - Element counts: charts are canvases; tables are `uniform_list`; nothing renders O(data) divs
   (`stack_timeline.rs` is the cautionary tale).
 
-## 11. Testing
+## 12. Testing
 
 - L2 stays gpui-free → plain `cargo test`: derives against `truth` fixtures, filter semantics,
   hub generation/staleness, brush math, ramp/contrast helpers.
@@ -314,7 +452,25 @@ Dependency chain: M0 → M1 → {M2, M3, M4 in any order} → M5. C-track items 
 - The gallery window is the visual checklist (both themes, dense data, empty states).
 - Manual acceptance script per milestone (recorded in this doc's PR descriptions).
 
-## 12. Risks
+## 13. Persistence & configuration
+
+Two files, two lifecycles, both with atomic temp-file+rename writes (the `recent.rs` pattern):
+
+- **User config — `config.toml`** in the platform config dir (`$XDG_CONFIG_HOME/mperf` on
+  Linux, `~/Library/Application Support/mperf` on macOS, `%APPDATA%\mperf` on Windows;
+  `MPERF_GUI_STATE_DIR` override stays for tests). Hand-editable, read at boot, documented in
+  the README: theme override (`system|light|dark`), managed recordings directory, ssh hosts
+  (`[[remote]] host / mperf_path`), pinned counter-track overrides per scenario, keybinding
+  overrides (M5). Unknown keys warn on stderr and are preserved on rewrite, never a crash.
+- **UI state — `ui-state.json`** in the platform state dir (where `recent.rs` writes today;
+  `recent.rs` grows into `state/persist.rs`). Machine-written, debounced (~1s): recents, window
+  geometry, panel widths, master-timeline collapsed flag, last active view per scenario. Corrupt
+  or missing state falls back to defaults silently.
+
+The managed recordings directory defaults to the platform data dir
+(`$XDG_DATA_HOME/mperf/recordings` and equivalents).
+
+## 14. Risks
 
 - **`Rc→Arc` ripple** through `profile_analysis.rs` (2009 LOC) — mechanical but must land first;
   isolate in its own commit inside M0.
@@ -329,3 +485,11 @@ Dependency chain: M0 → M1 → {M2, M3, M4 in any order} → M5. C-track items 
   driven by `TMAInfo` metric names, not a hardcoded 4-way tree; the prototype's tree is the Intel
   special case.
 - **gpui 0.2.x API drift** — pin the version for the rebuild; upgrade as its own change.
+- **gpui on Windows** is the least-exercised backend — smoke-build all three platforms in CI
+  from M0a on, not at M5; platform bugs found late are redesign bugs.
+- **Remote provisioning** (R2) — arch/libc mismatches for the uploaded static binary, remote
+  perf permissions (`perf_event_paranoid`, macOS kperf needs sudo), and multi-GB result pulls.
+  Mitigate: probe before run, surface the remote's own error text verbatim, `scp -C`/rsync, and
+  a size warning before pulling.
+- **Runner scope creep** — no live view, no run queue, no host fleet management in v1; one run,
+  one host, results on completion.
