@@ -285,3 +285,106 @@ output, SQL files, and stdin usage.
   collections, sampling on M mode instructions is unavailable.
 - Cache references and cache missess are mapped to `l2_access` and `l2_miss`
   events respectively.
+
+### SpacemiT K3 (X100)
+
+- K3 is heterogeneous: eight X100 application cores (`cpu0-7`) and eight A100
+  AI cores (`cpu8-15`), distinguished by `marchid`. Both have event tables, and
+  **their event encodings are different — the same raw code means different
+  things on the two clusters**, so the cluster must be identified correctly.
+- Linux will not schedule onto the A100 cores on its own; a helper such as
+  [k3_ai](https://github.com/brucehoult/k3_ai)'s `ai` is needed, which writes
+  the calling PID to `/proc/set_ai_thread`. Since miniperf itself still runs on
+  an X100 core, an A100 measurement has to name the cluster explicitly:
+
+  ```sh
+  MINIPERF_CPU_FAMILY=a100 ai mperf stat --topdown -l 2 -- ./workload
+  ```
+- The PMU exposes 16 counters. `mhpmcounter17` and `mhpmcounter18` are
+  dedicated to cycles and instructions, leaving 14 general-purpose counters, so
+  the entire top-down scenario is collected in a single group with no
+  multiplexing.
+- Unlike X60, X100 does implement overflow interrupts for the cycle and
+  instruction counters, so sampling uses `cycles` directly.
+- SpacemiT publishes no PMU event table for X100. The event names in
+  `pmu/events/spacemit/x100.json` were derived by measuring each raw event code
+  against microbenchmarks with known analytic instruction, branch, and cache
+  behaviour, then cross-checked against the event map in SpacemiT's K3 device
+  tree. The set of valid raw codes comes from that device tree's
+  `riscv,raw-event-to-mhpmcounters` property.
+- **The K3 device tree maps `STALLED_CYCLES_FRONTEND` to raw `0x03` and
+  `STALLED_CYCLES_BACKEND` to raw `0x04`; measurement shows these are the wrong
+  way round.** A dependent DRAM pointer chase, which can only stall in the
+  backend, puts 99.6% of its cycles in `0x03` and 0.03% in `0x04`; a
+  mispredicted-branch loop, which can only stall in the frontend, puts 99.6% in
+  `0x04` and 0.002% in `0x03`. Two runs of the same nop stream that differ only
+  in code footprint (64KB, fitting L1I, versus 2MB) move `0x04` from 1.4% to
+  48% while leaving `0x03` flat. miniperf uses raw codes directly and therefore
+  applies the corrected assignment; `perf stat -e stalled-cycles-frontend` on
+  this board reports backend stalls.
+- The A100 cluster assigns those two codes the *other* way round, matching the
+  device tree: the same DRAM chase run on an A100 core puts 98% of cycles in
+  `0x04`, the exact mirror of the X100 result. The device tree's PMU node is
+  labelled "X100 PMU" but its event map is consistent with the older
+  K1/X60-lineage cores that the A100 resembles, which is the likely origin of
+  the mismatch.
+- The A100 table is smaller than the X100 one. Most X60 event codes are not
+  implemented (`0xaa`/`0xab` L1D, `0xb8`/`0xb9` L2, `0x40`/`0x41` trap counters
+  all read zero), and the codes that do work often differ from X100: `0x2d` is
+  a load counter on A100 but speculative issue on X100, `0x29` is CSR
+  instructions rather than stores, `0x34` is fences rather than integer ALU
+  ops. A100 exposes no L2-miss or dTLB event, so its top-down stops at a
+  frontend breakdown; `be_bound` is reported without a memory/core split rather
+  than with one that cannot be costed. Its `fp_vector_uop` counter is useful on
+  its own: a VLEN-wide vector op counts as several micro-operations, so
+  `vector_uops_per_inst` shows how much of the 1024-bit vector unit a loop uses.
+- Measured latencies used as top-down constants (load-to-use, cycles):
+
+  | | L1D | L2 | DRAM |
+  |---|---|---|---|
+  | X100 | 3 | 25 | 294 |
+  | A100 | 2 | 35 | 435 |
+
+  The X100 DRAM figure is from a hugepage-backed chase; repeating it with 4KB
+  pages costs 376 cycles, and that 82-cycle difference is the page-walk
+  constant.
+- The stall counters saturate rather than partition, so `fe_bound` and
+  `be_bound` are normalised against the slots not accounted for by `retiring`
+  and `bad_speculation`. Level-1 buckets therefore always sum to 1. Note that
+  when an execution unit saturates without any cache misses, backpressure
+  stalls the frontend too and `fe_bound` reads high on what is really an
+  execution-bound workload; the level-2 breakdown (which attributes to
+  I-cache, ITLB, branch resteer, L2, DRAM, and dTLB) is the reliable signal.
+- K3 exposes no uncore PMU through perf: there is no DDR, interconnect, or LLC
+  event source in sysfs, and no RAPL-style energy counters. (The `PMU` blocks
+  in the SpacemiT address map are power management units, not performance
+  monitors.)
+- DDR bandwidth is available, but through a private character device rather
+  than perf. `/dev/ddr_perf`, from the vendor `ddr_bw` driver, answers an ioctl
+  per AXI port with the read and write traffic seen across both memory
+  controllers since the previous call. This is miniperf's general fallback, not
+  a K3 special case: whenever no perf-exposed memory controller is found on any
+  host, the device is probed — including how many ports it answers for — and
+  used if present, with `ddr_perf` reported as the source in snapshot metadata.
+  Probing is safe because the driver validates `port_id`: on K3 both ioctls
+  answer for ports 0-4 and return `EINVAL` beyond that, so the probe stops at
+  the real port count instead of needing one hardcoded per SoC.
+  Two properties of the interface shape that support:
+  - The returned deltas are `u32` **bytes**, so they saturate at 4GiB — under a
+    second of real traffic here, and measurably so: an eight-thread copy loop
+    reports a flat 4096MB for any interval of 1s or longer. miniperf therefore
+    polls every 50ms on a background thread and accumulates into 64-bit
+    counters, which keeps `sample()` correct however often the caller reads it.
+  - The "previous" value lives in the driver, one per port for the whole
+    system, so any two readers of `/dev/ddr_perf` consume each other's deltas.
+    Do not run another DDR bandwidth tool alongside a miniperf collection.
+- The device is root-only, so DDR counters need `sudo`; without it miniperf
+  reports no memory-controller monitor rather than failing. Validated against a
+  known workload: 8 x 256MB `memcpy` measured 2081MB read and 2332MB written
+  against 2048MB expected of each, repeatable to 0.3% across runs, the write
+  excess being write-allocate and first-touch faults.
+- These counters are system-wide, not per-process: they capture every master on
+  the AXI ports for as long as the collection runs. The same `memcpy` benchmark
+  measures 2081MB read on an idle machine and 5917MB immediately after a build,
+  with page-cache writeback still draining. Read the figures as whole-system
+  traffic during the run, not as the profiled process's own footprint.

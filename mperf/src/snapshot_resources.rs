@@ -342,7 +342,7 @@ fn collect(
             statuses.push(status(
                 "uncore_memory",
                 "available",
-                "perf_event/sysfs",
+                monitor.source(),
                 "system_during_target",
                 "memory-controller read/write counters",
             ));
@@ -354,7 +354,7 @@ fn collect(
                 "unavailable",
                 "perf_event/sysfs",
                 "unavailable",
-                "no recognized memory-controller PMU aliases",
+                "no memory-controller PMU aliases and no vendor bandwidth device",
             ));
             None
         }

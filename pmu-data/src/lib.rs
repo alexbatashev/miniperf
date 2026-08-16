@@ -48,6 +48,12 @@ pub const SIFIVE_U7: &str = "sifive_u7";
 /// SpacemiT X60 family identifier.
 pub const SPACEMIT_X60: &str = "spacemit_x60";
 
+/// SpacemiT X100 family identifier.
+pub const SPACEMIT_X100: &str = "spacemit_x100";
+
+/// SpacemiT A100 family identifier.
+pub const SPACEMIT_A100: &str = "spacemit_a100";
+
 /// Arm Cortex-A520 family identifier.
 pub const ARM_CORTEX_A520: &str = "cortex_a520";
 /// Arm Cortex-A720 family identifier.

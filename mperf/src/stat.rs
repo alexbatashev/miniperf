@@ -172,7 +172,7 @@ Performance counter stats for '{}':
 }
 
 fn render_topdown(scenario: &pmu_data::TmaScenario, level: u8, result: &pmu::CounterResult) {
-    let values = scenario
+    let mut values = scenario
         .events
         .iter()
         .filter_map(|name| {
@@ -193,21 +193,20 @@ fn render_topdown(scenario: &pmu_data::TmaScenario, level: u8, result: &pmu::Cou
         .iter()
         .map(|constant| (constant.name.clone(), constant.value as f64))
         .collect::<HashMap<_, _>>();
-    let mut rows = scenario
-        .metrics
-        .iter()
-        .filter_map(|metric| {
-            metric_depth(&metric.name)
-                .le(&level)
-                .then(|| {
-                    eval_tma(&metric.formula, &values, &constants)
-                        .ok()
-                        .map(|value| (metric, value))
-                })
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+    let mut rows = evaluate_scenario(scenario, &mut values, &constants, level);
+    rows.sort_by(|(left, _), (right, _)| {
+        let (left, right) = (
+            tree_sort_key(&left.name, &values),
+            tree_sort_key(&right.name, &values),
+        );
+        left.iter()
+            .zip(right.iter())
+            .find_map(|(left, right)| {
+                let ordering = left.total_cmp(right);
+                (ordering != std::cmp::Ordering::Equal).then_some(ordering)
+            })
+            .unwrap_or_else(|| left.len().cmp(&right.len()))
+    });
     println!("Top-down analysis ({})", scenario.name);
     for (index, (metric, value)) in rows.iter().enumerate() {
         let marker = if index == 0 { "*" } else { " " };
@@ -229,6 +228,46 @@ fn render_topdown(scenario: &pmu_data::TmaScenario, level: u8, result: &pmu::Cou
 
 fn metric_depth(name: &str) -> u8 {
     name.matches('.').count() as u8 + 1
+}
+
+/// Ranking key that keeps a top-down tree readable: the value of every
+/// ancestor in turn, negated. Sorting by it lexicographically puts each metric
+/// directly under its parent and ranks siblings by size, so a whole subtree
+/// stays together instead of being scattered by a flat sort on value.
+fn tree_sort_key(name: &str, values: &HashMap<String, f64>) -> Vec<f64> {
+    let mut key = Vec::new();
+    let mut path = String::new();
+    for part in name.split('.') {
+        if !path.is_empty() {
+            path.push('.');
+        }
+        path.push_str(part);
+        key.push(-values.get(&path).copied().unwrap_or(0.0));
+    }
+    key
+}
+
+/// Evaluate every metric in declaration order, feeding each result back into
+/// `values` so a child formula can reference its parent by name (the way a
+/// top-down child expresses itself as a share of its parent). Returns the
+/// metrics no deeper than `level`.
+fn evaluate_scenario<'a>(
+    scenario: &'a pmu_data::TmaScenario,
+    values: &mut HashMap<String, f64>,
+    constants: &HashMap<String, f64>,
+    level: u8,
+) -> Vec<(&'a pmu_data::TmaMetric, f64)> {
+    let mut rows = Vec::new();
+    for metric in &scenario.metrics {
+        let Ok(value) = eval_tma(&metric.formula, values, constants) else {
+            continue;
+        };
+        values.insert(metric.name.clone(), value);
+        if metric_depth(&metric.name) <= level {
+            rows.push((metric, value));
+        }
+    }
+    rows
 }
 
 fn eval_tma(
@@ -492,6 +531,124 @@ mod metric_tests {
         assert_eq!(
             applicable_metrics(&[ipc()], &[Counter::Cycles, Counter::Instructions]),
             vec![ipc()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod topdown_tests {
+    use super::*;
+
+    fn metric(name: &str, formula: &str) -> pmu_data::TmaMetric {
+        pmu_data::TmaMetric {
+            name: name.to_owned(),
+            desc: String::new(),
+            formula: formula.to_owned(),
+            group: Some("tma".to_owned()),
+        }
+    }
+
+    fn scenario(metrics: Vec<pmu_data::TmaMetric>) -> pmu_data::TmaScenario {
+        pmu_data::TmaScenario {
+            name: "tma".to_owned(),
+            events: vec!["cycles".to_owned(), "stall_backend".to_owned()],
+            groups: vec![],
+            precise_attribution: false,
+            constants: vec![pmu_data::TmaConstant {
+                name: "pipeline_width".to_owned(),
+                value: 4,
+            }],
+            metrics,
+            ui: None,
+        }
+    }
+
+    /// A child formula referring to its parent by name must see the parent's
+    /// computed value, not fail as an unknown event.
+    #[test]
+    fn child_metric_resolves_parent_reference() {
+        let scenario = scenario(vec![
+            metric("be_bound", "stall_backend / cycles"),
+            metric("be_bound.memory_bound", "min(be_bound, 0.25)"),
+            metric(
+                "be_bound.core_bound",
+                "max(0, be_bound - be_bound.memory_bound)",
+            ),
+        ]);
+        let mut values = HashMap::from([
+            ("cycles".to_owned(), 1_000.0),
+            ("stall_backend".to_owned(), 800.0),
+        ]);
+        let constants = HashMap::from([("pipeline_width".to_owned(), 4.0)]);
+
+        let rows = evaluate_scenario(&scenario, &mut values, &constants, 2);
+        let by_name: HashMap<_, _> = rows
+            .iter()
+            .map(|(metric, value)| (metric.name.as_str(), *value))
+            .collect();
+
+        assert_eq!(by_name["be_bound"], 0.8);
+        assert_eq!(by_name["be_bound.memory_bound"], 0.25);
+        assert_eq!(by_name["be_bound.core_bound"], 0.55);
+    }
+
+    /// Metrics deeper than the requested level are still evaluated, so their
+    /// values remain available to anything that references them.
+    #[test]
+    fn level_filter_hides_rows_without_breaking_references() {
+        let scenario = scenario(vec![
+            metric("be_bound", "stall_backend / cycles"),
+            metric("be_bound.memory_bound", "min(be_bound, 0.25)"),
+        ]);
+        let mut values = HashMap::from([
+            ("cycles".to_owned(), 1_000.0),
+            ("stall_backend".to_owned(), 800.0),
+        ]);
+        let constants = HashMap::new();
+
+        let rows = evaluate_scenario(&scenario, &mut values, &constants, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.name, "be_bound");
+        assert_eq!(values["be_bound.memory_bound"], 0.25);
+    }
+}
+
+#[cfg(test)]
+mod tree_order_tests {
+    use super::*;
+
+    /// Children must follow their own parent, and siblings rank by value, even
+    /// when a small subtree's child outweighs a larger subtree's child.
+    #[test]
+    fn orders_subtrees_under_their_parent() {
+        let values = HashMap::from([
+            ("fe_bound".to_owned(), 0.20),
+            ("fe_bound.latency".to_owned(), 0.19),
+            ("be_bound".to_owned(), 0.60),
+            ("be_bound.core_bound".to_owned(), 0.35),
+            ("be_bound.memory_bound".to_owned(), 0.25),
+        ]);
+        let mut names: Vec<&str> = values.keys().map(String::as_str).collect();
+        names.sort_by(|left, right| {
+            let (left, right) = (tree_sort_key(left, &values), tree_sort_key(right, &values));
+            left.iter()
+                .zip(right.iter())
+                .find_map(|(left, right)| {
+                    let ordering = left.total_cmp(right);
+                    (ordering != std::cmp::Ordering::Equal).then_some(ordering)
+                })
+                .unwrap_or_else(|| left.len().cmp(&right.len()))
+        });
+
+        assert_eq!(
+            names,
+            vec![
+                "be_bound",
+                "be_bound.core_bound",
+                "be_bound.memory_bound",
+                "fe_bound",
+                "fe_bound.latency",
+            ]
         );
     }
 }

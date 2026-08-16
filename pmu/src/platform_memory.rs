@@ -55,22 +55,171 @@ mod imp {
         scale: f64,
     }
 
+    /// Fallback bandwidth source for SoCs with no perf-exposed memory
+    /// controller: the `ddr_bw` character device, `/dev/ddr_perf`, which takes
+    /// an ioctl per AXI port and answers with the traffic seen since the
+    /// previous call. Nothing here is tied to a particular SoC — the port
+    /// count is probed, and the device is simply absent on hosts that lack it.
+    ///
+    /// Two things force a background poller rather than reads on demand. The
+    /// returned deltas are `u32` bytes, so they saturate at 4GiB — under a
+    /// second of real traffic on any modern controller — and the "previous"
+    /// value lives in the driver, one per port for the whole system, so
+    /// whoever calls first consumes the delta. Polling on a fixed short
+    /// interval and accumulating into 64-bit counters keeps `sample` correct
+    /// at any cadence.
+    mod ddr_perf {
+        use super::*;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            Arc,
+        };
+        use std::time::Duration;
+
+        const DEVICE: &str = "/dev/ddr_perf";
+        /// Bound on the port probe. Parts using this interface have a handful
+        /// of AXI ports; the bound only stops a driver that answers for every
+        /// index from spinning the probe forever.
+        const MAX_PORTS: u32 = 16;
+        /// 50ms keeps a single window under the driver's 4GiB saturation point
+        /// for anything up to ~85GB/s, well past what parts lacking an uncore
+        /// PMU deliver.
+        const POLL: Duration = Duration::from_millis(50);
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct Stat {
+            port_id: u32,
+            window: u32,
+            read_bytes: u32,
+            write_bytes: u32,
+            read_reqs: u32,
+            write_reqs: u32,
+            read_latency: u32,
+        }
+
+        const fn ioc(dir: u32, nr: u32, size: u32) -> libc::c_ulong {
+            ((dir << 30) | (size << 16) | (b'D' as u32) << 8 | nr) as libc::c_ulong
+        }
+        // _IOW('D', 1, int) and _IOWR('D', 2, struct ddr_perf_stat).
+        const IOC_INIT_PORT: libc::c_ulong = ioc(1, 1, 4);
+        const IOC_GET_STAT: libc::c_ulong = ioc(3, 2, std::mem::size_of::<Stat>() as u32);
+
+        struct Totals {
+            read: AtomicU64,
+            write: AtomicU64,
+        }
+
+        pub struct DdrPerf {
+            totals: Arc<Totals>,
+            stop: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<()>>,
+        }
+
+        fn get_stat(fd: i32, port: u32) -> Option<Stat> {
+            let mut stat = Stat {
+                port_id: port,
+                ..Default::default()
+            };
+            let rc = unsafe { libc::ioctl(fd, IOC_GET_STAT, &mut stat as *mut Stat) };
+            (rc == 0).then_some(stat)
+        }
+
+        impl DdrPerf {
+            pub fn start() -> Option<Self> {
+                if !Path::new(DEVICE).exists() {
+                    return None;
+                }
+                let path = std::ffi::CString::new(DEVICE).ok()?;
+                // The device is root-only; a plain user simply has no DDR
+                // counters, which is not an error worth propagating.
+                let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+                if fd < 0 {
+                    return None;
+                }
+
+                // How many ports exist is a property of the SoC, not of the
+                // interface, so probe rather than assume: initialize ports in
+                // turn until the driver stops answering. The first read per
+                // port only establishes the driver's baseline, so the probe
+                // doubles as priming every port before counting.
+                let ports = (0..MAX_PORTS)
+                    .take_while(|port| {
+                        let value = *port as libc::c_int;
+                        unsafe { libc::ioctl(fd, IOC_INIT_PORT, &value as *const libc::c_int) };
+                        get_stat(fd, *port).is_some()
+                    })
+                    .count() as u32;
+                if ports == 0 {
+                    unsafe { libc::close(fd) };
+                    return None;
+                }
+
+                let totals = Arc::new(Totals {
+                    read: AtomicU64::new(0),
+                    write: AtomicU64::new(0),
+                });
+                let stop = Arc::new(AtomicBool::new(false));
+                let worker = std::thread::spawn({
+                    let totals = Arc::clone(&totals);
+                    let stop = Arc::clone(&stop);
+                    move || {
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(POLL);
+                            let (mut read, mut write) = (0_u64, 0_u64);
+                            for port in 0..ports {
+                                if let Some(stat) = get_stat(fd, port) {
+                                    read += u64::from(stat.read_bytes);
+                                    write += u64::from(stat.write_bytes);
+                                }
+                            }
+                            totals.read.fetch_add(read, Ordering::Relaxed);
+                            totals.write.fetch_add(write, Ordering::Relaxed);
+                        }
+                        unsafe { libc::close(fd) };
+                    }
+                });
+
+                Some(Self {
+                    totals,
+                    stop,
+                    worker: Some(worker),
+                })
+            }
+
+            pub fn sample(&self) -> (u64, u64) {
+                (
+                    self.totals.read.load(Ordering::Relaxed),
+                    self.totals.write.load(Ordering::Relaxed),
+                )
+            }
+        }
+
+        impl Drop for DdrPerf {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::Relaxed);
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+    }
+
     /// Active system-scoped controller counters.
     pub struct MemoryControllerMonitor {
         handles: Vec<Handle>,
+        ddr_perf: Option<ddr_perf::DdrPerf>,
     }
 
     impl MemoryControllerMonitor {
-        /// Discover Intel IMC and AMD data-fabric PMUs. `None` means the host
-        /// exposes no recognized controller events.
+        /// Discover Intel IMC and AMD data-fabric PMUs, falling back to a
+        /// vendor bandwidth device where no uncore PMU is exposed. `None`
+        /// means the host offers neither.
         pub fn start() -> io::Result<Option<Self>> {
             let root = Path::new("/sys/bus/event_source/devices");
             let mut handles = Vec::new();
             let mut last_error = None;
-            for entry in match fs::read_dir(root) {
-                Ok(value) => value,
-                Err(_) => return Ok(None),
-            } {
+            for entry in fs::read_dir(root).into_iter().flatten() {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !(name.starts_with("uncore_imc") || name.starts_with("amd_df")) {
@@ -101,12 +250,16 @@ mod imp {
                     }
                 }
             }
-            if handles.is_empty() {
+            // No perf-exposed controller: try the vendor bandwidth device,
+            // which some SoCs publish DDR traffic through instead.
+            let ddr_perf = handles.is_empty().then(ddr_perf::DdrPerf::start).flatten();
+            if handles.is_empty() && ddr_perf.is_none() {
                 return match last_error {
                     Some(error) => Err(error),
                     None => Ok(None),
                 };
             }
+            // Energy counters are independent of where bandwidth comes from.
             let power = root.join("power");
             for (measurement, event_name) in [
                 (Measurement::PackageJoules, "energy-pkg"),
@@ -126,12 +279,26 @@ mod imp {
                     ioctls::ENABLE(handle.fd, 0);
                 }
             }
-            Ok(Some(Self { handles }))
+            Ok(Some(Self { handles, ddr_perf }))
+        }
+
+        /// Where the counters come from, for recording in snapshot metadata.
+        pub fn source(&self) -> &'static str {
+            if self.ddr_perf.is_some() {
+                "ddr_perf"
+            } else {
+                "perf_event/sysfs"
+            }
         }
 
         /// Read cumulative, multiplexing-scaled bytes.
         pub fn sample(&self) -> io::Result<MemoryControllerSample> {
             let mut result = MemoryControllerSample::default();
+            if let Some(ddr_perf) = &self.ddr_perf {
+                let (read, write) = ddr_perf.sample();
+                result.read_bytes = read;
+                result.write_bytes = write;
+            }
             for handle in &self.handles {
                 let mut values = [0_u64; 3];
                 let bytes = unsafe {
