@@ -222,28 +222,126 @@ mod x86_tests {
     }
 }
 
+/// Map a RISC-V `marchid` to a known CPU family id.
+#[cfg(target_arch = "riscv64")]
+fn riscv_family(marchid: &str) -> &'static str {
+    match marchid.trim() {
+        // FIXME: technically speaking this also includes E7 and S7
+        "0x8000000000000007" => pmu_data::SIFIVE_U7,
+        "0x8000000058000001" => pmu_data::SPACEMIT_X60,
+        "0x8000000058000002" => pmu_data::SPACEMIT_X100,
+        "0x8000000041000002" => pmu_data::SPACEMIT_A100,
+        _ => "unknown",
+    }
+}
+
 #[cfg(target_arch = "riscv64")]
 pub fn get_host_cpu_family() -> &'static str {
     use proc_getter::cpuinfo::cpuinfo;
 
+    // The two core types on a SpacemiT K3 use different event encodings, and
+    // auto detection below picks the first recognized core (the X100 cluster).
+    // A workload placed on the A100 cores — which needs a helper such as
+    // k3_ai's `ai`, since Linux will not schedule there on its own — must say
+    // so explicitly, because miniperf itself still runs on an X100 core:
+    //   MINIPERF_CPU_FAMILY=a100 ai mperf stat -- ./workload
+    if let Ok(forced) = std::env::var("MINIPERF_CPU_FAMILY") {
+        match forced.as_str() {
+            "a100" | "spacemit_a100" => return pmu_data::SPACEMIT_A100,
+            "x100" | "spacemit_x100" => return pmu_data::SPACEMIT_X100,
+            "x60" | "spacemit_x60" => return pmu_data::SPACEMIT_X60,
+            "" => {}
+            other => eprintln!("warning: ignoring unknown MINIPERF_CPU_FAMILY='{other}'"),
+        }
+    }
+
     let Ok(info) = cpuinfo() else {
         return "unknown";
     };
-    let Some(first_cpu) = info.first() else {
-        return "unknown";
-    };
-    let marchid = first_cpu.get("marchid");
 
-    match marchid {
-        Some(marchid) => {
-            match marchid.as_str() {
-                // FIXME: technically speaking this also includes E7 and S7
-                "0x8000000000000007" => pmu_data::SIFIVE_U7,
-                "0x8000000058000001" => pmu_data::SPACEMIT_X60,
-                _ => "unknown",
-            }
+    // Heterogeneous SoCs expose more than one core type: SpacemiT K3 pairs
+    // eight X100 application cores with eight A100 AI cores, each with its own
+    // marchid. Scan every entry and return the first core we have event data
+    // for, rather than trusting the first one listed.
+    info.iter()
+        .filter_map(|core| core.get("marchid"))
+        .map(|marchid| riscv_family(marchid))
+        .find(|family| *family != "unknown")
+        .unwrap_or("unknown")
+}
+
+#[cfg(all(test, target_arch = "riscv64"))]
+mod riscv_tests {
+    use super::*;
+
+    #[test]
+    fn maps_known_riscv_cores() {
+        assert_eq!(riscv_family("0x8000000058000002"), pmu_data::SPACEMIT_X100);
+        assert_eq!(riscv_family("0x8000000058000001"), pmu_data::SPACEMIT_X60);
+        assert_eq!(riscv_family("0x8000000000000007"), pmu_data::SIFIVE_U7);
+        // The A100 AI cores on the same K3 die use a different event encoding.
+        assert_eq!(riscv_family("0x8000000041000002"), pmu_data::SPACEMIT_A100);
+    }
+
+    #[test]
+    fn a100_uses_its_own_encoding_not_x100s() {
+        let a100 = find_cpu_family(pmu_data::SPACEMIT_A100).unwrap();
+        let x100 = find_cpu_family(pmu_data::SPACEMIT_X100).unwrap();
+
+        // Cycles and instructions agree across both cores...
+        assert_eq!(a100.events["cycles"].code, x100.events["cycles"].code);
+        assert_eq!(
+            a100.events["instructions"].code,
+            x100.events["instructions"].code
+        );
+        // ...but the stall counters are assigned the opposite way round: the
+        // A100 matches the K3 device tree and the X100 does not.
+        assert_eq!(a100.events["stall_frontend"].code, 0x3);
+        assert_eq!(a100.events["stall_backend"].code, 0x4);
+        assert_eq!(x100.events["stall_frontend"].code, 0x4);
+        assert_eq!(x100.events["stall_backend"].code, 0x3);
+        // Raw 0x2d is a load counter on A100 and speculative issue on X100.
+        assert_eq!(a100.events["load_inst"].code, 0x2d);
+        assert_eq!(x100.events["issued_inst"].code, 0x2d);
+    }
+
+    #[test]
+    fn x100_event_table_is_loaded() {
+        let family = find_cpu_family(pmu_data::SPACEMIT_X100).unwrap();
+        assert_eq!(family.name, "SpacemiT K3 (X100)");
+        // mhpmcounter3..16 are general purpose; cycles and instructions have
+        // dedicated counters 17 and 18.
+        assert_eq!(family.max_counters, Some(14));
+        assert_eq!(family.events.get("cycles").unwrap().code, 0x1e);
+        assert_eq!(family.events.get("instructions").unwrap().code, 0x1f);
+        // The K3 device tree labels raw 0x03 as STALLED_CYCLES_FRONTEND and
+        // 0x04 as STALLED_CYCLES_BACKEND. Measurement on the board shows the
+        // opposite, so miniperf uses the verified assignment.
+        assert_eq!(family.events.get("stall_frontend").unwrap().code, 0x4);
+        assert_eq!(family.events.get("stall_backend").unwrap().code, 0x3);
+        assert_eq!(
+            family.aliases.get("stalled_cycles_frontend").unwrap(),
+            "stall_frontend"
+        );
+    }
+
+    #[test]
+    fn x100_tma_fits_in_one_counter_group() {
+        let family = find_cpu_family(pmu_data::SPACEMIT_X100).unwrap();
+        let tma = family.scenarios.get("tma").unwrap();
+        assert_eq!(tma.groups.len(), 1);
+        // Twelve general-purpose counters plus the two dedicated ones, so the
+        // whole scenario is measured without multiplexing.
+        assert_eq!(tma.groups[0].events.len(), 14);
+        for event in &tma.events {
+            assert!(
+                family.events.contains_key(event),
+                "TMA event {event} missing from the x100 table"
+            );
         }
-        None => "unknown",
+        for metric in &tma.metrics {
+            assert_eq!(metric.group.as_deref(), Some("tma"));
+        }
     }
 }
 

@@ -1,0 +1,256 @@
+{
+  "family_id": "spacemit_a100",
+  "name": "SpacemiT K3 (A100)",
+  "vendor": "SpacemiT",
+  "arch": "riscv64",
+  "max_counters": 14,
+  "leader_event": "cycles",
+  "aliases": [
+    {
+      "target": "cycles",
+      "origin": "cycles"
+    },
+    {
+      "target": "instructions",
+      "origin": "instructions"
+    },
+    {
+      "target": "branches",
+      "origin": "br_inst"
+    },
+    {
+      "target": "branch_misses",
+      "origin": "br_mispred"
+    },
+    {
+      "target": "cache_references",
+      "origin": "l2_access"
+    },
+    {
+      "target": "stalled_cycles_frontend",
+      "origin": "stall_frontend"
+    },
+    {
+      "target": "stalled_cycles_backend",
+      "origin": "stall_backend"
+    }
+  ],
+  "events": [
+    {
+      "name": "cycles",
+      "desc": "Core clock cycles",
+      "code": "0x1e"
+    },
+    {
+      "name": "instructions",
+      "desc": "Instructions retired",
+      "code": "0x1f"
+    },
+    {
+      "name": "stall_frontend",
+      "desc": "Cycles stalled waiting on the frontend (instruction cache, branch resteer)",
+      "code": "0x3"
+    },
+    {
+      "name": "stall_backend",
+      "desc": "Cycles stalled waiting on the backend (memory, execution latency)",
+      "code": "0x4"
+    },
+    {
+      "name": "m_mode_cycle",
+      "desc": "Cycles spent in machine mode",
+      "code": "0x20"
+    },
+    {
+      "name": "s_mode_cycle",
+      "desc": "Cycles spent in supervisor mode",
+      "code": "0x21"
+    },
+    {
+      "name": "u_mode_cycle",
+      "desc": "Cycles spent in user mode",
+      "code": "0x22"
+    },
+    {
+      "name": "br_inst",
+      "desc": "Branch instructions retired",
+      "code": "0x1"
+    },
+    {
+      "name": "br_mispred",
+      "desc": "Mispredicted branch instructions",
+      "code": "0x2"
+    },
+    {
+      "name": "load_inst",
+      "desc": "Load instructions retired, including vector loads",
+      "code": "0x2d"
+    },
+    {
+      "name": "csr_inst",
+      "desc": "CSR instructions retired",
+      "code": "0x29"
+    },
+    {
+      "name": "fence_inst",
+      "desc": "Fence instructions retired",
+      "code": "0x34"
+    },
+    {
+      "name": "fp_vector_inst",
+      "desc": "Scalar floating-point and vector arithmetic instructions retired",
+      "code": "0x3b"
+    },
+    {
+      "name": "fp_vector_uop",
+      "desc": "Floating-point and vector micro-operations; a VLEN-wide vector instruction counts as several",
+      "code": "0x2b"
+    },
+    {
+      "name": "vector_store_inst",
+      "desc": "Vector store instructions retired",
+      "code": "0x3a"
+    },
+    {
+      "name": "l1d_read_access",
+      "desc": "L1 data cache read accesses",
+      "code": "0x6"
+    },
+    {
+      "name": "l1d_read_miss",
+      "desc": "L1 data cache read misses",
+      "code": "0x5"
+    },
+    {
+      "name": "l1d_write_access",
+      "desc": "L1 data cache write accesses",
+      "code": "0xa"
+    },
+    {
+      "name": "l1d_write_miss",
+      "desc": "L1 data cache write misses",
+      "code": "0x9"
+    },
+    {
+      "name": "l1i_read_access",
+      "desc": "L1 instruction cache read accesses",
+      "code": "0xc"
+    },
+    {
+      "name": "l1i_read_miss",
+      "desc": "L1 instruction cache read misses",
+      "code": "0xb"
+    },
+    {
+      "name": "l2_access",
+      "desc": "L2 cache accesses caused by L1 data cache refills",
+      "code": "0x15"
+    }
+  ],
+  "metrics": [
+    {
+      "name": "IPC",
+      "desc": "Instructions retired per cycle",
+      "expression": "instructions / cycles"
+    },
+    {
+      "name": "branch_mispredict_rate",
+      "desc": "Fraction of retired branches that were mispredicted",
+      "expression": "br_mispred / br_inst"
+    },
+    {
+      "name": "l1d_miss_rate",
+      "desc": "Fraction of L1 data cache reads that missed",
+      "expression": "l1d_read_miss / l1d_read_access"
+    },
+    {
+      "name": "l1i_miss_rate",
+      "desc": "Fraction of L1 instruction cache reads that missed",
+      "expression": "l1i_read_miss / l1i_read_access"
+    },
+    {
+      "name": "vector_uops_per_inst",
+      "desc": "Average micro-operations per floating-point or vector instruction",
+      "expression": "fp_vector_uop / fp_vector_inst"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "tma",
+      "events": [
+        "cycles",
+        "instructions",
+        "stall_frontend",
+        "stall_backend",
+        "br_mispred",
+        "l1i_read_miss"
+      ],
+      "groups": [
+        {
+          "name": "tma",
+          "events": [
+            "cycles",
+            "instructions",
+            "stall_frontend",
+            "stall_backend",
+            "br_mispred",
+            "l1i_read_miss"
+          ]
+        }
+      ],
+      "precise_attribution": false,
+      "constants": [
+        {
+          "name": "pipeline_width",
+          "value": 3
+        },
+        {
+          "name": "l2_hit_latency",
+          "value": 35
+        },
+        {
+          "name": "mispredict_penalty",
+          "value": 9
+        }
+      ],
+      "metrics": [
+        {
+          "name": "retiring",
+          "desc": "Issue slots used by instructions that retired",
+          "formula": "instructions / ($pipeline_width * cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "bad_speculation",
+          "desc": "Issue slots lost to mispredicted branches",
+          "formula": "min(max(0, 1 - retiring), br_mispred * $mispredict_penalty / cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "fe_bound",
+          "desc": "Issue slots lost because the frontend did not supply the backend",
+          "formula": "max(0, 1 - retiring - bad_speculation) * stall_frontend / max(1, stall_frontend + stall_backend)",
+          "group": "tma"
+        },
+        {
+          "name": "be_bound",
+          "desc": "Issue slots lost because the backend could not accept more work. A100 exposes no L2 miss or dTLB event, so a data-cache miss cannot be costed and this is not broken down further; use l1d_miss_rate to judge whether memory is the cause",
+          "formula": "max(0, 1 - retiring - bad_speculation) * stall_backend / max(1, stall_frontend + stall_backend)",
+          "group": "tma"
+        },
+        {
+          "name": "fe_bound.icache",
+          "desc": "Frontend stalls attributable to instruction cache misses",
+          "formula": "min(fe_bound, l1i_read_miss * $l2_hit_latency / cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "fe_bound.other",
+          "desc": "Frontend stalls from fetch and decode throughput rather than misses",
+          "formula": "max(0, fe_bound - fe_bound.icache)",
+          "group": "tma"
+        }
+      ]
+    }
+  ]
+}

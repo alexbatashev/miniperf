@@ -1,0 +1,436 @@
+{
+  "family_id": "spacemit_x100",
+  "name": "SpacemiT K3 (X100)",
+  "vendor": "SpacemiT",
+  "arch": "riscv64",
+  "max_counters": 14,
+  "leader_event": "cycles",
+  "aliases": [
+    {
+      "target": "cycles",
+      "origin": "cycles"
+    },
+    {
+      "target": "instructions",
+      "origin": "instructions"
+    },
+    {
+      "target": "branches",
+      "origin": "br_inst"
+    },
+    {
+      "target": "branch_misses",
+      "origin": "br_mispred"
+    },
+    {
+      "target": "cache_references",
+      "origin": "l2_access"
+    },
+    {
+      "target": "cache_misses",
+      "origin": "l2_miss"
+    },
+    {
+      "target": "stalled_cycles_frontend",
+      "origin": "stall_frontend"
+    },
+    {
+      "target": "stalled_cycles_backend",
+      "origin": "stall_backend"
+    }
+  ],
+  "events": [
+    {
+      "name": "cycles",
+      "desc": "Core clock cycles",
+      "code": "0x1e"
+    },
+    {
+      "name": "instructions",
+      "desc": "Instructions retired",
+      "code": "0x1f"
+    },
+    {
+      "name": "issued_inst",
+      "desc": "Instructions issued, including speculative work later squashed",
+      "code": "0x2d"
+    },
+    {
+      "name": "stall_frontend",
+      "desc": "Cycles stalled waiting on the frontend (fetch redirect, instruction cache, branch resteer)",
+      "code": "0x4"
+    },
+    {
+      "name": "stall_backend",
+      "desc": "Cycles stalled waiting on the backend (memory, execution latency, dependencies)",
+      "code": "0x3"
+    },
+    {
+      "name": "m_mode_cycle",
+      "desc": "Cycles spent in machine mode",
+      "code": "0x20"
+    },
+    {
+      "name": "s_mode_cycle",
+      "desc": "Cycles spent in supervisor mode",
+      "code": "0x21"
+    },
+    {
+      "name": "u_mode_cycle",
+      "desc": "Cycles spent in user mode",
+      "code": "0x22"
+    },
+    {
+      "name": "alu_inst",
+      "desc": "Integer ALU instructions retired",
+      "code": "0x34"
+    },
+    {
+      "name": "mem_inst",
+      "desc": "Load and store instructions retired",
+      "code": "0x35"
+    },
+    {
+      "name": "store_inst",
+      "desc": "Scalar store instructions retired, including AMO and SC",
+      "code": "0x29"
+    },
+    {
+      "name": "fp_inst",
+      "desc": "Scalar floating-point instructions retired",
+      "code": "0x3f"
+    },
+    {
+      "name": "vector_inst",
+      "desc": "Vector arithmetic instructions retired, excluding vector loads and stores",
+      "code": "0x36"
+    },
+    {
+      "name": "csr_inst",
+      "desc": "CSR instructions retired",
+      "code": "0x37"
+    },
+    {
+      "name": "fence_inst",
+      "desc": "Fence and LR/SC synchronization instructions retired",
+      "code": "0x38"
+    },
+    {
+      "name": "ecall_inst",
+      "desc": "ECALL instructions retired",
+      "code": "0x26"
+    },
+    {
+      "name": "br_inst",
+      "desc": "Branch instructions retired",
+      "code": "0x1"
+    },
+    {
+      "name": "br_mispred",
+      "desc": "Mispredicted branch instructions",
+      "code": "0x2"
+    },
+    {
+      "name": "br_inst_spec",
+      "desc": "Branch instructions executed, including speculative wrong-path branches",
+      "code": "0x33"
+    },
+    {
+      "name": "l1d_read_access",
+      "desc": "L1 data cache read accesses",
+      "code": "0x6"
+    },
+    {
+      "name": "l1d_read_miss",
+      "desc": "L1 data cache read misses",
+      "code": "0x5"
+    },
+    {
+      "name": "l1d_write_access",
+      "desc": "L1 data cache write accesses",
+      "code": "0xa"
+    },
+    {
+      "name": "l1d_write_miss",
+      "desc": "L1 data cache write misses",
+      "code": "0x9"
+    },
+    {
+      "name": "l1d_prefetch_access",
+      "desc": "L1 data cache prefetch accesses",
+      "code": "0x8"
+    },
+    {
+      "name": "l1d_prefetch_miss",
+      "desc": "L1 data cache prefetch misses",
+      "code": "0x7"
+    },
+    {
+      "name": "l1d_refill",
+      "desc": "L1 data cache line refills",
+      "code": "0x24"
+    },
+    {
+      "name": "l1i_read_access",
+      "desc": "L1 instruction cache read accesses",
+      "code": "0xc"
+    },
+    {
+      "name": "l1i_read_miss",
+      "desc": "L1 instruction cache read misses",
+      "code": "0xb"
+    },
+    {
+      "name": "l2_access",
+      "desc": "L2 cache accesses, including page-table walks",
+      "code": "0x10"
+    },
+    {
+      "name": "l2_miss",
+      "desc": "L2 cache misses served from memory",
+      "code": "0x11"
+    },
+    {
+      "name": "dtlb_read_access",
+      "desc": "Data TLB read accesses",
+      "code": "0x16"
+    },
+    {
+      "name": "dtlb_read_miss",
+      "desc": "Data TLB read misses causing a page-table walk",
+      "code": "0x25"
+    },
+    {
+      "name": "dtlb_write_access",
+      "desc": "Data TLB write accesses",
+      "code": "0x1a"
+    },
+    {
+      "name": "dtlb_write_miss",
+      "desc": "Data TLB write misses causing a page-table walk",
+      "code": "0x19"
+    },
+    {
+      "name": "itlb_read_miss",
+      "desc": "Instruction TLB misses causing a page-table walk",
+      "code": "0x1b"
+    }
+  ],
+  "metrics": [
+    {
+      "name": "IPC",
+      "desc": "Instructions retired per cycle",
+      "expression": "instructions / cycles"
+    },
+    {
+      "name": "branch_mispredict_rate",
+      "desc": "Fraction of retired branches that were mispredicted",
+      "expression": "br_mispred / br_inst"
+    },
+    {
+      "name": "speculation_waste",
+      "desc": "Fraction of issued instructions that never retired",
+      "expression": "(issued_inst - instructions) / issued_inst"
+    },
+    {
+      "name": "l1d_miss_rate",
+      "desc": "Fraction of L1 data cache reads that missed",
+      "expression": "l1d_read_miss / l1d_read_access"
+    },
+    {
+      "name": "l1i_miss_rate",
+      "desc": "Fraction of L1 instruction cache reads that missed",
+      "expression": "l1i_read_miss / l1i_read_access"
+    },
+    {
+      "name": "l2_miss_rate",
+      "desc": "Fraction of L2 accesses served from memory",
+      "expression": "l2_miss / l2_access"
+    },
+    {
+      "name": "dtlb_miss_rate",
+      "desc": "Fraction of data TLB reads that caused a page-table walk",
+      "expression": "dtlb_read_miss / dtlb_read_access"
+    },
+    {
+      "name": "memory_inst_share",
+      "desc": "Fraction of retired instructions that access memory",
+      "expression": "mem_inst / instructions"
+    }
+  ],
+  "scenarios": [
+    {
+      "name": "tma",
+      "events": [
+        "cycles",
+        "instructions",
+        "issued_inst",
+        "stall_frontend",
+        "stall_backend",
+        "br_mispred",
+        "l1i_read_miss",
+        "itlb_read_miss",
+        "l1d_read_miss",
+        "l2_miss",
+        "dtlb_read_miss",
+        "vector_inst",
+        "fp_inst",
+        "mem_inst"
+      ],
+      "groups": [
+        {
+          "name": "tma",
+          "events": [
+            "cycles",
+            "instructions",
+            "issued_inst",
+            "stall_frontend",
+            "stall_backend",
+            "br_mispred",
+            "l1i_read_miss",
+            "itlb_read_miss",
+            "l1d_read_miss",
+            "l2_miss",
+            "dtlb_read_miss",
+            "vector_inst",
+            "fp_inst",
+            "mem_inst"
+          ]
+        }
+      ],
+      "precise_attribution": false,
+      "constants": [
+        {
+          "name": "pipeline_width",
+          "value": 4
+        },
+        {
+          "name": "l2_hit_latency",
+          "value": 25
+        },
+        {
+          "name": "dram_latency",
+          "value": 294
+        },
+        {
+          "name": "page_walk_latency",
+          "value": 82
+        },
+        {
+          "name": "mispredict_penalty",
+          "value": 13
+        }
+      ],
+      "metrics": [
+        {
+          "name": "retiring",
+          "desc": "Issue slots used by instructions that retired",
+          "formula": "instructions / ($pipeline_width * cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "bad_speculation",
+          "desc": "Issue slots used by instructions that never retired",
+          "formula": "min(max(0, 1 - retiring), max(0, issued_inst - instructions) / ($pipeline_width * cycles))",
+          "group": "tma"
+        },
+        {
+          "name": "fe_bound",
+          "desc": "Issue slots lost because the frontend did not supply the backend",
+          "formula": "max(0, 1 - retiring - bad_speculation) * stall_frontend / max(1, stall_frontend + stall_backend)",
+          "group": "tma"
+        },
+        {
+          "name": "be_bound",
+          "desc": "Issue slots lost because the backend could not accept more work",
+          "formula": "max(0, 1 - retiring - bad_speculation) * stall_backend / max(1, stall_frontend + stall_backend)",
+          "group": "tma"
+        },
+        {
+          "name": "fe_bound.branch_resteer",
+          "desc": "Frontend stalls refetching after a mispredicted branch",
+          "formula": "min(fe_bound, br_mispred * $mispredict_penalty / cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "fe_bound.latency",
+          "desc": "Frontend stalls attributable to instruction cache and ITLB misses",
+          "formula": "min(max(0, fe_bound - fe_bound.branch_resteer), (l1i_read_miss * $l2_hit_latency + itlb_read_miss * $page_walk_latency) / cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "fe_bound.bandwidth",
+          "desc": "Frontend stalls from fetch and decode throughput rather than misses",
+          "formula": "max(0, fe_bound - fe_bound.branch_resteer - fe_bound.latency)",
+          "group": "tma"
+        },
+        {
+          "name": "bad_speculation.branch_mispredict",
+          "desc": "Bad speculation caused by mispredicted branches",
+          "formula": "min(bad_speculation, br_mispred * $mispredict_penalty / cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "bad_speculation.other",
+          "desc": "Bad speculation from pipeline flushes other than branch mispredicts",
+          "formula": "max(0, bad_speculation - bad_speculation.branch_mispredict)",
+          "group": "tma"
+        },
+        {
+          "name": "be_bound.memory_bound",
+          "desc": "Backend stalls attributable to the memory hierarchy",
+          "formula": "min(be_bound, (max(0, l1d_read_miss - l2_miss) * $l2_hit_latency + l2_miss * $dram_latency + dtlb_read_miss * $page_walk_latency) / cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "be_bound.core_bound",
+          "desc": "Backend stalls from execution latency and dependencies rather than memory",
+          "formula": "max(0, be_bound - be_bound.memory_bound)",
+          "group": "tma"
+        },
+        {
+          "name": "be_bound.memory_bound.l2_bound",
+          "desc": "Memory stalls served by the L2 cache",
+          "formula": "be_bound.memory_bound * (max(0, l1d_read_miss - l2_miss) * $l2_hit_latency) / max(1, max(0, l1d_read_miss - l2_miss) * $l2_hit_latency + l2_miss * $dram_latency + dtlb_read_miss * $page_walk_latency)",
+          "group": "tma"
+        },
+        {
+          "name": "be_bound.memory_bound.dram_bound",
+          "desc": "Memory stalls served from DRAM",
+          "formula": "be_bound.memory_bound * (l2_miss * $dram_latency) / max(1, max(0, l1d_read_miss - l2_miss) * $l2_hit_latency + l2_miss * $dram_latency + dtlb_read_miss * $page_walk_latency)",
+          "group": "tma"
+        },
+        {
+          "name": "be_bound.memory_bound.dtlb_bound",
+          "desc": "Memory stalls caused by data page-table walks",
+          "formula": "be_bound.memory_bound * (dtlb_read_miss * $page_walk_latency) / max(1, max(0, l1d_read_miss - l2_miss) * $l2_hit_latency + l2_miss * $dram_latency + dtlb_read_miss * $page_walk_latency)",
+          "group": "tma"
+        },
+        {
+          "name": "retiring.vector",
+          "desc": "Issue slots used by retired vector arithmetic",
+          "formula": "vector_inst / ($pipeline_width * cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "retiring.fp",
+          "desc": "Issue slots used by retired scalar floating-point instructions",
+          "formula": "fp_inst / ($pipeline_width * cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "retiring.memory",
+          "desc": "Issue slots used by retired loads and stores",
+          "formula": "mem_inst / ($pipeline_width * cycles)",
+          "group": "tma"
+        },
+        {
+          "name": "retiring.other",
+          "desc": "Issue slots used by other retired instructions",
+          "formula": "max(0, retiring - retiring.vector - retiring.fp - retiring.memory)",
+          "group": "tma"
+        }
+      ]
+    }
+  ]
+}
