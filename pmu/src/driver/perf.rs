@@ -878,6 +878,12 @@ fn base_counter_attr() -> perf_event_attr {
     attrs.size = std::mem::size_of::<perf_event_attr>() as u32;
     attrs.set_disabled(1);
 
+    // Sample timestamps must be on CLOCK_MONOTONIC so they correlate with
+    // every other source (eBPF, collector, preloads). Without this perf uses
+    // sched_clock, which nothing else can observe.
+    attrs.set_use_clockid(1);
+    attrs.clockid = libc::CLOCK_MONOTONIC;
+
     attrs.read_format = sys::bindings::PERF_FORMAT_GROUP as u64
         | sys::bindings::PERF_FORMAT_ID as u64
         | sys::bindings::PERF_FORMAT_TOTAL_TIME_ENABLED as u64

@@ -4,7 +4,6 @@ use mperf_data::{SnapshotCollectorStatus, SnapshotProcessInfo, SnapshotResourceS
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -200,9 +199,59 @@ END {{ printf("MPERF runq_ns %llu\n", @runq_ns); printf("MPERF runq_count %llu\n
                 self.status.quality = "unavailable".to_string();
                 self.status.message = "failed to stop BPF collector cleanly".to_string();
             }
+            if self.write_metrics_table().is_err() {
+                self.status.status = "error".to_string();
+                self.status.message = "failed to persist BPF metrics".to_string();
+            }
         }
-        let _ = &self.output;
         self.status
+    }
+
+    /// Convert bpftrace's final `MPERF <metric> <value>` lines into the
+    /// `bpf_metrics` Parquet table and drop the raw text.
+    fn write_metrics_table(&self) -> anyhow::Result<()> {
+        use store::arrow::array::{ArrayRef, Float64Array, StringArray};
+        use store::arrow::datatypes::{DataType, Field, Schema};
+
+        let text = fs::read_to_string(&self.output)?;
+        let mut metrics = Vec::new();
+        let mut values = Vec::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            if fields.next() != Some("MPERF") {
+                continue;
+            }
+            let (Some(metric), Some(value)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let Ok(value) = value.parse::<f64>() else {
+                continue;
+            };
+            metrics.push(metric.to_string());
+            values.push(value);
+        }
+        let directory = self
+            .output
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("BPF output has no parent directory"))?;
+        if !metrics.is_empty() {
+            let schema = std::sync::Arc::new(Schema::new(vec![
+                Field::new("metric", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, false),
+            ]));
+            let batch = store::arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    std::sync::Arc::new(StringArray::from(metrics)) as ArrayRef,
+                    std::sync::Arc::new(Float64Array::from(values)),
+                ],
+            )?;
+            let mut writer = store::SegmentWriter::new(directory, "bpf_metrics", None, schema);
+            writer.write(&batch)?;
+            writer.finish()?;
+        }
+        fs::remove_file(&self.output)?;
+        Ok(())
     }
 }
 
@@ -213,13 +262,12 @@ impl ResourceMonitor {
         cgroup: Option<PathBuf>,
         output: &Path,
     ) -> std::io::Result<Self> {
-        let file = fs::File::create(output.join("snapshot-resources.jsonl"))?;
-        let process_path = output.join("snapshot-processes.jsonl");
+        let output = output.to_owned();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let worker = thread::Builder::new()
             .name("mperf-snapshot-resources".to_string())
-            .spawn(move || collect(root_pid, launched, cgroup, file, process_path, worker_stop))?;
+            .spawn(move || collect(root_pid, launched, cgroup, &output, worker_stop))?;
         Ok(Self {
             stop,
             worker: Some(worker),
@@ -324,12 +372,18 @@ fn collect(
     root_pid: u32,
     launched: bool,
     cgroup: Option<PathBuf>,
-    file: fs::File,
-    process_path: PathBuf,
+    output: &Path,
     stop: Arc<AtomicBool>,
 ) -> Vec<SnapshotCollectorStatus> {
     let start = Instant::now();
-    let mut writer = BufWriter::new(file);
+    // Roll small segments so a crash loses at most the open one.
+    let mut writer = store::SegmentWriter::new(
+        output,
+        "resource_samples",
+        None,
+        resource_sample_schema(),
+    )
+    .with_segment_bytes(256 * 1024);
     let mut previous = HashMap::<(u32, u64), ProcTotals>::new();
     let mut cumulative = ProcTotals::default();
     let mut processes = HashMap::<(u32, u64), SnapshotProcessInfo>::new();
@@ -644,37 +698,128 @@ fn collect(
                 }
             }
         }
-        for sample in samples {
-            if serde_json::to_writer(&mut writer, &sample).is_err()
-                || writer.write_all(b"\n").is_err()
-            {
-                statuses.push(status(
-                    "resource_file",
-                    "error",
-                    "jsonl",
-                    "unavailable",
-                    "failed to write resource samples",
-                ));
-                break;
-            }
+        let written = resource_sample_batch(&samples).and_then(|batch| writer.write(&batch));
+        if written.is_err() {
+            statuses.push(status(
+                "resource_file",
+                "error",
+                "parquet",
+                "unavailable",
+                "failed to write resource samples",
+            ));
         }
-        let _ = writer.flush();
         if stop.load(Ordering::Acquire) {
             break;
         }
         thread::park_timeout(INTERVAL);
     }
+    let _ = writer.finish();
 
-    if let Ok(file) = fs::File::create(process_path) {
-        let mut process_writer = BufWriter::new(file);
-        let mut rows = processes.into_values().collect::<Vec<_>>();
-        rows.sort_by_key(|process| (process.first_seen_ns, process.pid));
-        for process in rows {
-            let _ = serde_json::to_writer(&mut process_writer, &process);
-            let _ = process_writer.write_all(b"\n");
-        }
+    let mut rows = processes.into_values().collect::<Vec<_>>();
+    rows.sort_by_key(|process| (process.first_seen_ns, process.pid));
+    let written = process_batch(&rows).and_then(|batch| {
+        let mut writer =
+            store::SegmentWriter::new(output, "process_samples", None, process_schema());
+        writer.write(&batch)?;
+        writer.finish().map(|_| ())
+    });
+    if written.is_err() {
+        statuses.push(status(
+            "resource_file",
+            "error",
+            "parquet",
+            "unavailable",
+            "failed to write the observed process tree",
+        ));
     }
     statuses
+}
+
+fn resource_sample_schema() -> std::sync::Arc<store::arrow::datatypes::Schema> {
+    use store::arrow::datatypes::{DataType, Field, Schema};
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("timestamp_ns", DataType::Int64, false),
+        Field::new("resource", DataType::Utf8, false),
+        Field::new("resource_id", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("metric", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new("unit", DataType::Utf8, false),
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("quality", DataType::Utf8, false),
+    ]))
+}
+
+fn resource_sample_batch(
+    samples: &[SnapshotResourceSample],
+) -> anyhow::Result<store::arrow::record_batch::RecordBatch> {
+    use store::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    let text = |field: fn(&SnapshotResourceSample) -> &str| -> ArrayRef {
+        std::sync::Arc::new(StringArray::from(
+            samples.iter().map(field).collect::<Vec<_>>(),
+        ))
+    };
+    Ok(store::arrow::record_batch::RecordBatch::try_new(
+        resource_sample_schema(),
+        vec![
+            std::sync::Arc::new(Int64Array::from(
+                samples
+                    .iter()
+                    .map(|sample| sample.timestamp_ns as i64)
+                    .collect::<Vec<_>>(),
+            )),
+            text(|sample| &sample.resource),
+            text(|sample| &sample.resource_id),
+            text(|sample| &sample.category),
+            text(|sample| &sample.metric),
+            std::sync::Arc::new(Float64Array::from(
+                samples.iter().map(|sample| sample.value).collect::<Vec<_>>(),
+            )),
+            text(|sample| &sample.unit),
+            text(|sample| &sample.scope),
+            text(|sample| &sample.source),
+            text(|sample| &sample.quality),
+        ],
+    )?)
+}
+
+fn process_schema() -> std::sync::Arc<store::arrow::datatypes::Schema> {
+    use store::arrow::datatypes::{DataType, Field, Schema};
+    std::sync::Arc::new(Schema::new(vec![
+        Field::new("pid", DataType::Int64, false),
+        Field::new("ppid", DataType::Int64, false),
+        Field::new("start_ticks", DataType::Int64, false),
+        Field::new("first_seen_ns", DataType::Int64, false),
+        Field::new("last_seen_ns", DataType::Int64, false),
+        Field::new("command", DataType::Utf8, false),
+        Field::new("quality", DataType::Utf8, false),
+    ]))
+}
+
+fn process_batch(
+    rows: &[mperf_data::SnapshotProcessInfo],
+) -> anyhow::Result<store::arrow::record_batch::RecordBatch> {
+    use store::arrow::array::{ArrayRef, Int64Array, StringArray};
+    let int = |field: fn(&mperf_data::SnapshotProcessInfo) -> i64| -> ArrayRef {
+        std::sync::Arc::new(Int64Array::from(rows.iter().map(field).collect::<Vec<_>>()))
+    };
+    Ok(store::arrow::record_batch::RecordBatch::try_new(
+        process_schema(),
+        vec![
+            int(|row| row.pid as i64),
+            int(|row| row.ppid as i64),
+            int(|row| row.start_ticks as i64),
+            int(|row| row.first_seen_ns as i64),
+            int(|row| row.last_seen_ns as i64),
+            std::sync::Arc::new(StringArray::from(
+                rows.iter().map(|row| row.command.as_str()).collect::<Vec<_>>(),
+            )),
+            std::sync::Arc::new(StringArray::from(
+                rows.iter().map(|row| row.quality.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?)
 }
 
 fn capability_statuses() -> Vec<SnapshotCollectorStatus> {

@@ -180,7 +180,7 @@ The compiler backend provides source-loop rows instead of one process-wide
 row. Build the collector and the LLVM pass first:
 
 ```sh
-cargo build --release -p mperf -p collector
+cargo build --release -p mperf -p miniperf-collector-core
 cmake -S utils/clang_plugin -B target/clang_plugin -GNinja \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm
@@ -190,9 +190,8 @@ cmake --build target/clang_plugin
 Compile the workload with the pass and collector:
 
 ```sh
-clang -O3 -g source.c -o workload \
-  -Xclang -fpass-plugin=target/clang_plugin/lib/miniperf_plugin.so \
-  -L target/release -lcollector
+clang -O3 -g source.c collector-core/stub/mperf_trace_stub.c -o workload \
+  -Xclang -fpass-plugin=target/clang_plugin/lib/miniperf_plugin.so -ldl
 ```
 
 Then record without selecting an alternate backend:

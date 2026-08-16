@@ -1,44 +1,6 @@
-use mperf_data::Scenario;
 use pmu::Counter;
 use pmu_data::{TmaScenario, arith_parser::Expr};
 use std::collections::BTreeSet;
-
-pub fn get_pmu_counters(scenario: Scenario) -> Vec<Counter> {
-    match scenario {
-        Scenario::Snapshot | Scenario::Mem | Scenario::Roofline => vec![
-            Counter::Cycles,
-            Counter::Instructions,
-            Counter::LLCReferences,
-            Counter::LLCMisses,
-            Counter::BranchMisses,
-            Counter::BranchInstructions,
-            Counter::StalledCyclesBackend,
-            Counter::StalledCyclesFrontend,
-            Counter::CpuClock,
-            Counter::CpuMigrations,
-            Counter::PageFaults,
-            Counter::ContextSwitches,
-        ],
-        Scenario::TMA => pmu::host_tma_scenario()
-            .expect("TMA counter selection requires a supported host CPU")
-            .events
-            .iter()
-            .map(|evt| match evt.as_str() {
-                "cycles" => Counter::Cycles,
-                "instructions" => Counter::Instructions,
-                "stalled_cycles_frontend" => Counter::StalledCyclesFrontend,
-                "stalled_cycles_backend" => Counter::StalledCyclesBackend,
-                _ => Counter::Custom(evt.clone()),
-            })
-            .chain([
-                Counter::CpuClock,
-                Counter::CpuMigrations,
-                Counter::PageFaults,
-                Counter::ContextSwitches,
-            ])
-            .collect(),
-    }
-}
 
 /// Resolves and validates the independent coherent groups used by TMA.
 ///

@@ -3,19 +3,22 @@ use pmu_data::{ScenarioUi, TmaConstant, TmaGroup, TmaMetric};
 use serde::{Deserialize, Serialize};
 
 mod event;
-mod ipc;
+mod manifest;
 mod ui;
 
 pub use event::{CallFrame, Event, EventType, IString, Location, ProcMapEntry, UserRegs};
-pub use ipc::{IPCMessage, IPCString};
+pub use manifest::{
+    CounterRender, CounterSpec, MarkerSpec, Severity, TrackSpec, ViewSpec, VisualizationManifest,
+};
+
 pub use ui::{resources_table_spec, scenario_ui};
 
 /// Version of the on-disk results format written by this build.
 ///
-/// This covers both the JSON metadata and the bincode event stream. Increment
-/// it whenever either layout changes incompatibly.
-/// Version 2 adds the raw user registers and stack bytes used for post-hoc unwinding.
-pub const CURRENT_FORMAT_VERSION: u32 = 2;
+/// Version 3 is the all-Parquet session directory: every table is a Parquet
+/// file in the result directory and identities are XXH3-64 hashes. Older
+/// versions are not readable; re-record.
+pub const CURRENT_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Copy, ValueEnum, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scenario {
@@ -348,7 +351,7 @@ pub struct RecordInfo {
 
 impl RecordInfo {
     pub fn ensure_supported_format(&self) -> Result<(), UnsupportedFormatVersion> {
-        if self.format_version > CURRENT_FORMAT_VERSION {
+        if self.format_version != CURRENT_FORMAT_VERSION {
             return Err(UnsupportedFormatVersion {
                 found: self.format_version,
                 supported: CURRENT_FORMAT_VERSION,
@@ -368,7 +371,7 @@ impl std::fmt::Display for UnsupportedFormatVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "results use format version {}, but this mperf supports up to version {}; upgrade mperf to view these results",
+            "results use format version {}, but this mperf supports only version {}; re-record with a matching mperf",
             self.found, self.supported
         )
     }
@@ -401,14 +404,16 @@ mod tests {
     }
 
     #[test]
-    fn accepts_current_and_legacy_results() {
-        for version in [None, Some(CURRENT_FORMAT_VERSION)] {
-            let info: RecordInfo = serde_json::from_str(&record_info_json(version)).unwrap();
-            info.ensure_supported_format().unwrap();
-            assert!(info.cpu_info.roofline_calibration.is_none());
-            assert_eq!(info.cpu_clock_source, None);
-            assert_eq!(info.logical_cpu_count, None);
-        }
+    fn accepts_only_the_current_format() {
+        let info: RecordInfo =
+            serde_json::from_str(&record_info_json(Some(CURRENT_FORMAT_VERSION))).unwrap();
+        info.ensure_supported_format().unwrap();
+        assert!(info.cpu_info.roofline_calibration.is_none());
+        assert_eq!(info.cpu_clock_source, None);
+        assert_eq!(info.logical_cpu_count, None);
+
+        let legacy: RecordInfo = serde_json::from_str(&record_info_json(None)).unwrap();
+        assert!(legacy.ensure_supported_format().is_err());
     }
 
     #[test]
@@ -439,7 +444,7 @@ mod tests {
             serde_json::from_str(&record_info_json(Some(CURRENT_FORMAT_VERSION + 1))).unwrap();
         let error = info.ensure_supported_format().unwrap_err().to_string();
 
-        assert!(error.contains("upgrade mperf"));
+        assert!(error.contains("re-record"));
         assert!(error.contains(&(CURRENT_FORMAT_VERSION + 1).to_string()));
     }
 

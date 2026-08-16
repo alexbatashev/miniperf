@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -12,13 +11,13 @@ use std::{
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use mperf_data::{
-    CallFrame, Event, IPCMessage, ProcMapEntry, RooflineInfo, RooflineMethodInfo, ScenarioInfo,
+    CallFrame, Event, ProcMapEntry, RooflineInfo, RooflineMethodInfo, ScenarioInfo,
 };
 use object::{Object, ObjectSymbol};
 use pmu::{Counter, Process, Record};
 
 use crate::{
-    Scenario, counter_selection::get_pmu_counters, event_dispatcher::EventDispatcher,
+    Scenario, event_dispatcher::EventDispatcher,
     utils::counter_to_event_ty,
 };
 
@@ -26,7 +25,6 @@ mod calibrate;
 mod loops;
 mod qemu;
 
-const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BackendKind {
@@ -474,7 +472,7 @@ impl RooflineBackend for CompilerBackend {
         &'a self,
         dispatcher: Arc<EventDispatcher>,
         command: &'a [String],
-        _output_directory: &'a Path,
+        output_directory: &'a Path,
     ) -> BackendFuture<'a> {
         Box::pin(async move {
             let exe_path = executable_directory()?.to_string_lossy().to_string();
@@ -482,43 +480,36 @@ impl RooflineBackend for CompilerBackend {
                 Ok(path) => format!("{path}:{exe_path}:{exe_path}/../lib"),
                 Err(_) => format!("{exe_path}:{exe_path}/../lib"),
             };
+            let collector_env = crate::source::Source::child_environment(
+                &crate::source::InternalEventsSource {
+                    roofline_instrumented: false,
+                },
+                output_directory,
+            );
 
             println!(
                 "Run 1: collecting performance data for '{}'",
                 command.join(" ")
             );
-            let baseline = profile_command(
-                dispatcher.clone(),
-                command,
-                vec![
-                    ("LD_LIBRARY_PATH".to_string(), ld_path.clone()),
-                    ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
-                ],
-                true,
-                None,
-            )
-            .await?;
+            let mut baseline_env = collector_env.clone();
+            baseline_env.push(("LD_LIBRARY_PATH".to_string(), ld_path.clone()));
+            let baseline =
+                profile_command(dispatcher.clone(), command, baseline_env, None).await?;
 
             println!(
                 "Run 2: collecting compiler-instrumented loop statistics for '{}'",
                 command.join(" ")
             );
-            let (pipe_name, task) = create_shmem_pipe(command_name(command), dispatcher)?;
-            let process = Process::new(
-                command,
-                &[
-                    ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name),
-                    ("LD_LIBRARY_PATH".to_string(), ld_path),
-                    ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
-                    (
-                        "MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED".to_string(),
-                        "1".to_string(),
-                    ),
-                ],
-            )?;
+            let mut instrumented_env = crate::source::Source::child_environment(
+                &crate::source::InternalEventsSource {
+                    roofline_instrumented: true,
+                },
+                output_directory,
+            );
+            instrumented_env.push(("LD_LIBRARY_PATH".to_string(), ld_path));
+            let process = Process::new(command, &instrumented_env)?;
             process.cont();
             process.wait()?;
-            task.await?;
             ensure_process_success(&process, "compiler Roofline accounting run")?;
 
             Ok(ScenarioInfo::Roofline(RooflineInfo {
@@ -544,16 +535,8 @@ async fn profile_command(
     dispatcher: Arc<EventDispatcher>,
     command: &[String],
     mut env: Vec<(String, String)>,
-    receive_collector_events: bool,
     rss_output: Option<PathBuf>,
 ) -> Result<ProfiledRun> {
-    let collector = if receive_collector_events {
-        let (pipe_name, task) = create_shmem_pipe(command_name(command), dispatcher.clone())?;
-        env.push(("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name));
-        Some(task)
-    } else {
-        None
-    };
     if let Some(rss_path) = rss_output.as_ref() {
         let allocation_path = rss_path.with_file_name("memory-allocations.txt");
         env.push((
@@ -585,7 +568,7 @@ async fn profile_command(
         let pid = process.pid();
         std::thread::spawn(move || sample_memory_timeline(pid, &path, stop, memory_controller))
     });
-    let counters = get_pmu_counters(Scenario::Roofline);
+    let counters = crate::source::scenario_counters(Scenario::Roofline);
     let mut instruction_counter = pmu::CountingDriverBuilder::new()
         .counters(&[Counter::Instructions])
         .process(Some(&process))
@@ -612,8 +595,8 @@ async fn profile_command(
                     .map(CallFrame::IP),
             );
             sample_dispatcher.publish_event_sync(Event {
-                unique_id: uuid::Uuid::now_v7().as_u128(),
-                correlation_id: sample.event_id,
+                unique_id: 0,
+                correlation_id: sample.event_id as u64,
                 parent_id: 0,
                 ty: counter_to_event_ty(&sample.counter),
                 thread_id: sample.tid,
@@ -669,9 +652,6 @@ async fn profile_command(
     }
     let end_ns = monotonic_timestamp()?;
     driver.stop()?;
-    if let Some(task) = collector {
-        task.await?;
-    }
     ensure_process_success(&process, "Roofline performance run")?;
 
     Ok(ProfiledRun {
@@ -744,49 +724,6 @@ fn ensure_process_success(process: &Process, description: &str) -> Result<()> {
     }
 }
 
-fn create_shmem_pipe(
-    prefix: &str,
-    dispatcher: Arc<EventDispatcher>,
-) -> Result<(String, tokio::task::JoinHandle<()>), std::io::Error> {
-    let pipe_name = format!(
-        "/{}{}{}",
-        prefix,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    );
-    let receiver = shmem::proc_channel::Receiver::<IPCMessage>::new(&pipe_name, SIZE_16MB)?;
-    let task = tokio::spawn(async move {
-        let mut strings = HashMap::<u128, u128>::new();
-        while let Some(message) = receiver.recv().await {
-            match message {
-                IPCMessage::String(string) => {
-                    let id = dispatcher.string_id_async(&string.value).await;
-                    strings.insert(string.key, id);
-                }
-                IPCMessage::Event(mut event) => {
-                    for stack in event.callstack.iter_mut() {
-                        if let CallFrame::Location(location) = stack {
-                            location.function_name = strings
-                                .get(&location.function_name)
-                                .copied()
-                                .unwrap_or_default();
-                            location.file_name = strings
-                                .get(&location.file_name)
-                                .copied()
-                                .unwrap_or_default();
-                        }
-                    }
-                    dispatcher.publish_event(event).await;
-                }
-            }
-        }
-    });
-    Ok((pipe_name, task))
-}
-
 fn executable_directory() -> std::io::Result<PathBuf> {
     let mut path = std::env::current_exe()?;
     path.pop();
@@ -806,11 +743,7 @@ fn installed_library(name: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn memory_preload_path() -> Option<PathBuf> {
-    installed_library("libmperf_memory_preload.so").or_else(|| {
-        option_env!("MPERF_BUILD_MEMORY_PRELOAD")
-            .map(PathBuf::from)
-            .filter(|path| path.is_file())
-    })
+    installed_library("libmperf_libc.so")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -818,12 +751,6 @@ fn memory_preload_path() -> Option<PathBuf> {
     None
 }
 
-fn command_name(command: &[String]) -> &str {
-    Path::new(&command[0])
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("mperf")
-}
 
 fn monotonic_timestamp() -> Result<u64> {
     let mut timestamp = libc::timespec {

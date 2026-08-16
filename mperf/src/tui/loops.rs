@@ -6,13 +6,13 @@ use ratatui::{
     style::{Style, Stylize},
     widgets::{Block, Cell, Paragraph, Row, Table, Widget, Wrap},
 };
-use sqlite::Connection;
+use store::Session;
 
 #[derive(Clone)]
 pub struct LoopsTab {
     hotspots: Arc<RwLock<Vec<Loop>>>,
     is_running: Arc<RwLock<bool>>,
-    connection: Arc<Mutex<Connection>>,
+    session: Arc<Mutex<Session>>,
     load_error: Arc<RwLock<Option<String>>>,
 }
 
@@ -110,11 +110,11 @@ impl Widget for LoopsTab {
 }
 
 impl LoopsTab {
-    pub fn new(connection: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(session: Arc<Mutex<Session>>) -> Self {
         LoopsTab {
             hotspots: Arc::new(RwLock::new(Vec::new())),
             is_running: Arc::new(RwLock::new(false)),
-            connection,
+            session,
             load_error: Arc::new(RwLock::new(None)),
         }
     }
@@ -132,50 +132,51 @@ impl LoopsTab {
     }
 
     async fn fetch_data(self) {
-        let conn = self.connection.lock();
-        let result: Result<Vec<Loop>, String> = conn
-            .prepare("SELECT * FROM roofline;")
-            .map_err(|error| error.to_string())
-            .and_then(|statement| {
-                statement
-                    .into_iter()
-                    .map(|row| -> Result<Loop, String> {
-                        let row = row.map_err(|error| error.to_string())?;
-                        let float = |column| {
-                            row.try_read::<Option<f64>, _>(column)
-                                .map(|value| value.unwrap_or_default())
-                                .map_err(|error| error.to_string())
-                        };
-                        Ok(Loop {
-                            function_name: row
-                                .try_read::<&str, _>("function_name")
-                                .map_err(|error| error.to_string())?
-                                .to_string(),
-                            file_name: row
-                                .try_read::<&str, _>("file_name")
-                                .map_err(|error| error.to_string())?
-                                .to_string(),
-                            line: row
-                                .try_read::<i64, _>("line")
-                                .map_err(|error| error.to_string())?
-                                as u32,
-                            sint_ops: float("scalar_int_ops")? / 1_000_000_000.0,
-                            sint_ai: float("scalar_int_ai")?,
-                            sfp_ops: float("scalar_float_ops")? / 1_000_000_000.0,
-                            sfp_ai: float("scalar_float_ai")?,
-                            sdp_ops: float("scalar_double_ops")? / 1_000_000_000.0,
-                            sdp_ai: float("scalar_double_ai")?,
-                            vint_ops: float("vector_int_ops")? / 1_000_000_000.0,
-                            vint_ai: float("vector_int_ai")?,
-                            vfp_ops: float("vector_float_ops")? / 1_000_000_000.0,
-                            vfp_ai: float("vector_float_ai")?,
-                            vdp_ops: float("vector_double_ops")? / 1_000_000_000.0,
-                            vdp_ai: float("vector_double_ai")?,
-                        })
-                    })
-                    .collect()
-            });
-        drop(conn);
+        let session = self.session.lock();
+        let result: Result<Vec<Loop>, String> = (|| {
+            if !session.has_table("roofline") {
+                return Err("this recording has no roofline table".to_string());
+            }
+            let mut statement = session
+                .connection()
+                .prepare("SELECT * FROM roofline")
+                .map_err(|error| error.to_string())?;
+            let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+
+            let mut loops = Vec::new();
+            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+                let float = |column| {
+                    row.get::<_, Option<f64>>(column)
+                        .map(|value| value.unwrap_or_default())
+                        .map_err(|error| error.to_string())
+                };
+                loops.push(Loop {
+                    function_name: row
+                        .get::<_, String>("function_name")
+                        .map_err(|error| error.to_string())?,
+                    file_name: row
+                        .get::<_, String>("file_name")
+                        .map_err(|error| error.to_string())?,
+                    line: row
+                        .get::<_, i64>("line")
+                        .map_err(|error| error.to_string())? as u32,
+                    sint_ops: float("scalar_int_ops")? / 1_000_000_000.0,
+                    sint_ai: float("scalar_int_ai")?,
+                    sfp_ops: float("scalar_float_ops")? / 1_000_000_000.0,
+                    sfp_ai: float("scalar_float_ai")?,
+                    sdp_ops: float("scalar_double_ops")? / 1_000_000_000.0,
+                    sdp_ai: float("scalar_double_ai")?,
+                    vint_ops: float("vector_int_ops")? / 1_000_000_000.0,
+                    vint_ai: float("vector_int_ai")?,
+                    vfp_ops: float("vector_float_ops")? / 1_000_000_000.0,
+                    vfp_ai: float("vector_float_ai")?,
+                    vdp_ops: float("vector_double_ops")? / 1_000_000_000.0,
+                    vdp_ai: float("vector_double_ai")?,
+                });
+            }
+            Ok(loops)
+        })();
+        drop(session);
 
         let rows = match result {
             Ok(rows) => rows,

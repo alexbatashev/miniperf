@@ -9,6 +9,7 @@ mod recent;
 mod roofline;
 mod snapshot;
 mod source;
+mod sql;
 mod theme;
 mod views;
 

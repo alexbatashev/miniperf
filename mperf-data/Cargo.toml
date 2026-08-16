@@ -6,9 +6,8 @@ license = "MIT OR LGPL-3.0-only"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+smallvec = { version = "1.15.0", features = ["serde"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 clap = { version = "4.5.23", features = ["derive"] }
-smallvec = {version = "1.15.0", features = ["serde", "impl_bincode"] }
-shmem = { path = "../shmem/" }
-bincode = "2.0.1"
 pmu-data = { package = "miniperf-pmu-data", path = "../pmu-data" }

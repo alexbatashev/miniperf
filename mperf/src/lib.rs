@@ -7,6 +7,7 @@ mod processing;
 mod query;
 mod record;
 mod roofline;
+mod source;
 #[cfg(target_os = "linux")]
 mod snapshot_resources;
 mod stat;
@@ -93,7 +94,12 @@ enum Commands {
     EventsExport {
         result_directory: String,
     },
-    /// Run one read-only SQLite query against recorded performance data.
+    /// Validate a session directory after a crash, quarantining segments
+    /// that were left without a footer.
+    Recover {
+        result_directory: String,
+    },
+    /// Run one read-only SQL query against recorded performance data.
     Query {
         /// Result directory followed by one quoted SQL statement. Use
         /// `mperf query help` for the complete guide.
@@ -194,6 +200,17 @@ pub async fn run() -> Result<()> {
             .await
         }
         Commands::Show { result_directory } => tui::tui_main(Path::new(&result_directory)).await,
+        Commands::Recover { result_directory } => {
+            let report = store::recover_session(Path::new(&result_directory))?;
+            println!("{} healthy segment(s)", report.healthy);
+            for file in &report.quarantined {
+                println!("quarantined {}", file.display());
+            }
+            if report.quarantined.is_empty() {
+                println!("no crash-damaged segments found");
+            }
+            Ok(())
+        }
         Commands::EventsExport { result_directory } => {
             do_events_export(Path::new(&result_directory));
             Ok(())

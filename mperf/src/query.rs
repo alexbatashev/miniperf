@@ -15,7 +15,7 @@ use num_format::{Locale, ToFormattedString};
 use pmu_data::ValueFormat;
 use serde::Serialize;
 use serde_json::{Map, Value as JsonValue};
-use sqlite::{Connection, OpenFlags, State, Value};
+use store::duckdb::{Connection, types::Value as DuckValue};
 
 pub const MAX_ROWS: usize = 10_000;
 
@@ -41,6 +41,43 @@ struct QueryResult {
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
     truncated: bool,
+}
+
+/// Rendering-oriented projection of a DuckDB result value.
+#[derive(Clone, Debug, PartialEq)]
+enum Value {
+    Null,
+    Integer(i64),
+    Unsigned(u64),
+    Float(f64),
+    String(String),
+    Binary(Vec<u8>),
+}
+
+impl From<DuckValue> for Value {
+    fn from(value: DuckValue) -> Self {
+        match value {
+            DuckValue::Null => Value::Null,
+            DuckValue::Boolean(value) => Value::Integer(value as i64),
+            DuckValue::TinyInt(value) => Value::Integer(value as i64),
+            DuckValue::SmallInt(value) => Value::Integer(value as i64),
+            DuckValue::Int(value) => Value::Integer(value as i64),
+            DuckValue::BigInt(value) => Value::Integer(value),
+            DuckValue::UTinyInt(value) => Value::Integer(value as i64),
+            DuckValue::USmallInt(value) => Value::Integer(value as i64),
+            DuckValue::UInt(value) => Value::Integer(value as i64),
+            DuckValue::UBigInt(value) => Value::Unsigned(value),
+            DuckValue::HugeInt(value) => i64::try_from(value)
+                .map_or_else(|_| Value::String(value.to_string()), Value::Integer),
+            DuckValue::UHugeInt(value) => u64::try_from(value)
+                .map_or_else(|_| Value::String(value.to_string()), Value::Unsigned),
+            DuckValue::Float(value) => Value::Float(value as f64),
+            DuckValue::Double(value) => Value::Float(value),
+            DuckValue::Text(value) | DuckValue::Enum(value) => Value::String(value),
+            DuckValue::Blob(bytes) | DuckValue::Geometry(bytes) => Value::Binary(bytes),
+            other => Value::String(format!("{other:?}")),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -103,14 +140,10 @@ pub fn do_query(
 
     let result_directory = Path::new(result_directory);
     let info = load_record_info(result_directory)?;
-    let database_path = result_directory.join("perf.db");
-    let connection = Connection::open_with_flags(&database_path, OpenFlags::new().with_read_only())
-        .with_context(|| format!("failed to open {} read-only", database_path.display()))?;
-    connection
-        .execute("PRAGMA query_only = ON")
-        .context("failed to enable SQLite query-only mode")?;
+    let session = store::Session::open(result_directory)
+        .with_context(|| format!("failed to open {}", result_directory.display()))?;
 
-    let result = execute(&connection, &sql, max_rows)?;
+    let result = execute(session.connection(), &sql, max_rows)?;
     match format {
         QueryFormat::Text => {
             let formats = known_formats(&info);
@@ -139,7 +172,11 @@ fn execute(connection: &Connection, sql: &str, max_rows: usize) -> Result<QueryR
     let mut statement = connection
         .prepare(sql)
         .with_context(|| format!("failed to prepare query: {}", one_line(sql)))?;
-    let columns = statement.column_names().to_vec();
+    let mut result_rows = statement.query([]).context("query execution failed")?;
+    let columns = result_rows
+        .as_ref()
+        .map(|statement| statement.column_names())
+        .unwrap_or_default();
     if columns.is_empty() {
         bail!("statement does not return rows; only read-only row-producing SQL is accepted");
     }
@@ -152,14 +189,14 @@ fn execute(connection: &Connection, sql: &str, max_rows: usize) -> Result<QueryR
 
     let mut rows = Vec::new();
     let mut truncated = false;
-    while statement.next().context("query execution failed")? == State::Row {
+    while let Some(row) = result_rows.next().context("query execution failed")? {
         if rows.len() == max_rows {
             truncated = true;
             break;
         }
         let row = (0..columns.len())
-            .map(|index| statement.read::<Value, _>(index))
-            .collect::<sqlite::Result<Vec<_>>>()
+            .map(|index| row.get::<_, DuckValue>(index).map(Value::from))
+            .collect::<store::duckdb::Result<Vec<_>>>()
             .context("failed to read query result")?;
         rows.push(row);
     }
@@ -289,7 +326,10 @@ fn render_text(
                 .get(&result.columns[index])
                 .cloned()
                 .unwrap_or_default();
-            let alignment = if matches!(value, Value::Integer(_) | Value::Float(_)) {
+            let alignment = if matches!(
+                value,
+                Value::Integer(_) | Value::Unsigned(_) | Value::Float(_)
+            ) {
                 CellAlignment::Right
             } else {
                 CellAlignment::Left
@@ -318,6 +358,7 @@ fn format_value(value: &Value, format: &ValueFormat) -> String {
         Value::Binary(bytes) => encode_blob(bytes),
         Value::String(value) => value.clone(),
         Value::Integer(value) => value.to_formatted_string(&Locale::en),
+        Value::Unsigned(value) => value.to_formatted_string(&Locale::en),
         Value::Float(value) => match format {
             ValueFormat::Percent => format!("{:.2}%", value * 100.0),
             ValueFormat::Percent1 => format!("{:.1}%", value * 100.0),
@@ -402,7 +443,7 @@ fn infer_column_type(rows: &[Vec<Value>], index: usize) -> &'static str {
             Value::Null => continue,
             Value::Binary(_) => "binary",
             Value::Float(_) => "number",
-            Value::Integer(_) => "integer",
+            Value::Integer(_) | Value::Unsigned(_) => "integer",
             Value::String(_) => "string",
         };
         inferred = match inferred {
@@ -422,6 +463,7 @@ fn json_value(value: &Value) -> Result<JsonValue> {
         Value::Binary(bytes) => JsonValue::String(encode_blob(bytes)),
         Value::String(value) => JsonValue::String(value.clone()),
         Value::Integer(value) => JsonValue::from(*value),
+        Value::Unsigned(value) => JsonValue::from(*value),
         Value::Float(value) => {
             JsonValue::Number(serde_json::Number::from_f64(*value).ok_or_else(|| {
                 anyhow::anyhow!("query returned a non-finite floating-point value")
@@ -448,18 +490,24 @@ USAGE
   mperf query RESULTS --file -
   mperf query help
 
-The command opens RESULTS/perf.db read-only and accepts one row-producing
-SQLite statement. SELECT, VALUES, WITH ... SELECT, EXPLAIN, and read-only
-PRAGMA statements are supported. Writes and multiple statements are rejected.
-The default output cap is 50 rows; --max-rows accepts values up to 10000.
+The command opens the RESULTS session directory as an in-memory DuckDB
+database with one read-only view per Parquet table and accepts one
+row-producing DuckDB statement. SELECT, VALUES, WITH ... SELECT, EXPLAIN, and
+read-only PRAGMA statements are supported. Writes and multiple statements are
+rejected. The default output cap is 50 rows; --max-rows accepts values up to
+10000.
+
+Every dataset below is a RESULTS/<name>.parquet file, so read_parquet() and
+the other DuckDB file functions work on the session directory directly.
 
 DISCOVER THE RECORDING SCHEMA
-  mperf query ./results "SELECT name, type FROM sqlite_schema
-                         WHERE type IN ('table', 'view') ORDER BY type, name"
+  mperf query ./results "SELECT view_name AS name FROM duckdb_views()
+                         WHERE NOT internal ORDER BY name"
 
-  mperf query ./results 'PRAGMA table_info(hotspots)'
+  mperf query ./results "PRAGMA table_info('hotspots')"
 
-  mperf query ./results "SELECT sql FROM sqlite_schema WHERE name = 'tma'"
+  mperf query ./results "SELECT * FROM read_parquet('./results/tma.parquet')
+                         LIMIT 5"
 
 COMMON DATASETS
   hotspots              Snapshot/Roofline function-level performance
@@ -539,18 +587,18 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
-                "CREATE TABLE values_table (
-                    name TEXT,
-                    count INTEGER,
-                    ratio REAL,
+            .execute_batch(
+                "CREATE TABLE stored_values (
+                    name VARCHAR,
+                    count BIGINT,
+                    ratio DOUBLE,
                     payload BLOB
                  );
-                 INSERT INTO values_table VALUES ('first', 10, 0.5, X'00ff');
-                 INSERT INTO values_table VALUES ('second', 20, NULL, NULL);
-                 PRAGMA query_only = ON;",
+                 INSERT INTO stored_values VALUES ('first', 10, 0.5, '\\x00\\xFF'::BLOB);
+                 INSERT INTO stored_values VALUES ('second', 20, NULL, NULL);
+                 CREATE VIEW values_table AS SELECT * FROM stored_values;",
             )
             .unwrap();
         connection
@@ -599,7 +647,9 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(write.contains("query execution failed"));
+        assert!(
+            write.contains("failed to prepare query") || write.contains("query execution failed")
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use mperf_data::MemoryLevelCalibration;
-use sqlite::{Connection, State};
+
+use crate::sql::{Connection, SqlResult};
 
 #[derive(Debug, Clone)]
 pub struct MemoryData {
@@ -173,82 +174,88 @@ fn load(
          FROM memory_summary LIMIT 1;",
         )
         .context("memory summary is unavailable")?;
-    let summary = if statement.next()? == State::Row {
-        Some(MemorySummary {
-            line_size: statement.read::<i64, _>(0)?.max(0) as u64,
-            reference_count: statement.read::<i64, _>(1)?.max(0) as u64,
-            architectural_load_bytes: statement.read::<i64, _>(2)?.max(0) as u64,
-            architectural_store_bytes: statement.read::<i64, _>(3)?.max(0) as u64,
-            accessed_footprint_bytes: statement.read::<i64, _>(4)?.max(0) as u64,
-            modeled_dram_read_bytes: statement.read::<i64, _>(5)?.max(0) as u64,
-            modeled_dram_write_bytes: statement.read::<i64, _>(6)?.max(0) as u64,
-            native_duration_ns: statement.read::<i64, _>(7)?.max(0) as u64,
-            peak_allocated_bytes: statement
-                .read::<Option<i64>, _>(8)?
+    let summary = match statement.query([])?.next()? {
+        Some(row) => Some(MemorySummary {
+            line_size: row.get::<_, i64>(0)?.max(0) as u64,
+            reference_count: row.get::<_, i64>(1)?.max(0) as u64,
+            architectural_load_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+            architectural_store_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+            accessed_footprint_bytes: row.get::<_, i64>(4)?.max(0) as u64,
+            modeled_dram_read_bytes: row.get::<_, i64>(5)?.max(0) as u64,
+            modeled_dram_write_bytes: row.get::<_, i64>(6)?.max(0) as u64,
+            native_duration_ns: row.get::<_, i64>(7)?.max(0) as u64,
+            peak_allocated_bytes: row
+                .get::<_, Option<i64>>(8)?
                 .map(|value| value.max(0) as u64),
-            peak_rss_bytes: statement
-                .read::<Option<i64>, _>(9)?
+            peak_rss_bytes: row
+                .get::<_, Option<i64>>(9)?
                 .map(|value| value.max(0) as u64),
-            cold_fraction: statement.read::<Option<f64>, _>(10)?,
-            achieved_gbytes_per_second: statement.read::<Option<f64>, _>(11)?,
-            peak_gbytes_per_second: statement.read::<Option<f64>, _>(12)?,
-            bandwidth_utilization: statement.read::<Option<f64>, _>(13)?,
-            bandwidth_source: statement.read::<String, _>(14)?,
-            bandwidth_scope: statement.read::<String, _>(15)?,
-            quality: statement.read::<String, _>(16)?,
-        })
-    } else {
-        None
+            cold_fraction: row.get::<_, Option<f64>>(10)?,
+            achieved_gbytes_per_second: row.get::<_, Option<f64>>(11)?,
+            peak_gbytes_per_second: row.get::<_, Option<f64>>(12)?,
+            bandwidth_utilization: row.get::<_, Option<f64>>(13)?,
+            bandwidth_source: row.get::<_, String>(14)?,
+            bandwidth_scope: row.get::<_, String>(15)?,
+            quality: row.get::<_, String>(16)?,
+        }),
+        None => None,
     };
-    let working_set = connection.prepare(
-        "SELECT window_references, mean_bytes, p95_bytes, max_bytes FROM memory_working_set ORDER BY window_references;"
-    )?.into_iter().map(|row| {
-        let row = row?;
-        Ok(WorkingSetPoint { window_references: row.read::<i64, _>(0).max(0) as u64, mean_bytes: row.read::<f64, _>(1), p95_bytes: row.read::<i64, _>(2).max(0) as u64, max_bytes: row.read::<i64, _>(3).max(0) as u64 })
-    }).collect::<Result<Vec<_>>>()?;
-    let miss_ratio = connection
-        .prepare("SELECT cache_bytes, miss_ratio FROM memory_miss_ratio ORDER BY cache_bytes;")?
-        .into_iter()
-        .map(|row| {
-            let row = row?;
-            Ok(MissRatioPoint {
-                cache_bytes: row.read::<i64, _>(0).max(0) as u64,
-                miss_ratio: row.read::<f64, _>(1),
+    let mut statement = connection.prepare(
+        "SELECT window_references, mean_bytes, p95_bytes, max_bytes FROM memory_working_set ORDER BY window_references;",
+    )?;
+    let working_set = statement
+        .query_map([], |row| {
+            Ok(WorkingSetPoint {
+                window_references: row.get::<_, i64>(0)?.max(0) as u64,
+                mean_bytes: row.get::<_, f64>(1)?,
+                p95_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                max_bytes: row.get::<_, i64>(3)?.max(0) as u64,
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    let mut statement = connection
+        .prepare("SELECT cache_bytes, miss_ratio FROM memory_miss_ratio ORDER BY cache_bytes;")?;
+    let miss_ratio = statement
+        .query_map([], |row| {
+            Ok(MissRatioPoint {
+                cache_bytes: row.get::<_, i64>(0)?.max(0) as u64,
+                miss_ratio: row.get::<_, f64>(1)?,
+            })
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
     let spatial = load_unsigned_histogram(
         connection,
         "SELECT utilization_percent, lines FROM memory_spatial_utilization ORDER BY utilization_percent;",
     )?;
-    let strides = connection
-        .prepare("SELECT stride_log2_lines, reference_count FROM memory_strides ORDER BY stride_log2_lines;")?
-        .into_iter()
-        .map(|row| {
-            let row = row?;
-            Ok(SignedHistogramPoint { bucket: row.read::<i64, _>(0), count: row.read::<i64, _>(1).max(0) as u64 })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let timeline = connection
-        .prepare(
-            "SELECT timestamp_ns, rss_bytes, dram_read_gbytes_per_second, dram_write_gbytes_per_second
+    let mut statement = connection.prepare(
+        "SELECT stride_log2_lines, reference_count FROM memory_strides ORDER BY stride_log2_lines;",
+    )?;
+    let strides = statement
+        .query_map([], |row| {
+            Ok(SignedHistogramPoint {
+                bucket: row.get::<_, i64>(0)?,
+                count: row.get::<_, i64>(1)?.max(0) as u64,
+            })
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    let mut statement = connection.prepare(
+        "SELECT timestamp_ns, rss_bytes, dram_read_gbytes_per_second, dram_write_gbytes_per_second
              FROM memory_timeline
              WHERE rss_bytes IS NOT NULL OR dram_read_gbytes_per_second IS NOT NULL
              ORDER BY timestamp_ns;",
-        )?
-        .into_iter()
-        .map(|row| {
-            let row = row?;
+    )?;
+    let timeline = statement
+        .query_map([], |row| {
             Ok(TimelinePoint {
-                timestamp_ns: row.read::<i64, _>(0).max(0) as u64,
+                timestamp_ns: row.get::<_, i64>(0)?.max(0) as u64,
                 rss_bytes: row
-                    .read::<Option<i64>, _>(1)
+                    .get::<_, Option<i64>>(1)?
                     .map(|value| value.max(0) as u64),
-                read_gbytes_per_second: row.read::<Option<f64>, _>(2),
-                write_gbytes_per_second: row.read::<Option<f64>, _>(3),
+                read_gbytes_per_second: row.get::<_, Option<f64>>(2)?,
+                write_gbytes_per_second: row.get::<_, Option<f64>>(3)?,
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
     Ok(MemoryData {
         summary,
         working_set,
@@ -262,17 +269,16 @@ fn load(
 }
 
 fn load_unsigned_histogram(connection: &Connection, query: &str) -> Result<Vec<HistogramPoint>> {
-    connection
-        .prepare(query)?
-        .into_iter()
-        .map(|row| {
-            let row = row?;
+    let mut statement = connection.prepare(query)?;
+    let points = statement
+        .query_map([], |row| {
             Ok(HistogramPoint {
-                bucket: row.read::<i64, _>(0).max(0) as u64,
-                count: row.read::<i64, _>(1).max(0) as u64,
+                bucket: row.get::<_, i64>(0)?.max(0) as u64,
+                count: row.get::<_, i64>(1)?.max(0) as u64,
             })
-        })
-        .collect()
+        })?
+        .collect::<SqlResult<Vec<_>>>()?;
+    Ok(points)
 }
 
 #[cfg(test)]

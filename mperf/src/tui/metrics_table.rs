@@ -13,13 +13,16 @@ use ratatui::{
     text::{Line, Text},
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Widget},
 };
-use sqlite::Connection;
+use store::{
+    Session,
+    duckdb::{Row as SqlRow, params},
+};
 
 #[derive(Clone)]
 pub struct MetricsTableTab {
     rows: Arc<RwLock<Vec<MetricsRow>>>,
     is_running: Arc<RwLock<bool>>,
-    connection: Arc<Mutex<Connection>>,
+    session: Arc<Mutex<Session>>,
     state: Arc<Mutex<MetricsState>>,
     config: Arc<MetricsTableConfig>,
     layout: Arc<RwLock<Option<RuntimeLayout>>>,
@@ -284,11 +287,11 @@ impl Widget for MetricsTableTab {
 }
 
 impl MetricsTableTab {
-    pub fn new(spec: MetricsTableSpec, connection: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(spec: MetricsTableSpec, session: Arc<Mutex<Session>>) -> Self {
         MetricsTableTab {
             rows: Arc::new(RwLock::new(Vec::new())),
             is_running: Arc::new(RwLock::new(false)),
-            connection,
+            session,
             state: Arc::new(Mutex::new(MetricsState::default())),
             config: Arc::new(MetricsTableConfig::from_spec(spec)),
             layout: Arc::new(RwLock::new(None)),
@@ -313,21 +316,30 @@ impl MetricsTableTab {
 
     async fn fetch_data(self) {
         let result: Result<Vec<MetricsRow>, String> = (|| {
-            let conn = self.connection.lock();
+            let session = self.session.lock();
+            if !session.has_table(&self.config.view) {
+                return Err(format!("No '{}' data in this recording", self.config.view));
+            }
             let query = self.config.build_query();
-            let stmt = conn.prepare(&query).map_err(|err| err.to_string())?;
+            let mut stmt = session
+                .connection()
+                .prepare(&query)
+                .map_err(|err| err.to_string())?;
+            let mut result_rows = stmt.query([]).map_err(|err| err.to_string())?;
 
-            let column_names = (0..stmt.column_count())
-                .map(|idx| stmt.column_name(idx).unwrap_or("").to_string())
+            let column_names = result_rows
+                .as_ref()
+                .map(|stmt| stmt.column_names())
+                .unwrap_or_default()
+                .into_iter()
                 .collect::<HashSet<_>>();
 
             let layout = self.config.build_runtime_layout(&column_names)?;
             *self.layout.write() = Some(layout.clone());
 
             let mut rows = Vec::new();
-            for row in stmt.into_iter() {
-                let row = row.map_err(|err| err.to_string())?;
-                rows.push(read_row(&layout, &row));
+            while let Some(row) = result_rows.next().map_err(|err| err.to_string())? {
+                rows.push(read_row(&layout, row));
             }
             Ok(rows)
         })();
@@ -517,9 +529,18 @@ impl MetricsTableTab {
 
     async fn fetch_assembly(self, func_name: String, request_id: u64) {
         let result: Result<AssemblyViewState, String> = (|| {
-            use sqlite::State;
-
-            let conn = self.connection.lock();
+            let session = self.session.lock();
+            for table in [
+                "pmu_counters",
+                "proc_map",
+                "assembly_address_stats",
+                "assembly_lines",
+            ] {
+                if !session.has_table(table) {
+                    return Err("Assembly data is not available for the selected row".to_string());
+                }
+            }
+            let conn = session.connection();
 
             let mut module_stmt = conn
                 .prepare(
@@ -529,19 +550,20 @@ impl MetricsTableTab {
                      WHERE proc_map.func_name = ?
                      GROUP BY proc_map.module_path
                      ORDER BY total_cycles DESC
-                     LIMIT 1;",
+                     LIMIT 1",
                 )
                 .map_err(|err| err.to_string())?;
-            module_stmt
-                .bind((1, func_name.as_str()))
-                .map_err(|err| err.to_string())?;
-
-            let module_path = match module_stmt.next().map_err(|err| err.to_string())? {
-                State::Row => module_stmt
-                    .read::<String, _>(0)
-                    .map_err(|err| err.to_string())?,
-                State::Done => {
-                    return Err("Assembly data is not available for the selected row".to_string());
+            let module_path = {
+                let mut rows = module_stmt
+                    .query(params![func_name])
+                    .map_err(|err| err.to_string())?;
+                match rows.next().map_err(|err| err.to_string())? {
+                    Some(row) => row.get::<_, String>(0).map_err(|err| err.to_string())?,
+                    None => {
+                        return Err(
+                            "Assembly data is not available for the selected row".to_string()
+                        );
+                    }
                 }
             };
 
@@ -550,62 +572,45 @@ impl MetricsTableTab {
                     "SELECT address, samples, cycles, instructions, branch_misses, branch_instructions, llc_misses, llc_references
                      FROM assembly_address_stats
                      WHERE module_path = ? AND func_name = ?
-                     ORDER BY address;",
+                     ORDER BY address",
                 )
-                .map_err(|err| err.to_string())?;
-            stats_stmt
-                .bind((1, module_path.as_str()))
-                .map_err(|err| err.to_string())?;
-            stats_stmt
-                .bind((2, func_name.as_str()))
                 .map_err(|err| err.to_string())?;
 
             let mut stats_map = HashMap::new();
             let mut ordered_addresses = Vec::new();
             let mut total_samples = 0u64;
 
-            while let State::Row = stats_stmt.next().map_err(|err| err.to_string())? {
-                let address = stats_stmt
-                    .read::<i64, _>("address")
-                    .map_err(|err| err.to_string())? as u64;
-                let samples = stats_stmt
-                    .read::<i64, _>("samples")
-                    .map_err(|err| err.to_string())? as u64;
-                let cycles = stats_stmt
-                    .read::<i64, _>("cycles")
-                    .map_err(|err| err.to_string())? as u64;
-                let instructions = stats_stmt
-                    .read::<i64, _>("instructions")
-                    .map_err(|err| err.to_string())? as u64;
-                let branch_misses = stats_stmt
-                    .read::<i64, _>("branch_misses")
-                    .map_err(|err| err.to_string())? as u64;
-                let branch_instructions = stats_stmt
-                    .read::<i64, _>("branch_instructions")
-                    .map_err(|err| err.to_string())?
-                    as u64;
-                let llc_misses = stats_stmt
-                    .read::<i64, _>("llc_misses")
-                    .map_err(|err| err.to_string())? as u64;
-                let llc_references = stats_stmt
-                    .read::<i64, _>("llc_references")
-                    .map_err(|err| err.to_string())? as u64;
+            {
+                let mut rows = stats_stmt
+                    .query(params![module_path, func_name])
+                    .map_err(|err| err.to_string())?;
+                while let Some(row) = rows.next().map_err(|err| err.to_string())? {
+                    let count = |column| {
+                        row.get::<_, i64>(column)
+                            .map(|value| value.max(0) as u64)
+                            .map_err(|err: store::duckdb::Error| err.to_string())
+                    };
+                    let address = row
+                        .get::<_, u64>("address")
+                        .map_err(|err| err.to_string())?;
+                    let samples = count("samples")?;
 
-                stats_map.insert(
-                    address,
-                    AssemblyStats {
-                        samples,
-                        cycles,
-                        instructions,
-                        branch_misses,
-                        branch_instructions,
-                        llc_misses,
-                        llc_references,
-                    },
-                );
-                ordered_addresses.push(address);
+                    stats_map.insert(
+                        address,
+                        AssemblyStats {
+                            samples,
+                            cycles: count("cycles")?,
+                            instructions: count("instructions")?,
+                            branch_misses: count("branch_misses")?,
+                            branch_instructions: count("branch_instructions")?,
+                            llc_misses: count("llc_misses")?,
+                            llc_references: count("llc_references")?,
+                        },
+                    );
+                    ordered_addresses.push(address);
 
-                total_samples = total_samples.saturating_add(samples);
+                    total_samples = total_samples.saturating_add(samples);
+                }
             }
 
             if ordered_addresses.is_empty() {
@@ -622,33 +627,25 @@ impl MetricsTableTab {
                     "SELECT runtime_address, symbol FROM assembly_lines
                      WHERE module_path = ? AND runtime_address BETWEEN ? AND ?
                        AND symbol IS NOT NULL
-                     ORDER BY runtime_address DESC LIMIT 1;",
+                     ORDER BY runtime_address DESC LIMIT 1",
                 )
                 .map_err(|err| err.to_string())?;
             let mut attributed_stats = HashMap::<u64, AssemblyStats>::new();
             let mut owner_symbols = Vec::new();
             let mut unattributed = Vec::new();
             for address in ordered_addresses {
-                instruction_stmt.reset().map_err(|err| err.to_string())?;
-                instruction_stmt
-                    .bind((1, module_path.as_str()))
-                    .map_err(|err| err.to_string())?;
-                instruction_stmt
-                    .bind((2, address.saturating_sub(MAX_INSTRUCTION_BYTES) as i64))
-                    .map_err(|err| err.to_string())?;
-                instruction_stmt
-                    .bind((3, address as i64))
-                    .map_err(|err| err.to_string())?;
-
                 let stats = stats_map[&address];
-                match instruction_stmt.next().map_err(|err| err.to_string())? {
-                    State::Row => {
-                        let instruction_address = instruction_stmt
-                            .read::<i64, _>("runtime_address")
-                            .map_err(|err| err.to_string())?
-                            as u64;
-                        let owner = instruction_stmt
-                            .read::<String, _>("symbol")
+                let lower = address.saturating_sub(MAX_INSTRUCTION_BYTES);
+                let mut rows = instruction_stmt
+                    .query(params![module_path, lower, address])
+                    .map_err(|err| err.to_string())?;
+                match rows.next().map_err(|err| err.to_string())? {
+                    Some(row) => {
+                        let instruction_address = row
+                            .get::<_, u64>("runtime_address")
+                            .map_err(|err| err.to_string())?;
+                        let owner = row
+                            .get::<_, String>("symbol")
                             .map_err(|err| err.to_string())?;
                         attributed_stats
                             .entry(instruction_address)
@@ -656,7 +653,7 @@ impl MetricsTableTab {
                             .merge(stats);
                         owner_symbols.push(owner);
                     }
-                    State::Done => unattributed.push((address, stats)),
+                    None => unattributed.push((address, stats)),
                 }
             }
             owner_symbols.sort_unstable();
@@ -665,25 +662,21 @@ impl MetricsTableTab {
             let mut lines_stmt = conn
                 .prepare(
                     "SELECT runtime_address, instruction FROM assembly_lines
-                     WHERE module_path = ? AND symbol = ? ORDER BY runtime_address;",
+                     WHERE module_path = ? AND symbol = ? ORDER BY runtime_address",
                 )
                 .map_err(|err| err.to_string())?;
 
             let mut rows = Vec::new();
             for owner in &owner_symbols {
-                lines_stmt.reset().map_err(|err| err.to_string())?;
-                lines_stmt
-                    .bind((1, module_path.as_str()))
+                let mut lines = lines_stmt
+                    .query(params![module_path, owner])
                     .map_err(|err| err.to_string())?;
-                lines_stmt
-                    .bind((2, owner.as_str()))
-                    .map_err(|err| err.to_string())?;
-                while let State::Row = lines_stmt.next().map_err(|err| err.to_string())? {
-                    let address = lines_stmt
-                        .read::<i64, _>("runtime_address")
-                        .map_err(|err| err.to_string())? as u64;
-                    let instruction = lines_stmt
-                        .read::<String, _>("instruction")
+                while let Some(row) = lines.next().map_err(|err| err.to_string())? {
+                    let address = row
+                        .get::<_, u64>("runtime_address")
+                        .map_err(|err| err.to_string())?;
+                    let instruction = row
+                        .get::<_, String>("instruction")
                         .map_err(|err| err.to_string())?;
                     let stats = attributed_stats.get(&address).copied().unwrap_or_default();
                     rows.push(assembly_row(address, instruction, stats, total_samples));
@@ -950,7 +943,7 @@ fn default_columns() -> Vec<ColumnConfig> {
     ]
 }
 
-fn read_row(layout: &RuntimeLayout, row: &sqlite::Row) -> MetricsRow {
+fn read_row(layout: &RuntimeLayout, row: &SqlRow<'_>) -> MetricsRow {
     let mut values = Vec::with_capacity(layout.columns.len());
 
     for column in &layout.columns {
@@ -960,22 +953,23 @@ fn read_row(layout: &RuntimeLayout, row: &sqlite::Row) -> MetricsRow {
     MetricsRow { values }
 }
 
-fn read_value(row: &sqlite::Row, column: &ColumnConfig) -> MetricValue {
+fn read_value(row: &SqlRow<'_>, column: &ColumnConfig) -> MetricValue {
+    let key = column.key.as_str();
     match column.format {
         ValueFormat::Text => row
-            .try_read::<Option<&str>, _>(column.key.as_str())
+            .get::<_, Option<String>>(key)
             .ok()
             .flatten()
-            .map(|s| MetricValue::Text(s.to_string()))
+            .map(MetricValue::Text)
             .unwrap_or(MetricValue::Null),
         ValueFormat::Integer => row
-            .try_read::<Option<i64>, _>(column.key.as_str())
+            .get::<_, Option<i64>>(key)
             .ok()
             .flatten()
             .map(MetricValue::Integer)
             .unwrap_or(MetricValue::Null),
         _ => row
-            .try_read::<Option<f64>, _>(column.key.as_str())
+            .get::<_, Option<f64>>(key)
             .ok()
             .flatten()
             .map(MetricValue::Float)
@@ -1434,21 +1428,48 @@ mod tests {
         assert!(config.columns.len() > 5);
     }
 
+    /// Materializes `statements` into a Parquet session directory so tests
+    /// exercise the same DuckDB views the TUI opens at runtime.
+    fn session(dir: &std::path::Path, statements: &str) -> Session {
+        let connection = store::duckdb::Connection::open_in_memory().unwrap();
+        connection.execute_batch(statements).unwrap();
+        let tables = {
+            let mut statement = connection
+                .prepare("SELECT table_name FROM duckdb_tables() ORDER BY table_name")
+                .unwrap();
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<store::duckdb::Result<Vec<_>>>()
+                .unwrap();
+            names
+        };
+        for table in tables {
+            connection
+                .execute_batch(&format!(
+                    "COPY {table} TO '{}/{table}.parquet' (FORMAT PARQUET)",
+                    dir.display()
+                ))
+                .unwrap();
+        }
+        Session::open(dir).unwrap()
+    }
+
     #[tokio::test]
     async fn assembly_view_attributes_samples_and_keeps_unavailable_metrics() {
-        let connection = Connection::open(":memory:").unwrap();
-        connection
-            .execute(
-                "CREATE TABLE pmu_counters (ip INTEGER, pmu_cycles INTEGER);
-                 CREATE TABLE proc_map (ip INTEGER, module_path TEXT, func_name TEXT);
+        let dir = tempfile::tempdir().unwrap();
+        let connection = session(
+            dir.path(),
+            "CREATE TABLE pmu_counters (ip UBIGINT, pmu_cycles BIGINT);
+                 CREATE TABLE proc_map (ip UBIGINT, module_path VARCHAR, func_name VARCHAR);
                  CREATE TABLE assembly_address_stats (
-                    module_path TEXT, func_name TEXT, address INTEGER, samples INTEGER,
-                    cycles INTEGER, instructions INTEGER, branch_misses INTEGER,
-                    branch_instructions INTEGER, llc_misses INTEGER, llc_references INTEGER
+                    module_path VARCHAR, func_name VARCHAR, address UBIGINT, samples BIGINT,
+                    cycles BIGINT, instructions BIGINT, branch_misses BIGINT,
+                    branch_instructions BIGINT, llc_misses BIGINT, llc_references BIGINT
                  );
                  CREATE TABLE assembly_lines (
-                    module_path TEXT, symbol TEXT, rel_address INTEGER,
-                    runtime_address INTEGER, instruction TEXT
+                    module_path VARCHAR, symbol VARCHAR, rel_address UBIGINT,
+                    runtime_address UBIGINT, instruction VARCHAR
                  );
                  INSERT INTO pmu_counters VALUES (4099, 10);
                  INSERT INTO proc_map VALUES (4099, '/tmp/test', 'logical');
@@ -1461,8 +1482,7 @@ mod tests {
                     ('/tmp/test', 'machine_a', 4096, 4096, 'mov %rax,%rbx'),
                     ('/tmp/test', 'machine_a', 4101, 4101, 'ret'),
                     ('/tmp/test', 'machine_b', 8192, 8192, 'add %rax,%rbx');",
-            )
-            .unwrap();
+        );
         let spec = MetricsTableSpec {
             view: "hotspots".to_string(),
             title: None,

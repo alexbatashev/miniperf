@@ -1,0 +1,11 @@
+[package]
+name = "miniperf-shim-cupti"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mperf_cupti"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"

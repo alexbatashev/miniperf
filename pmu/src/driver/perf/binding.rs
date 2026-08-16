@@ -110,13 +110,20 @@ pub fn grouped_on_cpu(
         _ => false,
     });
 
-    let max_counters_in_group = info.and_then(|info| info.max_counters).unwrap_or_else(|| {
-        if leader.is_some() {
-            2
-        } else {
-            3
-        }
-    });
+    // The NMI watchdog permanently occupies one hardware counter. A sampling
+    // group sized to the full PMU then never schedules and silently produces
+    // zero samples, so shrink every group by the counters the kernel keeps.
+    let max_counters_in_group = info
+        .and_then(|info| info.max_counters)
+        .unwrap_or_else(|| {
+            if leader.is_some() {
+                2
+            } else {
+                3
+            }
+        })
+        .saturating_sub(reserved_hardware_counters())
+        .max(1);
 
     let mut cycles_attrs = zip(counters, attrs.iter())
         .find(|(cntr, _)| **cntr == Counter::Cycles)
@@ -408,4 +415,12 @@ mod tests {
         assert!(plan[0].hardware_indices.is_empty());
         assert!(plan[0].include_software);
     }
+}
+
+/// Hardware counters the kernel itself occupies: currently one when the NMI
+/// watchdog is active (it pins a cycles event on every CPU).
+fn reserved_hardware_counters() -> usize {
+    std::fs::read_to_string("/proc/sys/kernel/nmi_watchdog")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false) as usize
 }

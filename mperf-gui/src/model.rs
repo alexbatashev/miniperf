@@ -4,15 +4,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use mperf_data::{RecordInfo, ScenarioInfo, scenario_ui};
 use num_format::{Locale, ToFormattedString};
 use pmu_data::{TabSpec, TmaMetric};
-use sqlite::{Connection, Value};
+use store::Session;
 
 use crate::{
-    flamegraph::FlamegraphData, memory::MemoryData, metrics::MetricsTableData,
-    profile::ProfileData, roofline::RooflineData, snapshot::SnapshotData,
+    flamegraph::FlamegraphData,
+    memory::MemoryData,
+    metrics::MetricsTableData,
+    profile::ProfileData,
+    roofline::RooflineData,
+    snapshot::SnapshotData,
+    sql::{Connection, SqlResult, table_columns},
 };
 
 #[derive(Debug)]
@@ -24,6 +29,11 @@ pub struct ResultsModel {
     pub profile: ProfileData,
     pub snapshot: Option<SnapshotData>,
     pub tabs: Vec<GuiTab>,
+    /// Viewer-attached visualization manifest (`manifest.yaml`/`.json` in the
+    /// session directory); presentation-only, absence never hides data.
+    /// Consumed by the redesigned track-based views.
+    #[allow(dead_code)]
+    pub manifest: Option<mperf_data::VisualizationManifest>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,22 +94,32 @@ impl ResultsModel {
             .with_context(|| format!("failed to parse {}", info_path.display()))?;
         record_info.ensure_supported_format()?;
 
-        let database_path = result_directory.join("perf.db");
-        fs::metadata(&database_path)
-            .with_context(|| format!("failed to access {}", database_path.display()))?;
-        let connection = sqlite::open(&database_path)
-            .with_context(|| format!("failed to open {}", database_path.display()))?;
-        let summary = SummaryStats::load(&connection)?;
-        let tma_summary = TmaSummaryData::for_scenario(&record_info.scenario_info, &connection);
-        let mut profile = ProfileData::load(&connection);
+        let session = Session::open(&result_directory)
+            .with_context(|| format!("failed to open {}", result_directory.display()))?;
+        let connection = session.connection();
+        let summary = SummaryStats::load(connection)?;
+        let tma_summary = TmaSummaryData::for_scenario(&record_info.scenario_info, connection);
+        let mut profile = ProfileData::load(connection);
         profile.logical_cpu_count = record_info.logical_cpu_count;
-        let snapshot = SnapshotData::load(&connection, record_info.logical_cpu_count);
+        let snapshot = SnapshotData::load(connection, record_info.logical_cpu_count);
 
         let tabs = scenario_ui(&record_info)
             .tabs
             .into_iter()
-            .map(|tab| GuiTab::load(tab, &connection, &result_directory, &record_info))
+            .map(|tab| GuiTab::load(tab, connection, &result_directory, &record_info))
             .collect();
+
+        let manifest = ["manifest.yaml", "manifest.yml", "manifest.json"]
+            .iter()
+            .map(|name| result_directory.join(name))
+            .find(|path| path.exists())
+            .and_then(|path| match mperf_data::VisualizationManifest::load(&path) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    eprintln!("ignoring visualization manifest: {error}");
+                    None
+                }
+            });
 
         Ok(Self {
             result_directory,
@@ -109,6 +129,7 @@ impl ResultsModel {
             profile,
             snapshot,
             tabs,
+            manifest,
         })
     }
 }
@@ -144,26 +165,22 @@ struct PersistedTmaSummary {
 fn load_persisted_tma_summary(
     connection: &Connection,
 ) -> Result<HashMap<String, PersistedTmaSummary>> {
-    let statement = connection
+    let mut statement = connection
         .prepare("SELECT metric, value, verdict FROM tma_summary;")
-        .context("TMA summary is unavailable: failed to query SQLite table `tma_summary`")?;
-    let mut summaries = HashMap::new();
+        .context("TMA summary is unavailable: failed to query table `tma_summary`")?;
+    let rows = statement
+        .query_map([], |row| {
+            let metric = row.get::<_, String>(0)?;
+            let value = finite_tma_value(row.get::<_, Option<f64>>(1)?);
+            let dominant = row
+                .get::<_, Option<String>>(2)?
+                .is_some_and(|verdict| verdict.trim().eq_ignore_ascii_case("dominant"));
+            Ok((metric, PersistedTmaSummary { value, dominant }))
+        })
+        .context("failed to read table `tma_summary`")?;
 
-    for row in statement.into_iter() {
-        let row = row.context("failed to read a row from SQLite table `tma_summary`")?;
-        let metric = match &row[0] {
-            Value::String(metric) => metric.clone(),
-            _ => bail!("SQLite table `tma_summary` contains a non-text metric name"),
-        };
-        let value = finite_tma_value(&row[1]);
-        let dominant = matches!(
-            &row[2],
-            Value::String(verdict) if verdict.trim().eq_ignore_ascii_case("dominant")
-        );
-        summaries.insert(metric, PersistedTmaSummary { value, dominant });
-    }
-
-    Ok(summaries)
+    rows.collect::<SqlResult<HashMap<_, _>>>()
+        .context("failed to read a row from table `tma_summary`")
 }
 
 fn join_tma_summary(
@@ -192,13 +209,8 @@ fn tma_hierarchy_level(name: &str) -> usize {
     name.bytes().filter(|byte| *byte == b'.').count() + 1
 }
 
-fn finite_tma_value(value: &Value) -> Option<f64> {
-    let value = match value {
-        Value::Integer(value) => *value as f64,
-        Value::Float(value) => *value,
-        _ => return None,
-    };
-    value.is_finite().then_some(value)
+fn finite_tma_value(value: Option<f64>) -> Option<f64> {
+    value.filter(|value| value.is_finite())
 }
 
 impl GuiTab {
@@ -254,15 +266,10 @@ impl GuiTab {
 
 impl SummaryStats {
     fn load(connection: &Connection) -> Result<Self> {
-        let available_columns: HashSet<String> = connection
-            .prepare("PRAGMA table_info(pmu_counters);")
-            .context("failed to inspect pmu_counters")?
+        let available_columns: HashSet<String> = table_columns(connection, "pmu_counters")
             .into_iter()
-            .map(|row| {
-                let row = row.context("failed to read pmu_counters schema")?;
-                Ok(row.read::<&str, _>("name").to_string())
-            })
-            .collect::<Result<_>>()?;
+            .map(|column| column.name)
+            .collect();
 
         let has_branch = available_columns.contains("pmu_branch_instructions")
             && available_columns.contains("pmu_branch_misses");
@@ -272,8 +279,8 @@ impl SummaryStats {
             && available_columns.contains("pmu_stalled_cycles_backend");
 
         let mut select_parts = vec![
-            "SUM(pmu_cycles) AS pmu_cycles".to_string(),
-            "SUM(pmu_instructions) AS pmu_instructions".to_string(),
+            "CAST(SUM(pmu_cycles) AS BIGINT) AS pmu_cycles".to_string(),
+            "CAST(SUM(pmu_instructions) AS BIGINT) AS pmu_instructions".to_string(),
         ];
 
         push_optional_sum(&mut select_parts, has_branch, "pmu_branch_instructions");
@@ -288,18 +295,18 @@ impl SummaryStats {
         push_optional_sum(&mut select_parts, has_stalled, "pmu_stalled_cycles_backend");
 
         let query = format!("SELECT {} FROM pmu_counters;", select_parts.join(",\n"));
-        let mut rows = connection
+        let mut statement = connection
             .prepare(&query)
-            .context("failed to prepare summary query")?
-            .into_iter();
+            .context("failed to prepare summary query")?;
+        let mut rows = statement.query([]).context("failed to run summary query")?;
         let row = rows
             .next()
-            .context("summary query returned no rows")?
-            .context("failed to read summary row")?;
+            .context("failed to read summary row")?
+            .context("summary query returned no rows")?;
 
         let read = |name| -> Result<u64> {
             Ok(row
-                .try_read::<Option<i64>, _>(name)
+                .get::<_, Option<i64>>(name)
                 .with_context(|| format!("failed to read {name}"))?
                 .unwrap_or_default() as u64)
         };
@@ -387,7 +394,7 @@ impl SummaryStats {
 fn push_optional_sum(parts: &mut Vec<String>, present: bool, column: &str) {
     if present {
         parts.push(format!(
-            "CAST(SUM({column} * 1.0 / confidence) AS INTEGER) AS {column}"
+            "CAST(SUM({column} * 1.0 / confidence) AS BIGINT) AS {column}"
         ));
     } else {
         parts.push(format!("0 AS {column}"));
@@ -461,15 +468,15 @@ mod tests {
 
     #[test]
     fn loads_required_and_optional_summary_counters() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "CREATE TABLE pmu_counters (
-                    confidence REAL,
-                    pmu_cycles INTEGER,
-                    pmu_instructions INTEGER,
-                    pmu_branch_instructions INTEGER,
-                    pmu_branch_misses INTEGER
+                    confidence DOUBLE,
+                    pmu_cycles BIGINT,
+                    pmu_instructions BIGINT,
+                    pmu_branch_instructions BIGINT,
+                    pmu_branch_misses BIGINT
                 );
                 INSERT INTO pmu_counters VALUES (0.5, 100, 60, 10, 2);",
             )
@@ -491,12 +498,12 @@ mod tests {
 
     #[test]
     fn tma_summary_preserves_scenario_order_and_hierarchy() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "CREATE TABLE tma_summary (
                     metric TEXT PRIMARY KEY,
-                    value REAL,
+                    value DOUBLE,
                     verdict TEXT
                 );
                 INSERT INTO tma_summary VALUES
@@ -545,13 +552,13 @@ mod tests {
         assert_eq!(summary.rows[3].value, None);
         assert_eq!(summary.rows[4].value, None);
         assert!(!summary.rows[4].dominant);
-        assert_eq!(finite_tma_value(&Value::Float(f64::INFINITY)), None);
-        assert_eq!(finite_tma_value(&Value::Float(f64::NAN)), None);
+        assert_eq!(finite_tma_value(Some(f64::INFINITY)), None);
+        assert_eq!(finite_tma_value(Some(f64::NAN)), None);
     }
 
     #[test]
     fn tma_summary_keeps_legacy_errors_and_is_absent_for_other_scenarios() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         let scenario = tma_scenario(vec![metric("retiring", "Retiring slots")]);
 
         let summary = TmaSummaryData::for_scenario(&scenario, &connection).unwrap();

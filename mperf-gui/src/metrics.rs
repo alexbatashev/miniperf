@@ -6,9 +6,9 @@ use std::{
 use anyhow::{Context, Result};
 use num_format::{Locale, ToFormattedString};
 use pmu_data::{MetricColumnSpec, MetricsTableSpec, SortDirection, ValueFormat};
-use sqlite::{Connection, Value};
 
 use crate::source::SourceLocation;
+use crate::sql::{Connection, Value, as_f64, as_i64, as_text, table_columns};
 
 #[derive(Debug)]
 pub struct MetricsTableData {
@@ -64,29 +64,38 @@ fn load(connection: &Connection, spec: &MetricsTableSpec) -> Result<MetricsTable
         .function_column
         .as_deref()
         .or_else(|| available.contains("func_name").then_some("func_name"));
-    let statement = connection
-        .prepare(query)
-        .with_context(|| format!("failed to query SQLite view `{}`", spec.view))?;
-    let mut rows = statement
-        .into_iter()
-        .map(|row| {
-            let row = row.with_context(|| format!("failed to read SQLite view `{}`", spec.view))?;
-            Ok(MetricsRow {
-                function: function_column.and_then(|column| match &row[column] {
-                    Value::String(value) => Some(value.clone()),
-                    _ => None,
-                }),
-                values: columns
-                    .iter()
-                    .map(|column| {
-                        let value = row[column.key.as_str()].clone();
-                        format_value(&value, &column.format)
-                    })
-                    .collect(),
-                source: None,
+    let mut statement = connection
+        .prepare(&query)
+        .with_context(|| format!("failed to query view `{}`", spec.view))?;
+    let mut query_rows = statement
+        .query([])
+        .with_context(|| format!("failed to query view `{}`", spec.view))?;
+    let mut rows = Vec::new();
+    while let Some(row) = query_rows
+        .next()
+        .with_context(|| format!("failed to read view `{}`", spec.view))?
+    {
+        let function = function_column
+            .map(|column| row.get::<_, Value>(column))
+            .transpose()
+            .with_context(|| format!("failed to read view `{}`", spec.view))?
+            .as_ref()
+            .and_then(as_text)
+            .map(str::to_string);
+        let values = columns
+            .iter()
+            .map(|column| {
+                let value = row.get::<_, Value>(column.key.as_str())?;
+                Ok(format_value(&value, &column.format))
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("failed to read view `{}`", spec.view))?;
+        rows.push(MetricsRow {
+            function,
+            values,
+            source: None,
+        });
+    }
     let source_locations = source_locations(connection).unwrap_or_default();
     for row in &mut rows {
         row.source = row
@@ -119,39 +128,37 @@ fn source_locations(connection: &Connection) -> Result<HashMap<String, SourceLoc
         GROUP BY proc_map.func_name, proc_map.file_name, proc_map.line
         ORDER BY total_cycles DESC;
     ";
-    let mut locations = HashMap::new();
-    for row in connection
+    let mut statement = connection
         .prepare(query)
-        .context("failed to prepare source-location query")?
-        .into_iter()
-    {
-        let row = row.context("failed to read source-location query")?;
-        let function = row.read::<&str, _>("func_name");
-        locations
-            .entry(function.to_string())
-            .or_insert_with(|| SourceLocation {
-                path: PathBuf::from(row.read::<&str, _>("file_name")),
-                line: row.read::<i64, _>("line").max(1) as usize,
-            });
+        .context("failed to prepare source-location query")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .context("failed to read source-location query")?;
+    let mut locations = HashMap::new();
+    for row in rows {
+        let (function, file, line) = row.context("failed to read source-location query")?;
+        locations.entry(function).or_insert_with(|| SourceLocation {
+            path: PathBuf::from(file),
+            line: line.max(1) as usize,
+        });
     }
     Ok(locations)
 }
 
 fn available_columns(connection: &Connection, view: &str) -> Result<HashSet<String>> {
-    let escaped_view = view.replace('\'', "''");
-    let query = format!("PRAGMA table_info('{escaped_view}')");
-    let columns = connection
-        .prepare(query)
-        .with_context(|| format!("failed to inspect SQLite view `{view}`"))?
+    let columns = table_columns(connection, view)
         .into_iter()
-        .map(|row| {
-            let row = row.with_context(|| format!("failed to inspect SQLite view `{view}`"))?;
-            Ok(row.read::<&str, _>("name").to_string())
-        })
-        .collect::<Result<HashSet<_>>>()?;
+        .map(|column| column.name)
+        .collect::<HashSet<_>>();
 
     if columns.is_empty() {
-        anyhow::bail!("SQLite view `{view}` does not exist or has no columns");
+        anyhow::bail!("view `{view}` does not exist or has no columns");
     }
     Ok(columns)
 }
@@ -274,10 +281,14 @@ fn display_column(column: &ResolvedColumn) -> MetricsColumn {
 fn format_value(value: &Value, format: &ValueFormat) -> String {
     match format {
         ValueFormat::Text => match value {
-            Value::String(value) => value.clone(),
-            Value::Integer(value) => value.to_string(),
-            Value::Float(value) => format_number(*value, 2),
-            _ => "N/A".to_string(),
+            Value::Float(_) | Value::Double(_) => as_f64(value)
+                .map(|value| format_number(value, 2))
+                .unwrap_or_else(|| "N/A".to_string()),
+            _ => as_text(value).map(str::to_string).unwrap_or_else(|| {
+                as_i64(value)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "N/A".to_string())
+            }),
         },
         ValueFormat::Integer => as_i64(value)
             .map(|value| value.to_formatted_string(&Locale::en))
@@ -295,22 +306,6 @@ fn format_value(value: &Value, format: &ValueFormat) -> String {
         | ValueFormat::Percent3 => as_f64(value)
             .map(|value| format!("{}%", format_number(value * 100.0, precision(format))))
             .unwrap_or_else(|| "N/A".to_string()),
-    }
-}
-
-fn as_i64(value: &Value) -> Option<i64> {
-    match value {
-        Value::Integer(value) => Some(*value),
-        Value::Float(value) => Some(*value as i64),
-        _ => None,
-    }
-}
-
-fn as_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Float(value) => Some(*value),
-        Value::Integer(value) => Some(*value as f64),
-        _ => None,
     }
 }
 
@@ -349,12 +344,12 @@ mod tests {
 
     #[test]
     fn loads_and_formats_metrics_rows() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "CREATE TABLE hotspots (
-                    func_name TEXT, total REAL, cycles INTEGER,
-                    instructions INTEGER, ipc REAL
+                    func_name TEXT, total DOUBLE, cycles BIGINT,
+                    instructions BIGINT, ipc DOUBLE
                 );
                 INSERT INTO hotspots VALUES ('cold', 0.1, 10, 20, 2.0);
                 INSERT INTO hotspots VALUES ('hot', 0.9, 90, 135, 1.5);",
@@ -372,25 +367,25 @@ mod tests {
 
     #[test]
     fn reports_missing_view_in_the_tab() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         let table = MetricsTableData::load(&connection, &spec());
         assert!(table.error.as_deref().unwrap().contains("does not exist"));
     }
 
     #[test]
     fn associates_hottest_recorded_source_location_with_function() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "CREATE TABLE hotspots (
-                    func_name TEXT, total REAL, cycles INTEGER,
-                    instructions INTEGER, ipc REAL
+                    func_name TEXT, total DOUBLE, cycles BIGINT,
+                    instructions BIGINT, ipc DOUBLE
                 );
                 INSERT INTO hotspots VALUES ('hot', 1.0, 90, 135, 1.5);
                 CREATE TABLE proc_map (
-                    ip INTEGER, func_name TEXT, file_name TEXT, line INTEGER
+                    ip BIGINT, func_name TEXT, file_name TEXT, line BIGINT
                 );
-                CREATE TABLE pmu_counters (ip INTEGER, pmu_cycles INTEGER);
+                CREATE TABLE pmu_counters (ip BIGINT, pmu_cycles BIGINT);
                 INSERT INTO proc_map VALUES (1, 'hot', '/src/hot.rs', 12);
                 INSERT INTO proc_map VALUES (2, 'hot', '/src/hot.rs', 44);
                 INSERT INTO pmu_counters VALUES (1, 10);
