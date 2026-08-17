@@ -84,7 +84,9 @@ pub fn load_modules(connection: &Connection) -> Result<Vec<ProcMapEntry>> {
 pub fn load_strings(connection: &Connection) -> Result<HashMap<u64, String>> {
     let mut statement = connection.prepare("SELECT id, string FROM strings")?;
     let strings = statement
-        .query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<store::duckdb::Result<HashMap<_, _>>>()?;
     Ok(strings)
 }

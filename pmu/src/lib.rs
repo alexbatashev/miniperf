@@ -10,18 +10,22 @@ mod cpu_family;
 mod criterion_measurement;
 mod driver;
 mod event_timer;
+mod fidelity;
 mod platform_memory;
 mod process;
 mod quick;
+mod topdown;
 
-pub use capabilities::{capabilities, Capabilities};
+pub use capabilities::{capabilities, Capabilities, PmuDevice};
 pub use cpu_family::{host_cpu_description, host_metrics};
 #[cfg(feature = "criterion")]
 pub use criterion_measurement::CriterionCounter;
+#[cfg(target_os = "linux")]
+pub use driver::{mem_sampling_driver, mem_sampling_kind};
 pub use driver::{
     list_supported_counters, CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver,
-    CountingDriverBuilder, DriverKind, MeasurementQuality, Record, Sample, SamplingCallback,
-    SamplingDriver, SamplingDriverBuilder, UnwindMode, UserRegs,
+    CountingDriverBuilder, DriverKind, MeasurementQuality, MemSample, Record, Sample,
+    SamplingCallback, SamplingDriver, SamplingDriverBuilder, UnwindMode, UserRegs,
 };
 #[cfg(feature = "criterion")]
 pub use event_timer::CounterCheckpoint;
@@ -29,12 +33,16 @@ pub use event_timer::{
     CounterStatistics, EventTimer, Measurement, MeasurementSpan, MeasurementStatistics,
     Measurements, ReadCost, ReadMethod,
 };
-pub use platform_memory::{MemoryControllerMonitor, MemoryControllerSample};
+pub use fidelity::{resolve, Resolution, Rung};
+pub use platform_memory::{
+    bandwidth_counters_present, MemoryControllerMonitor, MemoryControllerSample,
+};
 pub use pmu_data::{Metric, MetricError, MetricExpression};
 pub use process::Process;
 #[cfg(feature = "symbolize")]
 pub use quick::{top_symbols, SymbolCount};
 pub use quick::{QuickSampler, SampleBatch};
+pub use topdown::{is_topdown_event, sysfs_alias, GROUP_LEADER};
 
 /// Default sampling frequency used by [`SamplingDriverBuilder`].
 pub const DEFAULT_SAMPLE_FREQUENCY_HZ: u64 = 1_000;
@@ -42,6 +50,24 @@ pub const DEFAULT_SAMPLE_FREQUENCY_HZ: u64 = 1_000;
 /// Returns the top-down analysis scenario for the detected host CPU, if one is defined.
 pub fn host_tma_scenario() -> Option<pmu_data::TmaScenario> {
     cpu_family::host_tma_scenario()
+}
+
+/// The top-down scenario a recording will actually use: the hardware's fixed
+/// topdown counters when it has them, otherwise the event arithmetic defined
+/// for the detected CPU family.
+pub fn tma_scenario() -> Option<pmu_data::TmaScenario> {
+    topdown::scenario(&capabilities()).or_else(host_tma_scenario)
+}
+
+/// The counter a top-down scenario event name maps to.
+pub fn tma_counter(event: &str) -> Counter {
+    match event {
+        "cycles" => Counter::Cycles,
+        "instructions" => Counter::Instructions,
+        "stalled_cycles_frontend" => Counter::StalledCyclesFrontend,
+        "stalled_cycles_backend" => Counter::StalledCyclesBackend,
+        _ => Counter::Custom(event.to_owned()),
+    }
 }
 
 /// Maximum number of events in one coherent group on the host PMU, when known.

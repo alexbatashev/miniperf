@@ -295,7 +295,10 @@ unsafe extern "C" fn tool_initialize(
         set_callback(CALLBACK_TASK_CREATE, on_task_create as *mut c_void);
         set_callback(CALLBACK_TASK_SCHEDULE, on_task_schedule as *mut c_void);
         set_callback(CALLBACK_IMPLICIT_TASK, on_implicit_task as *mut c_void);
-        set_callback(CALLBACK_SYNC_REGION_WAIT, on_sync_region_wait as *mut c_void);
+        set_callback(
+            CALLBACK_SYNC_REGION_WAIT,
+            on_sync_region_wait as *mut c_void,
+        );
     }
     1
 }

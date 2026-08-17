@@ -309,7 +309,13 @@ impl Collector {
     }
 
     /// Record one bracketed device-clock calibration pair.
-    pub fn device_clock_pair(&self, device: &str, host_before_ns: i64, device_ns: i64, host_after_ns: i64) {
+    pub fn device_clock_pair(
+        &self,
+        device: &str,
+        host_before_ns: i64,
+        device_ns: i64,
+        host_after_ns: i64,
+    ) {
         let mut rows = self.device_clock.lock().unwrap();
         rows.device.push(device.to_owned());
         rows.host_before_ns.push(host_before_ns);
@@ -318,7 +324,14 @@ impl Collector {
     }
 
     /// Record one cross-node clock-offset measurement.
-    pub fn clock_sync(&self, peer: u32, phase: &str, local_ns: i64, peer_ns: i64, uncertainty_ns: i64) {
+    pub fn clock_sync(
+        &self,
+        peer: u32,
+        phase: &str,
+        local_ns: i64,
+        peer_ns: i64,
+        uncertainty_ns: i64,
+    ) {
         let mut rows = self.clock_sync.lock().unwrap();
         rows.peer.push(peer);
         rows.phase.push(phase.to_owned());
@@ -374,7 +387,8 @@ fn writer_loop(collector: Arc<Collector>, dir: PathBuf, queue: Arc<BufferQueue>)
     let mut events = EventRows::default();
     let mut events_writer = SegmentWriter::new(&dir, "events", Some(pid), EventRows::schema());
     let mut meta = EventMetaRows::default();
-    let mut meta_writer = SegmentWriter::new(&dir, "event_meta", Some(pid), EventMetaRows::schema());
+    let mut meta_writer =
+        SegmentWriter::new(&dir, "event_meta", Some(pid), EventMetaRows::schema());
     let mut stacks = StackRows::default();
     let mut stacks_writer = SegmentWriter::new(&dir, "stacks", Some(pid), StackRows::schema());
     let mut stacks_seen = HashSet::new();
@@ -550,7 +564,8 @@ pub fn current_tid() -> u32 {
 fn write_process_metadata(dir: &PathBuf, pid: u32, collector: &Collector) {
     let hostname = {
         let mut buffer = [0u8; 256];
-        let ok = unsafe { libc::gethostname(buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) };
+        let ok =
+            unsafe { libc::gethostname(buffer.as_mut_ptr() as *mut libc::c_char, buffer.len()) };
         if ok == 0 {
             let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(0);
             String::from_utf8_lossy(&buffer[..end]).into_owned()

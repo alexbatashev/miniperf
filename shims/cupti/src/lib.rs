@@ -31,8 +31,11 @@ struct CallbackData {
     correlation_id: u32,
 }
 
-type SubscribeFn =
-    unsafe extern "C" fn(*mut *mut c_void, extern "C" fn(*mut c_void, c_int, u32, *const c_void), *mut c_void) -> c_int;
+type SubscribeFn = unsafe extern "C" fn(
+    *mut *mut c_void,
+    extern "C" fn(*mut c_void, c_int, u32, *const c_void),
+    *mut c_void,
+) -> c_int;
 type EnableDomainFn = unsafe extern "C" fn(u32, *mut c_void, c_int) -> c_int;
 type GetTimestampFn = unsafe extern "C" fn(*mut u64) -> c_int;
 
@@ -102,7 +105,12 @@ fn payload_for(domain: c_int, callback_id: u32, name: *const c_char) -> *mut c_v
     handle
 }
 
-extern "C" fn on_callback(_userdata: *mut c_void, domain: c_int, callback_id: u32, data: *const c_void) {
+extern "C" fn on_callback(
+    _userdata: *mut c_void,
+    domain: c_int,
+    callback_id: u32,
+    data: *const c_void,
+) {
     if domain != CB_DOMAIN_RUNTIME_API && domain != CB_DOMAIN_DRIVER_API {
         return;
     }
@@ -122,7 +130,9 @@ extern "C" fn on_callback(_userdata: *mut c_void, domain: c_int, callback_id: u3
             }
         }
         CUPTI_API_EXIT => {
-            let span = unsafe { data.correlation_data.as_ref() }.copied().unwrap_or(0);
+            let span = unsafe { data.correlation_data.as_ref() }
+                .copied()
+                .unwrap_or(0);
             unsafe { emit(handle, KIND_END, 0, 0, span, 0) };
         }
         _ => {}
@@ -143,9 +153,7 @@ fn calibrate() {
         return;
     }
     let after = unsafe { core_timestamp() };
-    let core = unsafe {
-        libc::dlsym(libc::RTLD_DEFAULT, c"mperf_trace_device_clock".as_ptr())
-    };
+    let core = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mperf_trace_device_clock".as_ptr()) };
     if core.is_null() {
         return;
     }
@@ -185,7 +193,10 @@ pub extern "C" fn InitializeInjection() -> c_int {
     let cupti = unsafe {
         let handle = libc::dlopen(c"libcupti.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
         if handle.is_null() {
-            libc::dlopen(c"libcupti.so.12".as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL)
+            libc::dlopen(
+                c"libcupti.so.12".as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            )
         } else {
             handle
         }

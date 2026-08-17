@@ -81,7 +81,9 @@ fn write_resource_samples(tables: &Tables, _res_dir: &Path) -> Result<()> {
             .connection()
             .prepare("SELECT metric, value FROM bpf_metrics")?;
         let values = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
             .collect::<store::duckdb::Result<HashMap<_, _>>>()?;
         let latest = timestamp_ns.iter().copied().max().unwrap_or(0);
         for (bpf_resource, bpf_category, bpf_metric, bpf_unit, bpf_value) in [
@@ -284,10 +286,7 @@ fn write_findings(tables: &Tables, info: &RecordInfo) -> Result<()> {
     findings.sort_by_key(|finding| finding.0);
 
     let mut columns = Columns::default();
-    columns.i64(
-        "rank",
-        (1..=findings.len() as i64).collect::<Vec<_>>(),
-    );
+    columns.i64("rank", (1..=findings.len() as i64).collect::<Vec<_>>());
     columns.text(
         "severity",
         findings.iter().map(|f| f.1.to_owned()).collect(),

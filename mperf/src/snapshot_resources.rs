@@ -377,13 +377,9 @@ fn collect(
 ) -> Vec<SnapshotCollectorStatus> {
     let start = Instant::now();
     // Roll small segments so a crash loses at most the open one.
-    let mut writer = store::SegmentWriter::new(
-        output,
-        "resource_samples",
-        None,
-        resource_sample_schema(),
-    )
-    .with_segment_bytes(256 * 1024);
+    let mut writer =
+        store::SegmentWriter::new(output, "resource_samples", None, resource_sample_schema())
+            .with_segment_bytes(256 * 1024);
     let mut previous = HashMap::<(u32, u64), ProcTotals>::new();
     let mut cumulative = ProcTotals::default();
     let mut processes = HashMap::<(u32, u64), SnapshotProcessInfo>::new();
@@ -774,7 +770,10 @@ fn resource_sample_batch(
             text(|sample| &sample.category),
             text(|sample| &sample.metric),
             std::sync::Arc::new(Float64Array::from(
-                samples.iter().map(|sample| sample.value).collect::<Vec<_>>(),
+                samples
+                    .iter()
+                    .map(|sample| sample.value)
+                    .collect::<Vec<_>>(),
             )),
             text(|sample| &sample.unit),
             text(|sample| &sample.scope),
@@ -813,10 +812,14 @@ fn process_batch(
             int(|row| row.first_seen_ns as i64),
             int(|row| row.last_seen_ns as i64),
             std::sync::Arc::new(StringArray::from(
-                rows.iter().map(|row| row.command.as_str()).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|row| row.command.as_str())
+                    .collect::<Vec<_>>(),
             )),
             std::sync::Arc::new(StringArray::from(
-                rows.iter().map(|row| row.quality.as_str()).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|row| row.quality.as_str())
+                    .collect::<Vec<_>>(),
             )),
         ],
     )?)

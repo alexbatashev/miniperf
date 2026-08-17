@@ -1,6 +1,11 @@
 mod binding;
+pub(crate) mod branch;
 mod events;
+#[cfg(target_arch = "x86_64")]
+mod mem;
+mod spe;
 mod mmap;
+pub(crate) mod sysfs;
 
 use hashbrown::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,16 +13,16 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use branch::BranchMode;
 use events::process_counter;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 use events::resolve_counter_for_family;
 use libc::{close, mmap, munmap, sysconf, MAP_FAILED, MAP_SHARED, PROT_READ, PROT_WRITE};
 use mmap::{EventValue, ReadFormat, Records};
 use perf_event_open_sys::bindings::{
-    perf_event_attr, PERF_SAMPLE_BRANCH_CALL_STACK, PERF_SAMPLE_BRANCH_STACK,
-    PERF_SAMPLE_BRANCH_USER, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU, PERF_SAMPLE_ID,
-    PERF_SAMPLE_IP, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_USER, PERF_SAMPLE_STACK_USER,
-    PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
+    perf_event_attr, PERF_SAMPLE_BRANCH_STACK, PERF_SAMPLE_CALLCHAIN, PERF_SAMPLE_CPU,
+    PERF_SAMPLE_ID, PERF_SAMPLE_IP, PERF_SAMPLE_READ, PERF_SAMPLE_REGS_USER,
+    PERF_SAMPLE_STACK_USER, PERF_SAMPLE_TID, PERF_SAMPLE_TIME,
 };
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 use smallvec::SmallVec;
@@ -26,6 +31,9 @@ use crate::driver::{ProcAddr, Sample, UnwindMode};
 use crate::{Counter, Error, Record};
 
 pub use events::list_supported_counters;
+#[cfg(target_arch = "x86_64")]
+pub use mem::PerfMemSamplingDriver;
+pub use spe::{spe_pmu_path, PerfSpeSamplingDriver};
 
 use super::{
     CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver, MeasurementQuality,
@@ -50,7 +58,7 @@ pub struct PerfSamplingDriver {
     thread_handle: Option<thread::JoinHandle<()>>,
     enable_on_start: bool,
     sample_regs_user: u64,
-    sample_branch_stack: bool,
+    branch_mode: Option<BranchMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +70,10 @@ struct NativeCounterHandle {
     pub id: u64,
     pub fd: i32,
     pub leader: bool,
+    /// Whether this handle owns a sampling ring buffer. Normally the group
+    /// leader; in a fixed-topdown group the leader must not sample, so the
+    /// sampling sibling owns the ring instead.
+    pub sampled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +165,7 @@ impl PerfCountingDriver {
                     id,
                     fd,
                     leader: false,
+                    sampled: false,
                 });
                 continue;
             }
@@ -172,6 +185,7 @@ impl PerfCountingDriver {
                     id,
                     fd,
                     leader: false,
+                    sampled: false,
                 });
             }
         }
@@ -344,7 +358,7 @@ impl SamplingDriver for PerfSamplingDriver {
         let mmaps = self.mmaps.clone();
         let native_handles = self.native_handles.clone();
         let sample_regs_user = self.sample_regs_user;
-        let sample_branch_stack = self.sample_branch_stack;
+        let branch_mode = self.branch_mode;
 
         #[derive(Clone, Default)]
         struct LastSample {
@@ -362,8 +376,7 @@ impl SamplingDriver for PerfSamplingDriver {
 
             loop {
                 for (idx, &mmap) in mmaps.iter().enumerate() {
-                    let records =
-                        Records::from_ptr(mmap.ptr, sample_regs_user, sample_branch_stack);
+                    let records = Records::from_ptr(mmap.ptr, sample_regs_user, branch_mode);
 
                     for record in records.into_iter() {
                         match record {
@@ -377,6 +390,7 @@ impl SamplingDriver for PerfSamplingDriver {
                                 time_running,
                                 values,
                                 callstack,
+                                lbr_callstack,
                                 user_regs,
                                 user_stack,
                             } => {
@@ -410,6 +424,7 @@ impl SamplingDriver for PerfSamplingDriver {
                                         counter: handle.kind.clone(),
                                         value: value.value.saturating_sub(last_sample.value),
                                         callstack: callstack.clone(),
+                                        lbr_callstack: lbr_callstack.clone(),
                                         // Every grouped counter shares this correlation id and
                                         // call stack. Carry the large raw state once; postprocess
                                         // reuses its result for the sibling counter events.
@@ -447,7 +462,7 @@ impl SamplingDriver for PerfSamplingDriver {
                             mmap::MmapRecord::Lost { count } => {
                                 lost_samples.fetch_add(count, Ordering::Relaxed);
                             }
-                            mmap::MmapRecord::Unknown => {}
+                            _ => {}
                         }
                     }
                 }
@@ -493,15 +508,60 @@ impl SamplingDriver for PerfSamplingDriver {
     }
 }
 
+/// Whether a counter belongs to a fixed-topdown group.
+fn is_topdown(counter: &Counter) -> bool {
+    topdown_event_name(counter).is_some()
+}
+
+/// The topdown event name a counter carries, if it is one.
+fn topdown_event_name(counter: &Counter) -> Option<&str> {
+    match counter {
+        Counter::Custom(name) if crate::is_topdown_event(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// Flags for a counting member of a sampling group. Intel PERF_METRICS events
+/// and their `slots` leader are rejected by the kernel when they sample, so
+/// they join the group as plain counters and are reported through the sampling
+/// sibling's grouped read.
+fn apply_grouped_counting_flags(attr: &mut perf_event_attr, enable_on_exec: bool) {
+    attr.set_exclude_kernel(1);
+    attr.set_exclude_user(0);
+    attr.set_exclusive(0);
+    attr.set_inherit(1);
+    attr.set_enable_on_exec(enable_on_exec.into());
+}
+
+/// What each sample of a group captures, independent of the counters in it.
+#[derive(Clone, Copy)]
+pub struct SampleOptions {
+    /// Target interrupt frequency in hertz.
+    pub sample_freq: u64,
+    /// User call-stack collection strategy.
+    pub unwind_mode: UnwindMode,
+    /// User stack bytes captured for DWARF unwinding.
+    pub stack_dump_size: u32,
+    /// Whether to request PEBS/SPE-quality instruction pointers.
+    pub precise_ip: bool,
+    /// How to ask the branch recorder for call stacks, when at all.
+    pub branch_mode: Option<BranchMode>,
+}
+
 /// Apply the sampling-specific attribute flags shared by every counter.
 fn apply_sampling_flags(
     attr: &mut perf_event_attr,
-    sample_freq: u64,
-    unwind_mode: UnwindMode,
-    stack_dump_size: u32,
+    options: &SampleOptions,
     enable_on_exec: bool,
-    precise_ip: bool,
+    branch_mode: Option<BranchMode>,
 ) {
+    let SampleOptions {
+        sample_freq,
+        unwind_mode,
+        stack_dump_size,
+        precise_ip,
+        ..
+    } = *options;
     attr.set_exclude_kernel(1);
     attr.set_exclude_user(0);
     attr.set_exclusive(0);
@@ -533,9 +593,11 @@ fn apply_sampling_flags(
             attr.sample_stack_user = stack_dump_size;
         }
     }
-    if unwind_mode == UnwindMode::Lbr && cfg!(target_arch = "x86_64") {
+    // Branch records exist only on the core PMU: asking a software event for a
+    // branch stack fails the whole group open, so callers gate this per counter.
+    if let Some(mode) = branch_mode {
         sample_type |= PERF_SAMPLE_BRANCH_STACK as u64;
-        attr.branch_sample_type = (PERF_SAMPLE_BRANCH_CALL_STACK | PERF_SAMPLE_BRANCH_USER) as u64;
+        attr.branch_sample_type = mode.sample_type();
     }
     attr.sample_type = sample_type;
 
@@ -545,12 +607,9 @@ fn apply_sampling_flags(
 impl PerfSamplingDriver {
     pub fn new(
         counters: &[Counter],
-        sample_freq: u64,
+        options: &SampleOptions,
         pid: Option<i32>,
         prefer_raw_events: bool,
-        unwind_mode: UnwindMode,
-        stack_dump_size: u32,
-        precise_ip: bool,
     ) -> Result<PerfSamplingDriver, Error> {
         // On a heterogeneous (big.LITTLE) host, open a sampling group on each
         // cluster's PMU so the profile captures execution wherever the task
@@ -558,27 +617,21 @@ impl PerfSamplingDriver {
         let core_pmus = crate::cpu_family::host_core_pmus();
         if core_pmus.len() > 1 {
             #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-            return Self::new_per_core(
-                counters,
-                sample_freq,
-                pid,
-                &core_pmus,
-                unwind_mode,
-                stack_dump_size,
-                precise_ip,
-            );
+            return Self::new_per_core(counters, options, pid, &core_pmus);
         }
 
         let mut attrs = get_native_counters(counters, prefer_raw_events)?;
 
-        for attr in &mut attrs {
+        for (counter, attr) in std::iter::zip(counters, &mut attrs) {
+            if is_topdown(counter) {
+                apply_grouped_counting_flags(attr, pid.is_some());
+                continue;
+            }
             apply_sampling_flags(
                 attr,
-                sample_freq,
-                unwind_mode,
-                stack_dump_size,
+                options,
                 pid.is_some(),
-                precise_ip,
+                options.branch_mode.filter(|_| !counter.is_software()),
             );
         }
 
@@ -589,8 +642,8 @@ impl PerfSamplingDriver {
 
         Self::from_handles(
             native_handles,
-            dwarf_mask_for_mode(unwind_mode),
-            unwind_mode == UnwindMode::Lbr,
+            dwarf_mask_for_mode(options.unwind_mode),
+            options.branch_mode,
             pid.is_none(),
         )
     }
@@ -602,12 +655,9 @@ impl PerfSamplingDriver {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     fn new_per_core(
         counters: &[Counter],
-        sample_freq: u64,
+        options: &SampleOptions,
         pid: Option<i32>,
         core_pmus: &[crate::cpu_family::CorePmu],
-        unwind_mode: UnwindMode,
-        stack_dump_size: u32,
-        precise_ip: bool,
     ) -> Result<PerfSamplingDriver, Error> {
         let mut native_handles: Vec<NativeCounterHandle> = Vec::new();
 
@@ -620,13 +670,15 @@ impl PerfSamplingDriver {
                     let resolved = resolve_counter_for_family(cntr, pmu.family_id, true)
                         .unwrap_or_else(|| cntr.clone());
                     let mut attr = build_pmu_attr(&resolved, pmu.pmu_type)?;
+                    if is_topdown(cntr) {
+                        apply_grouped_counting_flags(&mut attr, pid.is_some());
+                        return Ok(attr);
+                    }
                     apply_sampling_flags(
                         &mut attr,
-                        sample_freq,
-                        unwind_mode,
-                        stack_dump_size,
+                        options,
                         pid.is_some(),
-                        precise_ip,
+                        options.branch_mode.filter(|_| !cntr.is_software()),
                     );
                     Ok(attr)
                 })
@@ -654,8 +706,8 @@ impl PerfSamplingDriver {
 
         Self::from_handles(
             native_handles,
-            dwarf_mask_for_mode(unwind_mode),
-            unwind_mode == UnwindMode::Lbr,
+            dwarf_mask_for_mode(options.unwind_mode),
+            options.branch_mode,
             pid.is_none(),
         )
     }
@@ -664,9 +716,18 @@ impl PerfSamplingDriver {
     fn from_handles(
         native_handles: Vec<NativeCounterHandle>,
         sample_regs_user: u64,
-        sample_branch_stack: bool,
+        branch_mode: Option<BranchMode>,
         enable_on_start: bool,
     ) -> Result<PerfSamplingDriver, Error> {
+        // Only hardware events carry a branch stack. When the counter fallback
+        // left a software event owning the ring, its records have no branch
+        // stack and parsing one would desynchronize the whole sample layout.
+        let branch_mode = branch_mode.filter(|_| {
+            native_handles
+                .iter()
+                .filter(|handle| handle.sampled)
+                .all(|handle| !handle.kind.is_software())
+        });
         let page_size = unsafe { sysconf(libc::_SC_PAGE_SIZE) } as usize;
         let perf_mlock_kb = std::fs::read_to_string("/proc/sys/kernel/perf_event_mlock_kb")
             .ok()
@@ -675,7 +736,7 @@ impl PerfSamplingDriver {
 
         let length = page_size * (mmap_pages + 1);
         let mut mmaps: Vec<UnsafeMmap> = Vec::new();
-        for handle in native_handles.iter().filter(|handle| handle.leader) {
+        for handle in native_handles.iter().filter(|handle| handle.sampled) {
             let ptr = unsafe {
                 let ptr = mmap(
                     std::ptr::null_mut(),
@@ -713,7 +774,7 @@ impl PerfSamplingDriver {
             lost_samples: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             thread_handle: None,
             sample_regs_user,
-            sample_branch_stack,
+            branch_mode,
             enable_on_start,
         })
     }
@@ -837,20 +898,20 @@ fn dwarf_mask_for_mode(mode: UnwindMode) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn dwarf_register_mask() -> u64 {
+pub(super) fn dwarf_register_mask() -> u64 {
     // Linux's PERF_REGS_MASK: segment registers DS/ES/FS/GS (bits 12..15)
     // cannot be requested through PERF_SAMPLE_REGS_USER on x86-64.
     ((1_u64 << sys::bindings::PERF_REG_X86_64_MAX) - 1) & !(0xf_u64 << 12)
 }
 
 #[cfg(target_arch = "aarch64")]
-fn dwarf_register_mask() -> u64 {
+pub(super) fn dwarf_register_mask() -> u64 {
     // x0..x29, link register, SP, and PC.
     (1_u64 << sys::bindings::PERF_REG_ARM64_MAX) - 1
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn dwarf_register_mask() -> u64 {
+pub(super) fn dwarf_register_mask() -> u64 {
     0
 }
 
@@ -961,6 +1022,17 @@ fn get_native_counters(
         .iter()
         .map(|cntr| {
             let mut attrs = base_counter_attr();
+
+            if let Some(name) = topdown_event_name(cntr) {
+                let event = sysfs::core_event_attr(&crate::sysfs_alias(name)).ok_or_else(|| {
+                    Error::InvalidConfiguration(format!(
+                        "topdown event '{name}' is not exposed by any core PMU"
+                    ))
+                })?;
+                attrs.type_ = event.type_;
+                attrs.config = event.config;
+                return Ok(attrs);
+            }
 
             let cntr = process_counter(cntr, prefer_raw_counters)?;
             let (type_, config) = counter_type_config(&cntr)?;

@@ -791,6 +791,7 @@ impl RooflineBackend for QemuBackend {
                 Vec::new(),
                 self.memory_profile
                     .then(|| output_directory.join("memory-rss.txt")),
+                super::bandwidth_timeline_path(output_directory),
             )
             .await?;
             let timing_path = output_directory.join("memory-native.json");
@@ -1149,6 +1150,7 @@ fn synthetic_event(
         timestamp,
         name: 0,
         callstack: smallvec![],
+        lbr_callstack: Vec::new(),
         user_regs: None,
         user_stack: Vec::new(),
     }

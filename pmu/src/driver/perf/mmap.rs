@@ -5,12 +5,14 @@ use perf_event_open_sys::bindings::{
 };
 use smallvec::{SmallVec, ToSmallVec};
 
+use super::branch::{BranchMode, BranchRecord};
 use crate::driver::UserRegs;
 
 pub struct Records {
     metadata: *mut perf_event_mmap_page,
     sample_regs_user: u64,
-    sample_branch_stack: bool,
+    branch_mode: Option<BranchMode>,
+    memory_layout: bool,
 }
 
 #[repr(C)]
@@ -41,6 +43,21 @@ pub enum MmapRecord {
         time_running: u64,
         values: SmallVec<[EventValue; 4]>,
         callstack: SmallVec<[u64; 8]>,
+        lbr_callstack: SmallVec<[u64; 8]>,
+        user_regs: Option<UserRegs>,
+        user_stack: Vec<u8>,
+    },
+    MemSample {
+        ip: u64,
+        pid: u32,
+        tid: u32,
+        cpu: u32,
+        time: u64,
+        data_addr: u64,
+        latency: u64,
+        data_src: u64,
+        callstack: SmallVec<[u64; 8]>,
+        lbr_callstack: SmallVec<[u64; 8]>,
         user_regs: Option<UserRegs>,
         user_stack: Vec<u8>,
     },
@@ -97,11 +114,27 @@ struct LostRecord {
 }
 
 impl Records {
-    pub fn from_ptr(ptr: *mut u8, sample_regs_user: u64, sample_branch_stack: bool) -> Records {
+    pub fn from_ptr(
+        ptr: *mut u8,
+        sample_regs_user: u64,
+        branch_mode: Option<BranchMode>,
+    ) -> Records {
         Records {
             metadata: ptr as *mut perf_event_mmap_page,
             sample_regs_user,
-            sample_branch_stack,
+            branch_mode,
+            memory_layout: false,
+        }
+    }
+
+    /// Parse samples using the precise-memory layout (`PERF_SAMPLE_ADDR` +
+    /// `WEIGHT_STRUCT` + `DATA_SRC` instead of grouped counter reads).
+    pub fn memory(ptr: *mut u8, sample_regs_user: u64, branch_mode: Option<BranchMode>) -> Records {
+        Records {
+            metadata: ptr as *mut perf_event_mmap_page,
+            sample_regs_user,
+            branch_mode,
+            memory_layout: true,
         }
     }
 
@@ -209,20 +242,22 @@ impl Iterator for Records {
         self.update_tail(record_size);
 
         let record = match header.type_ {
+            PERF_RECORD_SAMPLE if self.memory_layout => {
+                MemSampleFormat::parse(&record_buf, self.sample_regs_user, self.branch_mode)
+                    .unwrap_or(MmapRecord::Unknown)
+            }
             PERF_RECORD_SAMPLE => match SampleFormat::read_from_bytes(&record_buf) {
                 Some(sample_format) => {
                     let values = sample_format.read_values(&record_buf);
-                    let mut callstack = sample_format.read_callchain(&record_buf);
-                    if self.sample_branch_stack {
-                        let lbr_callstack = sample_format.read_branch_callstack(&record_buf);
-                        if lbr_callstack.len() > 1 {
-                            callstack = lbr_callstack;
-                        }
-                    }
+                    let callstack = sample_format.read_callchain(&record_buf);
+                    let lbr_callstack = match self.branch_mode {
+                        Some(mode) => sample_format.read_branch_callstack(&record_buf, mode),
+                        None => SmallVec::new(),
+                    };
                     let (user_regs, user_stack) = sample_format.read_user_state(
                         &record_buf,
                         self.sample_regs_user,
-                        self.sample_branch_stack,
+                        self.branch_mode.is_some(),
                     );
 
                     MmapRecord::Sample {
@@ -235,6 +270,7 @@ impl Iterator for Records {
                         time_running: sample_format.read.time_running,
                         values,
                         callstack,
+                        lbr_callstack,
                         user_regs,
                         user_stack,
                     }
@@ -343,26 +379,14 @@ impl SampleFormat {
             .filter(|end| *end <= record.len())
     }
 
-    fn read_branch_callstack(&self, record: &[u8]) -> SmallVec<[u64; 8]> {
+    fn read_branch_callstack(&self, record: &[u8], mode: BranchMode) -> SmallVec<[u64; 8]> {
         let Some(base) = self.callchain_end(record) else {
             return SmallVec::new();
         };
-        let Some(nr) = read_u64(record, base).map(|value| value as usize) else {
-            return SmallVec::new();
-        };
-        let entries_offset = base + 8;
         let Some(end) = self.branch_stack_end(record) else {
             return SmallVec::new();
         };
-        let mut frames = SmallVec::with_capacity(nr.saturating_add(1));
-        frames.push(self.ip);
-        for offset in (entries_offset..end).step_by(std::mem::size_of::<BranchEntry>()) {
-            let from = read_u64(record, offset).unwrap_or_default();
-            if from != 0 && frames.last().copied() != Some(from) {
-                frames.push(from);
-            }
-        }
-        frames
+        mode.frames(self.ip, branch_records(record, base + 8, end))
     }
 
     fn read_user_state(
@@ -420,6 +444,192 @@ impl SampleFormat {
         let dynamic_size = dynamic_size.min(stack.len());
         (regs, stack[..dynamic_size].to_vec())
     }
+}
+
+/// Parser for the precise-memory sample layout: `PERF_SAMPLE_IP | TID | TIME |
+/// ADDR | ID | CPU | PERIOD | CALLCHAIN | BRANCH_STACK | REGS_USER |
+/// STACK_USER | WEIGHT_STRUCT | DATA_SRC`, in the field order `perf_event.h`
+/// documents.
+struct MemSampleFormat;
+
+impl MemSampleFormat {
+    fn parse(record: &[u8], regs_mask: u64, branch_mode: Option<BranchMode>) -> Option<MmapRecord> {
+        let mut offset = std::mem::size_of::<perf_event_header>();
+        let ip = read_u64(record, offset)?;
+        offset += 8;
+        let ids = read_u64(record, offset)?;
+        offset += 8;
+        let (pid, tid) = (ids as u32, (ids >> 32) as u32);
+        let time = read_u64(record, offset)?;
+        offset += 8;
+        let data_addr = read_u64(record, offset)?;
+        offset += 16; // addr, then id
+        let cpu = read_u64(record, offset)? as u32;
+        offset += 16; // cpu + reserved, then period
+
+        let nr = read_u64(record, offset)? as usize;
+        offset += 8;
+        let end = offset.checked_add(nr.checked_mul(8)?)?;
+        if end > record.len() {
+            return None;
+        }
+        let mut callstack = SmallVec::with_capacity(nr);
+        for index in 0..nr {
+            callstack.push(read_u64(record, offset + index * 8)?);
+        }
+        // The kernel prefixes the callchain with a context marker.
+        if callstack.len() > 1 {
+            callstack.remove(0);
+        }
+        offset = end;
+
+        let mut lbr_callstack = SmallVec::new();
+        if let Some(mode) = branch_mode {
+            let entries = read_u64(record, offset)? as usize;
+            let entries_offset = offset + 8;
+            let entries_end = entries_offset
+                .checked_add(entries.checked_mul(std::mem::size_of::<BranchEntry>())?)?;
+            if entries_end > record.len() {
+                return None;
+            }
+            lbr_callstack = mode.frames(ip, branch_records(record, entries_offset, entries_end));
+            offset = entries_end;
+        }
+
+        let mut user_regs = None;
+        if regs_mask != 0 {
+            let abi = read_u64(record, offset)?;
+            offset += 8;
+            let count = if abi == 0 {
+                0
+            } else {
+                regs_mask.count_ones() as usize
+            };
+            let values_end = offset.checked_add(count.checked_mul(8)?)?;
+            if values_end > record.len() {
+                return None;
+            }
+            let values = (0..count)
+                .map(|index| read_u64(record, offset + index * 8).unwrap_or_default())
+                .collect();
+            offset = values_end;
+            if abi != 0 {
+                user_regs = Some(UserRegs {
+                    abi,
+                    mask: regs_mask,
+                    values,
+                });
+            }
+
+            let size = read_u64(record, offset)? as usize;
+            offset += 8;
+            if size != 0 {
+                let stack_end = offset.checked_add(size)?;
+                if stack_end > record.len() {
+                    return None;
+                }
+                let dynamic_size = (read_u64(record, stack_end)? as usize).min(size);
+                let stack = record[offset..offset + dynamic_size].to_vec();
+                offset = stack_end + 8;
+                return Some(Self::finish(
+                    MemFields {
+                        ip,
+                        pid,
+                        tid,
+                        cpu,
+                        time,
+                        data_addr,
+                        callstack,
+                        lbr_callstack,
+                        user_regs,
+                        user_stack: stack,
+                    },
+                    record,
+                    offset,
+                ));
+            }
+        }
+
+        Some(Self::finish(
+            MemFields {
+                ip,
+                pid,
+                tid,
+                cpu,
+                time,
+                data_addr,
+                callstack,
+                lbr_callstack,
+                user_regs,
+                user_stack: Vec::new(),
+            },
+            record,
+            offset,
+        ))
+    }
+
+    fn finish(fields: MemFields, record: &[u8], offset: usize) -> MmapRecord {
+        let MemFields {
+            ip,
+            pid,
+            tid,
+            cpu,
+            time,
+            data_addr,
+            callstack,
+            lbr_callstack,
+            user_regs,
+            user_stack,
+        } = fields;
+        // `union perf_sample_weight` keeps the access latency in its low 32
+        // bits under both the legacy `WEIGHT` and the 5.12 `WEIGHT_STRUCT`
+        // layouts, so one decode serves both.
+        let latency = read_u64(record, offset).unwrap_or_default() & 0xffff_ffff;
+        let data_src = read_u64(record, offset + 8).unwrap_or_default();
+        MmapRecord::MemSample {
+            ip,
+            pid,
+            tid,
+            cpu,
+            time,
+            data_addr,
+            latency,
+            data_src,
+            callstack,
+            lbr_callstack,
+            user_regs,
+            user_stack,
+        }
+    }
+}
+
+/// Everything a precise-memory sample carries before its weight and data
+/// source, which the parser reads last.
+struct MemFields {
+    ip: u64,
+    pid: u32,
+    tid: u32,
+    cpu: u32,
+    time: u64,
+    data_addr: u64,
+    callstack: SmallVec<[u64; 8]>,
+    lbr_callstack: SmallVec<[u64; 8]>,
+    user_regs: Option<UserRegs>,
+    user_stack: Vec<u8>,
+}
+
+/// Iterate the `perf_branch_entry` array between two record offsets.
+fn branch_records(
+    record: &[u8],
+    start: usize,
+    end: usize,
+) -> impl Iterator<Item = BranchRecord> + '_ {
+    (start..end)
+        .step_by(std::mem::size_of::<BranchEntry>())
+        .map(|offset| BranchRecord {
+            from: read_u64(record, offset).unwrap_or_default(),
+            flags: read_u64(record, offset + 16).unwrap_or_default(),
+        })
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
@@ -780,7 +990,7 @@ mod test {
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];
 
-        let records = Records::from_ptr(test_data.as_mut_ptr(), 0, false);
+        let records = Records::from_ptr(test_data.as_mut_ptr(), 0, None);
         let decoded = records.into_iter().collect::<Vec<_>>();
 
         insta::assert_debug_snapshot!(decoded);
@@ -851,7 +1061,7 @@ mod test {
 
     #[test]
     fn lbr_call_stack_fixture() {
-        use super::{ReadFormat, SampleFormat};
+        use super::{BranchMode, ReadFormat, SampleFormat};
 
         let sample = SampleFormat {
             header: perf_event_open_sys::bindings::perf_event_header::default(),
@@ -888,7 +1098,7 @@ mod test {
             bytes.extend_from_slice(&0_u64.to_ne_bytes());
         }
 
-        let callstack = sample.read_branch_callstack(&bytes);
+        let callstack = sample.read_branch_callstack(&bytes, BranchMode::CallStack);
         insta::assert_debug_snapshot!(callstack, @r###"
         [
             4194595,

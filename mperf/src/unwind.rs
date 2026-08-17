@@ -184,6 +184,7 @@ mod tests {
             time_running: 0,
             ip: 0,
             callchain: &[],
+            lbr_callchain: &[],
             regs_mask: (1 << 2) | (1 << 7) | (1 << 8),
             regs: &[20, 70, 80],
             user_stack: &[],

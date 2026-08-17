@@ -392,6 +392,7 @@ pub struct SampleRawRows {
     pub time_running: Vec<u64>,
     pub ip: Vec<u64>,
     pub callchain: Vec<Vec<u64>>,
+    pub lbr_callchain: Vec<Vec<u64>>,
     pub regs_abi: Vec<u64>,
     pub regs_mask: Vec<u64>,
     pub regs: Vec<Vec<u64>>,
@@ -412,6 +413,7 @@ impl SampleRawRows {
             Field::new("time_running", DataType::UInt64, false),
             Field::new("ip", DataType::UInt64, false),
             uint64_list_field("callchain"),
+            uint64_list_field("lbr_callchain"),
             Field::new("regs_abi", DataType::UInt64, false),
             Field::new("regs_mask", DataType::UInt64, false),
             uint64_list_field("regs"),
@@ -433,6 +435,11 @@ impl SampleRawRows {
         for chain in std::mem::take(&mut self.callchain) {
             callchain.values().append_slice(&chain);
             callchain.append(true);
+        }
+        let mut lbr_callchain = ListBuilder::new(UInt64Builder::new()).with_field(item.clone());
+        for chain in std::mem::take(&mut self.lbr_callchain) {
+            lbr_callchain.values().append_slice(&chain);
+            lbr_callchain.append(true);
         }
         let mut regs = ListBuilder::new(UInt64Builder::new()).with_field(item);
         for values in std::mem::take(&mut self.regs) {
@@ -456,6 +463,98 @@ impl SampleRawRows {
             UInt64Array::from(std::mem::take(&mut self.time_running)),
             UInt64Array::from(std::mem::take(&mut self.ip)),
             callchain.finish(),
+            lbr_callchain.finish(),
+            UInt64Array::from(std::mem::take(&mut self.regs_abi)),
+            UInt64Array::from(std::mem::take(&mut self.regs_mask)),
+            regs.finish(),
+            user_stack.finish(),
+        )?)
+    }
+}
+
+/// Column builder for the record-time `mem_samples_raw-<seq>.parquet`
+/// intermediate: precise memory samples (PEBS/IBS/SPE) with their raw
+/// callchains and unwind state, consumed and deleted by postprocess when it
+/// writes the final `mem_samples` table.
+#[derive(Default)]
+pub struct MemSampleRawRows {
+    pub timestamp: Vec<i64>,
+    pub pid: Vec<u32>,
+    pub tid: Vec<u32>,
+    pub cpu: Vec<u32>,
+    pub ip: Vec<u64>,
+    pub data_addr: Vec<u64>,
+    pub latency: Vec<u64>,
+    pub data_src: Vec<u64>,
+    pub callchain: Vec<Vec<u64>>,
+    pub lbr_callchain: Vec<Vec<u64>>,
+    pub regs_abi: Vec<u64>,
+    pub regs_mask: Vec<u64>,
+    pub regs: Vec<Vec<u64>>,
+    pub user_stack: Vec<Vec<u8>>,
+}
+
+impl MemSampleRawRows {
+    pub fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("pid", DataType::UInt32, false),
+            Field::new("tid", DataType::UInt32, false),
+            Field::new("cpu", DataType::UInt32, false),
+            Field::new("ip", DataType::UInt64, false),
+            Field::new("data_addr", DataType::UInt64, false),
+            Field::new("latency", DataType::UInt64, false),
+            Field::new("data_src", DataType::UInt64, false),
+            uint64_list_field("callchain"),
+            uint64_list_field("lbr_callchain"),
+            Field::new("regs_abi", DataType::UInt64, false),
+            Field::new("regs_mask", DataType::UInt64, false),
+            uint64_list_field("regs"),
+            Field::new("user_stack", DataType::Binary, false),
+        ]))
+    }
+
+    pub fn len(&self) -> usize {
+        self.timestamp.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.timestamp.is_empty()
+    }
+
+    pub fn to_batch(&mut self) -> Result<RecordBatch> {
+        let item = Arc::new(Field::new("item", DataType::UInt64, false));
+        let mut callchain = ListBuilder::new(UInt64Builder::new()).with_field(item.clone());
+        for chain in std::mem::take(&mut self.callchain) {
+            callchain.values().append_slice(&chain);
+            callchain.append(true);
+        }
+        let mut lbr_callchain = ListBuilder::new(UInt64Builder::new()).with_field(item.clone());
+        for chain in std::mem::take(&mut self.lbr_callchain) {
+            lbr_callchain.values().append_slice(&chain);
+            lbr_callchain.append(true);
+        }
+        let mut regs = ListBuilder::new(UInt64Builder::new()).with_field(item);
+        for values in std::mem::take(&mut self.regs) {
+            regs.values().append_slice(&values);
+            regs.append(true);
+        }
+        let mut user_stack = BinaryBuilder::new();
+        for bytes in std::mem::take(&mut self.user_stack) {
+            user_stack.append_value(&bytes);
+        }
+        Ok(columns!(
+            Self::schema(),
+            Int64Array::from(std::mem::take(&mut self.timestamp)),
+            UInt32Array::from(std::mem::take(&mut self.pid)),
+            UInt32Array::from(std::mem::take(&mut self.tid)),
+            UInt32Array::from(std::mem::take(&mut self.cpu)),
+            UInt64Array::from(std::mem::take(&mut self.ip)),
+            UInt64Array::from(std::mem::take(&mut self.data_addr)),
+            UInt64Array::from(std::mem::take(&mut self.latency)),
+            UInt64Array::from(std::mem::take(&mut self.data_src)),
+            callchain.finish(),
+            lbr_callchain.finish(),
             UInt64Array::from(std::mem::take(&mut self.regs_abi)),
             UInt64Array::from(std::mem::take(&mut self.regs_mask)),
             regs.finish(),

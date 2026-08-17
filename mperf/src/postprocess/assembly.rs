@@ -43,11 +43,13 @@ pub(crate) fn process(tables: &Tables, pb: &mut kdam::Bar) -> Result<()> {
     };
 
     if let Some(disassembler) = disassembler {
-        let mut statement = tables
-            .connection()
-            .prepare("SELECT module_path, address FROM assembly_samples ORDER BY module_path, address")?;
+        let mut statement = tables.connection().prepare(
+            "SELECT module_path, address FROM assembly_samples ORDER BY module_path, address",
+        )?;
         let sampled = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            })?
             .collect::<store::duckdb::Result<Vec<_>>>()?;
         let mut sampled_addresses = HashMap::<String, Vec<u64>>::new();
         for (module_path, address) in sampled {
@@ -93,7 +95,13 @@ pub(crate) fn process(tables: &Tables, pb: &mut kdam::Bar) -> Result<()> {
                 let Some(runtime_address) = apply_load_bias(rel_address, load_bias) else {
                     continue;
                 };
-                lines.push(module_path, line.symbol, rel_address, runtime_address, line.instruction);
+                lines.push(
+                    module_path,
+                    line.symbol,
+                    rel_address,
+                    runtime_address,
+                    line.instruction,
+                );
             }
         }
     }
@@ -105,7 +113,10 @@ pub(crate) fn process(tables: &Tables, pb: &mut kdam::Bar) -> Result<()> {
         "module_path",
         metadata.iter().map(|(path, _)| path.clone()).collect(),
     );
-    columns.i64("load_bias", metadata.iter().map(|(_, bias)| *bias).collect());
+    columns.i64(
+        "load_bias",
+        metadata.iter().map(|(_, bias)| *bias).collect(),
+    );
     tables.write("assembly_module_metadata", columns.finish()?)?;
 
     tables.write_query(
@@ -181,10 +192,7 @@ impl AssemblyLines {
         runtime_address: u64,
         instruction: String,
     ) {
-        if !self
-            .seen
-            .insert((module_path.to_owned(), runtime_address))
-        {
+        if !self.seen.insert((module_path.to_owned(), runtime_address)) {
             return;
         }
         self.module_path.push(module_path.to_owned());

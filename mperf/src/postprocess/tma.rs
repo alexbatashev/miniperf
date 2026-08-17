@@ -85,9 +85,8 @@ pub(crate) fn process(tables: &Tables, info: &ScenarioInfo) -> Result<()> {
 }
 
 fn metric_expression(info: &mperf_data::TMAInfo, metric: &pmu_data::TmaMetric) -> Result<String> {
-    let expression = pmu_data::arith_parser::try_parse_expr(&metric.formula).map_err(|error| {
-        anyhow::anyhow!("invalid TMA formula '{}': {error}", metric.name)
-    })?;
+    let expression = pmu_data::arith_parser::try_parse_expr(&metric.formula)
+        .map_err(|error| anyhow::anyhow!("invalid TMA formula '{}': {error}", metric.name))?;
     let marker = metric
         .group
         .as_ref()
@@ -96,20 +95,45 @@ fn metric_expression(info: &mperf_data::TMAInfo, metric: &pmu_data::TmaMetric) -
                 .iter()
                 .find(|candidate| &candidate.name == group)
                 .and_then(|group| {
-                    group
-                        .events
-                        .iter()
-                        .find(|event| event.as_str() != "cycles" && event.as_str() != "instructions")
+                    group.events.iter().find(|event| {
+                        event.as_str() != "cycles" && event.as_str() != "instructions"
+                    })
                 })
         })
         .map(|event| tma_marker_column(&info.counters, event));
+    let mut conditions = Vec::new();
+    if let Some(marker) = marker {
+        conditions.push(format!("pmu_counters.{marker} IS NOT NULL"));
+    }
+    if let Some(cpus) = &metric.cpus {
+        conditions.push(cpu_predicate(cpus));
+    }
+    let filter = (!conditions.is_empty()).then(|| conditions.join(" AND "));
     Ok(build_tma_sql_expr(
         &info.metrics,
         &info.counters,
         &info.constants,
         &expression,
-        marker.as_deref(),
+        filter.as_deref(),
     ))
+}
+
+/// A predicate restricting a metric to one core cluster, from its sysfs
+/// cpumask (`0,5-11`). Metrics on a heterogeneous host are only meaningful
+/// within one core type, whose topdown parameters they were written for.
+fn cpu_predicate(cpus: &str) -> String {
+    let ranges = cpus
+        .split(',')
+        .filter_map(|part| match part.trim().split_once('-') {
+            Some((low, high)) => Some((low.trim().parse::<u32>().ok()?, high.trim().parse().ok()?)),
+            None => part.trim().parse::<u32>().ok().map(|cpu| (cpu, cpu)),
+        })
+        .map(|(low, high)| format!("pmu_counters.cpu BETWEEN {low} AND {high}"))
+        .collect::<Vec<_>>();
+    if ranges.is_empty() {
+        return "TRUE".to_owned();
+    }
+    format!("({})", ranges.join(" OR "))
 }
 
 fn tma_marker_column(events: &[(EventType, String)], event: &str) -> String {
@@ -125,7 +149,7 @@ fn build_tma_sql_expr(
     events: &[(EventType, String)],
     constants: &[pmu_data::TmaConstant],
     expression: &pmu_data::arith_parser::Expr,
-    marker: Option<&str>,
+    filter: Option<&str>,
 ) -> String {
     use pmu_data::arith_parser::{BinOp, Expr};
 
@@ -143,9 +167,9 @@ fn build_tma_sql_expr(
                     } else {
                         format!("SUM(pmu_counters.{column} / pmu_counters.confidence)")
                     };
-                    marker.map_or(value.clone(), |marker| {
+                    filter.map_or(value.clone(), |filter| {
                         format!(
-                            "SUM(CASE WHEN pmu_counters.{marker} IS NOT NULL THEN ({}) END)",
+                            "SUM(CASE WHEN {filter} THEN ({}) END)",
                             value.trim_start_matches("SUM(").trim_end_matches(')')
                         )
                     })
@@ -159,7 +183,7 @@ fn build_tma_sql_expr(
                 let nested = pmu_data::arith_parser::parse_expr(&metric.formula);
                 format!(
                     "({})",
-                    build_tma_sql_expr(metrics, events, constants, &nested, marker)
+                    build_tma_sql_expr(metrics, events, constants, &nested, filter)
                 )
             }),
         Expr::Constant(name) => constants
@@ -169,8 +193,8 @@ fn build_tma_sql_expr(
             // into a plausible-looking zero-valued result.
             .map_or_else(|| "NULL".to_string(), |constant| constant.value.to_string()),
         Expr::Binary { op, lhs, rhs } => {
-            let lhs = build_tma_sql_expr(metrics, events, constants, lhs, marker);
-            let rhs = build_tma_sql_expr(metrics, events, constants, rhs, marker);
+            let lhs = build_tma_sql_expr(metrics, events, constants, lhs, filter);
+            let rhs = build_tma_sql_expr(metrics, events, constants, rhs, filter);
             match op {
                 BinOp::Add => format!("({lhs}) + ({rhs})"),
                 BinOp::Sub => format!("({lhs}) - ({rhs})"),
@@ -188,7 +212,7 @@ fn build_tma_sql_expr(
         Expr::Call { name, args } => {
             let args = args
                 .iter()
-                .map(|arg| build_tma_sql_expr(metrics, events, constants, arg, marker))
+                .map(|arg| build_tma_sql_expr(metrics, events, constants, arg, filter))
                 .collect::<Vec<_>>();
             match name.to_ascii_lowercase().as_str() {
                 "min" if args.len() == 2 => format!("least({}, {})", args[0], args[1]),
@@ -202,5 +226,19 @@ fn build_tma_sql_expr(
             }
         }
         Expr::Num(number) => number.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cpu_predicate;
+
+    #[test]
+    fn restricts_a_metric_to_its_core_cluster() {
+        assert_eq!(
+            cpu_predicate("0,5-11"),
+            "(pmu_counters.cpu BETWEEN 0 AND 0 OR pmu_counters.cpu BETWEEN 5 AND 11)"
+        );
+        assert_eq!(cpu_predicate(""), "TRUE");
     }
 }

@@ -1,4 +1,5 @@
 mod assembly;
+mod mem_samples;
 mod memory;
 mod roofline;
 mod samples;
@@ -20,7 +21,7 @@ use tables::{Columns, Tables, quote_identifier};
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub(crate) use samples::RawSample;
+pub(crate) use samples::{RawSample, merge_lbr_stack};
 
 /// Turn a recording into the derived tables every consumer reads: one Parquet
 /// file per table in the session directory.
@@ -43,11 +44,12 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
         }
         Scenario::Mem => {
             memory::process(&tables, &info, res_dir)?;
+            mem_samples::process(&tables, res_dir)?;
             assembly::process(&tables, &mut pb)?;
             write_hotspots(&tables)?;
         }
         Scenario::Roofline => {
-            roofline::process_loops(&tables, &info)?;
+            roofline::process_loops(&tables, &info, res_dir)?;
             if res_dir.join("qemu-roofline.memory.json").exists() {
                 memory::process(&tables, &info, res_dir)?;
             }
@@ -57,11 +59,13 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
             roofline::write_chart(&tables)?;
         }
         Scenario::TMA => {
+            mem_samples::process(&tables, res_dir)?;
             assembly::process(&tables, &mut pb)?;
             tma::process(&tables, &info.scenario_info)?;
         }
     }
 
+    write_capture_fidelity(&tables, &info)?;
     trace::write_custom_events(&tables)?;
     write_derived_metrics(&tables)?;
     samples::remove_raw_segments(&tables, res_dir)?;
@@ -83,6 +87,34 @@ pub(crate) fn event_column_name_for(name: &str) -> String {
         Some(ty) => ty.to_string(),
         None => format!("pmu_{}", name.replace('.', "_")),
     }
+}
+
+/// One row per rung considered for this recording: the chosen capture strategy
+/// and every better one, with the reason it was unavailable.
+fn write_capture_fidelity(tables: &Tables, info: &RecordInfo) -> Result<()> {
+    let mut scenario = Vec::new();
+    let mut rung = Vec::new();
+    let mut status = Vec::new();
+    let mut reason = Vec::new();
+    for fidelity in &info.capture_fidelity {
+        for rejected in &fidelity.rejected {
+            scenario.push(fidelity.scenario.clone());
+            rung.push(rejected.rung.clone());
+            status.push("rejected".to_string());
+            reason.push(rejected.reason.clone());
+        }
+        scenario.push(fidelity.scenario.clone());
+        rung.push(fidelity.rung.clone());
+        status.push("chosen".to_string());
+        reason.push(String::new());
+    }
+
+    let mut columns = Columns::default();
+    columns.text("scenario", scenario);
+    columns.text("rung", rung);
+    columns.text("status", status);
+    columns.text("reason", reason);
+    tables.write("capture_fidelity", columns.finish()?)
 }
 
 fn write_hotspots(tables: &Tables) -> Result<()> {
@@ -230,7 +262,9 @@ mod tests {
         let mut proc_map = Columns::default();
         proc_map.u64("ip", vec![4096]);
         proc_map.text("func_name", vec!["hot".to_owned()]);
-        tables.write("proc_map", proc_map.finish().unwrap()).unwrap();
+        tables
+            .write("proc_map", proc_map.finish().unwrap())
+            .unwrap();
         tables
     }
 

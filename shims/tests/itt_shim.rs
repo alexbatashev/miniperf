@@ -67,9 +67,10 @@ fn itt_collector_records_tasks() {
             task_begin(domain, IttId::default(), IttId::default(), name);
             task_end(domain);
         }
-        let shutdown: extern "C" fn() = std::mem::transmute(
-            libc::dlsym(libc::RTLD_DEFAULT, CString::new("mperf_trace_shutdown").unwrap().as_ptr()),
-        );
+        let shutdown: extern "C" fn() = std::mem::transmute(libc::dlsym(
+            libc::RTLD_DEFAULT,
+            CString::new("mperf_trace_shutdown").unwrap().as_ptr(),
+        ));
         shutdown();
     }
 

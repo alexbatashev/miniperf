@@ -298,6 +298,7 @@ mod tests {
             counter: Counter::Cycles,
             value: 1,
             callstack: Default::default(),
+            lbr_callstack: Default::default(),
             user_regs: None,
             user_stack: Vec::new(),
         }

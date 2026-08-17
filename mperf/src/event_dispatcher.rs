@@ -3,10 +3,10 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 
-use mperf_data::{Event, EventType, ProcMapEntry};
+use mperf_data::{Event, EventType, MemSample, ProcMapEntry};
 use store::{
-    ClockAnchorRows, EventKind, EventRows, ModuleRows, PayloadRows, SampleRawRows, SegmentWriter,
-    StringInterner, xxh3,
+    ClockAnchorRows, EventKind, EventRows, MemSampleRawRows, ModuleRows, PayloadRows,
+    SampleRawRows, SegmentWriter, StringInterner, xxh3,
 };
 use thread_local::ThreadLocal;
 
@@ -21,6 +21,7 @@ pub struct EventDispatcher {
 
 enum Msg {
     Event(Event),
+    MemSample(MemSample),
     Module(ProcMapEntry),
 }
 
@@ -34,6 +35,8 @@ struct Worker {
     interner: Arc<Mutex<StringInterner>>,
     samples: SampleRawRows,
     samples_writer: SegmentWriter,
+    mem_samples: MemSampleRawRows,
+    mem_samples_writer: SegmentWriter,
     events: EventRows,
     events_writer: SegmentWriter,
     payloads: PayloadRows,
@@ -53,6 +56,13 @@ impl Worker {
             interner,
             samples: SampleRawRows::default(),
             samples_writer: SegmentWriter::new(dir, "samples_raw", None, SampleRawRows::schema()),
+            mem_samples: MemSampleRawRows::default(),
+            mem_samples_writer: SegmentWriter::new(
+                dir,
+                "mem_samples_raw",
+                None,
+                MemSampleRawRows::schema(),
+            ),
             events: EventRows::default(),
             events_writer: SegmentWriter::new(dir, "events", None, EventRows::schema()),
             payloads: PayloadRows::default(),
@@ -102,6 +112,7 @@ impl Worker {
         );
         rows.callchain
             .push(event.callstack.iter().map(|frame| frame.as_ip()).collect());
+        rows.lbr_callchain.push(event.lbr_callstack);
         let (abi, mask, regs) = match event.user_regs {
             Some(regs) => (regs.abi, regs.mask, regs.values),
             None => (0, 0, Vec::new()),
@@ -112,6 +123,31 @@ impl Worker {
         rows.user_stack.push(event.user_stack);
         if rows.len() >= BATCH_ROWS {
             self.flush_samples();
+        }
+    }
+
+    fn consume_mem_sample(&mut self, sample: MemSample) {
+        let rows = &mut self.mem_samples;
+        rows.timestamp.push(sample.timestamp as i64);
+        rows.pid.push(sample.process_id);
+        rows.tid.push(sample.thread_id);
+        rows.cpu.push(sample.cpu);
+        rows.ip.push(sample.callstack.first().copied().unwrap_or(0));
+        rows.data_addr.push(sample.data_addr);
+        rows.latency.push(sample.latency);
+        rows.data_src.push(sample.data_src);
+        rows.callchain.push(sample.callstack);
+        rows.lbr_callchain.push(sample.lbr_callstack);
+        let (abi, mask, regs) = match sample.user_regs {
+            Some(regs) => (regs.abi, regs.mask, regs.values),
+            None => (0, 0, Vec::new()),
+        };
+        rows.regs_abi.push(abi);
+        rows.regs_mask.push(mask);
+        rows.regs.push(regs);
+        rows.user_stack.push(sample.user_stack);
+        if rows.len() >= BATCH_ROWS {
+            self.flush_mem_samples();
         }
     }
 
@@ -172,6 +208,19 @@ impl Worker {
         }
     }
 
+    fn flush_mem_samples(&mut self) {
+        if self.mem_samples.is_empty() {
+            return;
+        }
+        let result = self
+            .mem_samples
+            .to_batch()
+            .and_then(|batch| self.mem_samples_writer.write(&batch));
+        if let Err(err) = result {
+            eprintln!("failed to write mem samples: {err:#}");
+        }
+    }
+
     fn flush_events(&mut self) {
         if self.events.is_empty() {
             return;
@@ -187,6 +236,7 @@ impl Worker {
 
     fn finish(mut self) {
         self.flush_samples();
+        self.flush_mem_samples();
         self.flush_events();
         let mut modules = ModuleRows::default();
         for entry in std::mem::take(&mut self.modules) {
@@ -199,10 +249,23 @@ impl Worker {
         }
         self.clock.push("end");
         let steps = [
-            ("payloads", write_all(self.payloads.to_batch(), &mut self.payloads_writer)),
-            ("modules", write_all(modules.to_batch(), &mut self.modules_writer)),
-            ("clock", write_all(self.clock.to_batch(), &mut self.clock_writer)),
+            (
+                "payloads",
+                write_all(self.payloads.to_batch(), &mut self.payloads_writer),
+            ),
+            (
+                "modules",
+                write_all(modules.to_batch(), &mut self.modules_writer),
+            ),
+            (
+                "clock",
+                write_all(self.clock.to_batch(), &mut self.clock_writer),
+            ),
             ("samples_raw", self.samples_writer.finish().map(|_| ())),
+            (
+                "mem_samples_raw",
+                self.mem_samples_writer.finish().map(|_| ()),
+            ),
             ("events", self.events_writer.finish().map(|_| ())),
             ("strings", self.interner.lock().unwrap().finish()),
         ];
@@ -235,6 +298,7 @@ impl EventDispatcher {
             while let Ok(message) = rx.recv() {
                 match message {
                     Msg::Event(event) => worker.consume(event),
+                    Msg::MemSample(sample) => worker.consume_mem_sample(sample),
                     Msg::Module(entry) => {
                         worker.modules.insert(entry);
                     }
@@ -274,6 +338,12 @@ impl EventDispatcher {
     pub fn publish_event_sync(&self, evt: Event) {
         if self.tx.send(Msg::Event(evt)).is_err() {
             eprintln!("lost event: writer stopped");
+        }
+    }
+
+    pub fn publish_mem_sample_sync(&self, sample: MemSample) {
+        if self.tx.send(Msg::MemSample(sample)).is_err() {
+            eprintln!("lost memory sample: writer stopped");
         }
     }
 

@@ -19,13 +19,19 @@ pub fn get_tma_counter_groups(scenario: &TmaScenario) -> anyhow::Result<Vec<Vec<
         if group.events.is_empty() {
             anyhow::bail!("TMA group '{}' is empty", group.name);
         }
+        // Fixed-topdown events live in dedicated counters (Intel PERF_METRICS
+        // and its `slots`), so they never compete for the programmable ones.
+        let programmable = group
+            .events
+            .iter()
+            .filter(|event| !pmu::is_topdown_event(event))
+            .count();
         if let Some(limit) = capacity
-            && group.events.len() > limit
+            && programmable > limit
         {
             anyhow::bail!(
-                "TMA group '{}' needs {} counters but this PMU has only {limit}; split the methodology into independent coherent formulas",
-                group.name,
-                group.events.len()
+                "TMA group '{}' needs {programmable} counters but this PMU has only {limit}; split the methodology into independent coherent formulas",
+                group.name
             );
         }
         for event in &group.events {
@@ -40,13 +46,7 @@ pub fn get_tma_counter_groups(scenario: &TmaScenario) -> anyhow::Result<Vec<Vec<
             group
                 .events
                 .iter()
-                .map(|event| match event.as_str() {
-                    "cycles" => Counter::Cycles,
-                    "instructions" => Counter::Instructions,
-                    "stalled_cycles_frontend" => Counter::StalledCyclesFrontend,
-                    "stalled_cycles_backend" => Counter::StalledCyclesBackend,
-                    _ => Counter::Custom(event.clone()),
-                })
+                .map(|event| pmu::tma_counter(event))
                 .collect(),
         );
     }

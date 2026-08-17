@@ -113,13 +113,15 @@ impl ResultsModel {
             .iter()
             .map(|name| result_directory.join(name))
             .find(|path| path.exists())
-            .and_then(|path| match mperf_data::VisualizationManifest::load(&path) {
-                Ok(manifest) => Some(manifest),
-                Err(error) => {
-                    eprintln!("ignoring visualization manifest: {error}");
-                    None
-                }
-            });
+            .and_then(
+                |path| match mperf_data::VisualizationManifest::load(&path) {
+                    Ok(manifest) => Some(manifest),
+                    Err(error) => {
+                        eprintln!("ignoring visualization manifest: {error}");
+                        None
+                    }
+                },
+            );
 
         Ok(Self {
             result_directory,
@@ -451,6 +453,7 @@ mod tests {
             desc: description.to_string(),
             formula: "0".to_string(),
             group: None,
+            cpus: None,
         }
     }
 

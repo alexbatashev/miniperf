@@ -33,8 +33,7 @@ impl ControlPlane {
     pub fn create(pid: u32) -> Option<ControlPlane> {
         let prefix = std::env::var("MPERF_CONTROL_SHMEM").ok()?;
         let stats = Sender::new(&format!("{prefix}-{pid}-stats"), STATS_CHANNEL_BYTES).ok()?;
-        let commands =
-            Receiver::new(&format!("{prefix}-{pid}-cmd"), COMMAND_CHANNEL_BYTES).ok()?;
+        let commands = Receiver::new(&format!("{prefix}-{pid}-cmd"), COMMAND_CHANNEL_BYTES).ok()?;
         Some(ControlPlane { stats, commands })
     }
 

@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 
 mod event;
 mod manifest;
+mod mem;
 mod ui;
 
 pub use event::{CallFrame, Event, EventType, IString, Location, ProcMapEntry, UserRegs};
 pub use manifest::{
     CounterRender, CounterSpec, MarkerSpec, Severity, TrackSpec, ViewSpec, VisualizationManifest,
 };
+pub use mem::{MemDataSource, MemLevel, MemOp, MemSample, MemSnoop, MemTlb};
 
 pub use ui::{resources_table_spec, scenario_ui};
 
@@ -318,6 +320,23 @@ impl CpuClockSource {
     }
 }
 
+/// The capture strategy one scenario ran at, and the better strategies this
+/// host could not support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureFidelity {
+    pub scenario: String,
+    /// Identifier of the chosen rung, e.g. `counter_only`.
+    pub rung: String,
+    pub rejected: Vec<RejectedRung>,
+}
+
+/// A capture strategy that was preferred but unavailable here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedRung {
+    pub rung: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordInfo {
     /// On-disk results format. Missing means the legacy, pre-versioned format.
@@ -346,6 +365,10 @@ pub struct RecordInfo {
     /// Extensible host CPU measurements collected with this recording.
     #[serde(default)]
     pub cpu_info: CpuInfo,
+    /// Capture fidelity resolved for this recording. Empty in recordings made
+    /// before the fidelity ladder existed.
+    #[serde(default)]
+    pub capture_fidelity: Vec<CaptureFidelity>,
     pub scenario_info: ScenarioInfo,
 }
 

@@ -24,7 +24,9 @@ fn preload_records_allocations() {
         return;
     };
     let Some(collector) = collector_cdylib() else {
-        eprintln!("skipping: build libmperf_collector.so first (cargo build -p miniperf-collector-core)");
+        eprintln!(
+            "skipping: build libmperf_collector.so first (cargo build -p miniperf-collector-core)"
+        );
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -50,7 +52,10 @@ fn preload_records_allocations() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(mallocs > 0, "expected malloc events from the preloaded shell");
+    assert!(
+        mallocs > 0,
+        "expected malloc events from the preloaded shell"
+    );
     let rates: i64 = session
         .connection()
         .query_row(

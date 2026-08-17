@@ -1,5 +1,6 @@
 mod counter_selection;
 mod disassembly;
+mod doctor;
 mod event_dispatcher;
 mod events_export;
 mod postprocess;
@@ -7,9 +8,9 @@ mod processing;
 mod query;
 mod record;
 mod roofline;
-mod source;
 #[cfg(target_os = "linux")]
 mod snapshot_resources;
+mod source;
 mod stat;
 mod tui;
 #[cfg(all(
@@ -27,6 +28,7 @@ use std::{
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use doctor::do_doctor;
 use events_export::do_events_export;
 use mperf_data::Scenario;
 use query::{QueryFormat, do_query};
@@ -42,6 +44,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     List,
+    /// Diagnose this host's profiling readiness.
+    Doctor,
     Stat {
         #[arg(short, long)]
         pid: Option<u32>,
@@ -150,6 +154,7 @@ pub async fn run() -> Result<()> {
             level,
             command,
         } => do_stat(pid, command, events, topdown.then_some(level)),
+        Commands::Doctor => do_doctor(),
         Commands::List => {
             let events = pmu::list_supported_counters(pmu::DriverKind::Default);
             for event in events {

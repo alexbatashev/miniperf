@@ -57,8 +57,10 @@ impl SegmentWriter {
     }
 
     fn segment_path(&self) -> PathBuf {
-        self.dir
-            .join(format!("{}{}-{}.parquet", self.table, self.suffix, self.seq))
+        self.dir.join(format!(
+            "{}{}-{}.parquet",
+            self.table, self.suffix, self.seq
+        ))
     }
 
     pub fn write(&mut self, batch: &RecordBatch) -> Result<()> {

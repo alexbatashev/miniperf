@@ -16,8 +16,9 @@ pub use recover::{RecoveryReport, recover_session};
 #[cfg(feature = "session")]
 pub use session::{Session, table_base_name};
 pub use tables::{
-    ClockAnchorRows, ClockSyncRows, DeviceClockRows, fit_device_clock, EventKind, EventMetaRows, EventRows, ModuleRows, PayloadRows, SampleRawRows,
-    SampleRows, StackRows, StringRows,
+    ClockAnchorRows, ClockSyncRows, DeviceClockRows, EventKind, EventMetaRows, EventRows,
+    MemSampleRawRows, ModuleRows, PayloadRows, SampleRawRows, SampleRows, StackRows, StringRows,
+    fit_device_clock,
 };
 pub use writer::{SegmentWriter, write_table};
 

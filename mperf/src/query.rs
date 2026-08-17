@@ -525,6 +525,10 @@ COMMON DATASETS
   snapshot_summary       Recording-wide resource peaks and totals
   snapshot_findings      Ranked USE findings and next-measurement guidance
   snapshot_collectors    Collector availability, provenance, and remediation
+  capture_fidelity       Chosen capture strategy and why better ones were rejected
+  mem_samples            Precise memory samples: data address, level, latency
+  alloc_site_memory      Miss counts and latency per allocation site
+  cacheline_contention   Cache lines shared across threads (false-sharing candidates)
 
 EXAMPLES
   # Largest function hotspots
@@ -540,6 +544,10 @@ EXAMPLES
   mperf query ./results \
     "SELECT name, status, source, message FROM snapshot_collectors
      WHERE status <> 'available'"
+
+  # Capture fidelity of the recording
+  mperf query ./results \
+    'SELECT scenario, rung, status, reason FROM capture_fidelity'
 
   # Filter function names
   mperf query ./results \

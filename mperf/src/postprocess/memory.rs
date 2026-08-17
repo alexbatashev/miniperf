@@ -38,10 +38,10 @@ struct NativeTimingArtifact {
     end_ns: u64,
 }
 
-struct BandwidthSample {
-    timestamp: u64,
-    read_bytes: u64,
-    write_bytes: u64,
+pub(crate) struct BandwidthSample {
+    pub(crate) timestamp: u64,
+    pub(crate) read_bytes: u64,
+    pub(crate) write_bytes: u64,
 }
 
 struct AllocationPoint {
@@ -188,7 +188,10 @@ pub(crate) fn process(tables: &Tables, record_info: &RecordInfo, res_dir: &Path)
     summary.i64("modeled_dram_read_bytes", vec![modeled_load as i64]);
     summary.i64("modeled_dram_write_bytes", vec![modeled_store as i64]);
     summary.i64("native_duration_ns", vec![duration_ns as i64]);
-    summary.f64_opt("achieved_gbytes_per_second", vec![achieved_gbytes_per_second]);
+    summary.f64_opt(
+        "achieved_gbytes_per_second",
+        vec![achieved_gbytes_per_second],
+    );
     summary.f64_opt("peak_gbytes_per_second", vec![peak]);
     summary.f64_opt("bandwidth_utilization", vec![utilization]);
     summary.text("bandwidth_source", vec![bandwidth_source.to_owned()]);
@@ -304,7 +307,10 @@ pub(crate) fn process(tables: &Tables, record_info: &RecordInfo, res_dir: &Path)
 
     let mut miss = Columns::default();
     let powers = 0..=30_u32;
-    let lines = powers.clone().map(|power| 1_u64 << power).collect::<Vec<_>>();
+    let lines = powers
+        .clone()
+        .map(|power| 1_u64 << power)
+        .collect::<Vec<_>>();
     miss.i64("cache_lines", lines.iter().map(|v| *v as i64).collect());
     miss.i64(
         "cache_bytes",
@@ -393,7 +399,7 @@ fn parse_rss_samples(path: &Path) -> Result<Vec<(u64, u64)>> {
         .collect()
 }
 
-fn parse_bandwidth_samples(path: &Path) -> Result<Vec<BandwidthSample>> {
+pub(crate) fn parse_bandwidth_samples(path: &Path) -> Result<Vec<BandwidthSample>> {
     let Ok(contents) = std::fs::read_to_string(path) else {
         return Ok(Vec::new());
     };

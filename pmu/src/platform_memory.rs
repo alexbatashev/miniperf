@@ -2,6 +2,22 @@
 
 use std::io;
 
+/// PMU name prefixes that can expose memory-controller bandwidth counters.
+pub const BANDWIDTH_PMU_PREFIXES: [&str; 4] = ["uncore_imc", "amd_df", "amd_umc", "arm_cmn"];
+
+/// Vendor bandwidth device used where no uncore PMU is exposed.
+const DDR_PERF_DEVICE: &str = "/dev/ddr_perf";
+
+/// Whether `caps` describes a host on which [`MemoryControllerMonitor`] can
+/// count DRAM bytes. The rung requirement and the monitor's own discovery must
+/// agree, so both answer from here.
+pub fn bandwidth_counters_present(caps: &crate::Capabilities) -> bool {
+    BANDWIDTH_PMU_PREFIXES
+        .iter()
+        .any(|prefix| caps.pmus_with_prefix(prefix).next().is_some())
+        || std::path::Path::new(DDR_PERF_DEVICE).exists()
+}
+
 /// Cumulative memory-controller bytes since the monitor was enabled.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MemoryControllerSample {
@@ -76,7 +92,7 @@ mod imp {
         };
         use std::time::Duration;
 
-        const DEVICE: &str = "/dev/ddr_perf";
+        const DEVICE: &str = super::super::DDR_PERF_DEVICE;
         /// Bound on the port probe. Parts using this interface have a handful
         /// of AXI ports; the bound only stops a driver that answers for every
         /// index from spinning the probe forever.
@@ -222,7 +238,10 @@ mod imp {
             for entry in fs::read_dir(root).into_iter().flatten() {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if !(name.starts_with("uncore_imc") || name.starts_with("amd_df")) {
+                if !super::BANDWIDTH_PMU_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                {
                     continue;
                 }
                 let path = entry.path();

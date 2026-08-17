@@ -225,6 +225,10 @@ impl Source for PmuSamplingSource {
         } else {
             vec![context.root_pid()]
         };
+        // Call-stack LBR is a per-task feature; every group opened here is
+        // attached to a target PID, so the rung is always valid when the
+        // hardware has it.
+        let lbr = lbr_callstacks();
         for target_pid in target_pids {
             let mut builder = pmu::SamplingDriverBuilder::new().counters(&self.counters);
             if let Some(freq) = self.sample_freq {
@@ -234,6 +238,7 @@ impl Source for PmuSamplingSource {
             if let Some(size) = self.stack_dump_size {
                 builder = builder.stack_dump_size(size);
             }
+            builder = builder.lbr_callstack(lbr);
             if let Some(process) = &context.process {
                 builder = builder.process(process);
             } else {
@@ -271,6 +276,91 @@ impl Source for PmuSamplingSource {
                 "lossy"
             }
             .to_string(),
+            message,
+        }]
+    }
+}
+
+/// Precise memory sampling: the `PebsMem` and `ArmSpe` rungs of the memory
+/// scenario's ladder. Runs alongside the counter-based sampling group and
+/// contributes the `mem_samples` family; at `counter_only` it probes
+/// unavailable and nothing about the recording changes.
+#[derive(Default)]
+pub struct PreciseMemorySource {
+    driver: Option<Box<dyn pmu::SamplingDriver>>,
+    kind: Option<&'static str>,
+}
+
+impl Source for PreciseMemorySource {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn declare(&self) -> SourceDecl {
+        SourceDecl {
+            name: "precise_memory",
+            provides: &["mem_samples", "alloc_site_memory", "cacheline_contention"],
+        }
+    }
+
+    /// Allocation-site attribution needs the in-process collector's stack
+    /// capture around `malloc`/`free`; the unthrottled allocation stream alone
+    /// carries no call stacks.
+    fn child_environment(&self, directory: &Path) -> Vec<(String, String)> {
+        InternalEventsSource {
+            roofline_instrumented: false,
+        }
+        .child_environment(directory)
+    }
+
+    fn probe(&self, _directory: &Path) -> Availability {
+        let resolution = pmu::resolve(scenario_ladder(Scenario::Mem), &pmu::capabilities());
+        match resolution.chosen {
+            pmu::Rung::PebsMem | pmu::Rung::ArmSpe => Availability::Available,
+            _ => Availability::Unavailable {
+                reason: resolution
+                    .rejected
+                    .first()
+                    .map(|(_, reason)| reason.clone())
+                    .unwrap_or_else(|| "no precise memory sampling on this host".to_string()),
+            },
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(unused))]
+    fn start(&mut self, context: &SessionContext) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut driver = pmu::mem_sampling_driver(
+                context.root_pid() as i32,
+                pmu::DEFAULT_SAMPLE_FREQUENCY_HZ,
+                8 * 1024,
+                lbr_callstacks(),
+            )?;
+            driver.start(crate::record::mem_sample_callback(
+                context.dispatcher.clone(),
+            ))?;
+            self.driver = Some(driver);
+            self.kind = Some(pmu::mem_sampling_kind());
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
+        let mut status = "available";
+        let mut message = String::new();
+        if let Some(driver) = &mut self.driver {
+            if let Err(error) = driver.stop() {
+                status = "degraded";
+                message = error.to_string();
+            }
+        }
+        self.driver = None;
+        vec![SourceStatus {
+            name: "precise_memory".to_string(),
+            status: status.to_string(),
+            source: self.kind.take().unwrap_or("pebs").to_string(),
+            quality: "precise".to_string(),
             message,
         }]
     }
@@ -431,6 +521,54 @@ mod linux_sources {
     }
 }
 
+/// The capture strategies a scenario prefers, best first. Every ladder ends at
+/// `Rung::Baseline`, the behaviour implemented today; higher rungs resolve but
+/// still run the baseline capture until their workstream fills them in.
+pub fn scenario_ladder(scenario: Scenario) -> &'static [pmu::Rung] {
+    use pmu::Rung::*;
+    match scenario {
+        Scenario::Snapshot => &[LbrCallstack, Baseline],
+        Scenario::TMA => &[FixedTopdown, ArmSlotsTopdown, Baseline],
+        Scenario::Mem => &[PebsMem, IbsOp, ArmSpe, Baseline],
+        Scenario::Roofline => &[UncoreBw, Baseline],
+    }
+}
+
+/// Whether the host can decorate sampled events with Intel LBR call stacks,
+/// the `LbrCallstack` rung.
+pub fn lbr_callstacks() -> bool {
+    pmu::resolve(
+        &[pmu::Rung::LbrCallstack, pmu::Rung::Baseline],
+        &pmu::capabilities(),
+    )
+    .chosen
+        == pmu::Rung::LbrCallstack
+}
+
+/// Whether the Roofline ladder resolves to measured memory-controller
+/// bandwidth on this host, rather than the core-side baseline.
+pub fn roofline_uncore_bandwidth() -> bool {
+    pmu::resolve(scenario_ladder(Scenario::Roofline), &pmu::capabilities()).chosen
+        == pmu::Rung::UncoreBw
+}
+
+/// Resolve a scenario's ladder against the probed host.
+pub fn resolve_fidelity(scenario: Scenario) -> mperf_data::CaptureFidelity {
+    let resolution = pmu::resolve(scenario_ladder(scenario), &pmu::capabilities());
+    mperf_data::CaptureFidelity {
+        scenario: format!("{scenario:?}").to_lowercase(),
+        rung: resolution.chosen.name().to_string(),
+        rejected: resolution
+            .rejected
+            .into_iter()
+            .map(|(rung, reason)| mperf_data::RejectedRung {
+                rung: rung.name().to_string(),
+                reason,
+            })
+            .collect(),
+    }
+}
+
 pub fn scenario_counters(scenario: Scenario) -> Vec<Counter> {
     match scenario {
         Scenario::Snapshot | Scenario::Mem | Scenario::Roofline => vec![
@@ -447,17 +585,11 @@ pub fn scenario_counters(scenario: Scenario) -> Vec<Counter> {
             Counter::PageFaults,
             Counter::ContextSwitches,
         ],
-        Scenario::TMA => pmu::host_tma_scenario()
+        Scenario::TMA => pmu::tma_scenario()
             .expect("TMA counter selection requires a supported host CPU")
             .events
             .iter()
-            .map(|event| match event.as_str() {
-                "cycles" => Counter::Cycles,
-                "instructions" => Counter::Instructions,
-                "stalled_cycles_frontend" => Counter::StalledCyclesFrontend,
-                "stalled_cycles_backend" => Counter::StalledCyclesBackend,
-                _ => Counter::Custom(event.clone()),
-            })
+            .map(|event| pmu::tma_counter(event))
             .chain([
                 Counter::CpuClock,
                 Counter::CpuMigrations,

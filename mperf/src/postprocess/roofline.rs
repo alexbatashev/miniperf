@@ -84,7 +84,10 @@ impl RooflineData {
         }
         if event.kind == EventKind::End as u8 {
             let loop_info = self.loops.remove(&event.flow_id).ok_or_else(|| {
-                anyhow::anyhow!("roofline loop end references unknown loop {}", event.flow_id)
+                anyhow::anyhow!(
+                    "roofline loop end references unknown loop {}",
+                    event.flow_id
+                )
             })?;
             if event.pid as i32 == self.baseline_pid {
                 self.runs.push((loop_info, event.timestamp));
@@ -101,7 +104,10 @@ impl RooflineData {
             return Ok(());
         };
         let loop_info = self.loops.get_mut(&event.parent_id).ok_or_else(|| {
-            anyhow::anyhow!("roofline event references unknown parent {}", event.parent_id)
+            anyhow::anyhow!(
+                "roofline event references unknown parent {}",
+                event.parent_id
+            )
         })?;
         match ty {
             EventType::RooflineBytesLoad => loop_info.bytes_load = event.value,
@@ -118,9 +124,69 @@ impl RooflineData {
     }
 }
 
+/// Cumulative system-wide DRAM bytes recorded during the timed run, as a
+/// step-free curve that can be integrated over an arbitrary time window.
+struct BandwidthTimeline {
+    samples: Vec<(u64, u64)>,
+}
+
+impl BandwidthTimeline {
+    fn load(res_dir: &Path) -> Result<Option<Self>> {
+        let samples =
+            super::memory::parse_bandwidth_samples(&res_dir.join("memory-bandwidth.txt"))?
+                .into_iter()
+                .map(|sample| {
+                    (
+                        sample.timestamp,
+                        sample.read_bytes.saturating_add(sample.write_bytes),
+                    )
+                })
+                .collect::<Vec<_>>();
+        Ok((samples.len() >= 2).then_some(Self { samples }))
+    }
+
+    fn cumulative_at(&self, timestamp: u64) -> f64 {
+        match self
+            .samples
+            .binary_search_by_key(&timestamp, |(time, _)| *time)
+        {
+            Ok(index) => self.samples[index].1 as f64,
+            Err(0) => self.samples[0].1 as f64,
+            Err(index) if index == self.samples.len() => {
+                self.samples[self.samples.len() - 1].1 as f64
+            }
+            Err(index) => {
+                let (before_time, before_bytes) = self.samples[index - 1];
+                let (after_time, after_bytes) = self.samples[index];
+                let span = after_time.saturating_sub(before_time) as f64;
+                let fraction = if span == 0.0 {
+                    0.0
+                } else {
+                    (timestamp - before_time) as f64 / span
+                };
+                before_bytes as f64 + (after_bytes - before_bytes) as f64 * fraction
+            }
+        }
+    }
+
+    /// Bytes observed inside `intervals`, or `None` when nothing was observed
+    /// and a measured denominator would be meaningless.
+    fn bytes_in(&self, intervals: &[(u64, u64)]) -> Option<i64> {
+        let bytes: f64 = intervals
+            .iter()
+            .map(|(start, end)| self.cumulative_at(*end) - self.cumulative_at(*start))
+            .sum();
+        (bytes >= 1.0).then_some(bytes as i64)
+    }
+}
+
 /// Fold the recorded instrumentation events into `roofline_ops` and
 /// `roofline_loop_runs`.
-pub(crate) fn process_loops(tables: &Tables, record_info: &RecordInfo) -> Result<()> {
+pub(crate) fn process_loops(
+    tables: &Tables,
+    record_info: &RecordInfo,
+    res_dir: &Path,
+) -> Result<()> {
     let ScenarioInfo::Roofline(info) = &record_info.scenario_info else {
         return Ok(());
     };
@@ -192,6 +258,18 @@ pub(crate) fn process_loops(tables: &Tables, record_info: &RecordInfo) -> Result
         "loop_end_ts",
         data.runs.iter().map(|(_, end)| *end).collect(),
     );
+    let bandwidth = BandwidthTimeline::load(res_dir)?;
+    runs.i64_opt(
+        "measured_dram_bytes",
+        data.runs
+            .iter()
+            .map(|(run, end)| {
+                bandwidth
+                    .as_ref()
+                    .and_then(|timeline| timeline.bytes_in(&[(run.start as u64, *end as u64)]))
+            })
+            .collect(),
+    );
     tables.write("roofline_loop_runs", runs.finish()?)?;
 
     let mut ops = Columns::default();
@@ -204,7 +282,10 @@ pub(crate) fn process_loops(tables: &Tables, record_info: &RecordInfo) -> Result
         "thread_id",
         data.ops.iter().map(|op| op.tid as i64).collect(),
     );
-    ops.u64("file_name", data.ops.iter().map(|op| op.file_name).collect());
+    ops.u64(
+        "file_name",
+        data.ops.iter().map(|op| op.file_name).collect(),
+    );
     ops.u64(
         "function_name",
         data.ops.iter().map(|op| op.func_name).collect(),
@@ -329,12 +410,15 @@ pub(crate) fn process_binary_loops(
 ) -> Result<()> {
     let mut rows = BinaryLoopRows::default();
     if let Some(artifact) = binary_loop_artifact(record_info, res_dir)? {
-        collect_binary_loops(tables, record_info, artifact, &mut rows)?;
+        collect_binary_loops(tables, record_info, artifact, res_dir, &mut rows)?;
     }
     tables.write("roofline_binary_loops", rows.finish()?)
 }
 
-fn binary_loop_artifact(record_info: &RecordInfo, res_dir: &Path) -> Result<Option<BinaryLoopFile>> {
+fn binary_loop_artifact(
+    record_info: &RecordInfo,
+    res_dir: &Path,
+) -> Result<Option<BinaryLoopFile>> {
     let ScenarioInfo::Roofline(roofline_info) = &record_info.scenario_info else {
         return Ok(None);
     };
@@ -377,6 +461,7 @@ struct BinaryLoopRows {
     timing_samples: Vec<i64>,
     relative_errors: Vec<Option<f64>>,
     timing_qualities: Vec<String>,
+    measured_dram_bytes: Vec<Option<i64>>,
     counters: [Vec<i64>; 10],
 }
 
@@ -392,6 +477,7 @@ impl BinaryLoopRows {
         columns.i64("timing_samples", self.timing_samples);
         columns.f64_opt("timing_relative_error", self.relative_errors);
         columns.text("timing_quality", self.timing_qualities);
+        columns.i64_opt("measured_dram_bytes", self.measured_dram_bytes);
         for (name, values) in [
             "bytes_load",
             "bytes_store",
@@ -417,6 +503,7 @@ fn collect_binary_loops(
     tables: &Tables,
     record_info: &RecordInfo,
     artifact: BinaryLoopFile,
+    res_dir: &Path,
     rows: &mut BinaryLoopRows,
 ) -> Result<()> {
     let ScenarioInfo::Roofline(roofline_info) = &record_info.scenario_info else {
@@ -428,12 +515,8 @@ fn collect_binary_loops(
     let object = object::File::parse(object_data.as_slice())
         .with_context(|| format!("parse Roofline executable '{}'", executable.display()))?;
     let modules = utils::load_modules(tables.connection())?;
-    let mappings = executable_mappings(
-        &modules,
-        roofline_info.perf_pid as u32,
-        executable,
-        &object,
-    );
+    let mappings =
+        executable_mappings(&modules, roofline_info.perf_pid as u32, executable, &object);
     if mappings.is_empty() {
         anyhow::bail!(
             "native Roofline samples have no executable mapping for '{}'",
@@ -467,6 +550,7 @@ fn collect_binary_loops(
         }
     }
 
+    let bandwidth = BandwidthTimeline::load(res_dir)?;
     let sample_period_ns = 1_000_000_000_u64
         .checked_div(record_info.sampling_frequency_hz.unwrap_or(1_000).max(1))
         .unwrap_or(1_000_000);
@@ -485,12 +569,13 @@ fn collect_binary_loops(
         let timestamps = samples
             .iter()
             .filter(|sample| {
-                ranges
-                    .iter()
-                    .any(|(start, end)| sample.module_address >= *start && sample.module_address < *end)
+                ranges.iter().any(|(start, end)| {
+                    sample.module_address >= *start && sample.module_address < *end
+                })
             })
             .map(|sample| sample.timestamp as u64)
             .collect::<Vec<_>>();
+        let intervals = sampled_active_intervals(&timestamps, sample_period_ns);
         let sample_count = timestamps.len() as u64;
         // Treat samples as independent occupancy observations. The 95%
         // relative sampling error is approximately 1.96/sqrt(N). Only
@@ -516,13 +601,16 @@ fn collect_binary_loops(
         rows.file_name.push(loop_info.file.unwrap_or_default());
         rows.line.push(loop_info.line.unwrap_or_default() as i64);
         rows.trip_count.push(loop_info.trip_count as i64);
-        rows.duration.push(
-            (quality == "advisor-grade")
-                .then(|| sampled_active_duration(&timestamps, sample_period_ns) as i64),
-        );
+        rows.duration
+            .push((quality == "advisor-grade").then(|| active_duration(&intervals) as i64));
         rows.timing_samples.push(sample_count as i64);
         rows.relative_errors.push(relative_error);
         rows.timing_qualities.push(quality.to_owned());
+        rows.measured_dram_bytes.push(
+            bandwidth
+                .as_ref()
+                .and_then(|timeline| timeline.bytes_in(&intervals)),
+        );
         for (values, count) in rows.counters.iter_mut().zip([
             counts.bytes_load,
             counts.bytes_store,
@@ -600,30 +688,28 @@ fn normalize_sample_ip(ip: u64, mappings: &[ModuleMapping]) -> Option<u64> {
         })
 }
 
-fn sampled_active_duration(timestamps: &[u64], period_ns: u64) -> u64 {
-    let mut intervals = timestamps
+/// The disjoint time windows a loop occupied, each sample standing for the
+/// sampling period that ended at it.
+fn sampled_active_intervals(timestamps: &[u64], period_ns: u64) -> Vec<(u64, u64)> {
+    let mut observations = timestamps
         .iter()
         .map(|timestamp| (timestamp.saturating_sub(period_ns), *timestamp))
         .collect::<Vec<_>>();
-    intervals.sort_unstable();
-    let mut duration = 0_u64;
-    let mut current: Option<(u64, u64)> = None;
-    for (start, end) in intervals {
-        match current {
-            Some((current_start, current_end)) if start <= current_end => {
-                current = Some((current_start, current_end.max(end)));
-            }
-            Some((current_start, current_end)) => {
-                duration = duration.saturating_add(current_end.saturating_sub(current_start));
-                current = Some((start, end));
-            }
-            None => current = Some((start, end)),
+    observations.sort_unstable();
+    let mut intervals: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in observations {
+        match intervals.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => intervals.push((start, end)),
         }
     }
-    if let Some((start, end)) = current {
-        duration = duration.saturating_add(end.saturating_sub(start));
-    }
-    duration
+    intervals
+}
+
+fn active_duration(intervals: &[(u64, u64)]) -> u64 {
+    intervals.iter().fold(0_u64, |total, (start, end)| {
+        total.saturating_add(end.saturating_sub(*start))
+    })
 }
 
 fn parse_hex_address(value: &str) -> Result<u64> {
@@ -654,7 +740,8 @@ pub(crate) fn write_chart(tables: &Tables) -> Result<()> {
          ),
          runs AS (
            SELECT process_id, file_name, function_name, line,
-             SUM(loop_end_ts - loop_start_ts) AS total_duration
+             SUM(loop_end_ts - loop_start_ts) AS total_duration,
+             SUM(measured_dram_bytes) AS measured_dram_bytes
            FROM roofline_loop_runs
            GROUP BY process_id, file_name, function_name, line
          )
@@ -663,24 +750,27 @@ pub(crate) fn write_chart(tables: &Tables) -> Result<()> {
            s_func.string AS function_name,
            runs.line AS line,
            CAST(ops.scalar_int_ops AS DOUBLE) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS scalar_int_ops,
-           CAST(ops.scalar_int_ops AS DOUBLE) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS scalar_int_ai,
+           CAST(ops.scalar_int_ops AS DOUBLE) / NULLIF(COALESCE(runs.measured_dram_bytes, ops.bytes_load + ops.bytes_store), 0) AS scalar_int_ai,
            CAST(ops.scalar_float_ops AS DOUBLE) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS scalar_float_ops,
-           CAST(ops.scalar_float_ops AS DOUBLE) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS scalar_float_ai,
+           CAST(ops.scalar_float_ops AS DOUBLE) / NULLIF(COALESCE(runs.measured_dram_bytes, ops.bytes_load + ops.bytes_store), 0) AS scalar_float_ai,
            CAST(ops.scalar_double_ops AS DOUBLE) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS scalar_double_ops,
-           CAST(ops.scalar_double_ops AS DOUBLE) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS scalar_double_ai,
+           CAST(ops.scalar_double_ops AS DOUBLE) / NULLIF(COALESCE(runs.measured_dram_bytes, ops.bytes_load + ops.bytes_store), 0) AS scalar_double_ai,
            CAST(ops.vector_int_ops AS DOUBLE) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_int_ops,
-           CAST(ops.vector_int_ops AS DOUBLE) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_int_ai,
+           CAST(ops.vector_int_ops AS DOUBLE) / NULLIF(COALESCE(runs.measured_dram_bytes, ops.bytes_load + ops.bytes_store), 0) AS vector_int_ai,
            CAST(ops.vector_float_ops AS DOUBLE) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_float_ops,
-           CAST(ops.vector_float_ops AS DOUBLE) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_float_ai,
+           CAST(ops.vector_float_ops AS DOUBLE) / NULLIF(COALESCE(runs.measured_dram_bytes, ops.bytes_load + ops.bytes_store), 0) AS vector_float_ai,
            CAST(ops.vector_double_ops AS DOUBLE) * 1000000000.0 / NULLIF(runs.total_duration, 0) AS vector_double_ops,
-           CAST(ops.vector_double_ops AS DOUBLE) / NULLIF(ops.bytes_load + ops.bytes_store, 0) AS vector_double_ai,
+           CAST(ops.vector_double_ops AS DOUBLE) / NULLIF(COALESCE(runs.measured_dram_bytes, ops.bytes_load + ops.bytes_store), 0) AS vector_double_ai,
            CAST(NULL AS BIGINT) AS timing_samples,
            CAST(NULL AS DOUBLE) AS timing_relative_error,
            'legacy' AS timing_quality,
            CAST(NULL AS VARCHAR) AS module_offset,
            CAST(NULL AS BIGINT) AS trip_count,
            CAST(ops.bytes_load + ops.bytes_store AS BIGINT) AS arch_bytes,
-           CAST(NULL AS BIGINT) AS dram_bytes
+           CAST(NULL AS BIGINT) AS dram_bytes,
+           CAST(runs.measured_dram_bytes AS BIGINT) AS measured_dram_bytes,
+           CASE WHEN runs.measured_dram_bytes IS NULL THEN 'architectural'
+                ELSE 'uncore_measured' END AS traffic_source
          FROM runs
          LEFT JOIN ops
            ON runs.file_name = ops.file_name
@@ -697,24 +787,27 @@ pub(crate) fn write_chart(tables: &Tables) -> Result<()> {
            function_name,
            line,
            CAST(scalar_int_ops AS DOUBLE) * 1000000000.0 / NULLIF(duration_ns, 0),
-           CAST(scalar_int_ops AS DOUBLE) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+           CAST(scalar_int_ops AS DOUBLE) / NULLIF(COALESCE(measured_dram_bytes, arch_bytes_load + arch_bytes_store), 0),
            CAST(scalar_float_ops AS DOUBLE) * 1000000000.0 / NULLIF(duration_ns, 0),
-           CAST(scalar_float_ops AS DOUBLE) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+           CAST(scalar_float_ops AS DOUBLE) / NULLIF(COALESCE(measured_dram_bytes, arch_bytes_load + arch_bytes_store), 0),
            CAST(scalar_double_ops AS DOUBLE) * 1000000000.0 / NULLIF(duration_ns, 0),
-           CAST(scalar_double_ops AS DOUBLE) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+           CAST(scalar_double_ops AS DOUBLE) / NULLIF(COALESCE(measured_dram_bytes, arch_bytes_load + arch_bytes_store), 0),
            CAST(vector_int_ops AS DOUBLE) * 1000000000.0 / NULLIF(duration_ns, 0),
-           CAST(vector_int_ops AS DOUBLE) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+           CAST(vector_int_ops AS DOUBLE) / NULLIF(COALESCE(measured_dram_bytes, arch_bytes_load + arch_bytes_store), 0),
            CAST(vector_float_ops AS DOUBLE) * 1000000000.0 / NULLIF(duration_ns, 0),
-           CAST(vector_float_ops AS DOUBLE) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+           CAST(vector_float_ops AS DOUBLE) / NULLIF(COALESCE(measured_dram_bytes, arch_bytes_load + arch_bytes_store), 0),
            CAST(vector_double_ops AS DOUBLE) * 1000000000.0 / NULLIF(duration_ns, 0),
-           CAST(vector_double_ops AS DOUBLE) / NULLIF(arch_bytes_load + arch_bytes_store, 0),
+           CAST(vector_double_ops AS DOUBLE) / NULLIF(COALESCE(measured_dram_bytes, arch_bytes_load + arch_bytes_store), 0),
            timing_samples,
            timing_relative_error,
            timing_quality,
            module_offset,
            trip_count,
            arch_bytes_load + arch_bytes_store,
-           bytes_load + bytes_store
+           bytes_load + bytes_store,
+           measured_dram_bytes,
+           CASE WHEN measured_dram_bytes IS NULL THEN 'architectural'
+                ELSE 'uncore_measured' END
          FROM roofline_binary_loops",
     )
 }
@@ -725,7 +818,20 @@ mod tests {
     use crate::postprocess::tables::Columns;
 
     #[test]
-    fn binary_loops_replace_the_instrumented_rows() {
+    fn bandwidth_timeline_integrates_over_kernel_windows() {
+        let timeline = BandwidthTimeline {
+            samples: vec![(0, 0), (1_000, 1_000), (2_000, 5_000)],
+        };
+        assert_eq!(timeline.bytes_in(&[(0, 2_000)]), Some(5_000));
+        assert_eq!(timeline.bytes_in(&[(1_000, 1_500)]), Some(2_000));
+        // Windows outside the recorded curve contribute nothing.
+        assert_eq!(timeline.bytes_in(&[(3_000, 4_000)]), None);
+    }
+
+    /// The single chart row produced for one binary loop with 5000
+    /// architectural bytes, 1000 modeled DRAM bytes, and `measured` bytes
+    /// counted on the memory controller.
+    fn chart_row(measured: Option<i64>) -> (String, f64, f64, String, Option<i64>, String) {
         let dir = tempfile::tempdir().unwrap();
         let tables = Tables::open(dir.path()).unwrap();
         for table in ["roofline_ops", "roofline_loop_runs"] {
@@ -744,6 +850,7 @@ mod tests {
             columns.i64("vector_double_ops", vec![]);
             columns.i64("loop_start_ts", vec![]);
             columns.i64("loop_end_ts", vec![]);
+            columns.i64_opt("measured_dram_bytes", vec![]);
             tables.write(table, columns.finish().unwrap()).unwrap();
         }
         let mut strings = Columns::default();
@@ -761,10 +868,22 @@ mod tests {
         rows.timing_samples.push(400);
         rows.relative_errors.push(Some(0.098));
         rows.timing_qualities.push("advisor-grade".to_owned());
+        rows.measured_dram_bytes.push(measured);
         // bytes_load, bytes_store, arch_bytes_load, arch_bytes_store, then ops.
-        for (index, value) in [800, 200, 4000, 1000, 0, 0, 2_000_000_000, 0, 0, 6_000_000_000]
-            .into_iter()
-            .enumerate()
+        for (index, value) in [
+            800,
+            200,
+            4000,
+            1000,
+            0,
+            0,
+            2_000_000_000,
+            0,
+            0,
+            6_000_000_000,
+        ]
+        .into_iter()
+        .enumerate()
         {
             rows.counters[index].push(value);
         }
@@ -773,10 +892,11 @@ mod tests {
             .unwrap();
 
         write_chart(&tables).unwrap();
-        let (function, scalar_ai, vector_ai, quality) = tables
+        tables
             .connection()
             .query_row(
-                "SELECT function_name, scalar_double_ai, vector_double_ai, timing_quality
+                "SELECT function_name, scalar_double_ai, vector_double_ai, timing_quality,
+                        measured_dram_bytes, traffic_source
                  FROM roofline",
                 [],
                 |row| {
@@ -785,22 +905,42 @@ mod tests {
                         row.get::<_, f64>(1)?,
                         row.get::<_, f64>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
-            .unwrap();
+            .unwrap()
+    }
+
+    #[test]
+    fn binary_loops_replace_the_instrumented_rows() {
+        let (function, scalar_ai, vector_ai, quality, measured, source) = chart_row(None);
         assert_eq!(function, "kernel");
-        // Arithmetic intensity is architectural, so it divides by the 5000
-        // architectural bytes, not by the 1000 bytes that reached DRAM.
+        // Without measured traffic the denominator is the 5000 architectural
+        // bytes, not the 1000 bytes the model says reached DRAM.
         assert_eq!(scalar_ai, 400_000.0);
         assert_eq!(vector_ai, 1_200_000.0);
         assert_eq!(quality, "advisor-grade");
+        assert_eq!(measured, None);
+        assert_eq!(source, "architectural");
+    }
+
+    #[test]
+    fn measured_dram_bytes_become_the_intensity_denominator() {
+        let (_, scalar_ai, vector_ai, _, measured, source) = chart_row(Some(2_000));
+        assert_eq!(scalar_ai, 1_000_000.0);
+        assert_eq!(vector_ai, 3_000_000.0);
+        assert_eq!(measured, Some(2_000));
+        assert_eq!(source, "uncore_measured");
     }
 
     #[test]
     fn sampled_duration_unions_parallel_and_separated_observations() {
-        assert_eq!(sampled_active_duration(&[1_000, 1_500], 1_000), 1_500);
-        assert_eq!(sampled_active_duration(&[1_000, 3_000], 1_000), 2_000);
-        assert_eq!(sampled_active_duration(&[], 1_000), 0);
+        let duration =
+            |timestamps: &[u64]| active_duration(&sampled_active_intervals(timestamps, 1_000));
+        assert_eq!(duration(&[1_000, 1_500]), 1_500);
+        assert_eq!(duration(&[1_000, 3_000]), 2_000);
+        assert_eq!(duration(&[]), 0);
     }
 }

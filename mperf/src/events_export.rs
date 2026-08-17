@@ -60,7 +60,11 @@ fn export(path: &Path) -> Result<String> {
                 value: row.get::<_, i64>(6)? as u64,
                 timestamp: row.get::<_, i64>(0)? as u64,
                 name: if ty == EventType::PmuCustom { name } else { 0 },
-                callstack: u64_list(row.get(9)?).into_iter().map(CallFrame::IP).collect(),
+                callstack: u64_list(row.get(9)?)
+                    .into_iter()
+                    .map(CallFrame::IP)
+                    .collect(),
+                lbr_callstack: Vec::new(),
                 user_regs: (regs_mask != 0).then(|| UserRegs {
                     abi: row.get(10).unwrap_or(0),
                     mask: regs_mask,
@@ -91,13 +95,11 @@ fn export(path: &Path) -> Result<String> {
                 )
                 .unwrap_or(EventType::PmuCustom)
             };
-            let location = row
-                .get::<_, Option<u64>>(9)?
-                .map(|function_name| Location {
-                    function_name,
-                    file_name: row.get(10).unwrap_or(0),
-                    line: row.get(11).unwrap_or(0),
-                });
+            let location = row.get::<_, Option<u64>>(9)?.map(|function_name| Location {
+                function_name,
+                file_name: row.get(10).unwrap_or(0),
+                line: row.get(11).unwrap_or(0),
+            });
             events.push(Event {
                 unique_id: row.get(2)?,
                 correlation_id: row.get(4)?,
@@ -112,6 +114,7 @@ fn export(path: &Path) -> Result<String> {
                 timestamp: row.get::<_, i64>(0)? as u64,
                 name: 0,
                 callstack: location.into_iter().map(CallFrame::Location).collect(),
+                lbr_callstack: Vec::new(),
                 user_regs: None,
                 user_stack: Vec::new(),
             });

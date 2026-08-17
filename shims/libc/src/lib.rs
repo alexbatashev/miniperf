@@ -147,14 +147,7 @@ fn mem_emit(mut op: u8, mut first: u64, mut second: u64, mut size: u64) {
     cursor = append_number(&mut line, cursor, size, false);
     line[cursor] = b'\n';
     cursor += 1;
-    unsafe {
-        libc::syscall(
-            libc::SYS_write,
-            fd as libc::c_long,
-            line.as_ptr(),
-            cursor,
-        )
-    };
+    unsafe { libc::syscall(libc::SYS_write, fd as libc::c_long, line.as_ptr(), cursor) };
 }
 
 /// Bump arena serving allocations made while `dlsym` itself is resolving the
@@ -221,8 +214,7 @@ fn core_resolve() -> bool {
             return;
         }
         let library = env_lookup(c"MPERF_COLLECTOR_LIBRARY").unwrap_or(c"libmperf_collector.so");
-        let core =
-            unsafe { libc::dlopen(library.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        let core = unsafe { libc::dlopen(library.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
         if core.is_null() {
             CORE_STATE.store(-1, Ordering::Release);
             return;
@@ -334,7 +326,13 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     if !pointer.is_null() && !inside() {
         mem_emit(b'A', pointer as u64, 0, size as u64);
         if should_sample(size) {
-            shim_emit(payload_slot!(), c"malloc", FLAG_STACK, size as i64, pointer as u64);
+            shim_emit(
+                payload_slot!(),
+                c"malloc",
+                FLAG_STACK,
+                size as i64,
+                pointer as u64,
+            );
         }
     }
     pointer
@@ -354,7 +352,13 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
     if !pointer.is_null() && !inside() {
         mem_emit(b'A', pointer as u64, 0, total as u64);
         if should_sample(total) {
-            shim_emit(payload_slot!(), c"malloc", FLAG_STACK, total as i64, pointer as u64);
+            shim_emit(
+                payload_slot!(),
+                c"malloc",
+                FLAG_STACK,
+                total as i64,
+                pointer as u64,
+            );
         }
     }
     pointer
@@ -434,7 +438,13 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
     if !pointer.is_null() && !inside() {
         mem_emit(b'A', pointer as u64, 0, size as u64);
         if should_sample(size) {
-            shim_emit(payload_slot!(), c"malloc", FLAG_STACK, size as i64, pointer as u64);
+            shim_emit(
+                payload_slot!(),
+                c"malloc",
+                FLAG_STACK,
+                size as i64,
+                pointer as u64,
+            );
         }
     }
     pointer
@@ -482,8 +492,15 @@ pub unsafe extern "C" fn mmap(
     let next = resolve_next(c"mmap", &NEXT);
     if next.is_null() {
         return unsafe {
-            libc::syscall(libc::SYS_mmap, address, length, protection, flags, fd, offset)
-                as *mut c_void
+            libc::syscall(
+                libc::SYS_mmap,
+                address,
+                length,
+                protection,
+                flags,
+                fd,
+                offset,
+            ) as *mut c_void
         };
     }
     let next: unsafe extern "C" fn(
@@ -497,7 +514,13 @@ pub unsafe extern "C" fn mmap(
     let result = unsafe { next(address, length, protection, flags, fd, offset) };
     if result != libc::MAP_FAILED && flags & libc::MAP_ANONYMOUS != 0 && !inside() {
         mem_emit(b'M', result as u64, 0, length as u64);
-        shim_emit(payload_slot!(), c"mmap", FLAG_STACK, length as i64, result as u64);
+        shim_emit(
+            payload_slot!(),
+            c"mmap",
+            FLAG_STACK,
+            length as i64,
+            result as u64,
+        );
     }
     result
 }

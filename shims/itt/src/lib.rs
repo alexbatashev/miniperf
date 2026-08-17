@@ -143,7 +143,11 @@ fn register_payload(name: *const c_char, domain: *const c_char) -> *mut c_void {
         unsafe { std::mem::transmute(CORE_REGISTER.load(Ordering::Acquire)) };
     let payload = Payload {
         name,
-        function: if domain.is_null() { c"".as_ptr() } else { domain },
+        function: if domain.is_null() {
+            c"".as_ptr()
+        } else {
+            domain
+        },
         file: c"itt".as_ptr(),
         line: 0,
         column: 0,
@@ -204,9 +208,7 @@ pub unsafe extern "C" fn __itt_domain_createA(name: *const c_char) -> *mut IttDo
 /// # Safety
 /// Called by the ittnotify static loader with a valid NUL-terminated name.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __itt_string_handle_create(
-    name: *const c_char,
-) -> *mut IttStringHandle {
+pub unsafe extern "C" fn __itt_string_handle_create(name: *const c_char) -> *mut IttStringHandle {
     if name.is_null() {
         return std::ptr::null_mut();
     }
@@ -232,9 +234,7 @@ pub unsafe extern "C" fn __itt_string_handle_create(
 /// # Safety
 /// See `__itt_string_handle_create`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn __itt_string_handle_createA(
-    name: *const c_char,
-) -> *mut IttStringHandle {
+pub unsafe extern "C" fn __itt_string_handle_createA(name: *const c_char) -> *mut IttStringHandle {
     unsafe { __itt_string_handle_create(name) }
 }
 

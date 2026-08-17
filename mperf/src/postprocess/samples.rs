@@ -35,6 +35,7 @@ pub(crate) struct RawSample<'a> {
     pub time_running: u64,
     pub ip: u64,
     pub callchain: &'a [u64],
+    pub lbr_callchain: &'a [u64],
     pub regs_mask: u64,
     pub regs: &'a [u64],
     pub user_stack: &'a [u8],
@@ -52,6 +53,7 @@ struct RawColumns<'a> {
     time_running: &'a UInt64Array,
     ip: &'a UInt64Array,
     callchain: &'a ListArray,
+    lbr_callchain: &'a ListArray,
     regs_mask: &'a UInt64Array,
     regs: &'a ListArray,
     user_stack: &'a BinaryArray,
@@ -78,6 +80,7 @@ impl<'a> RawColumns<'a> {
             time_running: column(batch, "time_running")?,
             ip: column(batch, "ip")?,
             callchain: column(batch, "callchain")?,
+            lbr_callchain: column(batch, "lbr_callchain")?,
             regs_mask: column(batch, "regs_mask")?,
             regs: column(batch, "regs")?,
             user_stack: column(batch, "user_stack")?,
@@ -107,7 +110,7 @@ struct CounterLead {
 }
 
 #[derive(Clone)]
-struct ResolvedIp {
+pub(crate) struct ResolvedIp {
     functions: Vec<String>,
     function: String,
     file: String,
@@ -442,6 +445,7 @@ pub(crate) async fn process(
             let raw = RawColumns::new(&batch)?;
             for index in 0..batch.num_rows() {
                 let callchain = list_values(raw.callchain, index)?;
+                let lbr_callchain = list_values(raw.lbr_callchain, index)?;
                 let regs = list_values(raw.regs, index)?;
                 let sample = RawSample {
                     timestamp: raw.timestamp.value(index),
@@ -455,6 +459,7 @@ pub(crate) async fn process(
                     time_running: raw.time_running.value(index),
                     ip: raw.ip.value(index),
                     callchain: &callchain,
+                    lbr_callchain: &lbr_callchain,
                     regs_mask: raw.regs_mask.value(index),
                     regs: &regs,
                     user_stack: raw.user_stack.value(index),
@@ -471,6 +476,7 @@ pub(crate) async fn process(
                 )))]
                 let frames = Frames::from_slice(sample.callchain);
 
+                let frames = merge_lbr_stack(frames, sample.lbr_callchain);
                 let stack_id = stacks.intern(&frames);
                 samples.timestamp.push(sample.timestamp);
                 samples.pid.push(sample.pid);
@@ -528,7 +534,10 @@ pub(crate) async fn process(
                     .entry(sample.event_id)
                     .or_insert_with(|| {
                         super::event_column_name_for(
-                            strings.get(&sample.event_id).map(String::as_str).unwrap_or(""),
+                            strings
+                                .get(&sample.event_id)
+                                .map(String::as_str)
+                                .unwrap_or(""),
                         )
                     })
                     .clone();
@@ -614,7 +623,7 @@ pub(crate) async fn process(
     Ok(())
 }
 
-fn resolve_ip<'a>(
+pub(crate) fn resolve_ip<'a>(
     resolver: &symbolize::Resolver,
     cache: &'a mut HashMap<(u32, u64), ResolvedIp>,
     pid: u32,
@@ -650,7 +659,7 @@ fn resolve_ip<'a>(
     })
 }
 
-fn resolve_folded_stack(
+pub(crate) fn resolve_folded_stack(
     resolver: &symbolize::Resolver,
     cache: &mut HashMap<(u32, u64), ResolvedIp>,
     pid: u32,
@@ -662,6 +671,19 @@ fn resolve_folded_stack(
         functions.extend(resolved.functions.iter().rev().cloned());
     }
     functions.join(";")
+}
+
+/// Pick the better of the unwound stack and the branch-record (LBR) stack.
+///
+/// The unwound stack — kernel callchain or post-hoc DWARF — is authoritative
+/// once it walked past the sampled frame; LBR only sees the last ~32 taken
+/// branches and only in user space. It wins only where the other source gave
+/// up, or where hardware genuinely saw deeper.
+pub(crate) fn merge_lbr_stack(frames: Frames, lbr: &[u64]) -> Frames {
+    if lbr.len() > frames.len() {
+        return Frames::from_slice(lbr);
+    }
+    frames
 }
 
 fn flamegraph_sample_weight(counter_delta: i64) -> Option<u64> {
@@ -753,6 +775,29 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(dir.path().join("empty.folded")).unwrap(), b"");
         assert!(!dir.path().join("empty.svg").exists());
+    }
+
+    #[test]
+    fn lbr_stack_only_replaces_a_shallower_unwind() {
+        let unwound = Frames::from_slice(&[1, 2, 3]);
+        let lbr = [1_u64, 4, 5];
+        assert_eq!(
+            merge_lbr_stack(unwound.clone(), &lbr).as_slice(),
+            unwound.as_slice()
+        );
+        assert_eq!(
+            merge_lbr_stack(unwound, &[1, 4, 5, 6]).as_slice(),
+            &[1, 4, 5, 6]
+        );
+        assert_eq!(
+            merge_lbr_stack(Frames::from_slice(&[1]), &[1, 2]).as_slice(),
+            &[1, 2]
+        );
+        assert_eq!(merge_lbr_stack(Frames::new(), &[7]).as_slice(), &[7]);
+        assert_eq!(
+            merge_lbr_stack(Frames::from_slice(&[1, 2]), &[]).as_slice(),
+            &[1, 2]
+        );
     }
 
     #[test]

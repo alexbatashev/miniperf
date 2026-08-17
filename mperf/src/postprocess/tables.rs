@@ -73,10 +73,10 @@ impl Tables {
     }
 
     pub(crate) fn columns(&self, table: &str) -> Vec<String> {
-        let Ok(mut statement) = self
-            .connection()
-            .prepare(&format!("PRAGMA table_info('{}')", table.replace('\'', "''")))
-        else {
+        let Ok(mut statement) = self.connection().prepare(&format!(
+            "PRAGMA table_info('{}')",
+            table.replace('\'', "''")
+        )) else {
             return Vec::new();
         };
         statement
@@ -91,7 +91,8 @@ impl Tables {
             .query_row(sql, [], |row| row.get::<_, Option<f64>>(0))
             .or_else(|_| {
                 connection.query_row(sql, [], |row| {
-                    row.get::<_, Option<i64>>(0).map(|value| value.map(|v| v as f64))
+                    row.get::<_, Option<i64>>(0)
+                        .map(|value| value.map(|v| v as f64))
                 })
             })
             .ok()

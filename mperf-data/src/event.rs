@@ -78,6 +78,10 @@ pub struct Event {
     pub timestamp: u64,
     pub name: u64,
     pub callstack: SmallVec<[CallFrame; 32]>,
+    /// Call stack reconstructed from hardware branch records (Intel LBR
+    /// call-stack mode). Empty unless the sample carried a branch stack.
+    #[serde(default)]
+    pub lbr_callstack: Vec<u64>,
     /// Raw state used for offline DWARF unwinding. Empty for instrumentation events.
     pub user_regs: Option<UserRegs>,
     pub user_stack: Vec<u8>,

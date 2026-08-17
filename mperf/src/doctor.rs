@@ -1,0 +1,509 @@
+use anyhow::Result;
+use comfy_table::{Cell, Color, ContentArrangement, Table};
+use pmu::{Capabilities, Rung};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Severity {
+    Blocker,
+    Degraded,
+    Info,
+    Ok,
+}
+
+impl Severity {
+    fn label(self) -> &'static str {
+        match self {
+            Severity::Blocker => "blocker",
+            Severity::Degraded => "degraded",
+            Severity::Info => "info",
+            Severity::Ok => "ok",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Severity::Blocker => Color::Red,
+            Severity::Degraded => Color::Yellow,
+            Severity::Info => Color::Blue,
+            Severity::Ok => Color::Green,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Check {
+    feature: String,
+    status: String,
+    severity: Severity,
+    action: String,
+}
+
+fn check(
+    feature: &str,
+    status: impl Into<String>,
+    severity: Severity,
+    action: impl Into<String>,
+) -> Check {
+    // Em dashes render two columns wide in many terminals but count as one in
+    // the table layout, which skews every border line.
+    Check {
+        feature: feature.to_owned(),
+        status: status.into().replace('\u{2014}', "-"),
+        severity,
+        action: action.into(),
+    }
+}
+
+/// External programs the profiler shells out to at runtime.
+#[derive(Clone, Copy, Debug, Default)]
+struct Tooling {
+    bpftrace: bool,
+    objdump: bool,
+    debuginfod_find: bool,
+    debuginfod_requested: bool,
+}
+
+impl Tooling {
+    fn probe() -> Self {
+        Self {
+            bpftrace: which::which("bpftrace").is_ok(),
+            objdump: which::which("objdump").is_ok(),
+            debuginfod_find: which::which("debuginfod-find").is_ok(),
+            debuginfod_requested: std::env::var_os("DEBUGINFOD_URLS").is_some(),
+        }
+    }
+}
+
+fn sysctl(key: &str, value: &str) -> String {
+    format!(
+        "sudo sysctl -w {key}={value} (persist by adding `{key} = {value}` to /etc/sysctl.d/99-mperf.conf)"
+    )
+}
+
+fn paranoid_check(caps: &Capabilities) -> Check {
+    match caps.perf_event_paranoid {
+        None => check(
+            "perf_event_paranoid",
+            "unreadable",
+            Severity::Info,
+            "no /proc/sys/kernel/perf_event_paranoid on this host",
+        ),
+        Some(level) if level > 2 => check(
+            "perf_event_paranoid",
+            format!("level {level}: perf_event_open is denied without root"),
+            Severity::Blocker,
+            sysctl("kernel.perf_event_paranoid", "1"),
+        ),
+        Some(level @ 2) => check(
+            "perf_event_paranoid",
+            format!("level {level}: no kernel samples, no system-wide (uncore) events"),
+            Severity::Degraded,
+            sysctl("kernel.perf_event_paranoid", "0"),
+        ),
+        Some(level @ 1) => check(
+            "perf_event_paranoid",
+            format!("level {level}: no kernel samples"),
+            Severity::Degraded,
+            sysctl("kernel.perf_event_paranoid", "0"),
+        ),
+        Some(level) => check(
+            "perf_event_paranoid",
+            format!("level {level}: unrestricted"),
+            Severity::Ok,
+            "-",
+        ),
+    }
+}
+
+fn hardware_counter_check(caps: &Capabilities) -> Check {
+    if caps.hardware_counters {
+        check("hardware counters", "cpu-cycles opens", Severity::Ok, "-")
+    } else {
+        check(
+            "hardware counters",
+            "cpu-cycles cannot be opened - no PMU access (virtualized host or paranoid level)",
+            Severity::Blocker,
+            "lower perf_event_paranoid, or run on hardware that exposes a PMU",
+        )
+    }
+}
+
+fn kernel_symbol_check(caps: &Capabilities) -> Check {
+    if caps.kernel_symbols {
+        check(
+            "kernel symbols (kptr_restrict)",
+            "kernel addresses are readable",
+            Severity::Ok,
+            "-",
+        )
+    } else {
+        check(
+            "kernel symbols (kptr_restrict)",
+            format!(
+                "kptr_restrict={} - kernel frames stay unsymbolized",
+                caps.kptr_restrict
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+            ),
+            Severity::Degraded,
+            sysctl("kernel.kptr_restrict", "0"),
+        )
+    }
+}
+
+fn nmi_watchdog_check(caps: &Capabilities) -> Check {
+    match caps.nmi_watchdog {
+        Some(true) => check(
+            "NMI watchdog",
+            "enabled - holds one hardware counter, shrinking sampling groups",
+            Severity::Degraded,
+            sysctl("kernel.nmi_watchdog", "0"),
+        ),
+        Some(false) => check("NMI watchdog", "disabled", Severity::Ok, "-"),
+        None => check("NMI watchdog", "unknown", Severity::Info, "-"),
+    }
+}
+
+fn bpf_checks(caps: &Capabilities, tooling: &Tooling) -> Vec<Check> {
+    let mut checks = vec![if tooling.bpftrace {
+        check("bpftrace", "installed", Severity::Ok, "-")
+    } else {
+        check(
+            "bpftrace",
+            "not installed - snapshot loses scheduler, block-IO and TCP metrics",
+            Severity::Blocker,
+            "install bpftrace (pacman -S bpftrace / apt install bpftrace / dnf install bpftrace)",
+        )
+    }];
+
+    checks.push(if !caps.kernel_btf {
+        check(
+            "eBPF collection (snapshot)",
+            "kernel BTF missing at /sys/kernel/btf/vmlinux",
+            Severity::Blocker,
+            "boot a kernel built with CONFIG_DEBUG_INFO_BTF",
+        )
+    } else if caps.is_root {
+        check(
+            "eBPF collection (snapshot)",
+            "running as root",
+            Severity::Ok,
+            "-",
+        )
+    } else {
+        check(
+            "eBPF collection (snapshot)",
+            "not root - the BPF collector will be skipped",
+            Severity::Blocker,
+            "run snapshot under sudo: sudo mperf record -s snapshot -o OUT -- CMD",
+        )
+    });
+
+    checks
+}
+
+fn tooling_checks(tooling: &Tooling) -> Vec<Check> {
+    let mut checks = vec![if tooling.objdump {
+        check("objdump (disassembly)", "installed", Severity::Ok, "-")
+    } else {
+        check(
+            "objdump (disassembly)",
+            "not installed - the assembly view in `mperf show` is unavailable",
+            Severity::Degraded,
+            "install binutils (pacman -S binutils / apt install binutils)",
+        )
+    }];
+
+    if tooling.debuginfod_requested && !tooling.debuginfod_find {
+        checks.push(check(
+            "debuginfod-find",
+            "DEBUGINFOD_URLS is set but debuginfod-find is missing",
+            Severity::Degraded,
+            "install debuginfod (pacman -S debuginfod / apt install debuginfod)",
+        ));
+    }
+
+    checks
+}
+
+fn rung_feature(rung: Rung) -> &'static str {
+    match rung {
+        Rung::PebsMem => "precise sampling (Intel PEBS)",
+        Rung::IbsOp => "precise sampling (AMD IBS)",
+        Rung::ArmSpe => "precise sampling (Arm SPE)",
+        Rung::FixedTopdown => "fixed topdown (PERF_METRICS)",
+        Rung::ArmSlotsTopdown => "topdown (Arm pmuv3 slots)",
+        Rung::LbrCallstack => "branch records (LBR call stacks)",
+        Rung::UncoreBw => "uncore memory bandwidth",
+        Rung::Baseline => "baseline counters",
+    }
+}
+
+/// Rungs worth reporting on this host: no Arm SPE row on x86, no PEBS row on
+/// AMD, nothing vendor-specific on architectures that cannot have it.
+fn applicable_rungs(caps: &Capabilities) -> Vec<Rung> {
+    let mut rungs = Vec::new();
+    match caps.arch.as_str() {
+        "x86_64" | "x86" => {
+            if !caps.is_amd() {
+                rungs.push(Rung::PebsMem);
+                rungs.push(Rung::FixedTopdown);
+            }
+            if !caps.is_intel() {
+                rungs.push(Rung::IbsOp);
+            }
+            rungs.push(Rung::LbrCallstack);
+        }
+        "aarch64" => {
+            rungs.push(Rung::ArmSpe);
+            rungs.push(Rung::ArmSlotsTopdown);
+        }
+        _ => {}
+    }
+    rungs.push(Rung::UncoreBw);
+    rungs
+}
+
+fn rung_check(rung: Rung, caps: &Capabilities) -> Check {
+    let feature = rung_feature(rung);
+    let Some(reason) = rung.rejection(caps) else {
+        return check(feature, "available", Severity::Ok, "-");
+    };
+    let status = reason
+        .split_once(": ")
+        .map_or(reason.as_str(), |(_, rest)| rest)
+        .to_owned();
+
+    let (severity, action) = match rung {
+        Rung::IbsOp if !caps.has_cpu_flag("ibs") => (
+            Severity::Degraded,
+            "check BIOS for an IBS / 'Instruction Based Sampling' toggle",
+        ),
+        Rung::IbsOp => (
+            Severity::Degraded,
+            "kernel needs CONFIG_PERF_EVENTS_AMD_IBS to expose the ibs_op PMU",
+        ),
+        Rung::ArmSpe => (
+            Severity::Degraded,
+            "kernel needs CONFIG_ARM_SPE_PMU and firmware must expose SPE",
+        ),
+        Rung::UncoreBw if !caps.system_wide_allowed() => {
+            return check(
+                feature,
+                status,
+                Severity::Degraded,
+                sysctl("kernel.perf_event_paranoid", "0"),
+            );
+        }
+        Rung::UncoreBw => (Severity::Info, "no memory-controller PMU on this platform"),
+        _ => (Severity::Info, "not available on this CPU"),
+    };
+
+    check(feature, status, severity, action)
+}
+
+fn checks(caps: &Capabilities, tooling: &Tooling) -> Vec<Check> {
+    let mut checks = vec![
+        paranoid_check(caps),
+        hardware_counter_check(caps),
+        kernel_symbol_check(caps),
+        nmi_watchdog_check(caps),
+    ];
+    checks.extend(bpf_checks(caps, tooling));
+    checks.extend(
+        applicable_rungs(caps)
+            .into_iter()
+            .map(|rung| rung_check(rung, caps)),
+    );
+    checks.extend(tooling_checks(tooling));
+    checks
+}
+
+fn render(checks: &[Check]) -> Table {
+    let mut table = Table::new();
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec!["Feature", "Status", "Severity", "Action"]);
+    for check in checks {
+        table.add_row(vec![
+            Cell::new(&check.feature),
+            Cell::new(&check.status),
+            Cell::new(check.severity.label()).fg(check.severity.color()),
+            Cell::new(&check.action),
+        ]);
+    }
+    table
+}
+
+/// Diagnose this host's profiling readiness. Exits with a nonzero status when
+/// any check is a blocker.
+pub fn do_doctor() -> Result<()> {
+    let caps = pmu::capabilities();
+    let (vendor, model) = pmu::host_cpu_description();
+    let cpu = if model.starts_with(&vendor) {
+        model
+    } else {
+        format!("{vendor} {model}")
+    };
+    let checks = checks(&caps, &Tooling::probe());
+
+    println!(
+        "mperf doctor - {cpu} ({}), kernel {}\n",
+        caps.arch,
+        caps.kernel_version.as_deref().unwrap_or("unknown")
+    );
+    println!("{}", render(&checks));
+
+    let blockers = checks
+        .iter()
+        .filter(|check| check.severity == Severity::Blocker)
+        .count();
+    if blockers > 0 {
+        println!("\n{blockers} blocker(s) found");
+        std::process::exit(1);
+    }
+    println!("\nno blockers found");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pmu::PmuDevice;
+
+    fn pmu(name: &str) -> PmuDevice {
+        PmuDevice {
+            name: name.to_owned(),
+            ..PmuDevice::default()
+        }
+    }
+
+    fn intel_host() -> Capabilities {
+        Capabilities {
+            arch: "x86_64".to_owned(),
+            cpu_vendor: Some("GenuineIntel".to_owned()),
+            perf_event_paranoid: Some(1),
+            hardware_counters: true,
+            kernel_symbols: true,
+            kernel_btf: true,
+            nmi_watchdog: Some(true),
+            pmus: vec![pmu("cpu")],
+            ..Capabilities::default()
+        }
+    }
+
+    fn full_tooling() -> Tooling {
+        Tooling {
+            bpftrace: true,
+            objdump: true,
+            debuginfod_find: true,
+            debuginfod_requested: false,
+        }
+    }
+
+    fn find<'a>(checks: &'a [Check], feature: &str) -> &'a Check {
+        checks
+            .iter()
+            .find(|check| check.feature == feature)
+            .unwrap_or_else(|| panic!("no `{feature}` row"))
+    }
+
+    #[test]
+    fn paranoid_severity_follows_the_level() {
+        for (level, severity) in [
+            (3, Severity::Blocker),
+            (2, Severity::Degraded),
+            (1, Severity::Degraded),
+            (0, Severity::Ok),
+            (-1, Severity::Ok),
+        ] {
+            let caps = Capabilities {
+                perf_event_paranoid: Some(level),
+                ..Capabilities::default()
+            };
+            assert_eq!(paranoid_check(&caps).severity, severity, "level {level}");
+        }
+    }
+
+    #[test]
+    fn rows_are_vendor_aware() {
+        let intel = applicable_rungs(&intel_host());
+        assert!(intel.contains(&Rung::PebsMem));
+        assert!(!intel.contains(&Rung::IbsOp));
+        assert!(!intel.contains(&Rung::ArmSpe));
+
+        let amd = applicable_rungs(&Capabilities {
+            cpu_vendor: Some("AuthenticAMD".to_owned()),
+            ..intel_host()
+        });
+        assert!(amd.contains(&Rung::IbsOp));
+        assert!(!amd.contains(&Rung::PebsMem));
+        assert!(!amd.contains(&Rung::FixedTopdown));
+
+        let arm = applicable_rungs(&Capabilities {
+            arch: "aarch64".to_owned(),
+            cpu_vendor: None,
+            ..intel_host()
+        });
+        assert_eq!(
+            arm,
+            vec![Rung::ArmSpe, Rung::ArmSlotsTopdown, Rung::UncoreBw]
+        );
+
+        let riscv = applicable_rungs(&Capabilities {
+            arch: "riscv64".to_owned(),
+            cpu_vendor: None,
+            ..intel_host()
+        });
+        assert_eq!(riscv, vec![Rung::UncoreBw]);
+    }
+
+    #[test]
+    fn missing_hardware_features_never_block() {
+        let checks = checks(&intel_host(), &full_tooling());
+        for rung in applicable_rungs(&intel_host()) {
+            let check = find(&checks, rung_feature(rung));
+            assert_ne!(check.severity, Severity::Blocker, "{}", check.feature);
+        }
+        assert_eq!(
+            find(&checks, "precise sampling (Intel PEBS)").severity,
+            Severity::Info
+        );
+        assert_eq!(find(&checks, "NMI watchdog").severity, Severity::Degraded);
+    }
+
+    #[test]
+    fn ibs_points_at_the_bios_when_the_cpuid_flag_is_absent() {
+        let caps = Capabilities {
+            cpu_vendor: Some("AuthenticAMD".to_owned()),
+            ..intel_host()
+        };
+        let check = rung_check(Rung::IbsOp, &caps);
+        assert_eq!(check.severity, Severity::Degraded);
+        assert!(check.action.contains("BIOS"), "{}", check.action);
+    }
+
+    #[test]
+    fn ebpf_and_tooling_gaps_block() {
+        let bare = checks(&intel_host(), &Tooling::default());
+        assert_eq!(find(&bare, "bpftrace").severity, Severity::Blocker);
+        assert_eq!(
+            find(&bare, "eBPF collection (snapshot)").severity,
+            Severity::Blocker
+        );
+        assert_eq!(
+            find(&bare, "objdump (disassembly)").severity,
+            Severity::Degraded
+        );
+
+        let root = Capabilities {
+            is_root: true,
+            ..intel_host()
+        };
+        let privileged = checks(&root, &full_tooling());
+        assert!(
+            !privileged
+                .iter()
+                .any(|check| check.severity == Severity::Blocker),
+            "privileged host with all tooling should have no blockers"
+        );
+    }
+}

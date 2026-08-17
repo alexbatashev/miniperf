@@ -2235,6 +2235,7 @@ fn emit_pending_sample(
             counter: handle.counter.clone(),
             value: value_delta,
             callstack: sample.callstack.iter().copied().collect(),
+            lbr_callstack: Default::default(),
             user_regs: None,
             user_stack: Vec::new(),
         }));
@@ -2276,6 +2277,7 @@ fn emit_cpu_clock_observation(
         counter: Counter::CpuClock,
         value: sample_period_ns,
         callstack: sample.callstack.iter().copied().collect(),
+        lbr_callstack: Default::default(),
         user_regs: None,
         user_stack: Vec::new(),
     }));

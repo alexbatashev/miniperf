@@ -545,6 +545,7 @@ mod topdown_tests {
             desc: String::new(),
             formula: formula.to_owned(),
             group: Some("tma".to_owned()),
+            cpus: None,
         }
     }
 

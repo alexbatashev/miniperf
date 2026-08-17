@@ -76,7 +76,49 @@ fn tma_acceptance_fixtures_have_expected_dominant_paths() {
             dominant == expected || (expected == "be_bound" && dominant.starts_with("be_bound.")),
             "13-TMA: expected {expected}, got {dominant}"
         );
+        assert_fixed_topdown_fractions_are_exhaustive(&session);
         cleanup_recording(&results, &log, "13-TMA");
+    }
+}
+
+/// On a host that resolved to a hardware topdown rung the level-one metrics are
+/// counted, not estimated, so they must account for every issue slot. Hosts at
+/// the arithmetic baseline have no such guarantee and are skipped.
+fn assert_fixed_topdown_fractions_are_exhaustive(session: &Session) {
+    let rung: String = session
+        .connection()
+        .query_row(
+            "SELECT rung FROM capture_fidelity WHERE scenario = 'tma' AND status = 'chosen'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("13-TMA: read capture fidelity");
+    if !matches!(rung.as_str(), "fixed_topdown" | "arm_slots_topdown") {
+        eprintln!("13-TMA: fixed topdown check skipped: host recorded at '{rung}'");
+        return;
+    }
+    // A heterogeneous host reports one `<metric>.<core type>` set per core
+    // type; each set covers that core type's slots on its own.
+    let connection = session.connection();
+    let mut statement = connection
+        .prepare(
+            "SELECT SPLIT_PART(metric, '.', 2) AS core, SUM(value) AS total
+             FROM tma_summary GROUP BY core HAVING SUM(value) IS NOT NULL",
+        )
+        .expect("13-TMA: query level-one totals");
+    let totals = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>("core")?, row.get::<_, f64>("total")?))
+        })
+        .expect("13-TMA: run level-one totals")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("13-TMA: read level-one totals");
+    assert!(!totals.is_empty(), "13-TMA: {rung} produced no metrics");
+    for (core, total) in totals {
+        assert!(
+            (total - 1.0).abs() < 0.02,
+            "13-TMA: {rung} level-one fractions for '{core}' sum to {total}, not 1.0"
+        );
     }
 }
 

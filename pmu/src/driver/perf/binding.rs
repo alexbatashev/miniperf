@@ -50,6 +50,7 @@ pub fn direct(
             id,
             fd: new_fd,
             leader: false,
+            sampled: false,
         });
     }
 
@@ -67,6 +68,10 @@ pub fn grouped_on_cpu(
     pid: i32,
     cpu: i32,
 ) -> Result<Vec<NativeCounterHandle>, Error> {
+    if counters.iter().any(is_topdown) {
+        return grouped_topdown_on_cpu(counters, attrs, pid, cpu);
+    }
+
     // TMA passes one complete group after another, each beginning with cycles.
     // Do not flatten these into the historical arbitrary chunks: doing so
     // breaks the common denominator that makes a Top-down ratio meaningful.
@@ -115,13 +120,7 @@ pub fn grouped_on_cpu(
     // zero samples, so shrink every group by the counters the kernel keeps.
     let max_counters_in_group = info
         .and_then(|info| info.max_counters)
-        .unwrap_or_else(|| {
-            if leader.is_some() {
-                2
-            } else {
-                3
-            }
-        })
+        .unwrap_or_else(|| if leader.is_some() { 2 } else { 3 })
         .saturating_sub(reserved_hardware_counters())
         .max(1);
 
@@ -210,6 +209,62 @@ pub fn grouped_on_cpu(
         }
     }
 
+    Ok(handles)
+}
+
+fn is_topdown(counter: &Counter) -> bool {
+    matches!(counter, Counter::Custom(name) if crate::is_topdown_event(name))
+}
+
+/// Open the fixed-topdown group for one task on one CPU.
+///
+/// The whole event set forms a single scheduling domain: a level-one breakdown
+/// is only meaningful when every counter in it was enabled over exactly the
+/// same interval. Intel PERF_METRICS additionally demands that `slots` leads
+/// the group and that neither the leader nor the metric events sample, so the
+/// cycles sibling owns the ring buffer and reports the rest through its
+/// grouped read.
+fn grouped_topdown_on_cpu(
+    counters: &[Counter],
+    attrs: &mut [perf_event_attr],
+    pid: i32,
+    cpu: i32,
+) -> Result<Vec<NativeCounterHandle>, Error> {
+    let sampled = counters
+        .iter()
+        .position(|counter| *counter == Counter::Cycles)
+        .ok_or_else(|| {
+            Error::InvalidConfiguration("a topdown group must sample cycles".to_owned())
+        })?;
+    let leader = counters
+        .iter()
+        .position(|counter| matches!(counter, Counter::Custom(name) if name == crate::GROUP_LEADER))
+        .unwrap_or(sampled);
+
+    let mut handles = Vec::with_capacity(counters.len());
+    let leader_fd = unsafe { sys::perf_event_open(&mut attrs[leader], pid, cpu, -1, 0) };
+    push_handle_with(
+        &mut handles,
+        leader_fd,
+        counters[leader].clone(),
+        true,
+        leader == sampled,
+        cpu,
+    )?;
+    for (index, (counter, attr)) in zip(counters, attrs).enumerate() {
+        if index == leader {
+            continue;
+        }
+        let fd = unsafe { sys::perf_event_open(attr, pid, cpu, leader_fd, 0) };
+        push_handle_with(
+            &mut handles,
+            fd,
+            counter.clone(),
+            false,
+            index == sampled,
+            cpu,
+        )?;
+    }
     Ok(handles)
 }
 
@@ -330,7 +385,18 @@ fn push_handle(
     leader: bool,
     cpu: i32,
 ) -> Result<(), Error> {
-    match get_native_handle(fd, counter, leader, cpu) {
+    push_handle_with(handles, fd, counter, leader, leader, cpu)
+}
+
+fn push_handle_with(
+    handles: &mut Vec<NativeCounterHandle>,
+    fd: i32,
+    counter: Counter,
+    leader: bool,
+    sampled: bool,
+    cpu: i32,
+) -> Result<(), Error> {
+    match get_native_handle(fd, counter, leader, sampled, cpu) {
         Ok(handle) => {
             handles.push(handle);
             Ok(())
@@ -347,6 +413,7 @@ fn get_native_handle(
     fd: i32,
     cntr: Counter,
     leader: bool,
+    sampled: bool,
     cpu: i32,
 ) -> Result<NativeCounterHandle, Error> {
     if fd < 0 {
@@ -368,6 +435,7 @@ fn get_native_handle(
         id,
         fd,
         leader,
+        sampled,
     })
 }
 

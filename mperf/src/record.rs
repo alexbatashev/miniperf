@@ -30,6 +30,18 @@ pub async fn do_record(
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
 
+    let fidelity = crate::source::resolve_fidelity(scenario);
+    println!(
+        "Capture fidelity: {} at '{}'{}",
+        fidelity.scenario,
+        fidelity.rung,
+        fidelity
+            .rejected
+            .first()
+            .map(|rejected| format!(" ({})", rejected.reason))
+            .unwrap_or_default()
+    );
+
     let cpu_info = if scenario == Scenario::Mem
         && roofline::uses_native_performance(&roofline_options, &command)?
     {
@@ -139,6 +151,7 @@ pub async fn do_record(
         logical_cpu_count: host_logical_cpu_count(),
         cores,
         cpu_info,
+        capture_fidelity: vec![fidelity],
         scenario_info: info,
     };
 
@@ -396,6 +409,7 @@ pub(crate) fn sample_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::
                 timestamp: sample.time,
                 name,
                 callstack,
+                lbr_callstack: sample.lbr_callstack.into_vec(),
                 user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
                     abi: regs.abi,
                     mask: regs.mask,
@@ -411,6 +425,49 @@ pub(crate) fn sample_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::
             offset: addr.pgoff as usize,
             pid: addr.pid,
         }),
+        Record::MemSample(_) => {}
+    })
+}
+
+/// Forwards precise memory samples into the session's `mem_samples_raw` table.
+pub(crate) fn mem_sample_callback(
+    dispatcher: Arc<EventDispatcher>,
+) -> Arc<dyn pmu::SamplingCallback> {
+    Arc::new(move |record| match record {
+        Record::MemSample(sample) => {
+            let mut callstack = vec![sample.ip];
+            callstack.extend(
+                sample
+                    .callstack
+                    .into_iter()
+                    .filter(|address| *address != sample.ip),
+            );
+            dispatcher.publish_mem_sample_sync(mperf_data::MemSample {
+                timestamp: sample.time,
+                process_id: sample.pid,
+                thread_id: sample.tid,
+                cpu: sample.cpu,
+                data_addr: sample.data_addr,
+                latency: sample.latency,
+                data_src: sample.data_src,
+                callstack,
+                lbr_callstack: sample.lbr_callstack.into_vec(),
+                user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
+                    abi: regs.abi,
+                    mask: regs.mask,
+                    values: regs.values,
+                }),
+                user_stack: sample.user_stack,
+            });
+        }
+        Record::ProcAddr(addr) => dispatcher.publish_proc_map_sync(ProcMapEntry {
+            filename: addr.filename,
+            address: addr.addr as usize,
+            size: addr.len as usize,
+            offset: addr.pgoff as usize,
+            pid: addr.pid,
+        }),
+        Record::Sample(_) => {}
     })
 }
 
@@ -504,7 +561,7 @@ fn topdown(
     command: &[String],
     output_directory: &Path,
 ) -> Result<ScenarioInfo> {
-    let scenario = pmu::host_tma_scenario().context("TMA is not supported on this CPU")?;
+    let scenario = pmu::tma_scenario().context("TMA is not supported on this CPU")?;
     // Validate the formula groups, but do not turn each one into an independent
     // sampling leader. Multiple cycle leaders multiply the interrupt rate and
     // severely perturb the workload (especially while capturing DWARF stacks).
@@ -513,12 +570,18 @@ fn topdown(
 
     // TMA uses the same sampling engine and attribution mode as Snapshot.
     // Only the counter set differs.
+    // Precise memory samples (PEBS/SPE) run in their own event slots and do
+    // not compete with the topdown counter group, so a TMA recording gets
+    // instruction-level memory attribution for free where the host has it.
     let pass = Pass {
         name: "tma",
         required: vec![Box::new(PmuSamplingSource::for_scenario(Scenario::TMA))],
-        optional: vec![Box::new(crate::source::InternalEventsSource {
-            roofline_instrumented: false,
-        })],
+        optional: vec![
+            Box::new(crate::source::InternalEventsSource {
+                roofline_instrumented: false,
+            }),
+            Box::new(crate::source::PreciseMemorySource::default()),
+        ],
     };
     let mut pass = pass.resolve(output_directory)?;
     let child_env = pass.child_environment(output_directory);

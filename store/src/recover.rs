@@ -36,9 +36,8 @@ pub fn recover_session(dir: &Path) -> Result<RecoveryReport> {
             Ok(()) => report.healthy += 1,
             Err(_) => {
                 let quarantine = path.with_extension("parquet.corrupt");
-                std::fs::rename(&path, &quarantine).with_context(|| {
-                    format!("failed to quarantine {}", path.display())
-                })?;
+                std::fs::rename(&path, &quarantine)
+                    .with_context(|| format!("failed to quarantine {}", path.display()))?;
                 report.quarantined.push(quarantine);
             }
         }

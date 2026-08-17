@@ -23,8 +23,7 @@ const MPICH_BYTE: usize = 0x4c00_010d;
 const MPICH_STATUS_IGNORE: usize = 1;
 
 type SendFn = unsafe extern "C" fn(*const c_void, c_int, usize, c_int, c_int, usize) -> c_int;
-type RecvFn =
-    unsafe extern "C" fn(*mut c_void, c_int, usize, c_int, c_int, usize, usize) -> c_int;
+type RecvFn = unsafe extern "C" fn(*mut c_void, c_int, usize, c_int, c_int, usize, usize) -> c_int;
 type CommRankFn = unsafe extern "C" fn(usize, *mut c_int) -> c_int;
 type InitFn = unsafe extern "C" fn(*mut c_int, *mut *mut *mut c_char) -> c_int;
 type InitThreadFn =
@@ -68,8 +67,7 @@ fn core_resolve() -> bool {
 }
 
 fn timestamp() -> i64 {
-    let f: TimestampFn =
-        unsafe { std::mem::transmute(CORE_TIMESTAMP.load(Ordering::Acquire)) };
+    let f: TimestampFn = unsafe { std::mem::transmute(CORE_TIMESTAMP.load(Ordering::Acquire)) };
     unsafe { f() }
 }
 
@@ -122,8 +120,18 @@ fn env_number(names: &[&str]) -> Option<i64> {
 }
 
 fn rank_and_size(abi: Option<&MpiAbi>) -> (Option<i64>, Option<i64>) {
-    let mut rank = env_number(&["OMPI_COMM_WORLD_RANK", "PMIX_RANK", "PMI_RANK", "SLURM_PROCID"]);
-    let size = env_number(&["OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "SLURM_NTASKS", "MPI_LOCALNRANKS"]);
+    let mut rank = env_number(&[
+        "OMPI_COMM_WORLD_RANK",
+        "PMIX_RANK",
+        "PMI_RANK",
+        "SLURM_PROCID",
+    ]);
+    let size = env_number(&[
+        "OMPI_COMM_WORLD_SIZE",
+        "PMI_SIZE",
+        "SLURM_NTASKS",
+        "MPI_LOCALNRANKS",
+    ]);
     if rank.is_none()
         && let Some(abi) = abi
     {

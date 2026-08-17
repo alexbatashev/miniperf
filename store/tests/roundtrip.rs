@@ -9,7 +9,10 @@ fn base_names_strip_pid_and_seq() {
     assert_eq!(table_base_name("event_meta-1234-2"), "event_meta");
     assert_eq!(table_base_name("clock-99"), "clock");
     assert_eq!(table_base_name("stacks"), "stacks");
-    assert_eq!(table_base_name("snapshot_resource_samples"), "snapshot_resource_samples");
+    assert_eq!(
+        table_base_name("snapshot_resource_samples"),
+        "snapshot_resource_samples"
+    );
 }
 
 #[test]
