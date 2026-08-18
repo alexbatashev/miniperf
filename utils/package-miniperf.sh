@@ -21,6 +21,9 @@ package_crates=(-p mperf -p miniperf-collector-core)
 if [[ "${target}" != riscv64gc-unknown-linux-gnu ]]; then
     package_crates+=(-p mperf-gui)
 fi
+if [[ "${target}" == *-linux-* ]]; then
+    package_crates+=(-p miniperf-shim-libc)
+fi
 
 cargo build \
     --locked \
@@ -51,17 +54,9 @@ if [[ "${target}" == *-linux-* ]]; then
         "${target_directory}/${target}/release/libminiperf_qemu_roofline.so" \
         "${package_root}/lib/miniperf/libminiperf_qemu_roofline.so"
 
-    preload_library="$(find \
-        "${target_directory}/${target}/release/build" \
-        -path '*/mperf-*/out/libmperf_memory_preload.so' \
-        -print -quit)"
-    if [[ -z "${preload_library}" ]]; then
-        printf 'Memory preload library for %s was not built\n' "${target}" >&2
-        exit 1
-    fi
     install -m 0755 \
-        "${preload_library}" \
-        "${package_root}/lib/miniperf/libmperf_memory_preload.so"
+        "${target_directory}/${target}/release/libmperf_libc.so" \
+        "${package_root}/lib/miniperf/libmperf_libc.so"
 else
     install -m 0755 \
         "${target_directory}/${target}/release/libmperf_collector.dylib" \
