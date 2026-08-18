@@ -23,6 +23,7 @@ type Frames = SmallVec<[u64; 32]>;
 const BATCH_ROWS: usize = 8192;
 
 /// One row of `samples_raw`, borrowed from the Arrow batch it was read from.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct RawSample<'a> {
     pub timestamp: i64,
     pub pid: u32,

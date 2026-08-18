@@ -21,6 +21,7 @@ pub struct EventDispatcher {
 
 enum Msg {
     Event(Box<Event>),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     MemSample(MemSample),
     Module(ProcMapEntry),
 }
@@ -341,6 +342,7 @@ impl EventDispatcher {
         }
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn publish_mem_sample_sync(&self, sample: MemSample) {
         if self.tx.send(Msg::MemSample(sample)).is_err() {
             eprintln!("lost memory sample: writer stopped");

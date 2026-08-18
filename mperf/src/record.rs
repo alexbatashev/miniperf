@@ -431,6 +431,7 @@ pub(crate) fn sample_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::
 }
 
 /// Forwards precise memory samples into the session's `mem_samples_raw` table.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn mem_sample_callback(
     dispatcher: Arc<EventDispatcher>,
 ) -> Arc<dyn pmu::SamplingCallback> {

@@ -25,6 +25,7 @@ pub enum Availability {
 /// Everything a source needs to know about the pass it runs in. The target
 /// process is the launched (still suspended) root, or an attach PID.
 pub struct SessionContext {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub directory: PathBuf,
     pub dispatcher: Arc<EventDispatcher>,
     pub process: Option<Rc<Process>>,
@@ -37,6 +38,7 @@ impl SessionContext {
             .unwrap_or_else(|| self.process.as_ref().expect("no target process").pid() as u32)
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn launched(&self) -> bool {
         self.process.is_some()
     }
@@ -157,6 +159,7 @@ impl ResolvedPass {
 pub struct PmuSamplingSource {
     counters: Vec<Counter>,
     sample_freq: Option<u64>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     stack_dump_size: Option<u32>,
     drivers: Vec<Box<dyn pmu::SamplingDriver>>,
     recorded: Vec<Counter>,
