@@ -63,6 +63,7 @@ pub(crate) fn as_f64(value: &Value) -> Option<f64> {
         Value::UBigInt(value) => Some(*value as f64),
         Value::UHugeInt(value) => Some(*value as f64),
         Value::HugeInt(value) => Some(*value as f64),
+        Value::Decimal(value) => value.to_string().parse().ok(),
         _ => as_i64(value).map(|value| value as f64),
     }
 }

@@ -24,7 +24,6 @@ pub struct MemorySummary {
     pub accessed_footprint_bytes: u64,
     pub modeled_dram_read_bytes: u64,
     pub modeled_dram_write_bytes: u64,
-    pub native_duration_ns: u64,
     pub peak_allocated_bytes: Option<u64>,
     pub peak_rss_bytes: Option<u64>,
     pub cold_fraction: Option<f64>,
@@ -66,22 +65,6 @@ pub struct TimelinePoint {
     pub write_gbytes_per_second: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CacheTrafficLevel {
-    pub label: String,
-    pub capacity_bytes: u64,
-    pub shared_by: usize,
-    pub miss_ratio: f64,
-    pub line_fill_bytes: f64,
-    pub bandwidth_gbytes_per_second: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct MemoryHierarchy {
-    pub levels: Vec<CacheTrafficLevel>,
-    pub uses_recorded_topology: bool,
-}
-
 impl MemoryData {
     pub fn load(connection: &Connection, calibration_levels: Vec<MemoryLevelCalibration>) -> Self {
         match load(connection, calibration_levels) {
@@ -101,62 +84,6 @@ impl MemoryData {
             },
         }
     }
-
-    pub fn hierarchy(&self) -> Option<MemoryHierarchy> {
-        let summary = self.summary.as_ref()?;
-        let recorded = self
-            .calibration_levels
-            .iter()
-            .filter(|level| level.capacity_bytes > 0)
-            .map(|level| {
-                (
-                    level.level.clone(),
-                    level.capacity_bytes,
-                    level.shared_by,
-                    Some(level.gbytes_per_second),
-                )
-            })
-            .collect::<Vec<_>>();
-        let uses_recorded_topology = !recorded.is_empty();
-        let definitions = if uses_recorded_topology {
-            recorded
-        } else {
-            vec![
-                ("32 KiB cache".to_string(), 32 * 1024, 0, None),
-                ("256 KiB cache".to_string(), 256 * 1024, 0, None),
-                ("8 MiB cache".to_string(), 8 * 1024 * 1024, 0, None),
-            ]
-        };
-        let levels = definitions
-            .into_iter()
-            .map(
-                |(label, capacity_bytes, shared_by, bandwidth_gbytes_per_second)| {
-                    let miss_ratio = self.miss_ratio_at(capacity_bytes);
-                    CacheTrafficLevel {
-                        label,
-                        capacity_bytes,
-                        shared_by,
-                        miss_ratio,
-                        line_fill_bytes: miss_ratio
-                            * summary.reference_count as f64
-                            * summary.line_size as f64,
-                        bandwidth_gbytes_per_second,
-                    }
-                },
-            )
-            .collect();
-        Some(MemoryHierarchy {
-            levels,
-            uses_recorded_topology,
-        })
-    }
-
-    fn miss_ratio_at(&self, capacity_bytes: u64) -> f64 {
-        self.miss_ratio
-            .iter()
-            .min_by_key(|point| point.cache_bytes.abs_diff(capacity_bytes))
-            .map_or(0.0, |point| point.miss_ratio.clamp(0.0, 1.0))
-    }
 }
 
 fn load(
@@ -167,7 +94,7 @@ fn load(
         .prepare(
             "SELECT line_size, reference_count, architectural_load_bytes,
                 architectural_store_bytes, accessed_footprint_bytes,
-                modeled_dram_read_bytes, modeled_dram_write_bytes, native_duration_ns,
+                modeled_dram_read_bytes, modeled_dram_write_bytes,
                 peak_allocated_bytes, peak_rss_bytes,
                 cold_fraction, achieved_gbytes_per_second, peak_gbytes_per_second,
                 bandwidth_utilization, bandwidth_source, bandwidth_scope, quality
@@ -183,20 +110,19 @@ fn load(
             accessed_footprint_bytes: row.get::<_, i64>(4)?.max(0) as u64,
             modeled_dram_read_bytes: row.get::<_, i64>(5)?.max(0) as u64,
             modeled_dram_write_bytes: row.get::<_, i64>(6)?.max(0) as u64,
-            native_duration_ns: row.get::<_, i64>(7)?.max(0) as u64,
             peak_allocated_bytes: row
-                .get::<_, Option<i64>>(8)?
+                .get::<_, Option<i64>>(7)?
                 .map(|value| value.max(0) as u64),
             peak_rss_bytes: row
-                .get::<_, Option<i64>>(9)?
+                .get::<_, Option<i64>>(8)?
                 .map(|value| value.max(0) as u64),
-            cold_fraction: row.get::<_, Option<f64>>(10)?,
-            achieved_gbytes_per_second: row.get::<_, Option<f64>>(11)?,
-            peak_gbytes_per_second: row.get::<_, Option<f64>>(12)?,
-            bandwidth_utilization: row.get::<_, Option<f64>>(13)?,
-            bandwidth_source: row.get::<_, String>(14)?,
-            bandwidth_scope: row.get::<_, String>(15)?,
-            quality: row.get::<_, String>(16)?,
+            cold_fraction: row.get::<_, Option<f64>>(9)?,
+            achieved_gbytes_per_second: row.get::<_, Option<f64>>(10)?,
+            peak_gbytes_per_second: row.get::<_, Option<f64>>(11)?,
+            bandwidth_utilization: row.get::<_, Option<f64>>(12)?,
+            bandwidth_source: row.get::<_, String>(13)?,
+            bandwidth_scope: row.get::<_, String>(14)?,
+            quality: row.get::<_, String>(15)?,
         }),
         None => None,
     };
@@ -279,61 +205,4 @@ fn load_unsigned_histogram(connection: &Connection, query: &str) -> Result<Vec<H
         })?
         .collect::<SqlResult<Vec<_>>>()?;
     Ok(points)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hierarchy_uses_recorded_capacities_for_lru_line_fill_traffic() {
-        let data = MemoryData {
-            summary: Some(MemorySummary {
-                line_size: 64,
-                reference_count: 100,
-                architectural_load_bytes: 800,
-                architectural_store_bytes: 400,
-                accessed_footprint_bytes: 64 * 1024,
-                modeled_dram_read_bytes: 1_024,
-                modeled_dram_write_bytes: 512,
-                native_duration_ns: 1_000,
-                peak_allocated_bytes: None,
-                peak_rss_bytes: None,
-                cold_fraction: Some(0.1),
-                achieved_gbytes_per_second: Some(1.0),
-                peak_gbytes_per_second: Some(10.0),
-                bandwidth_utilization: Some(0.1),
-                bandwidth_source: "process_modeled".to_string(),
-                bandwidth_scope: "process".to_string(),
-                quality: "test".to_string(),
-            }),
-            working_set: Vec::new(),
-            miss_ratio: vec![MissRatioPoint {
-                cache_bytes: 32 * 1024,
-                miss_ratio: 0.25,
-            }],
-            spatial: Vec::new(),
-            strides: Vec::new(),
-            timeline: Vec::new(),
-            calibration_levels: vec![MemoryLevelCalibration {
-                level: "L1".to_string(),
-                gbytes_per_second: 200.0,
-                gbytes_per_second_samples: vec![200.0],
-                working_set_bytes: 16 * 1024,
-                capacity_bytes: 32 * 1024,
-                shared_by: 1,
-            }],
-            error: None,
-        };
-
-        let hierarchy = data.hierarchy().unwrap();
-        assert!(hierarchy.uses_recorded_topology);
-        assert_eq!(hierarchy.levels.len(), 1);
-        assert_eq!(hierarchy.levels[0].label, "L1");
-        assert_eq!(hierarchy.levels[0].capacity_bytes, 32 * 1024);
-        assert_eq!(hierarchy.levels[0].shared_by, 1);
-        assert_eq!(hierarchy.levels[0].miss_ratio, 0.25);
-        assert_eq!(hierarchy.levels[0].line_fill_bytes, 1_600.0);
-        assert_eq!(hierarchy.levels[0].bandwidth_gbytes_per_second, Some(200.0));
-    }
 }

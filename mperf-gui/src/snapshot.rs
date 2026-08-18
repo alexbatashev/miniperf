@@ -9,8 +9,6 @@ pub struct SnapshotData {
     pub resources: Vec<ResourceUse>,
     pub findings: Vec<SnapshotFinding>,
     pub collectors: Vec<SnapshotCollector>,
-    pub duration_ns: u64,
-    pub sample_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,7 +78,6 @@ pub struct SnapshotFinding {
 pub struct SnapshotCollector {
     pub name: String,
     pub status: String,
-    pub quality: String,
     pub message: String,
 }
 
@@ -89,7 +86,6 @@ pub struct ResourceUse {
     pub resource: String,
     /// Derived one-line summary, e.g. "3.5% of 48 CPUs".
     pub headline: Option<String>,
-    pub severity: Severity,
     /// Formatted summary metrics per USE category, in category order.
     pub summaries: [Vec<SummaryMetric>; 3],
     pub charts: Vec<SnapshotChart>,
@@ -100,6 +96,8 @@ pub struct SummaryMetric {
     pub metric: String,
     pub value: String,
     pub scope: String,
+    /// 0..=1 position against the metric's natural ceiling, when it has one.
+    pub fraction: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +106,6 @@ pub struct SnapshotChart {
     pub category: UseCategory,
     /// Display unit after rate conversion, e.g. "MiB/s", "cores", "%".
     pub unit: String,
-    pub scope: String,
     /// One series per resource id (host, device, interface, …), sorted by id.
     pub series: Vec<ChartSeries>,
     pub max_value: f64,
@@ -119,7 +116,6 @@ pub struct ChartSeries {
     pub id: String,
     /// (seconds from recording start, value in display units)
     pub points: Vec<(f64, f64)>,
-    pub last: f64,
 }
 
 struct SampleRow {
@@ -145,22 +141,10 @@ impl SnapshotData {
             .map(|sample| sample.timestamp_ns)
             .max()
             .unwrap_or(0);
-        let sample_count = samples
-            .iter()
-            .filter(|sample| sample.resource == samples[0].resource)
-            .filter(|sample| sample.metric == samples[0].metric)
-            .count() as u64;
-
         let findings = load_findings(connection);
         let collectors = load_collectors(connection);
         let summary_rows = load_summary(connection);
-        let resources = build_resources(
-            samples,
-            &summary_rows,
-            &findings,
-            duration_ns,
-            logical_cpu_count,
-        );
+        let resources = build_resources(samples, &summary_rows, duration_ns, logical_cpu_count);
         if resources.is_empty() {
             return None;
         }
@@ -169,8 +153,6 @@ impl SnapshotData {
             resources,
             findings,
             collectors,
-            duration_ns,
-            sample_count,
         })
     }
 }
@@ -285,8 +267,8 @@ fn load_findings(connection: &Connection) -> Vec<SnapshotFinding> {
 }
 
 fn load_collectors(connection: &Connection) -> Vec<SnapshotCollector> {
-    let Ok(mut statement) = connection
-        .prepare("SELECT name, status, quality, message FROM snapshot_collectors ORDER BY name;")
+    let Ok(mut statement) =
+        connection.prepare("SELECT name, status, message FROM snapshot_collectors ORDER BY name;")
     else {
         return Vec::new();
     };
@@ -294,8 +276,7 @@ fn load_collectors(connection: &Connection) -> Vec<SnapshotCollector> {
         Ok(SnapshotCollector {
             name: row.get(0)?,
             status: row.get(1)?,
-            quality: row.get(2)?,
-            message: row.get(3)?,
+            message: row.get(2)?,
         })
     }) else {
         return Vec::new();
@@ -308,7 +289,6 @@ const RESOURCE_ORDER: [&str; 5] = ["cpu", "memory", "disk", "io", "network"];
 fn build_resources(
     samples: Vec<SampleRow>,
     summary_rows: &[SummaryRow],
-    findings: &[SnapshotFinding],
     duration_ns: u64,
     logical_cpu_count: Option<u32>,
 ) -> Vec<ResourceUse> {
@@ -330,7 +310,7 @@ fn build_resources(
 
     let mut charts_by_resource = BTreeMap::<String, Vec<SnapshotChart>>::new();
     for ((resource, category, metric), by_id) in grouped {
-        let (unit, scope) = units
+        let (unit, _) = units
             .remove(&(resource.clone(), category, metric.clone()))
             .unwrap_or_default();
         let kind = metric_kind(&metric, &unit);
@@ -353,7 +333,6 @@ fn build_resources(
                 metric,
                 category,
                 unit: kind.display_unit(&unit),
-                scope,
                 series,
                 max_value,
             });
@@ -364,14 +343,6 @@ fn build_resources(
                 .cmp(&right.category)
                 .then_with(|| left.metric.cmp(&right.metric))
         });
-    }
-
-    let mut severities = BTreeMap::<&str, Severity>::new();
-    for finding in findings {
-        let entry = severities
-            .entry(&finding.resource)
-            .or_insert(Severity::Info);
-        *entry = (*entry).max(finding.severity);
     }
 
     let mut resources = charts_by_resource.keys().cloned().collect::<Vec<_>>();
@@ -386,7 +357,7 @@ fn build_resources(
         .into_iter()
         .map(|resource| {
             let charts = charts_by_resource.remove(&resource).unwrap_or_default();
-            let summaries = summarize(summary_rows, &resource);
+            let summaries = summarize(summary_rows, &resource, duration_ns, logical_cpu_count);
             ResourceUse {
                 headline: headline(
                     &resource,
@@ -395,10 +366,6 @@ fn build_resources(
                     duration_ns,
                     logical_cpu_count,
                 ),
-                severity: severities
-                    .get(resource.as_str())
-                    .copied()
-                    .unwrap_or(Severity::Info),
                 summaries,
                 charts,
                 resource,
@@ -475,15 +442,19 @@ fn build_series(
     if converted.is_empty() {
         return None;
     }
-    let last = converted.last().map(|point| point.1).unwrap_or(0.0);
     Some(ChartSeries {
         id,
         points: converted,
-        last,
     })
 }
 
-fn summarize(summary_rows: &[SummaryRow], resource: &str) -> [Vec<SummaryMetric>; 3] {
+fn summarize(
+    summary_rows: &[SummaryRow],
+    resource: &str,
+    duration_ns: u64,
+    logical_cpu_count: Option<u32>,
+) -> [Vec<SummaryMetric>; 3] {
+    let host_total = summary_value(summary_rows, resource, "host_total");
     let mut result: [Vec<SummaryMetric>; 3] = Default::default();
     for row in summary_rows.iter().filter(|row| row.resource == resource) {
         let index = UseCategory::ALL
@@ -497,9 +468,33 @@ fn summarize(summary_rows: &[SummaryRow], resource: &str) -> [Vec<SummaryMetric>
                 .map(|value| format_value(value, &row.unit))
                 .unwrap_or_else(|| "—".to_string()),
             scope: row.scope.clone(),
+            fraction: metric_fraction(row, duration_ns, logical_cpu_count, host_total),
         });
     }
     result
+}
+
+/// Normalizes a summary value into 0..=1 when its unit has a natural ceiling:
+/// percentages, CPU time against the machine's capacity, byte gauges against
+/// the host's total. Everything else has no meaningful meter.
+fn metric_fraction(
+    row: &SummaryRow,
+    duration_ns: u64,
+    logical_cpu_count: Option<u32>,
+    host_total: Option<f64>,
+) -> Option<f64> {
+    let value = row.value?;
+    let fraction = match row.unit.as_str() {
+        "percent" => value / 100.0,
+        "seconds" if row.resource == "cpu" => {
+            let capacity =
+                (duration_ns as f64 / 1e9) * logical_cpu_count.unwrap_or(1).max(1) as f64;
+            value / capacity
+        }
+        "bytes" => value / host_total.filter(|total| *total > 0.0)?,
+        _ => return None,
+    };
+    fraction.is_finite().then(|| fraction.clamp(0.0, 1.0))
 }
 
 fn summary_value(summary_rows: &[SummaryRow], resource: &str, metric: &str) -> Option<f64> {
@@ -767,7 +762,6 @@ mod tests {
         assert_eq!(cpu_chart.series[0].points, vec![(1.0, 2.0), (2.0, 2.0)]);
 
         let memory = &data.resources[1];
-        assert_eq!(memory.severity, Severity::High);
         let rss_chart = memory.charts.iter().find(|c| c.metric == "rss").unwrap();
         assert_eq!(rss_chart.unit, "bytes");
         assert_eq!(rss_chart.series[0].points.len(), 3);
@@ -779,7 +773,36 @@ mod tests {
 
         assert_eq!(data.findings.len(), 1);
         assert_eq!(data.collectors[0].status, "permission_denied");
-        assert_eq!(data.duration_ns, 2_000_000_000);
+    }
+
+    #[test]
+    fn summary_metrics_meter_only_against_a_real_ceiling() {
+        let row = |resource: &str, metric: &str, value: f64, unit: &str| SummaryRow {
+            resource: resource.to_owned(),
+            category: UseCategory::Utilization,
+            metric: metric.to_owned(),
+            value: Some(value),
+            unit: unit.to_owned(),
+            scope: "process_tree".to_owned(),
+        };
+        let rows = [
+            row("cpu", "cgroup_cpu_time", 4.0, "seconds"),
+            row("memory", "rss", 2.0, "bytes"),
+            row("memory", "host_total", 8.0, "bytes"),
+            row("io", "psi_some_avg10", 25.0, "percent"),
+            row("disk", "read_operations", 1234.0, "operations"),
+        ];
+        let fraction = |resource: &str| {
+            summarize(&rows, resource, 2_000_000_000, Some(8))[0]
+                .first()
+                .and_then(|metric| metric.fraction)
+        };
+
+        // 4 CPU-seconds of a 2s × 8-CPU budget.
+        assert_eq!(fraction("cpu"), Some(0.25));
+        assert_eq!(fraction("memory"), Some(0.25));
+        assert_eq!(fraction("io"), Some(0.25));
+        assert_eq!(fraction("disk"), None);
     }
 
     #[test]

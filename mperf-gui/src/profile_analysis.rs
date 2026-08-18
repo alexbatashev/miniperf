@@ -1,7 +1,6 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
-    ops::Range,
 };
 
 use crate::profile::{
@@ -10,6 +9,8 @@ use crate::profile::{
 };
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// Never fold into fewer rows than this, however sparse the recording is.
+const MIN_FOLD_BINS: u64 = 12;
 
 /// A common sample filter used by every profile analysis.
 ///
@@ -21,10 +22,14 @@ pub(crate) struct SampleFilter {
     pub range: Option<TimeRange>,
     pub process_id: Option<u32>,
     pub thread_id: Option<u32>,
+    /// Accept only samples from these threads; `None` accepts every thread.
+    pub threads: Option<BTreeSet<u32>>,
     pub cpu: Option<u32>,
     pub required_counter: Option<usize>,
     /// Accept a sample when its stack contains at least one selected frame.
     pub frame_ids: Option<BTreeSet<usize>>,
+    /// Accept a sample when its leaf frame is in this set (module scoping).
+    pub leaf_frames: Option<BTreeSet<usize>>,
 }
 
 impl SampleFilter {
@@ -50,6 +55,13 @@ impl SampleFilter {
         {
             return false;
         }
+        if self
+            .threads
+            .as_ref()
+            .is_some_and(|threads| !threads.contains(&sample.thread_id))
+        {
+            return false;
+        }
         if self.cpu.is_some_and(|cpu| sample.cpu != Some(cpu)) {
             return false;
         }
@@ -58,6 +70,14 @@ impl SampleFilter {
                 .stack
                 .iter()
                 .any(|frame_id| frame_ids.contains(frame_id))
+        }) {
+            return false;
+        }
+        if self.leaf_frames.as_ref().is_some_and(|leaf_frames| {
+            !sample
+                .stack
+                .last()
+                .is_some_and(|frame_id| leaf_frames.contains(frame_id))
         }) {
             return false;
         }
@@ -84,6 +104,13 @@ impl SampleFilter {
         {
             return false;
         }
+        if self
+            .threads
+            .as_ref()
+            .is_some_and(|threads| !threads.contains(&observation.thread_id))
+        {
+            return false;
+        }
         if self.cpu.is_some_and(|cpu| observation.cpu != Some(cpu)) {
             return false;
         }
@@ -92,6 +119,14 @@ impl SampleFilter {
                 .stack
                 .iter()
                 .any(|frame_id| frame_ids.contains(frame_id))
+        }) {
+            return false;
+        }
+        if self.leaf_frames.as_ref().is_some_and(|leaf_frames| {
+            !observation
+                .stack
+                .last()
+                .is_some_and(|frame_id| leaf_frames.contains(frame_id))
         }) {
             return false;
         }
@@ -113,6 +148,9 @@ pub(crate) struct FlameScopeBin {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FlameScopeHeatmap {
     pub range: TimeRange,
+    /// Time folded into one row (classically one second, shortened for short
+    /// recordings so the grid keeps a usable number of columns).
+    pub fold_ns: u64,
     pub bin_width_ns: u64,
     pub rows: usize,
     pub columns: usize,
@@ -122,19 +160,34 @@ pub(crate) struct FlameScopeHeatmap {
 }
 
 impl FlameScopeHeatmap {
-    pub fn build(profile: &ProfileData, filter: &SampleFilter, max_columns: usize) -> Option<Self> {
+    pub fn build(profile: &ProfileData, filter: &SampleFilter, max_bins: usize) -> Option<Self> {
         let range = analysis_range(profile, filter)?;
         let duration = range.end_ns.saturating_sub(range.start_ns);
         if duration == 0 {
             return None;
         }
 
-        let target_columns = max_columns.max(1);
-        let bin_width_ns = nice_bin_width(div_ceil(NANOS_PER_SECOND, target_columns as u64)).max(1);
-        let columns = usize::try_from(div_ceil(NANOS_PER_SECOND, bin_width_ns))
+        let fold_ns = fold_period(duration);
+        let rows = usize::try_from(div_ceil(duration, fold_ns))
             .unwrap_or(usize::MAX)
             .max(1);
-        let rows = usize::try_from(div_ceil(duration, NANOS_PER_SECOND))
+
+        // Bin height follows sample density, not just time: a grid finer than
+        // the samples can fill reads as noise, not as a heatmap.
+        let accepted = profile
+            .samples
+            .iter()
+            .filter(|sample| filter.matches(sample))
+            .filter(|sample| {
+                sample.timestamp_ns >= range.start_ns && sample.timestamp_ns < range.end_ns
+            })
+            .count() as u64;
+        let cap = max_bins.max(1) as u64;
+        let target_bins = (accepted / rows as u64 / 2).clamp(MIN_FOLD_BINS.min(cap), cap);
+        let bin_width_ns = nice_bin_width(div_ceil(fold_ns, target_bins))
+            .min(fold_ns)
+            .max(1);
+        let columns = usize::try_from(div_ceil(fold_ns, bin_width_ns))
             .unwrap_or(usize::MAX)
             .max(1);
         let cell_count = rows.checked_mul(columns)?;
@@ -150,9 +203,9 @@ impl FlameScopeHeatmap {
                 continue;
             }
             let relative = sample.timestamp_ns - range.start_ns;
-            let row = usize::try_from(relative / NANOS_PER_SECOND).ok()?;
-            let within_second = relative % NANOS_PER_SECOND;
-            let column = usize::try_from(within_second / bin_width_ns).ok()?;
+            let row = usize::try_from(relative / fold_ns).ok()?;
+            let within_fold = relative % fold_ns;
+            let column = usize::try_from(within_fold / bin_width_ns).ok()?;
             let Some(bin) = row
                 .checked_mul(columns)
                 .and_then(|index| index.checked_add(column))
@@ -167,6 +220,7 @@ impl FlameScopeHeatmap {
         let max_samples = bins.iter().map(|bin| bin.samples).max().unwrap_or(0);
         Some(Self {
             range,
+            fold_ns,
             bin_width_ns,
             rows,
             columns,
@@ -180,36 +234,6 @@ impl FlameScopeHeatmap {
         row.checked_mul(self.columns)
             .and_then(|index| index.checked_add(column))
             .and_then(|index| self.bins.get(index))
-    }
-
-    /// Converts a rectangular heatmap selection into its disjoint time ranges.
-    ///
-    /// A folded row is a separate second, so selecting the same sub-second
-    /// columns across several rows intentionally returns one range per row.
-    pub fn selected_ranges(&self, rows: Range<usize>, columns: Range<usize>) -> Vec<TimeRange> {
-        let row_start = rows.start.min(self.rows);
-        let row_end = rows.end.min(self.rows);
-        let column_start = columns.start.min(self.columns);
-        let column_end = columns.end.min(self.columns);
-        if row_start >= row_end || column_start >= column_end {
-            return Vec::new();
-        }
-
-        (row_start..row_end)
-            .filter_map(|row| {
-                let second_start = self
-                    .range
-                    .start_ns
-                    .saturating_add((row as u64).saturating_mul(NANOS_PER_SECOND));
-                let start_ns = second_start
-                    .saturating_add((column_start as u64).saturating_mul(self.bin_width_ns));
-                let end_ns = second_start
-                    .saturating_add((column_end as u64).saturating_mul(self.bin_width_ns))
-                    .min(second_start.saturating_add(NANOS_PER_SECOND))
-                    .min(self.range.end_ns);
-                (start_ns < end_ns).then_some(TimeRange { start_ns, end_ns })
-            })
-            .collect()
     }
 }
 
@@ -233,8 +257,40 @@ pub(crate) struct CallTree {
     pub total_samples: u64,
 }
 
+/// How much one accepted sample contributes to a call-tree node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StackWeight {
+    /// Every sample weighs one — the cycles-proportional default.
+    Samples,
+    /// The sample's value for `counter_metrics[index]`, rounded down.
+    Counter(usize),
+}
+
+impl StackWeight {
+    fn of(self, sample: &ProfileSample) -> u64 {
+        match self {
+            Self::Samples => 1,
+            Self::Counter(index) => sample
+                .counters
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| value as u64)
+                .unwrap_or(0),
+        }
+    }
+}
+
 impl CallTree {
-    pub fn build(profile: &ProfileData, filter: &SampleFilter) -> Self {
+    /// `inverted` reverses every stack, turning the tree bottom-up (leaves at
+    /// the root); `weight` scales each sample's contribution.
+    pub fn build_weighted(
+        profile: &ProfileData,
+        filter: &SampleFilter,
+        inverted: bool,
+        weight: StackWeight,
+    ) -> Self {
         let labels = frame_labels(&profile.frames);
         let mut samples = profile
             .samples
@@ -271,9 +327,18 @@ impl CallTree {
         let mut child_lookup = BTreeMap::<(usize, usize), usize>::new();
 
         for sample in samples {
-            nodes[0].inclusive_samples = nodes[0].inclusive_samples.saturating_add(1);
+            let value = weight.of(sample);
+            if value == 0 {
+                continue;
+            }
+            nodes[0].inclusive_samples = nodes[0].inclusive_samples.saturating_add(value);
             let mut parent = 0usize;
-            for (depth, frame_id) in sample.stack.iter().copied().enumerate() {
+            let stack: Vec<usize> = if inverted {
+                sample.stack.iter().rev().copied().collect()
+            } else {
+                sample.stack.clone()
+            };
+            for (depth, frame_id) in stack.into_iter().enumerate() {
                 let node_id = if let Some(node_id) = child_lookup.get(&(parent, frame_id)) {
                     *node_id
                 } else {
@@ -296,14 +361,10 @@ impl CallTree {
                     node_id
                 };
                 nodes[node_id].inclusive_samples =
-                    nodes[node_id].inclusive_samples.saturating_add(1);
+                    nodes[node_id].inclusive_samples.saturating_add(value);
                 parent = node_id;
             }
-            if parent == 0 {
-                nodes[0].self_samples = nodes[0].self_samples.saturating_add(1);
-            } else {
-                nodes[parent].self_samples = nodes[parent].self_samples.saturating_add(1);
-            }
+            nodes[parent].self_samples = nodes[parent].self_samples.saturating_add(value);
         }
 
         for node_id in 0..nodes.len() {
@@ -693,169 +754,6 @@ impl TimelineLaneKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TimeOrderSegment {
-    pub depth: usize,
-    pub frame_id: usize,
-    pub label: String,
-    /// Root-to-this-frame path; prevents unrelated contexts from being merged.
-    pub path: Vec<usize>,
-    pub start_ns: u64,
-    pub end_ns: u64,
-    /// All accepted observations in the represented time buckets.
-    pub samples: u64,
-    /// Observations matching the modal stack chosen for downsampling.
-    pub representative_samples: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TimeOrderLane {
-    pub key: TimelineLaneKey,
-    pub label: String,
-    pub segments: Vec<TimeOrderSegment>,
-}
-
-/// A downsampled time-order stack timeline.
-///
-/// Each lane/bin chooses the modal complete stack, then adjacent bins with the
-/// same call path are merged. CPU lanes are preferred whenever any accepted
-/// sample has CPU attribution; legacy recordings fall back to thread lanes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct TimeOrderTimeline {
-    pub range: TimeRange,
-    pub bin_width_ns: u64,
-    pub bins: usize,
-    pub total_samples: u64,
-    pub max_depth: usize,
-    pub uses_cpu_lanes: bool,
-    pub lanes: Vec<TimeOrderLane>,
-}
-
-impl TimeOrderTimeline {
-    pub fn build(profile: &ProfileData, filter: &SampleFilter, max_bins: usize) -> Option<Self> {
-        let range = analysis_range(profile, filter)?;
-        let duration = range.end_ns.saturating_sub(range.start_ns);
-        if duration == 0 {
-            return None;
-        }
-        let bin_width_ns = nice_bin_width(div_ceil(duration, max_bins.max(1) as u64)).max(1);
-        let bins = usize::try_from(div_ceil(duration, bin_width_ns))
-            .unwrap_or(usize::MAX)
-            .max(1);
-        let accepted = profile
-            .samples
-            .iter()
-            .filter(|sample| filter.matches(sample))
-            .filter(|sample| {
-                sample.timestamp_ns >= range.start_ns && sample.timestamp_ns < range.end_ns
-            })
-            .collect::<Vec<_>>();
-        let uses_cpu_lanes = accepted.iter().any(|sample| sample.cpu.is_some());
-        let labels = frame_labels(&profile.frames);
-
-        let mut bucket_stacks =
-            BTreeMap::<(TimelineLaneKey, usize), BTreeMap<Vec<usize>, u64>>::new();
-        for sample in &accepted {
-            let key = if uses_cpu_lanes {
-                TimelineLaneKey::Cpu(sample.cpu)
-            } else {
-                TimelineLaneKey::Thread(sample.thread_id)
-            };
-            let bin = usize::try_from((sample.timestamp_ns - range.start_ns) / bin_width_ns)
-                .unwrap_or(usize::MAX)
-                .min(bins - 1);
-            *bucket_stacks
-                .entry((key, bin))
-                .or_default()
-                .entry(sample.stack.clone())
-                .or_default() += 1;
-        }
-
-        let lane_keys = bucket_stacks
-            .keys()
-            .map(|(key, _)| *key)
-            .collect::<BTreeSet<_>>();
-        let mut max_depth = 0usize;
-        let lanes = lane_keys
-            .into_iter()
-            .map(|key| {
-                let mut segments = Vec::<TimeOrderSegment>::new();
-                let mut active_segments = Vec::<Option<usize>>::new();
-                for bin in 0..bins {
-                    let Some(stacks) = bucket_stacks.get(&(key, bin)) else {
-                        active_segments.fill(None);
-                        continue;
-                    };
-                    let bucket_samples = stacks.values().copied().sum::<u64>();
-                    let Some((stack, representative_samples)) = modal_stack(stacks) else {
-                        active_segments.fill(None);
-                        continue;
-                    };
-                    max_depth = max_depth.max(stack.len());
-                    let start_ns = range
-                        .start_ns
-                        .saturating_add((bin as u64).saturating_mul(bin_width_ns));
-                    let end_ns = start_ns.saturating_add(bin_width_ns).min(range.end_ns);
-                    for depth in 0..stack.len() {
-                        if active_segments.len() <= depth {
-                            active_segments.resize(depth + 1, None);
-                        }
-                        let path = stack[..=depth].to_vec();
-                        let frame_id = stack[depth];
-                        let active = active_segments[depth].filter(|segment_index| {
-                            segments.get(*segment_index).is_some_and(|segment| {
-                                segment.path == path && segment.end_ns == start_ns
-                            })
-                        });
-                        if let Some(segment_index) = active {
-                            let segment = &mut segments[segment_index];
-                            segment.end_ns = end_ns;
-                            segment.samples = segment.samples.saturating_add(bucket_samples);
-                            segment.representative_samples = segment
-                                .representative_samples
-                                .saturating_add(representative_samples);
-                        } else {
-                            segments.push(TimeOrderSegment {
-                                depth,
-                                frame_id,
-                                label: labels
-                                    .get(&frame_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("Unknown frame {frame_id}")),
-                                path,
-                                start_ns,
-                                end_ns,
-                                samples: bucket_samples,
-                                representative_samples,
-                            });
-                            active_segments[depth] = Some(segments.len() - 1);
-                        }
-                    }
-                    for active in active_segments.iter_mut().skip(stack.len()) {
-                        *active = None;
-                    }
-                }
-                segments.sort_by_key(|segment| (segment.depth, segment.start_ns, segment.frame_id));
-                TimeOrderLane {
-                    key,
-                    label: key.label(),
-                    segments,
-                }
-            })
-            .collect();
-
-        Some(Self {
-            range,
-            bin_width_ns,
-            bins,
-            total_samples: accepted.len() as u64,
-            max_depth,
-            uses_cpu_lanes,
-            lanes,
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct CpuUtilizationBucket {
     /// Attributed CPU-clock nanoseconds before utilization is capped.
@@ -1067,6 +965,190 @@ impl CpuUtilizationHeatmap {
     }
 }
 
+/// Elapsed time spent with N CPUs simultaneously busy, folded out of the same
+/// occupancy attribution the per-CPU lanes are painted from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ConcurrencyHistogram {
+    /// Seconds spent at index-many busy CPUs; slot 0 is fully idle time.
+    pub slots: Vec<f64>,
+    pub average_busy: f64,
+    pub total_seconds: f64,
+}
+
+impl ConcurrencyHistogram {
+    pub fn build(heatmap: &CpuUtilizationHeatmap, logical_cpu_count: Option<u32>) -> Self {
+        let cpus = logical_cpu_count
+            .map(|count| count as usize)
+            .unwrap_or(0)
+            .max(heatmap.lanes.len())
+            .max(1);
+        let mut slots = vec![0.0; cpus + 1];
+        let mut weighted = 0.0;
+        let mut total_seconds = 0.0;
+        for bucket in 0..heatmap.buckets {
+            let start = heatmap
+                .range
+                .start_ns
+                .saturating_add((bucket as u64).saturating_mul(heatmap.bucket_duration_ns));
+            let end = start
+                .saturating_add(heatmap.bucket_duration_ns)
+                .min(heatmap.range.end_ns);
+            let seconds = end.saturating_sub(start) as f64 / NANOS_PER_SECOND as f64;
+            if seconds <= 0.0 {
+                continue;
+            }
+            let busy: f64 = heatmap
+                .lanes
+                .iter()
+                .filter_map(|lane| lane.buckets.get(bucket))
+                .map(|bucket| bucket.utilization)
+                .sum();
+            let slot = (busy.round().max(0.0) as usize).min(cpus);
+            slots[slot] += seconds;
+            weighted += slot as f64 * seconds;
+            total_seconds += seconds;
+        }
+        Self {
+            slots,
+            average_busy: if total_seconds > 0.0 {
+                weighted / total_seconds
+            } else {
+                0.0
+            },
+            total_seconds,
+        }
+    }
+}
+
+/// Frames that mean "this thread is waiting on someone else". Matched as
+/// substrings because libc spells them differently on every platform.
+const SYNC_FRAME_MARKERS: [&str; 12] = [
+    "futex",
+    "barrier",
+    "pthread_cond",
+    "pthread_join",
+    "lll_lock",
+    "sem_wait",
+    "psynch",
+    "ulock_wait",
+    "cond_wait",
+    "sched_yield",
+    "nanosleep",
+    "mutex_lock",
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThreadBalanceRow {
+    pub thread_id: u32,
+    /// Attributed CPU time over the analysed wall time.
+    pub busy_fraction: f64,
+    /// Share of the thread's samples parked in a synchronization frame.
+    pub sync_fraction: f64,
+    pub migrations: u64,
+    pub samples: u64,
+}
+
+/// Per-thread busy/wait/migration balance over the filtered range.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThreadBalance {
+    pub rows: Vec<ThreadBalanceRow>,
+    /// Whether any observation carried a CPU id; migrations mean nothing without.
+    pub has_cpu_ids: bool,
+}
+
+impl ThreadBalance {
+    pub fn build(profile: &ProfileData, filter: &SampleFilter) -> Option<Self> {
+        let range = analysis_range(profile, filter)?;
+        let wall = range.end_ns.saturating_sub(range.start_ns) as f64;
+        if wall <= 0.0 {
+            return None;
+        }
+        let sync_frames: BTreeSet<usize> = profile
+            .frames
+            .iter()
+            .filter(|frame| {
+                let name = frame.name.to_lowercase();
+                SYNC_FRAME_MARKERS
+                    .iter()
+                    .any(|marker| name.contains(marker))
+            })
+            .map(|frame| frame.id)
+            .collect();
+
+        let mut samples = BTreeMap::<u32, (u64, u64)>::new();
+        let mut cpu_time = BTreeMap::<u32, f64>::new();
+        let mut trails = BTreeMap::<u32, Vec<(u64, u32)>>::new();
+        let mut has_cpu_ids = false;
+
+        for sample in profile
+            .samples
+            .iter()
+            .filter(|sample| filter.matches(sample))
+        {
+            let entry = samples.entry(sample.thread_id).or_default();
+            entry.0 += 1;
+            if sample.stack.iter().any(|frame| sync_frames.contains(frame)) {
+                entry.1 += 1;
+            }
+            if let Some(cpu) = sample.cpu {
+                has_cpu_ids = true;
+                trails
+                    .entry(sample.thread_id)
+                    .or_default()
+                    .push((sample.timestamp_ns, cpu));
+            }
+        }
+
+        for observation in profile
+            .cpu_observations
+            .iter()
+            .filter(|observation| filter.matches_cpu_observation_without_time(observation))
+            .filter(|observation| {
+                observation.timestamp_ns >= range.start_ns
+                    && observation.timestamp_ns < range.end_ns
+            })
+        {
+            *cpu_time.entry(observation.thread_id).or_default() += observation.weight_ns as f64;
+            if let Some(cpu) = observation.cpu {
+                has_cpu_ids = true;
+                trails
+                    .entry(observation.thread_id)
+                    .or_default()
+                    .push((observation.timestamp_ns, cpu));
+            }
+        }
+
+        let threads: BTreeSet<u32> = samples.keys().chain(cpu_time.keys()).copied().collect();
+        let rows = threads
+            .into_iter()
+            .map(|thread_id| {
+                let (total, sync) = samples.get(&thread_id).copied().unwrap_or_default();
+                ThreadBalanceRow {
+                    thread_id,
+                    busy_fraction: (cpu_time.get(&thread_id).copied().unwrap_or(0.0) / wall)
+                        .clamp(0.0, 1.0),
+                    sync_fraction: fraction(sync, total),
+                    migrations: migrations(trails.get_mut(&thread_id)),
+                    samples: total,
+                }
+            })
+            .collect();
+        Some(Self { rows, has_cpu_ids })
+    }
+}
+
+/// Counts CPU changes along a thread's time-ordered trail of observations.
+fn migrations(trail: Option<&mut Vec<(u64, u32)>>) -> u64 {
+    let Some(trail) = trail else {
+        return 0;
+    };
+    trail.sort_unstable();
+    trail
+        .windows(2)
+        .filter(|pair| pair[0].1 != pair[1].1)
+        .count() as u64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CounterAggregation {
     Sum,
@@ -1202,18 +1284,6 @@ fn frame_labels(frames: &[ProfileFrame]) -> BTreeMap<usize, String> {
         .collect()
 }
 
-fn modal_stack(stacks: &BTreeMap<Vec<usize>, u64>) -> Option<(&Vec<usize>, u64)> {
-    stacks
-        .iter()
-        .max_by(|(left_stack, left_count), (right_stack, right_count)| {
-            left_count
-                .cmp(right_count)
-                // `max_by` should pick the lexicographically smaller path on a tie.
-                .then_with(|| right_stack.cmp(left_stack))
-        })
-        .map(|(stack, count)| (stack, *count))
-}
-
 fn sort_relations(relations: &mut [FunctionRelation]) {
     relations.sort_by(|left, right| {
         Reverse(left.samples)
@@ -1221,6 +1291,11 @@ fn sort_relations(relations: &mut [FunctionRelation]) {
             .then_with(|| left.label.cmp(&right.label))
             .then_with(|| left.frame_id.cmp(&right.frame_id))
     });
+}
+
+/// Column of the retired-instructions counter, when the recording has one.
+pub(crate) fn instructions_metric(metrics: &[CounterMetric]) -> Option<usize> {
+    find_metric(metrics, &["instructions", "pmu_instructions"])
 }
 
 fn find_metric(metrics: &[CounterMetric], candidates: &[&str]) -> Option<usize> {
@@ -1255,6 +1330,13 @@ fn div_ceil(value: u64, divisor: u64) -> u64 {
 }
 
 /// Returns the next 1/2/5 × 10ⁿ interval at or above `minimum`.
+/// Time folded into one flame-scope row. One second is the classic choice and
+/// stays the cap; shorter recordings fold tighter so the grid keeps roughly
+/// sixty columns instead of collapsing into two.
+fn fold_period(duration_ns: u64) -> u64 {
+    nice_bin_width(div_ceil(duration_ns, 60).max(1))
+}
+
 fn nice_bin_width(minimum: u64) -> u64 {
     let minimum = minimum.max(1);
     let mut magnitude = 1u64;
@@ -1356,6 +1438,25 @@ mod tests {
         }
     }
 
+    fn observation(
+        timestamp_ns: u64,
+        thread_id: u32,
+        cpu: Option<u32>,
+        interval_start_ns: u64,
+        weight_ns: u64,
+    ) -> CpuObservation {
+        CpuObservation {
+            timestamp_ns,
+            process_id: 7,
+            thread_id,
+            cpu,
+            interval_start_ns: Some(interval_start_ns),
+            stack: vec![0],
+            weight_ns,
+            source: CpuObservationSource::CounterDelta,
+        }
+    }
+
     fn assert_close(actual: f64, expected: f64) {
         assert!(
             (actual - expected).abs() < 1e-9,
@@ -1364,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn flamescope_folds_seconds_into_adaptive_sample_bins() {
+    fn flamescope_grid_follows_duration_then_sample_density() {
         let profile = profile(
             vec![frame(0, "root")],
             vec![
@@ -1378,28 +1479,31 @@ mod tests {
 
         let heatmap = FlameScopeHeatmap::build(&profile, &SampleFilter::default(), 100).unwrap();
 
-        assert_eq!(heatmap.bin_width_ns, 10_000_000);
-        assert_eq!((heatmap.rows, heatmap.columns), (2, 100));
+        // A two-second recording folds at 50ms, and four samples cannot fill a
+        // fine grid, so the bins collapse to the density floor.
+        assert_eq!(heatmap.fold_ns, 50_000_000);
+        assert_eq!((heatmap.rows, heatmap.columns), (40, 10));
+        assert_eq!(heatmap.bin_width_ns, 5_000_000);
         assert_eq!(heatmap.total_samples, 4);
         assert_eq!(heatmap.max_samples, 1);
         assert_eq!(heatmap.bin(0, 0).unwrap().samples, 1);
-        assert_eq!(heatmap.bin(0, 1).unwrap().samples, 1);
-        assert_eq!(heatmap.bin(1, 1).unwrap().samples, 1);
-        assert_eq!(heatmap.bin(1, 99).unwrap().samples, 1);
+        assert_eq!(heatmap.bin(0, 2).unwrap().samples, 1);
+        assert_eq!(heatmap.bin(20, 2).unwrap().samples, 1);
+        assert_eq!(heatmap.bin(39, 9).unwrap().samples, 1);
+    }
 
-        assert_eq!(
-            heatmap.selected_ranges(0..2, 1..2),
-            vec![
-                TimeRange {
-                    start_ns: 10_000_000,
-                    end_ns: 20_000_000,
-                },
-                TimeRange {
-                    start_ns: 1_010_000_000,
-                    end_ns: 1_020_000_000,
-                },
-            ]
-        );
+    #[test]
+    fn dense_recordings_get_the_full_bin_budget() {
+        let samples = (0..6_000)
+            .map(|ix| sample(ix * 200_000, 1, None, &[0], &[]))
+            .collect::<Vec<_>>();
+        let profile = profile(vec![frame(0, "root")], samples, vec![]);
+
+        let heatmap = FlameScopeHeatmap::build(&profile, &SampleFilter::default(), 50).unwrap();
+
+        assert_eq!(heatmap.fold_ns, 20_000_000);
+        assert_eq!(heatmap.columns, 40);
+        assert_eq!(heatmap.bin_width_ns, 500_000);
     }
 
     #[test]
@@ -1454,6 +1558,107 @@ mod tests {
     }
 
     #[test]
+    fn thread_set_filter_accepts_only_selected_threads() {
+        let profile = profile(
+            vec![frame(0, "root")],
+            vec![
+                sample(0, 1, None, &[0], &[]),
+                sample(1, 2, None, &[0], &[]),
+                sample(2, 3, None, &[0], &[]),
+            ],
+            vec![],
+        );
+        let filter = SampleFilter {
+            threads: Some(BTreeSet::from([1, 3])),
+            ..SampleFilter::default()
+        };
+
+        let functions = FunctionAnalysis::build(&profile, &filter);
+        assert_eq!(functions.total_samples, 2);
+    }
+
+    #[test]
+    fn leaf_frame_filter_scopes_by_sampled_leaf_not_stack_contents() {
+        let profile = profile(
+            vec![frame(0, "root"), frame(1, "user_fn"), frame(2, "lib_fn")],
+            vec![
+                sample(0, 1, None, &[0, 1], &[]),
+                sample(1, 1, None, &[0, 1, 2], &[]),
+                sample(2, 1, None, &[], &[]),
+            ],
+            vec![],
+        );
+        let filter = SampleFilter {
+            leaf_frames: Some(BTreeSet::from([1])),
+            ..SampleFilter::default()
+        };
+
+        let functions = FunctionAnalysis::build(&profile, &filter);
+        assert_eq!(functions.total_samples, 1);
+        assert!(
+            functions
+                .functions
+                .iter()
+                .all(|function| function.label != "lib_fn")
+        );
+    }
+
+    #[test]
+    fn flame_scope_folds_short_recordings_tighter_than_a_second() {
+        assert_eq!(fold_period(120 * NANOS_PER_SECOND), 2 * NANOS_PER_SECOND);
+        assert_eq!(fold_period(60 * NANOS_PER_SECOND), NANOS_PER_SECOND);
+        assert_eq!(fold_period(1_160_000_000), 20_000_000);
+        assert_eq!(fold_period(100_000_000), 2_000_000);
+    }
+
+    #[test]
+    fn inverted_call_tree_roots_at_the_leaves() {
+        let profile = profile(
+            vec![frame(0, "main"), frame(1, "work"), frame(2, "memcpy")],
+            vec![
+                sample(0, 1, None, &[0, 1, 2], &[]),
+                sample(1, 1, None, &[0, 2], &[]),
+                sample(2, 1, None, &[0, 1], &[]),
+            ],
+            vec![],
+        );
+
+        let tree = CallTree::build_weighted(
+            &profile,
+            &SampleFilter::default(),
+            true,
+            StackWeight::Samples,
+        );
+
+        let roots = &tree.nodes[tree.root].children;
+        assert_eq!(tree.nodes[roots[0]].label, "memcpy");
+        assert_eq!(tree.nodes[roots[0]].inclusive_samples, 2);
+        assert_eq!(tree.nodes[roots[1]].label, "work");
+        assert_eq!(tree.nodes[roots[1]].inclusive_samples, 1);
+    }
+
+    #[test]
+    fn counter_weighted_call_tree_uses_counter_values_not_sample_counts() {
+        let profile = profile(
+            vec![frame(0, "main"), frame(1, "work")],
+            vec![
+                sample(0, 1, None, &[0, 1], &[Some(100.0)]),
+                sample(1, 1, None, &[0], &[Some(25.0)]),
+                sample(2, 1, None, &[0, 1], &[None]),
+            ],
+            vec![metric("instructions")],
+        );
+        let weight = StackWeight::Counter(instructions_metric(&profile.counter_metrics).unwrap());
+
+        let tree = CallTree::build_weighted(&profile, &SampleFilter::default(), false, weight);
+
+        assert_eq!(tree.total_samples, 125);
+        let work = tree.nodes.iter().find(|node| node.label == "work").unwrap();
+        assert_eq!(work.inclusive_samples, 100);
+        assert_eq!(work.self_samples, 100);
+    }
+
+    #[test]
     fn call_tree_is_left_heavy_proportional_and_focusable() {
         let profile = profile(
             vec![frame(0, "A"), frame(1, "B"), frame(2, "C"), frame(3, "D")],
@@ -1466,7 +1671,12 @@ mod tests {
             vec![],
         );
 
-        let tree = CallTree::build(&profile, &SampleFilter::default());
+        let tree = CallTree::build_weighted(
+            &profile,
+            &SampleFilter::default(),
+            false,
+            StackWeight::Samples,
+        );
         assert_eq!(tree.total_samples, 4);
         let root_children = &tree.nodes[tree.root].children;
         assert_eq!(tree.nodes[root_children[0]].label, "A");
@@ -1630,67 +1840,6 @@ mod tests {
         assert_eq!(details.function.self_samples, 1);
         assert_eq!(details.callers[0].samples, 1);
         assert_eq!(details.callees[0].samples, 1);
-    }
-
-    #[test]
-    fn time_order_prefers_cpu_lanes_and_merges_identical_paths() {
-        let profile = profile(
-            vec![frame(0, "A"), frame(1, "B"), frame(2, "C")],
-            vec![
-                sample(0, 10, Some(2), &[0, 1], &[]),
-                sample(10, 10, Some(2), &[0, 1], &[]),
-                sample(20, 11, Some(3), &[0, 2], &[]),
-                sample(30, 12, None, &[0], &[]),
-            ],
-            vec![],
-        );
-
-        let timeline = TimeOrderTimeline::build(&profile, &SampleFilter::default(), 4).unwrap();
-        assert!(timeline.uses_cpu_lanes);
-        assert_eq!(
-            timeline
-                .lanes
-                .iter()
-                .map(|lane| lane.key)
-                .collect::<Vec<_>>(),
-            [
-                TimelineLaneKey::Cpu(None),
-                TimelineLaneKey::Cpu(Some(2)),
-                TimelineLaneKey::Cpu(Some(3)),
-            ]
-        );
-        let cpu_two = timeline
-            .lanes
-            .iter()
-            .find(|lane| lane.key == TimelineLaneKey::Cpu(Some(2)))
-            .unwrap();
-        let b = cpu_two
-            .segments
-            .iter()
-            .find(|segment| segment.frame_id == 1)
-            .unwrap();
-        assert_eq!((b.start_ns, b.end_ns), (0, 20));
-        assert_eq!((b.samples, b.representative_samples), (2, 2));
-    }
-
-    #[test]
-    fn time_order_falls_back_to_thread_lanes_for_legacy_samples() {
-        let profile = profile(
-            vec![frame(0, "A")],
-            vec![sample(0, 8, None, &[0], &[]), sample(1, 7, None, &[0], &[])],
-            vec![],
-        );
-
-        let timeline = TimeOrderTimeline::build(&profile, &SampleFilter::default(), 10).unwrap();
-        assert!(!timeline.uses_cpu_lanes);
-        assert_eq!(
-            timeline
-                .lanes
-                .iter()
-                .map(|lane| lane.key)
-                .collect::<Vec<_>>(),
-            [TimelineLaneKey::Thread(7), TimelineLaneKey::Thread(8)]
-        );
     }
 
     #[test]
@@ -1997,6 +2146,67 @@ mod tests {
             vec![metric("os_cpu_clock")],
         );
         assert!(CpuUtilizationHeatmap::build(&null_metric, &SampleFilter::default(), 10).is_none());
+    }
+
+    #[test]
+    fn concurrency_histogram_books_elapsed_time_per_busy_cpu_count() {
+        let mut profile = profile(
+            vec![frame(0, "A")],
+            vec![sample(0, 1, Some(0), &[0], &[])],
+            vec![],
+        );
+        profile.logical_cpu_count = Some(2);
+        // First 10ns: both CPUs busy. Second 10ns: only CPU 0.
+        profile.cpu_observations = vec![
+            observation(10, 1, Some(0), 0, 10),
+            observation(10, 2, Some(1), 0, 10),
+            observation(19, 1, Some(0), 10, 9),
+        ];
+
+        let heatmap = CpuUtilizationHeatmap::build_with_bucket_duration(
+            &profile,
+            &SampleFilter::default(),
+            2,
+            Some(10),
+        )
+        .unwrap();
+        let histogram = ConcurrencyHistogram::build(&heatmap, profile.logical_cpu_count);
+
+        assert_eq!(histogram.slots.len(), 3);
+        assert_close(histogram.slots[0], 0.0);
+        assert_close(histogram.slots[1], 1e-8);
+        assert_close(histogram.slots[2], 1e-8);
+        assert_close(histogram.total_seconds, 2e-8);
+        assert_close(histogram.average_busy, 1.5);
+    }
+
+    #[test]
+    fn thread_balance_reports_busy_sync_and_migrations() {
+        let mut profile = profile(
+            vec![frame(0, "work"), frame(1, "pthread_cond_wait")],
+            vec![
+                sample(0, 1, Some(0), &[0], &[]),
+                sample(10, 1, Some(1), &[0, 1], &[]),
+                sample(20, 2, Some(3), &[0], &[]),
+            ],
+            vec![],
+        );
+        profile.cpu_observations = vec![
+            observation(10, 1, Some(0), 0, 10),
+            observation(20, 1, Some(1), 10, 5),
+        ];
+
+        let balance = ThreadBalance::build(&profile, &SampleFilter::default()).unwrap();
+
+        assert!(balance.has_cpu_ids);
+        assert_eq!(balance.rows.len(), 2);
+        assert_eq!(balance.rows[0].thread_id, 1);
+        assert_close(balance.rows[0].sync_fraction, 0.5);
+        // 15ns of CPU time over a 21ns range.
+        assert_close(balance.rows[0].busy_fraction, 15.0 / 21.0);
+        assert_eq!(balance.rows[0].migrations, 1);
+        assert_eq!(balance.rows[1].samples, 1);
+        assert_close(balance.rows[1].busy_fraction, 0.0);
     }
 
     #[test]
