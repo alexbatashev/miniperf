@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-mod perf;
+pub(crate) mod perf;
 
 #[cfg(target_os = "macos")]
 mod kperf;
@@ -36,8 +36,6 @@ pub enum UnwindMode {
     #[default]
     /// Capture registers and stack bytes for post-hoc DWARF unwinding.
     Dwarf,
-    /// Intel Last Branch Record call stacks. Falls back to DWARF when unsupported.
-    Lbr,
 }
 
 /// Register state captured by `PERF_SAMPLE_REGS_USER`.
@@ -140,8 +138,40 @@ pub struct CounterResult {
 pub enum Record {
     /// A performance-counter sample.
     Sample(Sample),
+    /// A precise memory-access sample (PEBS/IBS/SPE).
+    MemSample(MemSample),
     /// A process address-space mapping.
     ProcAddr(ProcAddr),
+}
+
+/// One precise memory access: skid-free IP plus the data address, vendor data
+/// source encoding and access latency the hardware reported for it.
+#[derive(Debug)]
+pub struct MemSample {
+    /// Instruction pointer of the accessing instruction.
+    pub ip: u64,
+    /// Process ID.
+    pub pid: u32,
+    /// Thread ID.
+    pub tid: u32,
+    /// CPU the access executed on.
+    pub cpu: u32,
+    /// Timestamp on `CLOCK_MONOTONIC`.
+    pub time: u64,
+    /// Virtual address the access targeted.
+    pub data_addr: u64,
+    /// Access latency in core cycles, zero when unreported.
+    pub latency: u64,
+    /// Raw vendor data-source encoding, normalized downstream.
+    pub data_src: u64,
+    /// Kernel-provided instruction-pointer callchain.
+    pub callstack: SmallVec<[u64; 8]>,
+    /// Call stack reconstructed from the hardware branch records.
+    pub lbr_callstack: SmallVec<[u64; 8]>,
+    /// Raw user register state for post-hoc unwinding.
+    pub user_regs: Option<UserRegs>,
+    /// User stack bytes beginning at the sampled stack pointer.
+    pub user_stack: Vec<u8>,
 }
 
 /// A structure that represents a single sample
@@ -172,6 +202,9 @@ pub struct Sample {
     pub value: u64,
     /// Kernel-provided instruction-pointer callchain.
     pub callstack: SmallVec<[u64; 8]>,
+    /// Call stack reconstructed from the hardware branch stack (Intel LBR
+    /// call-stack mode). Empty when branch records were not requested.
+    pub lbr_callstack: SmallVec<[u64; 8]>,
     /// Raw user register state for post-hoc unwinding.
     pub user_regs: Option<UserRegs>,
     /// User stack bytes beginning at the sampled stack pointer.
@@ -210,11 +243,54 @@ pub struct SamplingDriverBuilder {
     unwind_mode: UnwindMode,
     stack_dump_size: u32,
     precise_ip: bool,
+    lbr_callstack: bool,
 }
 
 impl<F: Fn(Record) + Send + Sync> SamplingCallback for F {
     fn call(&self, record: Record) {
         self(record)
+    }
+}
+
+/// Open precise memory sampling (data address, data source and latency per
+/// access) for a target process, alongside whatever counter-based sampling is
+/// already running: Arm SPE where an `arm_spe_*` PMU exists, Intel PEBS
+/// `mem-loads`/`mem-stores` otherwise.
+#[cfg(target_os = "linux")]
+pub fn mem_sampling_driver(
+    pid: i32,
+    sample_freq: u64,
+    stack_dump_size: u32,
+    lbr_callstack: bool,
+) -> Result<Box<dyn SamplingDriver>, Error> {
+    if perf::spe_pmu_path().is_some() {
+        return Ok(Box::new(perf::PerfSpeSamplingDriver::new(pid)?));
+    }
+    #[cfg(target_arch = "x86_64")]
+    return Ok(Box::new(perf::PerfMemSamplingDriver::new(
+        pid,
+        sample_freq,
+        stack_dump_size,
+        perf::dwarf_register_mask(),
+        lbr_callstack,
+    )?));
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (sample_freq, stack_dump_size, lbr_callstack);
+        Err(Error::InvalidConfiguration(
+            "no precise memory sampling facility on this host".to_owned(),
+        ))
+    }
+}
+
+/// The precise-memory facility `mem_sampling_driver` would use, for status
+/// reporting: `"spe"` or `"pebs"`.
+#[cfg(target_os = "linux")]
+pub fn mem_sampling_kind() -> &'static str {
+    if perf::spe_pmu_path().is_some() {
+        "spe"
+    } else {
+        "pebs"
     }
 }
 
@@ -306,6 +382,7 @@ impl SamplingDriverBuilder {
             unwind_mode: UnwindMode::Dwarf,
             stack_dump_size: 8 * 1024,
             precise_ip: false,
+            lbr_callstack: false,
         }
     }
 
@@ -350,6 +427,14 @@ impl SamplingDriverBuilder {
         self
     }
 
+    /// Requests hardware branch records in call-stack mode (Intel LBR) as an
+    /// extra stack source alongside the selected unwind mode. Silently ignored
+    /// where the hardware or kernel rejects it.
+    pub fn lbr_callstack(mut self, enabled: bool) -> Self {
+        self.lbr_callstack = enabled;
+        self
+    }
+
     /// Maximum number of user stack bytes captured for each DWARF sample.
     pub fn stack_dump_size(mut self, bytes: u32) -> Self {
         self.stack_dump_size = bytes;
@@ -374,17 +459,24 @@ impl SamplingDriverBuilder {
         cfg_if::cfg_if! {
             if #[cfg(target_os="linux")] {
                 if self.kind == DriverKind::Default || self.kind == DriverKind::Perf {
+                    let options = perf::SampleOptions {
+                        sample_freq: self.sample_freq,
+                        unwind_mode: self.unwind_mode,
+                        stack_dump_size: self.stack_dump_size,
+                        precise_ip: self.precise_ip,
+                        branch_mode: None,
+                    };
                     let driver = sampling_with_fallback(
                         self.counters,
-                        self.unwind_mode,
-                        |counters, unwind_mode| PerfSamplingDriver::new(
+                        self.lbr_callstack,
+                        |counters, branch_mode| PerfSamplingDriver::new(
                             counters,
-                            self.sample_freq,
+                            &perf::SampleOptions {
+                                branch_mode,
+                                ..options
+                            },
                             self.pid,
                             self.prefer_raw_events,
-                            unwind_mode,
-                            self.stack_dump_size,
-                            self.precise_ip,
                         ),
                     )?;
                     return Ok(Box::new(driver));
@@ -409,30 +501,28 @@ impl SamplingDriverBuilder {
 #[cfg(target_os = "linux")]
 fn sampling_with_fallback<T, F>(
     mut counters: Vec<Counter>,
-    mut unwind_mode: UnwindMode,
+    branch_records: bool,
     mut open: F,
 ) -> Result<T, Error>
 where
-    F: FnMut(&[Counter], UnwindMode) -> Result<T, Error>,
+    F: FnMut(&[Counter], Option<perf::branch::BranchMode>) -> Result<T, Error>,
 {
-    if unwind_mode == UnwindMode::Lbr && !cfg!(target_arch = "x86_64") {
-        unwind_mode = UnwindMode::Dwarf;
-    }
+    let mut modes = if branch_records {
+        perf::branch::BranchMode::LADDER.iter()
+    } else {
+        [].iter()
+    };
+    let mut branch_mode = modes.next().copied();
 
     loop {
-        match open(&counters, unwind_mode) {
+        match open(&counters, branch_mode) {
             Ok(driver) => return Ok(driver),
-            // Opening the event is the authoritative support probe: VMs,
-            // AMD PMUs, and Intel models without call-stack LBR support reject
-            // this combination. Retry in DWARF mode before counter fallbacks.
-            Err(_) if unwind_mode == UnwindMode::Lbr => unwind_mode = UnwindMode::Dwarf,
-            Err(error) if error.counter_name() == Some(Counter::Cycles.name()) => {
-                counters.retain(Counter::is_software);
-                if !counters.contains(&Counter::CpuClock) {
-                    counters.insert(0, Counter::CpuClock);
-                }
-            }
-            Err(error) if error.is_event_unsupported() => {
+            // An event this PMU simply does not implement says nothing about
+            // branch records: drop the event, not the fidelity rung.
+            Err(error)
+                if error.is_event_unsupported()
+                    && error.counter_name() != Some(Counter::Cycles.name()) =>
+            {
                 let unsupported = error.counter_name().unwrap_or_default();
                 let Some(index) = counters
                     .iter()
@@ -441,6 +531,17 @@ where
                     return Err(error);
                 };
                 counters.remove(index);
+            }
+            // Opening the event is the authoritative support probe for a
+            // branch recorder: Intel LBR takes call-stack mode, AMD LbrV2 only
+            // call filtering, AMD BRS only a plain history, and a VM none at
+            // all. Step down the modes before touching the counters.
+            Err(_) if branch_mode.is_some() => branch_mode = modes.next().copied(),
+            Err(error) if error.counter_name() == Some(Counter::Cycles.name()) => {
+                counters.retain(Counter::is_software);
+                if !counters.contains(&Counter::CpuClock) {
+                    counters.insert(0, Counter::CpuClock);
+                }
             }
             Err(error) => return Err(error),
         }
@@ -528,11 +629,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unsupported_event_does_not_cost_the_branch_records() {
+        let mut attempts = Vec::new();
+        let selected = sampling_with_fallback(
+            vec![
+                Counter::Cycles,
+                Counter::StalledCyclesBackend,
+                Counter::CpuClock,
+            ],
+            true,
+            |counters, branch_mode| {
+                attempts.push((counters.to_vec(), branch_mode));
+                if counters.contains(&Counter::StalledCyclesBackend) {
+                    Err(Error::perf_event_open_with(
+                        &Counter::StalledCyclesBackend,
+                        None,
+                        std::io::Error::from_raw_os_error(libc::ENOENT),
+                        Some(4),
+                    ))
+                } else {
+                    Ok(counters.to_vec())
+                }
+            },
+        )
+        .expect("dropping the unsupported event should open");
+
+        assert_eq!(selected, vec![Counter::Cycles, Counter::CpuClock]);
+        assert!(
+            attempts
+                .iter()
+                .all(|(_, mode)| *mode == Some(perf::branch::BranchMode::CallStack)),
+            "branch records must survive an unrelated counter failure"
+        );
+    }
+
+    #[test]
     fn sampling_falls_back_to_cpu_clock_when_cycles_cannot_open() {
         let mut attempts = Vec::new();
         let selected = sampling_with_fallback(
             vec![Counter::Cycles, Counter::Instructions],
-            UnwindMode::Dwarf,
+            false,
             |counters, _| {
                 attempts.push(counters.to_vec());
                 if counters.contains(&Counter::Cycles) {

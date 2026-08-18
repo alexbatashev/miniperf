@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use mperf_data::{RooflineCalibration, RooflineMethodInfo};
-use sqlite::{Connection, Value};
 
 use crate::source::SourceLocation;
+use crate::sql::{Connection, Value, as_f64, as_i64, as_text, row_values, table_columns};
 
 const LABEL_ASSET_PREFIX: &str = "roofline-label:";
 
@@ -157,10 +157,11 @@ impl RooflineLoop {
 }
 
 fn load_loops(connection: &Connection) -> Result<Vec<RooflineLoop>> {
-    let confidence_columns = if connection
-        .prepare("SELECT timing_quality FROM roofline LIMIT 0")
-        .is_ok()
-    {
+    let columns = table_columns(connection, "roofline");
+    if columns.is_empty() {
+        bail!("Roofline data is unavailable: table `roofline` does not exist");
+    }
+    let confidence_columns = if columns.iter().any(|column| column.name == "timing_quality") {
         "timing_samples, timing_relative_error, timing_quality, module_offset, trip_count"
     } else {
         "NULL AS timing_samples, NULL AS timing_relative_error, NULL AS timing_quality, NULL AS module_offset, NULL AS trip_count"
@@ -192,63 +193,50 @@ fn load_loops(connection: &Connection) -> Result<Vec<RooflineLoop>> {
             line ASC;
     "
     );
-    connection
-        .prepare(query)
-        .context("Roofline data is unavailable: failed to query SQLite view `roofline`")?
-        .into_iter()
-        .map(|row| {
-            let row = row.context("failed to read a row from SQLite view `roofline`")?;
-            Ok(RooflineLoop {
-                function_name: string_value(&row["function_name"])
-                    .unwrap_or_else(|| "[unknown loop]".to_string()),
-                file_name: string_value(&row["file_name"]).unwrap_or_default(),
-                line: integer_value(&row["line"]).unwrap_or_default().max(0) as usize,
-                scalar_int_ops: finite_value(&row["scalar_int_ops"]),
-                scalar_int_ai: finite_value(&row["scalar_int_ai"]),
-                scalar_float_ops: finite_value(&row["scalar_float_ops"]),
-                scalar_float_ai: finite_value(&row["scalar_float_ai"]),
-                scalar_double_ops: finite_value(&row["scalar_double_ops"]),
-                scalar_double_ai: finite_value(&row["scalar_double_ai"]),
-                vector_int_ops: finite_value(&row["vector_int_ops"]),
-                vector_int_ai: finite_value(&row["vector_int_ai"]),
-                vector_float_ops: finite_value(&row["vector_float_ops"]),
-                vector_float_ai: finite_value(&row["vector_float_ai"]),
-                vector_double_ops: finite_value(&row["vector_double_ops"]),
-                vector_double_ai: finite_value(&row["vector_double_ai"]),
-                timing_samples: integer_value(&row["timing_samples"])
-                    .and_then(|value| u64::try_from(value).ok()),
-                timing_relative_error: finite_value(&row["timing_relative_error"]),
-                timing_quality: string_value(&row["timing_quality"]),
-                module_offset: string_value(&row["module_offset"]),
-                trip_count: integer_value(&row["trip_count"])
-                    .and_then(|value| u64::try_from(value).ok()),
-            })
-        })
-        .collect()
+    let mut statement = connection
+        .prepare(&query)
+        .context("Roofline data is unavailable: failed to query view `roofline`")?;
+    let mut rows = statement
+        .query([])
+        .context("Roofline data is unavailable: failed to query view `roofline`")?;
+    let mut loops = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .context("failed to read a row from view `roofline`")?
+    {
+        let row = row_values(row, 20).context("failed to read a row from view `roofline`")?;
+        loops.push(RooflineLoop {
+            function_name: string_value(&row[0]).unwrap_or_else(|| "[unknown loop]".to_string()),
+            file_name: string_value(&row[1]).unwrap_or_default(),
+            line: as_i64(&row[2]).unwrap_or_default().max(0) as usize,
+            scalar_int_ops: finite_value(&row[3]),
+            scalar_int_ai: finite_value(&row[4]),
+            scalar_float_ops: finite_value(&row[5]),
+            scalar_float_ai: finite_value(&row[6]),
+            scalar_double_ops: finite_value(&row[7]),
+            scalar_double_ai: finite_value(&row[8]),
+            vector_int_ops: finite_value(&row[9]),
+            vector_int_ai: finite_value(&row[10]),
+            vector_float_ops: finite_value(&row[11]),
+            vector_float_ai: finite_value(&row[12]),
+            vector_double_ops: finite_value(&row[13]),
+            vector_double_ai: finite_value(&row[14]),
+            timing_samples: as_i64(&row[15]).and_then(|value| u64::try_from(value).ok()),
+            timing_relative_error: finite_value(&row[16]),
+            timing_quality: string_value(&row[17]),
+            module_offset: string_value(&row[18]),
+            trip_count: as_i64(&row[19]).and_then(|value| u64::try_from(value).ok()),
+        });
+    }
+    Ok(loops)
 }
 
 fn string_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn integer_value(value: &Value) -> Option<i64> {
-    match value {
-        Value::Integer(value) => Some(*value),
-        Value::Float(value) => Some(*value as i64),
-        _ => None,
-    }
+    as_text(value).map(str::to_string)
 }
 
 fn finite_value(value: &Value) -> Option<f64> {
-    let value = match value {
-        Value::Integer(value) => *value as f64,
-        Value::Float(value) => *value,
-        _ => return None,
-    };
-    value.is_finite().then_some(value)
+    as_f64(value).filter(|value| value.is_finite())
 }
 
 fn finite_positive(value: f64) -> Option<f64> {
@@ -315,25 +303,25 @@ mod tests {
 
     #[test]
     fn loads_every_roofline_row_and_combines_fp64_scalar_and_vector_values() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "CREATE TABLE roofline (
                     function_name TEXT,
                     file_name TEXT,
-                    line INTEGER,
-                    scalar_int_ops REAL,
-                    scalar_int_ai REAL,
-                    scalar_float_ops REAL,
-                    scalar_float_ai REAL,
-                    scalar_double_ops REAL,
-                    scalar_double_ai REAL,
-                    vector_int_ops REAL,
-                    vector_int_ai REAL,
-                    vector_float_ops REAL,
-                    vector_float_ai REAL,
-                    vector_double_ops REAL,
-                    vector_double_ai REAL
+                    line BIGINT,
+                    scalar_int_ops DOUBLE,
+                    scalar_int_ai DOUBLE,
+                    scalar_float_ops DOUBLE,
+                    scalar_float_ai DOUBLE,
+                    scalar_double_ops DOUBLE,
+                    scalar_double_ai DOUBLE,
+                    vector_int_ops DOUBLE,
+                    vector_int_ai DOUBLE,
+                    vector_float_ops DOUBLE,
+                    vector_float_ai DOUBLE,
+                    vector_double_ops DOUBLE,
+                    vector_double_ai DOUBLE
                 );
                 INSERT INTO roofline VALUES
                     ('mixed', '/src/kernel.c', 42,
@@ -411,7 +399,7 @@ mod tests {
 
     #[test]
     fn reports_a_missing_roofline_view_without_hiding_the_tab() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         let data = RooflineData::load(&connection, Some(calibration()), None);
 
         assert!(data.loops.is_empty());
@@ -425,7 +413,7 @@ mod tests {
 
     #[test]
     fn selects_cache_hierarchy_for_carm_and_dram_roof_for_dram_intensity() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
 
         let architectural = RooflineData::load(
             &connection,

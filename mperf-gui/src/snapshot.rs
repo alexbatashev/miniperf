@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use sqlite::Connection;
+use crate::sql::Connection;
 
 /// USE-method snapshot data: per-resource utilization/saturation/errors
 /// summaries, ranked findings, collector coverage, and metric time series.
@@ -176,31 +176,45 @@ impl SnapshotData {
 }
 
 fn load_samples(connection: &Connection) -> Option<Vec<SampleRow>> {
-    let statement = connection
+    let mut statement = connection
         .prepare(
             "SELECT timestamp_ns, resource, resource_id, category, metric, value, unit, scope
              FROM snapshot_resource_samples ORDER BY timestamp_ns ASC;",
         )
         .ok()?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })
+        .ok()?;
     let mut samples = Vec::new();
-    for row in statement.into_iter() {
-        let row = row.ok()?;
-        let Some(category) = UseCategory::parse(row.read::<&str, _>(3)) else {
+    for row in rows {
+        let (timestamp_ns, resource, resource_id, category, metric, value, unit, scope) =
+            row.ok()?;
+        let Some(category) = UseCategory::parse(&category) else {
             continue;
         };
-        let value = row.read::<f64, _>(5);
         if !value.is_finite() {
             continue;
         }
         samples.push(SampleRow {
-            timestamp_ns: row.read::<i64, _>(0).max(0) as u64,
-            resource: row.read::<&str, _>(1).to_string(),
-            resource_id: row.read::<&str, _>(2).to_string(),
+            timestamp_ns: timestamp_ns.max(0) as u64,
+            resource,
+            resource_id,
             category,
-            metric: row.read::<&str, _>(4).to_string(),
+            metric,
             value,
-            unit: row.read::<&str, _>(6).to_string(),
-            scope: row.read::<&str, _>(7).to_string(),
+            unit,
+            scope,
         });
     }
     Some(samples)
@@ -216,69 +230,77 @@ struct SummaryRow {
 }
 
 fn load_summary(connection: &Connection) -> Vec<SummaryRow> {
-    let Ok(statement) = connection.prepare(
+    let Ok(mut statement) = connection.prepare(
         "SELECT resource, category, metric, value, unit, scope FROM snapshot_summary
          ORDER BY resource, category, metric;",
     ) else {
         return Vec::new();
     };
-    statement
-        .into_iter()
-        .filter_map(|row| {
-            let row = row.ok()?;
-            Some(SummaryRow {
-                resource: row.read::<&str, _>(0).to_string(),
-                category: UseCategory::parse(row.read::<&str, _>(1))?,
-                metric: row.read::<&str, _>(2).to_string(),
-                value: row.try_read::<f64, _>(3).ok(),
-                unit: row.read::<&str, _>(4).to_string(),
-                scope: row.read::<&str, _>(5).to_string(),
-            })
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<f64>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| {
+        let (resource, category, metric, value, unit, scope) = row.ok()?;
+        Some(SummaryRow {
+            resource,
+            category: UseCategory::parse(&category)?,
+            metric,
+            value,
+            unit,
+            scope,
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn load_findings(connection: &Connection) -> Vec<SnapshotFinding> {
-    let Ok(statement) = connection.prepare(
+    let Ok(mut statement) = connection.prepare(
         "SELECT severity, resource, finding, evidence, recommendation, quality
-         FROM snapshot_findings ORDER BY rank ASC;",
+         FROM snapshot_findings ORDER BY \"rank\" ASC;",
     ) else {
         return Vec::new();
     };
-    statement
-        .into_iter()
-        .filter_map(|row| {
-            let row = row.ok()?;
-            Some(SnapshotFinding {
-                severity: Severity::parse(row.read::<&str, _>(0)),
-                resource: row.read::<&str, _>(1).to_string(),
-                finding: row.read::<&str, _>(2).to_string(),
-                evidence: row.read::<&str, _>(3).to_string(),
-                recommendation: row.read::<&str, _>(4).to_string(),
-                quality: row.read::<&str, _>(5).to_string(),
-            })
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok(SnapshotFinding {
+            severity: Severity::parse(&row.get::<_, String>(0)?),
+            resource: row.get(1)?,
+            finding: row.get(2)?,
+            evidence: row.get(3)?,
+            recommendation: row.get(4)?,
+            quality: row.get(5)?,
         })
-        .collect()
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok()).collect()
 }
 
 fn load_collectors(connection: &Connection) -> Vec<SnapshotCollector> {
-    let Ok(statement) = connection
+    let Ok(mut statement) = connection
         .prepare("SELECT name, status, quality, message FROM snapshot_collectors ORDER BY name;")
     else {
         return Vec::new();
     };
-    statement
-        .into_iter()
-        .filter_map(|row| {
-            let row = row.ok()?;
-            Some(SnapshotCollector {
-                name: row.read::<&str, _>(0).to_string(),
-                status: row.read::<&str, _>(1).to_string(),
-                quality: row.read::<&str, _>(2).to_string(),
-                message: row.read::<&str, _>(3).to_string(),
-            })
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok(SnapshotCollector {
+            name: row.get(0)?,
+            status: row.get(1)?,
+            quality: row.get(2)?,
+            message: row.get(3)?,
         })
-        .collect()
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(|row| row.ok()).collect()
 }
 
 const RESOURCE_ORDER: [&str; 5] = ["cpu", "memory", "disk", "io", "network"];
@@ -630,20 +652,20 @@ mod tests {
     use super::*;
 
     fn connection() -> Connection {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "
                 CREATE TABLE snapshot_resource_samples (
-                    timestamp_ns INTEGER, resource TEXT, resource_id TEXT, category TEXT,
-                    metric TEXT, value REAL, unit TEXT, scope TEXT, source TEXT, quality TEXT
+                    timestamp_ns BIGINT, resource TEXT, resource_id TEXT, category TEXT,
+                    metric TEXT, value DOUBLE, unit TEXT, scope TEXT, source TEXT, quality TEXT
                 );
                 CREATE TABLE snapshot_summary (
-                    resource TEXT, category TEXT, metric TEXT, value REAL,
+                    resource TEXT, category TEXT, metric TEXT, value DOUBLE,
                     unit TEXT, scope TEXT, source TEXT, quality TEXT
                 );
                 CREATE TABLE snapshot_findings (
-                    rank INTEGER, severity TEXT, resource TEXT, finding TEXT,
+                    \"rank\" BIGINT, severity TEXT, resource TEXT, finding TEXT,
                     evidence TEXT, recommendation TEXT, scope TEXT, quality TEXT
                 );
                 CREATE TABLE snapshot_collectors (
@@ -672,7 +694,7 @@ mod tests {
             unit,
         } = m;
         connection
-            .execute(format!(
+            .execute_batch(&format!(
                 "INSERT INTO snapshot_resource_samples VALUES
                  ({}, '{resource}', '{id}', '{category}', '{metric}', {value}, '{unit}',
                   'process_tree', 'procfs', 'best_effort');",
@@ -715,7 +737,7 @@ mod tests {
             insert_sample(&connection, t, &DISK, busy_ms);
         }
         connection
-            .execute(
+            .execute_batch(
                 "INSERT INTO snapshot_summary VALUES
                  ('cpu', 'utilization', 'cgroup_cpu_time', 4.0, 'seconds', 'process_tree', 'cgroup_v2', 'exact');
                  INSERT INTO snapshot_findings VALUES
@@ -762,7 +784,7 @@ mod tests {
 
     #[test]
     fn missing_tables_yield_no_snapshot() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         assert!(SnapshotData::load(&connection, None).is_none());
         let empty = self::tests::connection();
         assert!(SnapshotData::load(&empty, None).is_none());

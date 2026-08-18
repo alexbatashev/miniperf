@@ -5,4 +5,4 @@ edition = "2021"
 publish = false
 build = "build.rs"
 [dependencies]
-sqlite = "0.37.0"
+miniperf-store = { path = "../store" }

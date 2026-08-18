@@ -1,5 +1,6 @@
 mod counter_selection;
 mod disassembly;
+mod doctor;
 mod event_dispatcher;
 mod events_export;
 mod postprocess;
@@ -9,6 +10,7 @@ mod record;
 mod roofline;
 #[cfg(target_os = "linux")]
 mod snapshot_resources;
+mod source;
 mod stat;
 mod tui;
 #[cfg(all(
@@ -26,6 +28,7 @@ use std::{
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use doctor::do_doctor;
 use events_export::do_events_export;
 use mperf_data::Scenario;
 use query::{QueryFormat, do_query};
@@ -41,6 +44,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     List,
+    /// Diagnose this host's profiling readiness.
+    Doctor,
     Stat {
         #[arg(short, long)]
         pid: Option<u32>,
@@ -93,7 +98,12 @@ enum Commands {
     EventsExport {
         result_directory: String,
     },
-    /// Run one read-only SQLite query against recorded performance data.
+    /// Validate a session directory after a crash, quarantining segments
+    /// that were left without a footer.
+    Recover {
+        result_directory: String,
+    },
+    /// Run one read-only SQL query against recorded performance data.
     Query {
         /// Result directory followed by one quoted SQL statement. Use
         /// `mperf query help` for the complete guide.
@@ -144,6 +154,7 @@ pub async fn run() -> Result<()> {
             level,
             command,
         } => do_stat(pid, command, events, topdown.then_some(level)),
+        Commands::Doctor => do_doctor(),
         Commands::List => {
             let events = pmu::list_supported_counters(pmu::DriverKind::Default);
             for event in events {
@@ -194,6 +205,17 @@ pub async fn run() -> Result<()> {
             .await
         }
         Commands::Show { result_directory } => tui::tui_main(Path::new(&result_directory)).await,
+        Commands::Recover { result_directory } => {
+            let report = store::recover_session(Path::new(&result_directory))?;
+            println!("{} healthy segment(s)", report.healthy);
+            for file in &report.quarantined {
+                println!("quarantined {}", file.display());
+            }
+            if report.quarantined.is_empty() {
+                println!("no crash-damaged segments found");
+            }
+            Ok(())
+        }
         Commands::EventsExport { result_directory } => {
             do_events_export(Path::new(&result_directory));
             Ok(())

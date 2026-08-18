@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         desc: #desc.to_string(),
                         formula: #formula.to_string(),
                         group: #group,
+                        cpus: None,
                     }
                 }
             });

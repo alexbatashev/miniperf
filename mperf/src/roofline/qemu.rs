@@ -789,9 +789,9 @@ impl RooflineBackend for QemuBackend {
                 dispatcher.clone(),
                 &baseline_command,
                 Vec::new(),
-                false,
                 self.memory_profile
                     .then(|| output_directory.join("memory-rss.txt")),
+                super::bandwidth_timeline_path(output_directory),
             )
             .await?;
             let timing_path = output_directory.join("memory-native.json");
@@ -1063,7 +1063,7 @@ async fn publish_start(
     pid: i32,
     timestamp: u64,
     guest: &str,
-) -> u128 {
+) -> u64 {
     let id = dispatcher.unique_id();
     let function_name = dispatcher.string_id_async("[QEMU whole process]").await;
     let file_name = dispatcher.string_id_async(guest).await;
@@ -1089,7 +1089,7 @@ async fn publish_end(
     dispatcher: &Arc<EventDispatcher>,
     pid: i32,
     timestamp: u64,
-    correlation_id: u128,
+    correlation_id: u64,
 ) {
     dispatcher
         .publish_event(synthetic_event(
@@ -1109,8 +1109,8 @@ fn synthetic_event(
     pid: i32,
     timestamp: u64,
     ty: EventType,
-    unique_id: u128,
-    parent_or_correlation_id: u128,
+    unique_id: u64,
+    parent_or_correlation_id: u64,
     value: u64,
 ) -> Event {
     let is_counter = matches!(
@@ -1150,6 +1150,7 @@ fn synthetic_event(
         timestamp,
         name: 0,
         callstack: smallvec![],
+        lbr_callstack: Vec::new(),
         user_regs: None,
         user_stack: Vec::new(),
     }

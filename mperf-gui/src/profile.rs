@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use sqlite::{Connection, Value};
+
+use crate::sql::{
+    Column, Connection, Value, as_f64, as_i64, as_text, as_u64, row_values, table_columns,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProfileData {
@@ -142,12 +145,6 @@ impl ProfileData {
     }
 }
 
-#[derive(Debug)]
-struct SqliteColumn {
-    name: String,
-    declared_type: String,
-}
-
 #[derive(Debug, Clone)]
 struct ResolvedFrame {
     name: String,
@@ -163,9 +160,9 @@ struct FrameKey {
 }
 
 fn load_profile(connection: &Connection) -> Result<ProfileData> {
-    let sample_columns = table_columns(connection, "pmu_counters")?;
+    let sample_columns = table_columns(connection, "pmu_counters");
     if sample_columns.is_empty() {
-        bail!("timestamped profiles are unavailable: SQLite table `pmu_counters` does not exist");
+        bail!("timestamped profiles are unavailable: table `pmu_counters` does not exist");
     }
 
     let timestamp_column = required_column(&sample_columns, "timestamp")?;
@@ -215,13 +212,20 @@ fn load_profile(connection: &Connection) -> Result<ProfileData> {
         selected_columns.join(", "),
         quoted(timestamp_column)
     );
-    let statement = connection
-        .prepare(query)
+    let mut statement = connection
+        .prepare(&query)
+        .context("failed to query timestamped profile samples")?;
+    let mut rows = statement
+        .query([])
         .context("failed to query timestamped profile samples")?;
     let mut samples = Vec::new();
 
-    for row in statement.into_iter() {
-        let row = row.context("failed to read a timestamped profile sample")?;
+    while let Some(row) = rows
+        .next()
+        .context("failed to read a timestamped profile sample")?
+    {
+        let row = row_values(row, 6 + dynamic_columns.len())
+            .context("failed to read a timestamped profile sample")?;
         let timestamp_ns = required_nonnegative_u64(&row[0], "pmu_counters.timestamp")?;
         let process_id = required_u32(&row[1], "pmu_counters.process_id")?;
         let thread_id = required_u32(&row[2], "pmu_counters.thread_id")?;
@@ -274,7 +278,7 @@ fn load_cpu_observations(
     frames: &mut Vec<ProfileFrame>,
     frame_ids: &mut HashMap<FrameKey, usize>,
 ) -> Result<Vec<CpuObservation>> {
-    let columns = table_columns(connection, "cpu_observations")?;
+    let columns = table_columns(connection, "cpu_observations");
     if columns.is_empty() {
         return Ok(legacy_cpu_observations(samples, counter_metrics));
     }
@@ -304,12 +308,15 @@ fn load_cpu_observations(
         selected_columns.join(", "),
         quoted(timestamp_column)
     );
-    let statement = connection
-        .prepare(query)
+    let mut statement = connection
+        .prepare(&query)
+        .context("failed to query CPU observations")?;
+    let mut rows = statement
+        .query([])
         .context("failed to query CPU observations")?;
     let mut observations = Vec::new();
-    for row in statement.into_iter() {
-        let row = row.context("failed to read a CPU observation")?;
+    while let Some(row) = rows.next().context("failed to read a CPU observation")? {
+        let row = row_values(row, 8).context("failed to read a CPU observation")?;
         let timestamp_ns = required_nonnegative_u64(&row[0], "cpu_observations.timestamp")?;
         let process_id = required_u32(&row[1], "cpu_observations.process_id")?;
         let thread_id = required_u32(&row[2], "cpu_observations.thread_id")?;
@@ -393,9 +400,9 @@ fn intern_stack(
 }
 
 fn load_proc_map(connection: &Connection) -> Result<HashMap<u64, ResolvedFrame>> {
-    let columns = table_columns(connection, "proc_map")?;
+    let columns = table_columns(connection, "proc_map");
     if columns.is_empty() {
-        bail!("timestamped profiles are unavailable: SQLite table `proc_map` does not exist");
+        bail!("timestamped profiles are unavailable: table `proc_map` does not exist");
     }
 
     let ip_column = required_column(&columns, "ip")?;
@@ -418,14 +425,20 @@ fn load_proc_map(connection: &Connection) -> Result<HashMap<u64, ResolvedFrame>>
             .unwrap_or_else(|| "NULL AS line".to_string()),
     ];
     let query = format!("SELECT {} FROM proc_map;", selected_columns.join(", "));
-    let statement = connection
-        .prepare(query)
+    let mut statement = connection
+        .prepare(&query)
+        .context("failed to query profile symbols from `proc_map`")?;
+    let mut rows = statement
+        .query([])
         .context("failed to query profile symbols from `proc_map`")?;
     let mut resolved = HashMap::new();
 
-    for row in statement.into_iter() {
-        let row = row.context("failed to read a profile symbol from `proc_map`")?;
-        let ip = sqlite_ip(&row[0]).context("invalid `proc_map.ip`")?;
+    while let Some(row) = rows
+        .next()
+        .context("failed to read a profile symbol from `proc_map`")?
+    {
+        let row = row_values(row, 5).context("failed to read a profile symbol from `proc_map`")?;
+        let ip = instruction_pointer(&row[0]).context("invalid `proc_map.ip`")?;
         let name = optional_text(&row[1], "proc_map.func_name")?
             .filter(|name| name != "[unknown]")
             .unwrap_or_else(|| unknown_name(ip));
@@ -501,29 +514,7 @@ fn unknown_name(ip: u64) -> String {
     format!("0x{ip:x}")
 }
 
-fn table_columns(connection: &Connection, table: &str) -> Result<Vec<SqliteColumn>> {
-    let query = format!("PRAGMA table_info({});", quoted(table));
-    connection
-        .prepare(query)
-        .with_context(|| format!("failed to inspect SQLite table `{table}`"))?
-        .into_iter()
-        .map(|row| {
-            let row = row.with_context(|| format!("failed to inspect SQLite table `{table}`"))?;
-            Ok(SqliteColumn {
-                name: row
-                    .try_read::<&str, _>("name")
-                    .context("missing column name in SQLite schema")?
-                    .to_string(),
-                declared_type: row
-                    .try_read::<&str, _>("type")
-                    .context("missing column type in SQLite schema")?
-                    .to_string(),
-            })
-        })
-        .collect()
-}
-
-fn required_column<'a>(columns: &'a [SqliteColumn], expected: &str) -> Result<&'a str> {
+fn required_column<'a>(columns: &'a [Column], expected: &str) -> Result<&'a str> {
     find_column(columns, expected).with_context(|| {
         format!(
             "timestamped profiles are unavailable in this legacy recording: \
@@ -532,7 +523,7 @@ fn required_column<'a>(columns: &'a [SqliteColumn], expected: &str) -> Result<&'
     })
 }
 
-fn find_column<'a>(columns: &'a [SqliteColumn], expected: &str) -> Option<&'a str> {
+fn find_column<'a>(columns: &'a [Column], expected: &str) -> Option<&'a str> {
     columns
         .iter()
         .find(|column| column.name.eq_ignore_ascii_case(expected))
@@ -599,34 +590,30 @@ fn quoted(identifier: &str) -> String {
 
 fn parse_call_stack(value: &Value, field: &str) -> Result<Vec<u64>> {
     match value {
-        Value::String(stack) => serde_json::from_str(stack)
+        Value::Text(stack) => serde_json::from_str(stack)
             .with_context(|| format!("invalid `{field}` value `{stack}`")),
+        Value::List(frames) | Value::Array(frames) => {
+            Ok(frames.iter().filter_map(as_u64).collect())
+        }
         Value::Null => Ok(Vec::new()),
         _ => bail!("`{field}` is not text"),
     }
 }
 
-fn sqlite_ip(value: &Value) -> Result<u64> {
+fn instruction_pointer(value: &Value) -> Result<u64> {
     match value {
-        // SQLite only has signed integers. Casting reconstructs raw addresses
-        // that were persisted from `u64` with `as i64`.
-        Value::Integer(value) => Ok(*value as u64),
-        Value::Float(value) if value.is_finite() && value.fract() == 0.0 => Ok(*value as u64),
-        Value::String(value) => value
+        Value::Text(value) => value
             .parse()
             .with_context(|| format!("invalid instruction pointer `{value}`")),
-        _ => bail!("instruction pointer is not an integer"),
+        _ => as_u64(value).context("instruction pointer is not an integer"),
     }
 }
 
 fn required_nonnegative_u64(value: &Value, field: &str) -> Result<u64> {
-    match value {
-        Value::Integer(value) if *value >= 0 => Ok(*value as u64),
-        Value::Float(value) if value.is_finite() && *value >= 0.0 && value.fract() == 0.0 => {
-            Ok(*value as u64)
-        }
-        _ => bail!("`{field}` is not a non-negative integer"),
-    }
+    as_i64(value)
+        .filter(|value| *value >= 0)
+        .map(|value| value as u64)
+        .with_context(|| format!("`{field}` is not a non-negative integer"))
 }
 
 fn optional_nonnegative_u64(value: &Value, field: &str) -> Result<Option<u64>> {
@@ -642,60 +629,39 @@ fn required_u32(value: &Value, field: &str) -> Result<u32> {
 }
 
 fn optional_cpu(value: &Value) -> Option<u32> {
-    match value {
-        Value::Integer(value) if (0..u32::MAX as i64).contains(value) => Some(*value as u32),
-        Value::Float(value)
-            if value.is_finite()
-                && value.fract() == 0.0
-                && *value >= 0.0
-                && *value < u32::MAX as f64 =>
-        {
-            Some(*value as u32)
-        }
-        _ => None,
-    }
+    as_i64(value)
+        .filter(|value| (0..u32::MAX as i64).contains(value))
+        .map(|value| value as u32)
 }
 
 fn positive_f64(value: &Value) -> Option<f64> {
-    let value = match value {
-        Value::Integer(value) => *value as f64,
-        Value::Float(value) => *value,
-        _ => return None,
-    };
-    (value.is_finite() && value > 0.0).then_some(value)
+    as_f64(value).filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn numeric_counter(value: &Value, column: &str) -> Result<Option<f64>> {
     match value {
         Value::Null => Ok(None),
-        Value::Integer(value) => Ok(Some(*value as f64)),
-        Value::Float(value) => Ok(Some(*value)),
-        _ => bail!("numeric counter `{column}` contains a non-numeric value"),
+        _ => as_f64(value)
+            .map(Some)
+            .with_context(|| format!("numeric counter `{column}` contains a non-numeric value")),
     }
 }
 
 fn optional_text(value: &Value, field: &str) -> Result<Option<String>> {
     match value {
         Value::Null => Ok(None),
-        Value::String(value) if value.trim().is_empty() => Ok(None),
-        Value::String(value) => Ok(Some(value.clone())),
-        _ => bail!("`{field}` is not text"),
+        _ => match as_text(value) {
+            Some(text) if text.trim().is_empty() => Ok(None),
+            Some(text) => Ok(Some(text.to_string())),
+            None => bail!("`{field}` is not text"),
+        },
     }
 }
 
 fn optional_positive_u32(value: &Value) -> Option<u32> {
-    match value {
-        Value::Integer(value) => u32::try_from(*value).ok().filter(|value| *value > 0),
-        Value::Float(value)
-            if value.is_finite()
-                && value.fract() == 0.0
-                && *value > 0.0
-                && *value <= u32::MAX as f64 =>
-        {
-            Some(*value as u32)
-        }
-        _ => None,
-    }
+    as_i64(value)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
 }
 
 #[cfg(test)]
@@ -704,15 +670,15 @@ mod tests {
 
     #[test]
     fn loads_root_to_leaf_interned_stacks_and_dynamic_nullable_counters() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "
                 CREATE TABLE proc_map (
-                    ip INTEGER,
+                    ip BIGINT,
                     func_name TEXT,
                     file_name TEXT,
-                    line INTEGER,
+                    line BIGINT,
                     module_path TEXT
                 );
                 INSERT INTO proc_map VALUES (16, 'leaf', '', NULL, '/app');
@@ -720,14 +686,14 @@ mod tests {
                 INSERT INTO proc_map VALUES (32, 'root', '/src/root.rs', 4, '/app');
 
                 CREATE TABLE pmu_counters (
-                    timestamp INTEGER NOT NULL,
-                    process_id INTEGER NOT NULL,
-                    thread_id INTEGER NOT NULL,
+                    timestamp BIGINT NOT NULL,
+                    process_id BIGINT NOT NULL,
+                    thread_id BIGINT NOT NULL,
                     call_stack TEXT,
-                    cpu INTEGER,
-                    confidence REAL,
-                    pmu_cycles INTEGER,
-                    custom_rate REAL,
+                    cpu BIGINT,
+                    confidence DOUBLE,
+                    pmu_cycles BIGINT,
+                    custom_rate DOUBLE,
                     annotation TEXT
                 );
                 INSERT INTO pmu_counters
@@ -815,17 +781,17 @@ mod tests {
 
     #[test]
     fn cpu_column_is_capability_detected_and_sentinels_are_unknown() {
-        let legacy = sqlite::open(":memory:").unwrap();
+        let legacy = Connection::open_in_memory().unwrap();
         legacy
-            .execute(
+            .execute_batch(
                 "
-                CREATE TABLE proc_map (ip INTEGER, func_name TEXT);
+                CREATE TABLE proc_map (ip BIGINT, func_name TEXT);
                 CREATE TABLE pmu_counters (
-                    timestamp INTEGER,
-                    process_id INTEGER,
-                    thread_id INTEGER,
+                    timestamp BIGINT,
+                    process_id BIGINT,
+                    thread_id BIGINT,
                     call_stack TEXT,
-                    pmu_cycles INTEGER
+                    pmu_cycles BIGINT
                 );
                 INSERT INTO pmu_counters VALUES (1, 2, 3, '[]', 4);
                 ",
@@ -835,18 +801,18 @@ mod tests {
         assert_eq!(legacy_profile.error, None);
         assert_eq!(legacy_profile.samples[0].cpu, None);
 
-        let current = sqlite::open(":memory:").unwrap();
+        let current = Connection::open_in_memory().unwrap();
         current
-            .execute(
+            .execute_batch(
                 "
-                CREATE TABLE proc_map (ip INTEGER, func_name TEXT);
+                CREATE TABLE proc_map (ip BIGINT, func_name TEXT);
                 CREATE TABLE pmu_counters (
-                    timestamp INTEGER,
-                    process_id INTEGER,
-                    thread_id INTEGER,
+                    timestamp BIGINT,
+                    process_id BIGINT,
+                    thread_id BIGINT,
                     call_stack TEXT,
-                    cpu INTEGER,
-                    pmu_cycles INTEGER
+                    cpu BIGINT,
+                    pmu_cycles BIGINT
                 );
                 INSERT INTO pmu_counters VALUES (1, 2, 3, '[]', 4, 10);
                 INSERT INTO pmu_counters VALUES (2, 2, 3, '[]', -1, 10);
@@ -868,28 +834,28 @@ mod tests {
 
     #[test]
     fn loads_stack_independent_cpu_observations_with_source_semantics() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "
-                CREATE TABLE proc_map (ip INTEGER, func_name TEXT);
+                CREATE TABLE proc_map (ip BIGINT, func_name TEXT);
                 INSERT INTO proc_map VALUES (16, 'leaf');
                 CREATE TABLE pmu_counters (
-                    timestamp INTEGER,
-                    process_id INTEGER,
-                    thread_id INTEGER,
+                    timestamp BIGINT,
+                    process_id BIGINT,
+                    thread_id BIGINT,
                     call_stack TEXT,
-                    cpu INTEGER,
-                    os_cpu_clock INTEGER
+                    cpu BIGINT,
+                    os_cpu_clock BIGINT
                 );
                 INSERT INTO pmu_counters VALUES (100, 2, 3, '[16]', 4, 10);
                 CREATE TABLE cpu_observations (
-                    process_id INTEGER,
-                    thread_id INTEGER,
-                    cpu INTEGER,
-                    timestamp INTEGER,
-                    interval_start_ns INTEGER,
-                    weight_ns INTEGER,
+                    process_id BIGINT,
+                    thread_id BIGINT,
+                    cpu BIGINT,
+                    timestamp BIGINT,
+                    interval_start_ns BIGINT,
+                    weight_ns BIGINT,
                     source TEXT,
                     call_stack TEXT
                 );
@@ -924,25 +890,25 @@ mod tests {
 
     #[test]
     fn legacy_counter_delta_without_wall_interval_keeps_compatibility_semantics() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "
-                CREATE TABLE proc_map (ip INTEGER, func_name TEXT);
+                CREATE TABLE proc_map (ip BIGINT, func_name TEXT);
                 CREATE TABLE pmu_counters (
-                    timestamp INTEGER,
-                    process_id INTEGER,
-                    thread_id INTEGER,
+                    timestamp BIGINT,
+                    process_id BIGINT,
+                    thread_id BIGINT,
                     call_stack TEXT,
-                    cpu INTEGER,
-                    os_cpu_clock INTEGER
+                    cpu BIGINT,
+                    os_cpu_clock BIGINT
                 );
                 CREATE TABLE cpu_observations (
-                    process_id INTEGER,
-                    thread_id INTEGER,
-                    cpu INTEGER,
-                    timestamp INTEGER,
-                    weight_ns INTEGER,
+                    process_id BIGINT,
+                    thread_id BIGINT,
+                    cpu BIGINT,
+                    timestamp BIGINT,
+                    weight_ns BIGINT,
                     source TEXT,
                     call_stack TEXT
                 );
@@ -965,7 +931,7 @@ mod tests {
 
     #[test]
     fn missing_or_legacy_schema_is_reported_without_panicking() {
-        let missing = sqlite::open(":memory:").unwrap();
+        let missing = Connection::open_in_memory().unwrap();
         let missing_profile = ProfileData::load(&missing);
         assert!(missing_profile.samples.is_empty());
         assert!(
@@ -976,16 +942,16 @@ mod tests {
                 .contains("pmu_counters")
         );
 
-        let legacy = sqlite::open(":memory:").unwrap();
+        let legacy = Connection::open_in_memory().unwrap();
         legacy
-            .execute(
+            .execute_batch(
                 "
-                CREATE TABLE proc_map (ip INTEGER, func_name TEXT);
+                CREATE TABLE proc_map (ip BIGINT, func_name TEXT);
                 CREATE TABLE pmu_counters (
-                    timestamp INTEGER,
-                    process_id INTEGER,
-                    thread_id INTEGER,
-                    pmu_cycles INTEGER
+                    timestamp BIGINT,
+                    process_id BIGINT,
+                    thread_id BIGINT,
+                    pmu_cycles BIGINT
                 );
                 ",
             )

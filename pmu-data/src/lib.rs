@@ -146,6 +146,11 @@ pub struct TmaMetric {
     /// formula when possible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// CPUs this metric is computed from, as a sysfs cpumask (`0,5-11`). Set on
+    /// heterogeneous hosts, where each core type has its own topdown
+    /// parameters; `None` means every CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<String>,
 }
 
 /// A set of events that must be read as one perf group.

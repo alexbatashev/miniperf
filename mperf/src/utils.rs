@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+
+use anyhow::Result;
 use mperf_data::{EventType, ProcMapEntry};
 use pmu::Counter;
+use store::duckdb::Connection;
 use symbolize::{ProcessMap, Resolver};
 
 pub fn counter_to_event_ty(counter: &Counter) -> EventType {
@@ -23,6 +27,68 @@ pub fn counter_to_event_ty(counter: &Counter) -> EventType {
             code: _,
         } => EventType::PmuCustom,
     }
+}
+
+/// The event type whose recorded name is `name`, or `None` for a custom counter.
+pub fn event_type_from_name(name: &str) -> Option<EventType> {
+    const TYPES: [EventType; 26] = [
+        EventType::PmuCycles,
+        EventType::PmuInstructions,
+        EventType::PmuLlcReferences,
+        EventType::PmuLlcMisses,
+        EventType::PmuBranchInstructions,
+        EventType::PmuBranchMisses,
+        EventType::PmuStalledCyclesFrontend,
+        EventType::PmuStalledCyclesBackend,
+        EventType::PmuCustom,
+        EventType::OsCpuClock,
+        EventType::OsCpuMigrations,
+        EventType::OsPageFaults,
+        EventType::OsContextSwitches,
+        EventType::OsTotalTime,
+        EventType::OsUserTime,
+        EventType::OsSystemTime,
+        EventType::RooflineBytesLoad,
+        EventType::RooflineBytesStore,
+        EventType::RooflineScalarIntOps,
+        EventType::RooflineScalarFloatOps,
+        EventType::RooflineScalarDoubleOps,
+        EventType::RooflineVectorIntOps,
+        EventType::RooflineVectorFloatOps,
+        EventType::RooflineVectorDoubleOps,
+        EventType::RooflineLoopStart,
+        EventType::RooflineLoopEnd,
+    ];
+    TYPES.into_iter().find(|ty| ty.to_string() == name)
+}
+
+/// Executable mappings recorded in the session's `modules` table.
+pub fn load_modules(connection: &Connection) -> Result<Vec<ProcMapEntry>> {
+    let mut statement =
+        connection.prepare("SELECT pid, path, address, size, \"offset\" FROM modules")?;
+    let modules = statement
+        .query_map([], |row| {
+            Ok(ProcMapEntry {
+                pid: row.get::<_, u32>(0)?,
+                filename: row.get::<_, String>(1)?,
+                address: row.get::<_, u64>(2)? as usize,
+                size: row.get::<_, u64>(3)? as usize,
+                offset: row.get::<_, u64>(4)? as usize,
+            })
+        })?
+        .collect::<store::duckdb::Result<Vec<_>>>()?;
+    Ok(modules)
+}
+
+/// The interned string dictionary of a session.
+pub fn load_strings(connection: &Connection) -> Result<HashMap<u64, String>> {
+    let mut statement = connection.prepare("SELECT id, string FROM strings")?;
+    let strings = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<store::duckdb::Result<HashMap<_, _>>>()?;
+    Ok(strings)
 }
 
 pub fn resolve_proc_maps(proc_maps: &[ProcMapEntry]) -> Resolver {

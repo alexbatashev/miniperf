@@ -1,0 +1,12 @@
+[package]
+name = "miniperf-shims"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "shims"
+
+[dev-dependencies]
+libc = "0.2"
+miniperf-store = { path = "../store" }
+tempfile = "3"

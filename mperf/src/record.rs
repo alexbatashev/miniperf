@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use mperf_data::{CallFrame, CpuClockSource, Event, ProcMapEntry, RecordInfo, ScenarioInfo};
-use std::{fs::File, path::Path, sync::Arc};
+use std::{fs::File, path::Path, rc::Rc, sync::Arc};
 
 #[cfg(target_os = "macos")]
 use std::{collections::HashMap, path::PathBuf};
@@ -9,10 +9,11 @@ use pmu::{Counter, Process, Record};
 
 use crate::{
     Scenario,
-    counter_selection::{get_pmu_counters, get_tma_counter_groups},
+    counter_selection::get_tma_counter_groups,
     event_dispatcher::EventDispatcher,
     postprocess::perform_postprocessing,
     roofline,
+    source::{Pass, PmuSamplingSource, SessionContext, Source},
     utils::counter_to_event_ty,
 };
 
@@ -28,6 +29,18 @@ pub async fn do_record(
     duration: Option<std::time::Duration>,
 ) -> Result<()> {
     println!("Record profile with {scenario:?} scenario");
+
+    let fidelity = crate::source::resolve_fidelity(scenario);
+    println!(
+        "Capture fidelity: {} at '{}'{}",
+        fidelity.scenario,
+        fidelity.rung,
+        fidelity
+            .rejected
+            .first()
+            .map(|rejected| format!(" ({})", rejected.reason))
+            .unwrap_or_default()
+    );
 
     let cpu_info = if scenario == Scenario::Mem
         && roofline::uses_native_performance(&roofline_options, &command)?
@@ -95,7 +108,7 @@ pub async fn do_record(
             )
             .await?
         }
-        Scenario::TMA => topdown(dispatcher.clone(), &command)?,
+        Scenario::TMA => topdown(dispatcher.clone(), &command, output_directory)?,
     };
 
     drop(dispatcher);
@@ -138,6 +151,7 @@ pub async fn do_record(
         logical_cpu_count: host_logical_cpu_count(),
         cores,
         cpu_info,
+        capture_fidelity: vec![fidelity],
         scenario_info: info,
     };
 
@@ -177,59 +191,39 @@ fn snapshot(
         anyhow::bail!("record snapshot requires a command or --pid");
     }
 
+    let optional: Vec<Box<dyn Source>> = vec![Box::new(crate::source::InternalEventsSource {
+        roofline_instrumented: false,
+    })];
+    #[cfg(target_os = "linux")]
+    let optional = {
+        let mut optional = optional;
+        optional.push(Box::new(crate::source::ProcfsSource::default()));
+        optional.push(Box::new(crate::source::BpfSource::default()));
+        optional
+    };
+    let pass = Pass {
+        name: "snapshot",
+        required: vec![Box::new(PmuSamplingSource::for_scenario(
+            Scenario::Snapshot,
+        ))],
+        optional,
+    };
+    let mut pass = pass.resolve(output_directory)?;
+    let child_env = pass.child_environment(output_directory);
+
     let process = if pid.is_none() {
-        Some(Process::new(command, &[])?)
+        Some(Rc::new(Process::new(command, &child_env)?))
     } else {
         None
     };
 
-    let counters = get_pmu_counters(Scenario::Snapshot);
-
-    let recorded_pid = pid.unwrap_or_else(|| process.as_ref().unwrap().pid() as u32) as i32;
-    #[cfg(target_os = "linux")]
-    let target_pids = if let Some(pid) = pid {
-        let tree = crate::snapshot_resources::process_tree(pid);
-        if tree.is_empty() {
-            vec![pid]
-        } else {
-            tree.into_iter().map(|member| member.pid).collect()
-        }
-    } else {
-        vec![recorded_pid as u32]
+    let context = SessionContext {
+        directory: output_directory.to_owned(),
+        dispatcher: dispatcher.clone(),
+        process: process.clone(),
+        attached_pid: pid,
     };
-    #[cfg(not(target_os = "linux"))]
-    let target_pids = vec![recorded_pid as u32];
-    let mut drivers = Vec::with_capacity(target_pids.len());
-    for target_pid in target_pids {
-        let builder = pmu::SamplingDriverBuilder::new().counters(&counters);
-        #[cfg(target_os = "linux")]
-        let mut builder = builder.sample_freq(99).stack_dump_size(2 * 1024);
-        #[cfg(not(target_os = "linux"))]
-        let mut builder = builder;
-        if let Some(process) = &process {
-            builder = builder.process(process);
-        } else {
-            builder = builder.pid(target_pid as i32);
-        }
-        drivers.push(builder.build()?);
-    }
-    let recorded_counters = drivers
-        .first()
-        .map(|driver| driver.counters())
-        .unwrap_or_default();
-    #[cfg(target_os = "linux")]
-    let cgroup_scope =
-        crate::snapshot_resources::CgroupScope::create(recorded_pid as u32, pid.is_none());
-    #[cfg(target_os = "linux")]
-    let resource_monitor = crate::snapshot_resources::ResourceMonitor::start(
-        recorded_pid as u32,
-        pid.is_none(),
-        cgroup_scope.path(),
-        output_directory,
-    )?;
-    #[cfg(target_os = "linux")]
-    let bpf_monitor =
-        crate::snapshot_resources::BpfMonitor::start(recorded_pid as u32, output_directory);
+    let recorded_pid = context.root_pid() as i32;
     // On macOS Process::new returns an already-exec'd, suspended child, so its
     // dyld mappings are available before the first instruction is profiled.
     // Attached processes are already live on every platform.
@@ -237,9 +231,7 @@ fn snapshot(
         publish_process_maps(dispatcher.clone(), recorded_pid);
     }
 
-    for driver in &mut drivers {
-        driver.start(snapshot_callback(dispatcher.clone()))?;
-    }
+    pass.start(&context)?;
     #[cfg(target_os = "linux")]
     let stop_reason = {
         let started = std::time::Instant::now();
@@ -345,17 +337,21 @@ fn snapshot(
     } else {
         unreachable!("snapshot requires a command or PID")
     };
-    for driver in &mut drivers {
-        driver.stop()?;
-    }
-    #[cfg(target_os = "linux")]
-    let mut collectors = resource_monitor.stop();
-    #[cfg(target_os = "linux")]
-    collectors.push(bpf_monitor.stop());
-    #[cfg(target_os = "linux")]
-    collectors.push(cgroup_scope.status());
-    #[cfg(not(target_os = "linux"))]
-    let collectors: Vec<mperf_data::SnapshotCollectorStatus> = Vec::new();
+    let statuses = pass.stop(&context);
+    let recorded_counters = pass
+        .sources
+        .iter()
+        .find_map(|source| {
+            source
+                .as_any()
+                .downcast_ref::<PmuSamplingSource>()
+                .map(PmuSamplingSource::recorded_counters)
+        })
+        .unwrap_or_default();
+    let collectors: Vec<mperf_data::SnapshotCollectorStatus> = statuses
+        .into_iter()
+        .filter(|status| status.name != "pmu_sampling" || status.status != "available")
+        .collect();
 
     let warnings = collectors
         .iter()
@@ -365,10 +361,7 @@ fn snapshot(
 
     Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
         pid: recorded_pid,
-        counters: recorded_counters
-            .iter()
-            .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
-            .collect(),
+        counters: recorded_counters,
         scope: if cfg!(target_os = "linux") {
             if pid.is_some() {
                 "attached_tree_best_effort"
@@ -386,10 +379,10 @@ fn snapshot(
     }))
 }
 
-fn snapshot_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingCallback> {
+pub(crate) fn sample_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingCallback> {
     Arc::new(move |record| match record {
         Record::Sample(sample) => {
-            let unique_id = uuid::Uuid::now_v7().as_u128();
+            let unique_id = dispatcher.unique_id();
             let mut callstack = smallvec::smallvec![CallFrame::IP(sample.ip)];
             callstack.extend(
                 sample
@@ -405,7 +398,7 @@ fn snapshot_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingC
             };
             dispatcher.publish_event_sync(Event {
                 unique_id,
-                correlation_id: sample.event_id,
+                correlation_id: sample.event_id as u64,
                 parent_id: 0,
                 ty: counter_to_event_ty(&sample.counter),
                 thread_id: sample.tid,
@@ -417,6 +410,7 @@ fn snapshot_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingC
                 timestamp: sample.time,
                 name,
                 callstack,
+                lbr_callstack: sample.lbr_callstack.into_vec(),
                 user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
                     abi: regs.abi,
                     mask: regs.mask,
@@ -432,6 +426,50 @@ fn snapshot_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingC
             offset: addr.pgoff as usize,
             pid: addr.pid,
         }),
+        Record::MemSample(_) => {}
+    })
+}
+
+/// Forwards precise memory samples into the session's `mem_samples_raw` table.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn mem_sample_callback(
+    dispatcher: Arc<EventDispatcher>,
+) -> Arc<dyn pmu::SamplingCallback> {
+    Arc::new(move |record| match record {
+        Record::MemSample(sample) => {
+            let mut callstack = vec![sample.ip];
+            callstack.extend(
+                sample
+                    .callstack
+                    .into_iter()
+                    .filter(|address| *address != sample.ip),
+            );
+            dispatcher.publish_mem_sample_sync(mperf_data::MemSample {
+                timestamp: sample.time,
+                process_id: sample.pid,
+                thread_id: sample.tid,
+                cpu: sample.cpu,
+                data_addr: sample.data_addr,
+                latency: sample.latency,
+                data_src: sample.data_src,
+                callstack,
+                lbr_callstack: sample.lbr_callstack.into_vec(),
+                user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
+                    abi: regs.abi,
+                    mask: regs.mask,
+                    values: regs.values,
+                }),
+                user_stack: sample.user_stack,
+            });
+        }
+        Record::ProcAddr(addr) => dispatcher.publish_proc_map_sync(ProcMapEntry {
+            filename: addr.filename,
+            address: addr.addr as usize,
+            size: addr.len as usize,
+            offset: addr.pgoff as usize,
+            pid: addr.pid,
+        }),
+        Record::Sample(_) => {}
     })
 }
 
@@ -520,81 +558,74 @@ fn macos_segment_is_executable(size: u64, initial_protection: i32) -> bool {
     size > 0 && initial_protection & VM_PROT_EXECUTE != 0
 }
 
-fn topdown(dispatcher: Arc<EventDispatcher>, command: &[String]) -> Result<ScenarioInfo> {
-    let scenario = pmu::host_tma_scenario().context("TMA is not supported on this CPU")?;
-    let process = Process::new(command, &[])?;
+fn topdown(
+    dispatcher: Arc<EventDispatcher>,
+    command: &[String],
+    output_directory: &Path,
+) -> Result<ScenarioInfo> {
+    let scenario = pmu::tma_scenario().context("TMA is not supported on this CPU")?;
     // Validate the formula groups, but do not turn each one into an independent
     // sampling leader. Multiple cycle leaders multiply the interrupt rate and
     // severely perturb the workload (especially while capturing DWARF stacks).
     // The original TMA collector sampled the deduplicated event set once.
     get_tma_counter_groups(&scenario)?;
-    let counters = get_pmu_counters(Scenario::TMA);
 
     // TMA uses the same sampling engine and attribution mode as Snapshot.
-    // Only the counter set differs. The original TMA implementation worked
-    // this way; switching selected scenarios to PEBS changed the meaning and
-    // availability of samples without changing the metric formulas.
-    let mut driver = pmu::SamplingDriverBuilder::new()
-        .counters(&counters)
-        .process(&process)
-        .build()?;
-    let recorded_counters = driver.counters();
+    // Only the counter set differs.
+    // Precise memory samples (PEBS/SPE) run in their own event slots and do
+    // not compete with the topdown counter group, so a TMA recording gets
+    // instruction-level memory attribution for free where the host has it.
+    let pass = Pass {
+        name: "tma",
+        required: vec![Box::new(PmuSamplingSource::for_scenario(Scenario::TMA))],
+        optional: vec![
+            Box::new(crate::source::InternalEventsSource {
+                roofline_instrumented: false,
+            }),
+            Box::new(crate::source::PreciseMemorySource::default()),
+        ],
+    };
+    let mut pass = pass.resolve(output_directory)?;
+    let child_env = pass.child_environment(output_directory);
+    let process = Rc::new(Process::new(command, &child_env)?);
+    let context = SessionContext {
+        directory: output_directory.to_owned(),
+        dispatcher: dispatcher.clone(),
+        process: Some(process.clone()),
+        attached_pid: None,
+    };
     let recorded_pid = process.pid();
     if cfg!(target_os = "macos") {
         publish_process_maps(dispatcher.clone(), recorded_pid);
     }
 
-    let sample_dispatcher = dispatcher.clone();
-    driver.start(Arc::new(move |record| match record {
-        Record::Sample(sample) => {
-            let name = if let Counter::Custom(name) = &sample.counter {
-                sample_dispatcher.string_id(name)
-            } else {
-                0
-            };
-            sample_dispatcher.publish_event_sync(Event {
-                unique_id: uuid::Uuid::now_v7().as_u128(),
-                correlation_id: sample.event_id,
-                parent_id: 0,
-                ty: counter_to_event_ty(&sample.counter),
-                thread_id: sample.tid,
-                process_id: sample.pid,
-                cpu: sample.cpu,
-                time_enabled: sample.time_enabled,
-                time_running: sample.time_running,
-                value: sample.value,
-                name,
-                timestamp: sample.time,
-                callstack: sample.callstack.into_iter().map(CallFrame::IP).collect(),
-                user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
-                    abi: regs.abi,
-                    mask: regs.mask,
-                    values: regs.values,
-                }),
-                user_stack: sample.user_stack,
-            });
-        }
-        Record::ProcAddr(addr) => sample_dispatcher.publish_proc_map_sync(ProcMapEntry {
-            filename: addr.filename,
-            address: addr.addr as usize,
-            size: addr.len as usize,
-            offset: addr.pgoff as usize,
-            pid: addr.pid,
-        }),
-    }))?;
+    pass.start(&context)?;
 
     process.cont();
     std::thread::sleep(std::time::Duration::from_millis(20));
     publish_process_maps(dispatcher, recorded_pid);
     process.wait()?;
-    driver.stop()?;
+    let statuses = pass.stop(&context);
+    for status in statuses
+        .iter()
+        .filter(|status| status.status != "available")
+    {
+        eprintln!("Warning: {}: {}", status.name, status.message);
+    }
+    let recorded_counters = pass
+        .sources
+        .iter()
+        .find_map(|source| {
+            source
+                .as_any()
+                .downcast_ref::<PmuSamplingSource>()
+                .map(PmuSamplingSource::recorded_counters)
+        })
+        .unwrap_or_default();
 
     Ok(ScenarioInfo::TMA(mperf_data::TMAInfo {
         pid: recorded_pid,
-        counters: recorded_counters
-            .iter()
-            .map(|counter| (counter_to_event_ty(counter), counter.name().to_string()))
-            .collect(),
+        counters: recorded_counters,
         groups: scenario.groups,
         precise_attribution: scenario.precise_attribution,
         metrics: scenario.metrics,

@@ -247,7 +247,7 @@ impl TabsWidget {
     }
 
     async fn fetch_data(self, res_dir: PathBuf) {
-        let (info, connection) = match load_results(&res_dir).await {
+        let (info, session) = match load_results(&res_dir).await {
             Ok(results) => results,
             Err(error) => {
                 *self.load_error.write() = Some(format!(
@@ -257,7 +257,7 @@ impl TabsWidget {
                 return;
             }
         };
-        let connection = Arc::new(Mutex::new(connection));
+        let session = Arc::new(Mutex::new(session));
         let mut write_tabs = self.tabs.write();
 
         let ui = scenario_ui(&info);
@@ -265,24 +265,24 @@ impl TabsWidget {
         for tab in ui.tabs.iter() {
             match tab {
                 pmu_data::TabSpec::Summary => write_tabs.push(Tab::Summary(Box::new(
-                    SummaryTab::new(info.clone(), connection.clone()),
+                    SummaryTab::new(info.clone(), session.clone()),
                 ))),
                 pmu_data::TabSpec::Resources => write_tabs.push(Tab::MetricsTable(
-                    MetricsTableTab::new(mperf_data::resources_table_spec(), connection.clone()),
+                    MetricsTableTab::new(mperf_data::resources_table_spec(), session.clone()),
                 )),
                 pmu_data::TabSpec::Flamegraph => {
                     write_tabs.push(Tab::Flamegraph(FlamegraphTab::new(res_dir.clone())))
                 }
                 pmu_data::TabSpec::Loops => {
                     if matches!(info.scenario, Scenario::Roofline) {
-                        write_tabs.push(Tab::Loops(LoopsTab::new(connection.clone())));
+                        write_tabs.push(Tab::Loops(LoopsTab::new(session.clone())));
                     }
                 }
                 pmu_data::TabSpec::Memory => write_tabs.push(Tab::MetricsTable(
-                    MetricsTableTab::new(memory_table_spec(), connection.clone()),
+                    MetricsTableTab::new(memory_table_spec(), session.clone()),
                 )),
                 pmu_data::TabSpec::MetricsTable(spec) => write_tabs.push(Tab::MetricsTable(
-                    MetricsTableTab::new(spec.clone(), connection.clone()),
+                    MetricsTableTab::new(spec.clone(), session.clone()),
                 )),
             }
         }
@@ -373,17 +373,16 @@ fn memory_table_spec() -> pmu_data::MetricsTableSpec {
     }
 }
 
-async fn load_results(res_dir: &Path) -> Result<(RecordInfo, sqlite::Connection)> {
+async fn load_results(res_dir: &Path) -> Result<(RecordInfo, store::Session)> {
     let info_path = res_dir.join("info.json");
     let data = fs::read_to_string(&info_path)
         .await
         .with_context(|| format!("failed to read {}", info_path.display()))?;
     let info = parse_record_info(&data)?;
 
-    let db_path = res_dir.join("perf.db");
-    let connection =
-        sqlite::open(&db_path).with_context(|| format!("failed to open {}", db_path.display()))?;
-    Ok((info, connection))
+    let session = store::Session::open(res_dir)
+        .with_context(|| format!("failed to open {}", res_dir.display()))?;
+    Ok((info, session))
 }
 
 fn parse_record_info(data: &str) -> Result<RecordInfo> {
@@ -430,6 +429,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(&format!("format version {version}")));
-        assert!(error.contains("upgrade mperf"));
+        assert!(error.contains("re-record"));
     }
 }

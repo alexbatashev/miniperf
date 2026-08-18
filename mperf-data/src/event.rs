@@ -1,19 +1,15 @@
 use core::fmt;
-use std::io::{Read, Write};
 
-use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 
-#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IString {
-    pub id: u128,
+    pub id: u64,
     pub value: String,
 }
 
-#[derive(
-    Encode, Decode, Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord,
-)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum EventType {
     PmuCycles,
@@ -44,31 +40,31 @@ pub enum EventType {
     RooflineLoopEnd,
 }
 
-#[derive(Encode, Decode, Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Location {
-    pub function_name: u128,
-    pub file_name: u128,
+    pub function_name: u64,
+    pub file_name: u64,
     pub line: u32,
 }
 
-#[derive(Encode, Decode, Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum CallFrame {
     Location(Location),
     IP(u64),
 }
 
-#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRegs {
     pub abi: u64,
     pub mask: u64,
     pub values: Vec<u64>,
 }
 
-#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
-    pub unique_id: u128,
-    pub correlation_id: u128,
-    pub parent_id: u128,
+    pub unique_id: u64,
+    pub correlation_id: u64,
+    pub parent_id: u64,
     pub ty: EventType,
     pub thread_id: u32,
     pub process_id: u32,
@@ -80,40 +76,24 @@ pub struct Event {
     pub time_running: u64,
     pub value: u64,
     pub timestamp: u64,
-    pub name: u128,
+    pub name: u64,
     pub callstack: SmallVec<[CallFrame; 32]>,
+    /// Call stack reconstructed from hardware branch records (Intel LBR
+    /// call-stack mode). Empty unless the sample carried a branch stack.
+    #[serde(default)]
+    pub lbr_callstack: Vec<u64>,
     /// Raw state used for offline DWARF unwinding. Empty for instrumentation events.
     pub user_regs: Option<UserRegs>,
     pub user_stack: Vec<u8>,
 }
 
-#[derive(Encode, Decode, Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub struct ProcMapEntry {
     pub filename: String,
     pub address: usize,
     pub size: usize,
     pub offset: usize,
     pub pid: u32,
-}
-
-impl Event {
-    pub fn write_binary<W>(&self, writer: &mut W) -> Result<(), Box<dyn std::error::Error>>
-    where
-        W: Write,
-    {
-        bincode::encode_into_std_write(self, writer, bincode::config::standard())?;
-        Ok(())
-    }
-
-    pub fn read_binary<R>(reader: &mut R) -> Result<Self, Box<dyn std::error::Error>>
-    where
-        R: Read,
-    {
-        Ok(bincode::decode_from_std_read(
-            reader,
-            bincode::config::standard(),
-        )?)
-    }
 }
 
 impl EventType {

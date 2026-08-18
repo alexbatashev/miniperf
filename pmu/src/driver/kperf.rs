@@ -2235,6 +2235,7 @@ fn emit_pending_sample(
             counter: handle.counter.clone(),
             value: value_delta,
             callstack: sample.callstack.iter().copied().collect(),
+            lbr_callstack: Default::default(),
             user_regs: None,
             user_stack: Vec::new(),
         }));
@@ -2276,6 +2277,7 @@ fn emit_cpu_clock_observation(
         counter: Counter::CpuClock,
         value: sample_period_ns,
         callstack: sample.callstack.iter().copied().collect(),
+        lbr_callstack: Default::default(),
         user_regs: None,
         user_stack: Vec::new(),
     }));
@@ -2798,7 +2800,7 @@ mod tests {
             .iter()
             .map(|record| match record {
                 Record::Sample(sample) => sample.value,
-                Record::ProcAddr(_) => panic!("expected sample"),
+                Record::ProcAddr(_) | Record::MemSample(_) => panic!("expected sample"),
             })
             .collect();
         assert_eq!(values, [50]);

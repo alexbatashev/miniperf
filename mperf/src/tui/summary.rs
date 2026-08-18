@@ -15,12 +15,12 @@ use ratatui::{
     style::{Style, Stylize},
     widgets::{Block, Paragraph, Row, Table, Widget, Wrap},
 };
-use sqlite::Connection;
+use store::Session;
 
 #[derive(Clone)]
 pub struct SummaryTab {
     record_info: RecordInfo,
-    connection: Arc<Mutex<Connection>>,
+    session: Arc<Mutex<Session>>,
     stat: Arc<RwLock<Stat>>,
     load_started: Arc<AtomicBool>,
     load_error: Arc<RwLock<Option<String>>>,
@@ -40,10 +40,10 @@ struct Stat {
 }
 
 impl SummaryTab {
-    pub fn new(record_info: RecordInfo, connection: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(record_info: RecordInfo, session: Arc<Mutex<Session>>) -> Self {
         SummaryTab {
             record_info,
-            connection,
+            session,
             stat: Arc::new(RwLock::new(Stat::default())),
             load_started: Arc::new(AtomicBool::new(false)),
             load_error: Arc::new(RwLock::new(None)),
@@ -63,17 +63,20 @@ impl SummaryTab {
     }
 
     async fn fetch_data(self) {
-        let conn = self.connection.lock();
+        let session = self.session.lock();
         let result: Result<Stat, String> = (|| {
-            let available_columns: HashSet<String> = conn
-                .prepare("PRAGMA table_info(pmu_counters);")
+            if !session.has_table("pmu_counters") {
+                return Err("this recording has no pmu_counters table".to_string());
+            }
+            let conn = session.connection();
+            let mut columns_statement = conn
+                .prepare("PRAGMA table_info('pmu_counters')")
+                .map_err(|error| error.to_string())?;
+            let available_columns: HashSet<String> = columns_statement
+                .query_map([], |row| row.get::<_, String>("name"))
                 .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(|row| {
-                    let row = row.map_err(|error| error.to_string())?;
-                    Ok(row.read::<&str, _>("name").to_string())
-                })
-                .collect::<Result<_, String>>()?;
+                .collect::<store::duckdb::Result<_>>()
+                .map_err(|error| error.to_string())?;
 
             let has_branch = available_columns.contains("pmu_branch_instructions")
                 && available_columns.contains("pmu_branch_misses");
@@ -82,65 +85,43 @@ impl SummaryTab {
             let has_stalled = available_columns.contains("pmu_stalled_cycles_frontend")
                 && available_columns.contains("pmu_stalled_cycles_backend");
 
+            let scaled = |counter: &str| {
+                format!("CAST(SUM({counter} * 1.0 / confidence) AS BIGINT) AS {counter}")
+            };
+            let missing = |counter: &str| format!("CAST(0 AS BIGINT) AS {counter}");
+
             let mut select_parts = vec![
-                "SUM(pmu_cycles) AS pmu_cycles".to_string(),
-                "SUM(pmu_instructions) AS pmu_instructions".to_string(),
+                "CAST(SUM(pmu_cycles) AS BIGINT) AS pmu_cycles".to_string(),
+                "CAST(SUM(pmu_instructions) AS BIGINT) AS pmu_instructions".to_string(),
             ];
 
-            if has_branch {
-                select_parts.push(
-                "CAST(SUM(pmu_branch_instructions * 1.0 / confidence) AS INTEGER) AS pmu_branch_instructions"
-                    .to_string(),
-            );
-                select_parts.push(
-                "CAST(SUM(pmu_branch_misses * 1.0 / confidence) AS INTEGER) AS pmu_branch_misses"
-                    .to_string(),
-            );
-            } else {
-                select_parts.push("0 AS pmu_branch_instructions".to_string());
-                select_parts.push("0 AS pmu_branch_misses".to_string());
+            for (present, counters) in [
+                (has_branch, ["pmu_branch_instructions", "pmu_branch_misses"]),
+                (has_cache, ["pmu_llc_references", "pmu_llc_misses"]),
+                (
+                    has_stalled,
+                    ["pmu_stalled_cycles_frontend", "pmu_stalled_cycles_backend"],
+                ),
+            ] {
+                for counter in counters {
+                    select_parts.push(if present {
+                        scaled(counter)
+                    } else {
+                        missing(counter)
+                    });
+                }
             }
 
-            if has_cache {
-                select_parts.push(
-                "CAST(SUM(pmu_llc_references * 1.0 / confidence) AS INTEGER) AS pmu_llc_references"
-                    .to_string(),
-            );
-                select_parts.push(
-                    "CAST(SUM(pmu_llc_misses * 1.0 / confidence) AS INTEGER) AS pmu_llc_misses"
-                        .to_string(),
-                );
-            } else {
-                select_parts.push("0 AS pmu_llc_references".to_string());
-                select_parts.push("0 AS pmu_llc_misses".to_string());
-            }
-
-            if has_stalled {
-                select_parts.push(
-                "CAST(SUM(pmu_stalled_cycles_frontend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_frontend"
-                    .to_string(),
-            );
-                select_parts.push(
-                "CAST(SUM(pmu_stalled_cycles_backend * 1.0 / confidence) AS INTEGER) AS pmu_stalled_cycles_backend"
-                    .to_string(),
-            );
-            } else {
-                select_parts.push("0 AS pmu_stalled_cycles_frontend".to_string());
-                select_parts.push("0 AS pmu_stalled_cycles_backend".to_string());
-            }
-
-            let query = format!("SELECT {} FROM pmu_counters;", select_parts.join(",\n"));
-            let mut rows = conn
-                .prepare(&query)
-                .map_err(|error| error.to_string())?
-                .into_iter();
+            let query = format!("SELECT {} FROM pmu_counters", select_parts.join(",\n"));
+            let mut statement = conn.prepare(&query).map_err(|error| error.to_string())?;
+            let mut rows = statement.query([]).map_err(|error| error.to_string())?;
             let row = rows
                 .next()
-                .ok_or_else(|| "summary query returned no rows".to_string())?
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "summary query returned no rows".to_string())?;
 
             let read = |name| {
-                row.try_read::<Option<i64>, _>(name)
+                row.get::<_, Option<i64>>(name)
                     .map(|value| value.unwrap_or_default() as u64)
                     .map_err(|error| error.to_string())
             };
@@ -162,7 +143,7 @@ impl SummaryTab {
                 initialized: true,
             })
         })();
-        drop(conn);
+        drop(session);
 
         match result {
             Ok(stat) => *self.stat.write() = stat,

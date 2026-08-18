@@ -34,13 +34,11 @@ ratatui = {version = "0.29.0", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28.1", features = ["event-stream"] }
 tokio-stream = "0.1.17"
 tokio-util = "0.7.13"
-memmap2 = "0.9.5"
-serde-jsonlines = "0.7.0"
 thread_local = "1.1.8"
 libc = "0.2.169"
 smallvec = "1.13.2"
 shmem = { path = "../shmem/" }
-sqlite = "0.37.0"
+miniperf-store = { path = "../store" }
 uuid = { version = "1.16.0", features = ["v7"] }
 kdam = "0.6.2"
 flamelens = "0.3.1"

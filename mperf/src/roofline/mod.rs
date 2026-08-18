@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -11,22 +10,15 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use mperf_data::{
-    CallFrame, Event, IPCMessage, ProcMapEntry, RooflineInfo, RooflineMethodInfo, ScenarioInfo,
-};
+use mperf_data::{CallFrame, Event, ProcMapEntry, RooflineInfo, RooflineMethodInfo, ScenarioInfo};
 use object::{Object, ObjectSymbol};
 use pmu::{Counter, Process, Record};
 
-use crate::{
-    Scenario, counter_selection::get_pmu_counters, event_dispatcher::EventDispatcher,
-    utils::counter_to_event_ty,
-};
+use crate::{Scenario, event_dispatcher::EventDispatcher, utils::counter_to_event_ty};
 
 mod calibrate;
 mod loops;
 mod qemu;
-
-const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum BackendKind {
@@ -122,7 +114,14 @@ pub async fn record(
         anyhow::bail!("record roofline requires a command");
     }
 
-    let selected = select_method(options, command)?;
+    let mut selected = select_method(options, command)?;
+    if crate::source::roofline_uncore_bandwidth() {
+        selected.info.traffic = "dram-measured".to_string();
+        selected.info.warnings.push(
+            "DRAM traffic is measured on system-wide memory-controller counters and therefore includes traffic from other processes"
+                .to_string(),
+        );
+    }
     println!("Roofline method: {}", selected.info.reason);
     for warning in &selected.info.warnings {
         eprintln!("Warning: {warning}");
@@ -474,7 +473,7 @@ impl RooflineBackend for CompilerBackend {
         &'a self,
         dispatcher: Arc<EventDispatcher>,
         command: &'a [String],
-        _output_directory: &'a Path,
+        output_directory: &'a Path,
     ) -> BackendFuture<'a> {
         Box::pin(async move {
             let exe_path = executable_directory()?.to_string_lossy().to_string();
@@ -482,20 +481,25 @@ impl RooflineBackend for CompilerBackend {
                 Ok(path) => format!("{path}:{exe_path}:{exe_path}/../lib"),
                 Err(_) => format!("{exe_path}:{exe_path}/../lib"),
             };
+            let collector_env = crate::source::Source::child_environment(
+                &crate::source::InternalEventsSource {
+                    roofline_instrumented: false,
+                },
+                output_directory,
+            );
 
             println!(
                 "Run 1: collecting performance data for '{}'",
                 command.join(" ")
             );
+            let mut baseline_env = collector_env.clone();
+            baseline_env.push(("LD_LIBRARY_PATH".to_string(), ld_path.clone()));
             let baseline = profile_command(
                 dispatcher.clone(),
                 command,
-                vec![
-                    ("LD_LIBRARY_PATH".to_string(), ld_path.clone()),
-                    ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
-                ],
-                true,
+                baseline_env,
                 None,
+                bandwidth_timeline_path(output_directory),
             )
             .await?;
 
@@ -503,22 +507,16 @@ impl RooflineBackend for CompilerBackend {
                 "Run 2: collecting compiler-instrumented loop statistics for '{}'",
                 command.join(" ")
             );
-            let (pipe_name, task) = create_shmem_pipe(command_name(command), dispatcher)?;
-            let process = Process::new(
-                command,
-                &[
-                    ("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name),
-                    ("LD_LIBRARY_PATH".to_string(), ld_path),
-                    ("MPERF_COLLECTOR_ENABLED".to_string(), "1".to_string()),
-                    (
-                        "MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED".to_string(),
-                        "1".to_string(),
-                    ),
-                ],
-            )?;
+            let mut instrumented_env = crate::source::Source::child_environment(
+                &crate::source::InternalEventsSource {
+                    roofline_instrumented: true,
+                },
+                output_directory,
+            );
+            instrumented_env.push(("LD_LIBRARY_PATH".to_string(), ld_path));
+            let process = Process::new(command, &instrumented_env)?;
             process.cont();
             process.wait()?;
-            task.await?;
             ensure_process_success(&process, "compiler Roofline accounting run")?;
 
             Ok(ScenarioInfo::Roofline(RooflineInfo {
@@ -544,16 +542,9 @@ async fn profile_command(
     dispatcher: Arc<EventDispatcher>,
     command: &[String],
     mut env: Vec<(String, String)>,
-    receive_collector_events: bool,
     rss_output: Option<PathBuf>,
+    bandwidth_output: Option<PathBuf>,
 ) -> Result<ProfiledRun> {
-    let collector = if receive_collector_events {
-        let (pipe_name, task) = create_shmem_pipe(command_name(command), dispatcher.clone())?;
-        env.push(("MPERF_COLLECTOR_SHMEM_ID".to_string(), pipe_name));
-        Some(task)
-    } else {
-        None
-    };
     if let Some(rss_path) = rss_output.as_ref() {
         let allocation_path = rss_path.with_file_name("memory-allocations.txt");
         env.push((
@@ -567,25 +558,23 @@ async fn profile_command(
             env.push(("LD_PRELOAD".to_string(), preload));
         }
     }
+    let precise_memory_source = rss_output
+        .as_ref()
+        .and_then(|path| path.parent())
+        .and_then(precise_memory_source);
+    if let Some((source, directory)) = &precise_memory_source {
+        env.extend(source.child_environment(directory));
+    }
     let process = Process::new(command, &env)?;
-    let rss_stop = Arc::new(AtomicBool::new(false));
-    let memory_controller = if rss_output.is_some() {
-        match pmu::MemoryControllerMonitor::start() {
-            Ok(monitor) => monitor,
-            Err(error) => {
-                eprintln!("Warning: hardware memory-controller bandwidth is unavailable: {error}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let sampler_stop = Arc::new(AtomicBool::new(false));
+    let bandwidth_thread =
+        bandwidth_output.and_then(|path| start_bandwidth_timeline(path, sampler_stop.clone()));
     let rss_thread = rss_output.map(|path| {
-        let stop = rss_stop.clone();
+        let stop = sampler_stop.clone();
         let pid = process.pid();
-        std::thread::spawn(move || sample_memory_timeline(pid, &path, stop, memory_controller))
+        std::thread::spawn(move || sample_memory_timeline(pid, &path, stop))
     });
-    let counters = get_pmu_counters(Scenario::Roofline);
+    let counters = crate::source::scenario_counters(Scenario::Roofline);
     let mut instruction_counter = pmu::CountingDriverBuilder::new()
         .counters(&[Counter::Instructions])
         .process(Some(&process))
@@ -595,6 +584,9 @@ async fn profile_command(
         .counters(&counters)
         .process(&process)
         .build()?;
+    let mut precise_memory = precise_memory_source.map(|(source, directory)| {
+        start_precise_memory(source, dispatcher.clone(), &directory, &process)
+    });
     let sample_dispatcher = dispatcher;
     driver.start(Arc::new(move |record| match record {
         Record::Sample(sample) => {
@@ -612,8 +604,8 @@ async fn profile_command(
                     .map(CallFrame::IP),
             );
             sample_dispatcher.publish_event_sync(Event {
-                unique_id: uuid::Uuid::now_v7().as_u128(),
-                correlation_id: sample.event_id,
+                unique_id: 0,
+                correlation_id: sample.event_id as u64,
                 parent_id: 0,
                 ty: counter_to_event_ty(&sample.counter),
                 thread_id: sample.tid,
@@ -625,6 +617,7 @@ async fn profile_command(
                 timestamp: sample.time,
                 name,
                 callstack,
+                lbr_callstack: Vec::new(),
                 user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
                     abi: regs.abi,
                     mask: regs.mask,
@@ -642,6 +635,7 @@ async fn profile_command(
                 pid: addr.pid,
             });
         }
+        Record::MemSample(_) => {}
     }))?;
     if let Some(counter) = instruction_counter.as_mut()
         && counter.start().is_err()
@@ -661,16 +655,26 @@ async fn profile_command(
     } else {
         0
     };
-    rss_stop.store(true, Ordering::Relaxed);
+    sampler_stop.store(true, Ordering::Relaxed);
     if let Some(thread) = rss_thread {
         thread
             .join()
             .map_err(|_| anyhow::anyhow!("RSS sampler panicked"))??;
     }
+    if let Some(thread) = bandwidth_thread {
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("bandwidth sampler panicked"))??;
+    }
     let end_ns = monotonic_timestamp()?;
     driver.stop()?;
-    if let Some(task) = collector {
-        task.await?;
+    if let Some((source, context)) = precise_memory.as_mut() {
+        for status in crate::source::Source::stop(source.as_mut(), context)
+            .iter()
+            .filter(|status| status.status != "available")
+        {
+            eprintln!("Warning: {}: {}", status.name, status.message);
+        }
     }
     ensure_process_success(&process, "Roofline performance run")?;
 
@@ -686,21 +690,46 @@ async fn profile_command(
     })
 }
 
-fn sample_memory_timeline(
-    pid: i32,
-    output: &Path,
-    stop: Arc<AtomicBool>,
-    mut memory_controller: Option<pmu::MemoryControllerMonitor>,
-) -> Result<()> {
+/// The `PebsMem` rung of the memory scenario's ladder, when the host supports
+/// it. Below that rung nothing is created and the recording — including the
+/// profiled child's environment — is exactly what it was before.
+fn precise_memory_source(directory: &Path) -> Option<(Box<dyn crate::source::Source>, PathBuf)> {
+    let source: Box<dyn crate::source::Source> =
+        Box::new(crate::source::PreciseMemorySource::default());
+    match source.probe(directory) {
+        crate::source::Availability::Available => Some((source, directory.to_owned())),
+        crate::source::Availability::Unavailable { reason } => {
+            println!("Precise memory sampling unavailable: {reason}");
+            None
+        }
+    }
+}
+
+fn start_precise_memory(
+    mut source: Box<dyn crate::source::Source>,
+    dispatcher: Arc<EventDispatcher>,
+    directory: &Path,
+    process: &Process,
+) -> (
+    Box<dyn crate::source::Source>,
+    crate::source::SessionContext,
+) {
+    let context = crate::source::SessionContext {
+        directory: directory.to_owned(),
+        dispatcher,
+        process: None,
+        attached_pid: Some(process.pid() as u32),
+    };
+    if let Err(error) = source.start(&context) {
+        eprintln!("Warning: precise memory sampling could not start: {error:#}");
+    }
+    (source, context)
+}
+
+fn sample_memory_timeline(pid: i32, output: &Path, stop: Arc<AtomicBool>) -> Result<()> {
     use std::io::Write;
     let mut file = std::fs::File::create(output)
         .with_context(|| format!("create RSS timeline '{}'", output.display()))?;
-    let bandwidth_path = output.with_file_name("memory-bandwidth.txt");
-    let mut bandwidth_file = memory_controller
-        .as_ref()
-        .map(|_| std::fs::File::create(&bandwidth_path))
-        .transpose()
-        .with_context(|| format!("create bandwidth timeline '{}'", bandwidth_path.display()))?;
     while !stop.load(Ordering::Relaxed) {
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status"))
             && let Some(kbytes) = status
@@ -709,31 +738,64 @@ fn sample_memory_timeline(
                 .and_then(|value| value.split_whitespace().next())
                 .and_then(|value| value.parse::<u64>().ok())
         {
-            let timestamp = monotonic_timestamp()?;
-            writeln!(file, "{} {}", timestamp, kbytes.saturating_mul(1024))?;
-            if let Some(monitor) = memory_controller.as_ref() {
-                match monitor.sample() {
-                    Ok(sample) => {
-                        if let Some(bandwidth_file) = bandwidth_file.as_mut() {
-                            writeln!(
-                                bandwidth_file,
-                                "{} {} {}",
-                                timestamp, sample.read_bytes, sample.write_bytes
-                            )?;
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("Warning: memory-controller sampling stopped: {error}");
-                        memory_controller = None;
-                        bandwidth_file = None;
-                        let _ = std::fs::remove_file(&bandwidth_path);
-                    }
-                }
-            }
+            writeln!(
+                file,
+                "{} {}",
+                monotonic_timestamp()?,
+                kbytes.saturating_mul(1024)
+            )?;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     Ok(())
+}
+
+/// The measured-DRAM timeline for the timed run: cumulative system-wide
+/// memory-controller bytes, sampled often enough that postprocess can
+/// integrate it over each kernel's execution window.
+fn start_bandwidth_timeline(
+    output: PathBuf,
+    stop: Arc<AtomicBool>,
+) -> Option<std::thread::JoinHandle<Result<()>>> {
+    let monitor = match pmu::MemoryControllerMonitor::start() {
+        Ok(Some(monitor)) => monitor,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!("Warning: measured DRAM bandwidth is unavailable: {error}");
+            return None;
+        }
+    };
+    Some(std::thread::spawn(move || {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&output)
+            .with_context(|| format!("create bandwidth timeline '{}'", output.display()))?;
+        loop {
+            let finished = stop.load(Ordering::Relaxed);
+            match monitor.sample() {
+                Ok(sample) => writeln!(
+                    file,
+                    "{} {} {}",
+                    monotonic_timestamp()?,
+                    sample.read_bytes,
+                    sample.write_bytes
+                )?,
+                Err(error) => {
+                    eprintln!("Warning: memory-controller sampling stopped: {error}");
+                    return Ok(());
+                }
+            }
+            if finished {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }))
+}
+
+/// Where to write measured DRAM bytes, when the Roofline ladder resolves to
+/// the uncore rung on this host.
+fn bandwidth_timeline_path(directory: &Path) -> Option<PathBuf> {
+    crate::source::roofline_uncore_bandwidth().then(|| directory.join("memory-bandwidth.txt"))
 }
 
 fn ensure_process_success(process: &Process, description: &str) -> Result<()> {
@@ -742,49 +804,6 @@ fn ensure_process_success(process: &Process, description: &str) -> Result<()> {
         Some(code) => anyhow::bail!("{description} exited with status {code}"),
         None => anyhow::bail!("{description} finished without an observable exit status"),
     }
-}
-
-fn create_shmem_pipe(
-    prefix: &str,
-    dispatcher: Arc<EventDispatcher>,
-) -> Result<(String, tokio::task::JoinHandle<()>), std::io::Error> {
-    let pipe_name = format!(
-        "/{}{}{}",
-        prefix,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    );
-    let receiver = shmem::proc_channel::Receiver::<IPCMessage>::new(&pipe_name, SIZE_16MB)?;
-    let task = tokio::spawn(async move {
-        let mut strings = HashMap::<u128, u128>::new();
-        while let Some(message) = receiver.recv().await {
-            match message {
-                IPCMessage::String(string) => {
-                    let id = dispatcher.string_id_async(&string.value).await;
-                    strings.insert(string.key, id);
-                }
-                IPCMessage::Event(mut event) => {
-                    for stack in event.callstack.iter_mut() {
-                        if let CallFrame::Location(location) = stack {
-                            location.function_name = strings
-                                .get(&location.function_name)
-                                .copied()
-                                .unwrap_or_default();
-                            location.file_name = strings
-                                .get(&location.file_name)
-                                .copied()
-                                .unwrap_or_default();
-                        }
-                    }
-                    dispatcher.publish_event(event).await;
-                }
-            }
-        }
-    });
-    Ok((pipe_name, task))
 }
 
 fn executable_directory() -> std::io::Result<PathBuf> {
@@ -806,11 +825,7 @@ fn installed_library(name: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn memory_preload_path() -> Option<PathBuf> {
-    installed_library("libmperf_memory_preload.so").or_else(|| {
-        option_env!("MPERF_BUILD_MEMORY_PRELOAD")
-            .map(PathBuf::from)
-            .filter(|path| path.is_file())
-    })
+    installed_library("libmperf_libc.so")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -818,19 +833,12 @@ fn memory_preload_path() -> Option<PathBuf> {
     None
 }
 
-fn command_name(command: &[String]) -> &str {
-    Path::new(&command[0])
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("mperf")
-}
-
 fn monotonic_timestamp() -> Result<u64> {
     let mut timestamp = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, &mut timestamp) } != 0 {
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut timestamp) } != 0 {
         return Err(std::io::Error::last_os_error()).context("read monotonic clock");
     }
     Ok((timestamp.tv_sec as u64) * 1_000_000_000 + timestamp.tv_nsec as u64)

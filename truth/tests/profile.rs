@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use sqlite::State;
+use store::{duckdb::Row, Session};
 use truth::assert_f6_1_duty_split;
 
 const DUTY_SPLIT_FP: &str = env!("TRUTH_DUTY_SPLIT_FP");
@@ -20,7 +20,7 @@ fn f6_1_mperf_reports_analytic_duty_split() {
     let Some((results, log_path)) = record_fixture(DUTY_SPLIT_FP, "3", "01-F6.1") else {
         return;
     };
-    let counts = instruction_sample_counts(&results.join("perf.db"), "01-F6.1");
+    let counts = instruction_sample_counts(&results, "01-F6.1");
     cleanup_recording(&results, &log_path, "01-F6.1");
     assert_f6_1_duty_split(counts[0], counts[1]);
 }
@@ -31,7 +31,7 @@ fn f3_1_dwarf_resolves_optimized_no_frame_pointer_fixture() {
     let Some((results, log_path)) = record_fixture(DUTY_SPLIT_NO_FP, "1", "01-F3.1") else {
         return;
     };
-    let counts = hotspot_instruction_counts(&results.join("perf.db"), "01-F3.1");
+    let counts = hotspot_instruction_counts(&results, "01-F3.1");
     assert!(
         counts.into_iter().all(|count| count > 0),
         "01-F3.1 DWARF: optimized no-frame-pointer fixture did not resolve both duty functions: {counts:?}"
@@ -60,19 +60,65 @@ fn tma_acceptance_fixtures_have_expected_dominant_paths() {
         let Some((results, log)) = record_tma_fixture(fixture, "13-TMA") else {
             return;
         };
-        let connection = sqlite::open(results.join("perf.db")).expect("13-TMA: open database");
-        let mut statement = connection
+        let session = Session::open(&results).expect("13-TMA: open session");
+        let mut statement = session
+            .connection()
             .prepare("SELECT metric FROM tma_summary WHERE verdict = 'dominant'")
             .expect("13-TMA: query verdict");
-        assert_eq!(statement.next().expect("13-TMA: read verdict"), State::Row);
-        let dominant = statement
-            .read::<String, _>("metric")
+        let mut rows = statement.query([]).expect("13-TMA: run verdict query");
+        let dominant = rows
+            .next()
+            .expect("13-TMA: read verdict")
+            .expect("13-TMA: missing dominant verdict")
+            .get::<_, String>("metric")
             .expect("13-TMA: read metric");
         assert!(
             dominant == expected || (expected == "be_bound" && dominant.starts_with("be_bound.")),
             "13-TMA: expected {expected}, got {dominant}"
         );
+        assert_fixed_topdown_fractions_are_exhaustive(&session);
         cleanup_recording(&results, &log, "13-TMA");
+    }
+}
+
+/// On a host that resolved to a hardware topdown rung the level-one metrics are
+/// counted, not estimated, so they must account for every issue slot. Hosts at
+/// the arithmetic baseline have no such guarantee and are skipped.
+fn assert_fixed_topdown_fractions_are_exhaustive(session: &Session) {
+    let rung: String = session
+        .connection()
+        .query_row(
+            "SELECT rung FROM capture_fidelity WHERE scenario = 'tma' AND status = 'chosen'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("13-TMA: read capture fidelity");
+    if !matches!(rung.as_str(), "fixed_topdown" | "arm_slots_topdown") {
+        eprintln!("13-TMA: fixed topdown check skipped: host recorded at '{rung}'");
+        return;
+    }
+    // A heterogeneous host reports one `<metric>.<core type>` set per core
+    // type; each set covers that core type's slots on its own.
+    let connection = session.connection();
+    let mut statement = connection
+        .prepare(
+            "SELECT SPLIT_PART(metric, '.', 2) AS core, SUM(value) AS total
+             FROM tma_summary GROUP BY core HAVING SUM(value) IS NOT NULL",
+        )
+        .expect("13-TMA: query level-one totals");
+    let totals = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>("core")?, row.get::<_, f64>("total")?))
+        })
+        .expect("13-TMA: run level-one totals")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("13-TMA: read level-one totals");
+    assert!(!totals.is_empty(), "13-TMA: {rung} produced no metrics");
+    for (core, total) in totals {
+        assert!(
+            (total - 1.0).abs() < 0.02,
+            "13-TMA: {rung} level-one fractions for '{core}' sum to {total}, not 1.0"
+        );
     }
 }
 
@@ -143,52 +189,44 @@ fn cleanup_recording(results: &Path, log_path: &Path, milestone: &str) {
         .unwrap_or_else(|error| panic!("{milestone}: failed to remove profiler log: {error}"));
 }
 
-fn instruction_sample_counts(database: &Path, milestone: &str) -> [u64; 2] {
+fn instruction_sample_counts(results: &Path, milestone: &str) -> [u64; 2] {
     query_duty_counts(
-        database,
+        results,
         milestone,
-        "SELECT proc_map.func_name, COUNT(*) AS value \
+        "SELECT proc_map.func_name AS func_name, COUNT(*) AS value \
          FROM pmu_counters INNER JOIN proc_map ON pmu_counters.ip = proc_map.ip \
          WHERE pmu_counters.pmu_instructions > 0 \
            AND (proc_map.func_name LIKE 'duty_60%' OR proc_map.func_name LIKE 'duty_40%') \
          GROUP BY proc_map.func_name",
-        "value",
     )
 }
 
-fn hotspot_instruction_counts(database: &Path, milestone: &str) -> [u64; 2] {
+fn hotspot_instruction_counts(results: &Path, milestone: &str) -> [u64; 2] {
     query_duty_counts(
-        database,
+        results,
         milestone,
         "SELECT func_name, instructions AS value FROM hotspots \
          WHERE func_name LIKE 'duty_60%' OR func_name LIKE 'duty_40%'",
-        "value",
     )
 }
 
-fn query_duty_counts(
-    database: &Path,
-    milestone: &str,
-    query: &str,
-    value_column: &str,
-) -> [u64; 2] {
-    let connection = sqlite::open(database).unwrap_or_else(|error| {
+fn query_duty_counts(results: &Path, milestone: &str, query: &str) -> [u64; 2] {
+    let session = Session::open(results).unwrap_or_else(|error| {
         panic!(
-            "{milestone}: failed to open profiler database {}: {error}",
-            database.display()
+            "{milestone}: failed to open profiler session {}: {error}",
+            results.display()
         )
     });
-    let mut statement = connection
+    let mut statement = session
+        .connection()
         .prepare(query)
         .unwrap_or_else(|error| panic!("{milestone}: failed to query hotspots: {error}"));
+    let mut rows = statement
+        .query([])
+        .unwrap_or_else(|error| panic!("{milestone}: failed to run query: {error}"));
     let mut counts = [0_u64; 2];
-    while let Ok(State::Row) = statement.next() {
-        let name = statement
-            .read::<String, _>("func_name")
-            .expect("01-F6.1: invalid function name");
-        let value = statement
-            .read::<Option<i64>, _>(value_column)
-            .expect("01-F6.1: invalid instruction count");
+    while let Ok(Some(row)) = rows.next() {
+        let (name, value) = duty_row(row);
         let slot = if name.starts_with("duty_60") {
             0
         } else if name.starts_with("duty_40") {
@@ -196,9 +234,19 @@ fn query_duty_counts(
         } else {
             continue;
         };
-        counts[slot] += value.unwrap_or(0).max(0) as u64;
+        counts[slot] += value;
     }
     counts
+}
+
+fn duty_row(row: &Row<'_>) -> (String, u64) {
+    let name = row
+        .get::<_, String>("func_name")
+        .expect("01-F6.1: invalid function name");
+    let value = row
+        .get::<_, Option<i64>>("value")
+        .expect("01-F6.1: invalid instruction count");
+    (name, value.unwrap_or(0).max(0) as u64)
 }
 
 fn perf_events_are_available() -> bool {

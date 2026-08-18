@@ -1,13 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
-    "collector",
+    "collector-core",
     "mperf",
     "mperf-data",
+    "mperf-trace",
     "mperf-gui",
     "pmu",
     "pmu-data",
+    "shims",
+    "shims/libc",
+    "shims/itt",
+    "shims/ompt",
+    "shims/mpi",
+    "shims/cupti",
     "shmem",
+    "store",
     "symbolize",
     "truth",
     "utils/event-import",

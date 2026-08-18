@@ -1,0 +1,18 @@
+[package]
+name = "miniperf-collector-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mperf_collector"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1.0"
+libc = "0.2"
+miniperf-store = { path = "../store", default-features = false }
+shmem = { path = "../shmem" }
+
+[dev-dependencies]
+miniperf-store = { path = "../store" }
+tempfile = "3"
