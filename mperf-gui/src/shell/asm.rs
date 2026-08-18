@@ -71,8 +71,12 @@ pub fn load(result_directory: &Path, module: &str, function: &str) -> Result<Asm
             let line = row.get::<_, Value>(3)?;
             instructions.push(AsmInstruction {
                 address: as_i64(&row.get::<_, Value>(0)?).unwrap_or_default().max(0) as u64,
-                text: as_text(&row.get::<_, Value>(1)?).unwrap_or_default().to_owned(),
-                line: as_i64(&line).filter(|line| *line > 0).map(|line| line as usize),
+                text: as_text(&row.get::<_, Value>(1)?)
+                    .unwrap_or_default()
+                    .to_owned(),
+                line: as_i64(&line)
+                    .filter(|line| *line > 0)
+                    .map(|line| line as usize),
                 samples: as_i64(&row.get::<_, Value>(4)?).unwrap_or_default().max(0) as u64,
                 llc_misses: as_i64(&row.get::<_, Value>(5)?).unwrap_or_default().max(0) as u64,
             });

@@ -265,7 +265,10 @@ impl ShellSession {
 
 /// Memory analysis is kept only when the recording actually produced one;
 /// availability is data-presence driven, never scenario-driven.
-fn load_memory(connection: &crate::sql::Connection, record_info: &RecordInfo) -> Option<MemoryData> {
+fn load_memory(
+    connection: &crate::sql::Connection,
+    record_info: &RecordInfo,
+) -> Option<MemoryData> {
     let calibration = record_info
         .cpu_info
         .memory_calibration

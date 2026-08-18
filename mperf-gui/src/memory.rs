@@ -206,4 +206,3 @@ fn load_unsigned_histogram(connection: &Connection, query: &str) -> Result<Vec<H
         .collect::<SqlResult<Vec<_>>>()?;
     Ok(points)
 }
-
