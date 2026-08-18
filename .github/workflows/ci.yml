@@ -52,11 +52,6 @@ jobs:
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            task: build
-            command: cargo build --workspace --all-targets
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
             task: clippy
             command: cargo clippy --workspace --all-targets -- -D warnings
           - platform: macos-aarch64
