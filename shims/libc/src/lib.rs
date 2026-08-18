@@ -147,7 +147,61 @@ fn mem_emit(mut op: u8, mut first: u64, mut second: u64, mut size: u64) {
     cursor = append_number(&mut line, cursor, size, false);
     line[cursor] = b'\n';
     cursor += 1;
-    unsafe { libc::syscall(libc::SYS_write, fd as libc::c_long, line.as_ptr(), cursor) };
+    unsafe { libc::write(fd, line.as_ptr().cast(), cursor) };
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn mmap_fallback(
+    address: *mut c_void,
+    length: usize,
+    protection: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: libc::off_t,
+) -> *mut c_void {
+    unsafe {
+        libc::syscall(
+            libc::SYS_mmap,
+            address,
+            length,
+            protection,
+            flags,
+            fd,
+            offset,
+        ) as *mut c_void
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn mmap_fallback(
+    _address: *mut c_void,
+    _length: usize,
+    _protection: c_int,
+    _flags: c_int,
+    _fd: c_int,
+    _offset: libc::off_t,
+) -> *mut c_void {
+    libc::MAP_FAILED
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn munmap_fallback(address: *mut c_void, length: usize) -> c_int {
+    unsafe { libc::syscall(libc::SYS_munmap, address, length) as c_int }
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn munmap_fallback(_address: *mut c_void, _length: usize) -> c_int {
+    -1
+}
+
+#[cfg(target_os = "macos")]
+fn pthread_id_value(thread: libc::pthread_t) -> u64 {
+    thread as u64
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pthread_id_value(thread: libc::pthread_t) -> u64 {
+    thread
 }
 
 /// Bump arena serving allocations made while `dlsym` itself is resolving the
@@ -505,17 +559,7 @@ pub unsafe extern "C" fn mmap(
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"mmap", &NEXT);
     if next.is_null() {
-        return unsafe {
-            libc::syscall(
-                libc::SYS_mmap,
-                address,
-                length,
-                protection,
-                flags,
-                fd,
-                offset,
-            ) as *mut c_void
-        };
+        return unsafe { mmap_fallback(address, length, protection, flags, fd, offset) };
     }
     let next: unsafe extern "C" fn(
         *mut c_void,
@@ -546,7 +590,7 @@ pub unsafe extern "C" fn munmap(address: *mut c_void, length: usize) -> c_int {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"munmap", &NEXT);
     if next.is_null() {
-        return unsafe { libc::syscall(libc::SYS_munmap, address, length) as c_int };
+        return unsafe { munmap_fallback(address, length) };
     }
     let next: unsafe extern "C" fn(*mut c_void, usize) -> c_int =
         unsafe { std::mem::transmute(next) };
@@ -598,9 +642,13 @@ pub unsafe extern "C" fn pthread_create(
     ) -> c_int = unsafe { std::mem::transmute(next) };
     let result = unsafe { next(thread, attributes, start, argument) };
     if result == 0 && !inside() {
-        shim_emit(payload_slot!(), c"pthread_create", FLAG_STACK, 0, unsafe {
-            *thread
-        });
+        shim_emit(
+            payload_slot!(),
+            c"pthread_create",
+            FLAG_STACK,
+            0,
+            pthread_id_value(unsafe { *thread }),
+        );
     }
     result
 }
@@ -618,7 +666,13 @@ pub unsafe extern "C" fn pthread_join(thread: libc::pthread_t, value: *mut *mut 
         unsafe { std::mem::transmute(next) };
     let result = unsafe { next(thread, value) };
     if result == 0 && !inside() {
-        shim_emit(payload_slot!(), c"pthread_join", 0, 0, thread);
+        shim_emit(
+            payload_slot!(),
+            c"pthread_join",
+            0,
+            0,
+            pthread_id_value(thread),
+        );
     }
     result
 }
