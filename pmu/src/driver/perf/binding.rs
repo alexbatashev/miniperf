@@ -445,6 +445,14 @@ fn close_handles(handles: &[NativeCounterHandle]) {
     }
 }
 
+/// Hardware counters the kernel itself occupies: currently one when the NMI
+/// watchdog is active (it pins a cycles event on every CPU).
+fn reserved_hardware_counters() -> usize {
+    std::fs::read_to_string("/proc/sys/kernel/nmi_watchdog")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::sampling_group_plan;
@@ -483,12 +491,4 @@ mod tests {
         assert!(plan[0].hardware_indices.is_empty());
         assert!(plan[0].include_software);
     }
-}
-
-/// Hardware counters the kernel itself occupies: currently one when the NMI
-/// watchdog is active (it pins a cycles event on every CPU).
-fn reserved_hardware_counters() -> usize {
-    std::fs::read_to_string("/proc/sys/kernel/nmi_watchdog")
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false) as usize
 }

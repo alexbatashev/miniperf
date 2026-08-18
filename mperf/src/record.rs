@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use mperf_data::{CallFrame, CpuClockSource, Event, ProcMapEntry, RecordInfo, ScenarioInfo};
-use std::{fs::File, path::Path, sync::Arc};
+use std::{fs::File, path::Path, rc::Rc, sync::Arc};
 
 #[cfg(target_os = "macos")]
 use std::{collections::HashMap, path::PathBuf};
@@ -211,7 +211,7 @@ fn snapshot(
     let child_env = pass.child_environment(output_directory);
 
     let process = if pid.is_none() {
-        Some(Arc::new(Process::new(command, &child_env)?))
+        Some(Rc::new(Process::new(command, &child_env)?))
     } else {
         None
     };
@@ -585,7 +585,7 @@ fn topdown(
     };
     let mut pass = pass.resolve(output_directory)?;
     let child_env = pass.child_environment(output_directory);
-    let process = Arc::new(Process::new(command, &child_env)?);
+    let process = Rc::new(Process::new(command, &child_env)?);
     let context = SessionContext {
         directory: output_directory.to_owned(),
         dispatcher: dispatcher.clone(),

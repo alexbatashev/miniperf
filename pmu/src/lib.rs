@@ -20,13 +20,13 @@ pub use capabilities::{capabilities, Capabilities, PmuDevice};
 pub use cpu_family::{host_cpu_description, host_metrics};
 #[cfg(feature = "criterion")]
 pub use criterion_measurement::CriterionCounter;
-#[cfg(target_os = "linux")]
-pub use driver::{mem_sampling_driver, mem_sampling_kind};
 pub use driver::{
     list_supported_counters, CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver,
     CountingDriverBuilder, DriverKind, MeasurementQuality, MemSample, Record, Sample,
     SamplingCallback, SamplingDriver, SamplingDriverBuilder, UnwindMode, UserRegs,
 };
+#[cfg(target_os = "linux")]
+pub use driver::{mem_sampling_driver, mem_sampling_kind};
 #[cfg(feature = "criterion")]
 pub use event_timer::CounterCheckpoint;
 pub use event_timer::{

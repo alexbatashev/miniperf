@@ -9,10 +9,10 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    fn new() -> Box<Buffer> {
-        Box::new(Buffer {
+    fn new() -> Buffer {
+        Buffer {
             data: Vec::with_capacity(BUFFER_BYTES),
-        })
+        }
     }
 
     pub fn has_room(&self, bytes: usize) -> bool {
@@ -21,8 +21,8 @@ impl Buffer {
 }
 
 struct QueueState {
-    full: VecDeque<Box<Buffer>>,
-    pool: Vec<Box<Buffer>>,
+    full: VecDeque<Buffer>,
+    pool: Vec<Buffer>,
     closing: bool,
 }
 
@@ -46,25 +46,25 @@ impl BufferQueue {
     }
 
     /// Take an empty buffer, or `None` when the pool is exhausted.
-    pub fn acquire(&self) -> Option<Box<Buffer>> {
+    pub fn acquire(&self) -> Option<Buffer> {
         self.state.lock().unwrap().pool.pop()
     }
 
     /// Hand a filled buffer to the writer.
-    pub fn submit(&self, buffer: Box<Buffer>) {
+    pub fn submit(&self, buffer: Buffer) {
         self.state.lock().unwrap().full.push_back(buffer);
         self.ready.notify_one();
     }
 
     /// Return an empty buffer to the pool.
-    pub fn recycle(&self, mut buffer: Box<Buffer>) {
+    pub fn recycle(&self, mut buffer: Buffer) {
         buffer.data.clear();
         self.state.lock().unwrap().pool.push(buffer);
     }
 
     /// Writer side: wait for the next filled buffer. `None` once closed and
     /// drained.
-    pub fn next_full(&self) -> Option<Box<Buffer>> {
+    pub fn next_full(&self) -> Option<Buffer> {
         let mut state = self.state.lock().unwrap();
         loop {
             if let Some(buffer) = state.full.pop_front() {

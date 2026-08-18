@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -56,7 +56,7 @@ struct Registry {
 }
 
 struct ThreadSlot {
-    buffer: Mutex<Option<Box<Buffer>>>,
+    buffer: Mutex<Option<Buffer>>,
     dropped: AtomicU64,
 }
 
@@ -561,7 +561,7 @@ pub fn current_tid() -> u32 {
     current_thread_id()
 }
 
-fn write_process_metadata(dir: &PathBuf, pid: u32, collector: &Collector) {
+fn write_process_metadata(dir: &Path, pid: u32, collector: &Collector) {
     let hostname = {
         let mut buffer = [0u8; 256];
         let ok =

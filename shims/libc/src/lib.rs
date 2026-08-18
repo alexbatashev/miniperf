@@ -315,6 +315,8 @@ macro_rules! payload_slot {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// The caller must satisfy the platform `malloc` contract.
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"malloc", &NEXT);
@@ -339,6 +341,8 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// The caller must satisfy the platform `calloc` contract.
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"calloc", &NEXT);
@@ -365,6 +369,8 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// `pointer` must be null or allocated by a compatible allocator.
 pub unsafe extern "C" fn free(pointer: *mut c_void) {
     if pointer.is_null() || is_arena(pointer) {
         return;
@@ -383,6 +389,8 @@ pub unsafe extern "C" fn free(pointer: *mut c_void) {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// `pointer` must be null or allocated by a compatible allocator.
 pub unsafe extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_void {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"realloc", &NEXT);
@@ -426,6 +434,8 @@ pub unsafe extern "C" fn realloc(pointer: *mut c_void, size: usize) -> *mut c_vo
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// The caller must satisfy the platform `aligned_alloc` contract.
 pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"aligned_alloc", &NEXT);
@@ -451,6 +461,8 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// `pointer` must be valid for writing and the allocation arguments must satisfy `posix_memalign`.
 pub unsafe extern "C" fn posix_memalign(
     pointer: *mut *mut c_void,
     alignment: usize,
@@ -480,6 +492,8 @@ pub unsafe extern "C" fn posix_memalign(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// The caller must satisfy the platform `mmap` contract.
 pub unsafe extern "C" fn mmap(
     address: *mut c_void,
     length: usize,
@@ -526,6 +540,8 @@ pub unsafe extern "C" fn mmap(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// `address` and `length` must describe a mapping valid for `munmap`.
 pub unsafe extern "C" fn munmap(address: *mut c_void, length: usize) -> c_int {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"munmap", &NEXT);
@@ -543,6 +559,8 @@ pub unsafe extern "C" fn munmap(address: *mut c_void, length: usize) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// The caller must satisfy the platform `sbrk` contract.
 pub unsafe extern "C" fn sbrk(increment: libc::intptr_t) -> *mut c_void {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"sbrk", &NEXT);
@@ -559,6 +577,8 @@ pub unsafe extern "C" fn sbrk(increment: libc::intptr_t) -> *mut c_void {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// All pointers and the start routine must remain valid as required by `pthread_create`.
 pub unsafe extern "C" fn pthread_create(
     thread: *mut libc::pthread_t,
     attributes: *const libc::pthread_attr_t,
@@ -578,18 +598,16 @@ pub unsafe extern "C" fn pthread_create(
     ) -> c_int = unsafe { std::mem::transmute(next) };
     let result = unsafe { next(thread, attributes, start, argument) };
     if result == 0 && !inside() {
-        shim_emit(
-            payload_slot!(),
-            c"pthread_create",
-            FLAG_STACK,
-            0,
-            unsafe { *thread } as u64,
-        );
+        shim_emit(payload_slot!(), c"pthread_create", FLAG_STACK, 0, unsafe {
+            *thread
+        });
     }
     result
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+/// `value` must be null or valid for writing as required by `pthread_join`.
 pub unsafe extern "C" fn pthread_join(thread: libc::pthread_t, value: *mut *mut c_void) -> c_int {
     static NEXT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     let next = resolve_next(c"pthread_join", &NEXT);
@@ -600,7 +618,7 @@ pub unsafe extern "C" fn pthread_join(thread: libc::pthread_t, value: *mut *mut 
         unsafe { std::mem::transmute(next) };
     let result = unsafe { next(thread, value) };
     if result == 0 && !inside() {
-        shim_emit(payload_slot!(), c"pthread_join", 0, 0, thread as u64);
+        shim_emit(payload_slot!(), c"pthread_join", 0, 0, thread);
     }
     result
 }

@@ -61,10 +61,9 @@ impl Session {
             let mut statement = connection.prepare(
                 "SELECT view_name FROM duckdb_views() WHERE NOT internal ORDER BY view_name",
             )?;
-            let names = statement
+            statement
                 .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<duckdb::Result<Vec<_>>>()?;
-            names
+                .collect::<duckdb::Result<Vec<_>>>()?
         };
         Ok(Session { connection, tables })
     }

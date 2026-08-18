@@ -69,24 +69,26 @@ struct Timeline {
     bandwidth_source: Vec<Option<String>>,
 }
 
+#[derive(Default)]
+struct TimelinePoint<'a> {
+    timestamp: u64,
+    allocated: Option<i64>,
+    mapped: Option<i64>,
+    rss: Option<i64>,
+    read: Option<f64>,
+    write: Option<f64>,
+    source: Option<&'a str>,
+}
+
 impl Timeline {
-    fn push(
-        &mut self,
-        timestamp: u64,
-        allocated: Option<i64>,
-        mapped: Option<i64>,
-        rss: Option<i64>,
-        read: Option<f64>,
-        write: Option<f64>,
-        source: Option<&str>,
-    ) {
-        self.timestamp_ns.push(timestamp as i64);
-        self.live_allocated_bytes.push(allocated);
-        self.live_mapped_bytes.push(mapped);
-        self.rss_bytes.push(rss);
-        self.dram_read.push(read);
-        self.dram_write.push(write);
-        self.bandwidth_source.push(source.map(str::to_owned));
+    fn push(&mut self, point: TimelinePoint<'_>) {
+        self.timestamp_ns.push(point.timestamp as i64);
+        self.live_allocated_bytes.push(point.allocated);
+        self.live_mapped_bytes.push(point.mapped);
+        self.rss_bytes.push(point.rss);
+        self.dram_read.push(point.read);
+        self.dram_write.push(point.write);
+        self.bandwidth_source.push(point.source.map(str::to_owned));
     }
 
     fn finish(self) -> Result<store::arrow::record_batch::RecordBatch> {
@@ -214,7 +216,11 @@ pub(crate) fn process(tables: &Tables, record_info: &RecordInfo, res_dir: &Path)
 
     let mut timeline = Timeline::default();
     for (timestamp, rss) in rss_samples {
-        timeline.push(timestamp, None, None, Some(rss as i64), None, None, None);
+        timeline.push(TimelinePoint {
+            timestamp,
+            rss: Some(rss as i64),
+            ..TimelinePoint::default()
+        });
     }
     for pair in bandwidth_samples.windows(2) {
         let elapsed = pair[1].timestamp.saturating_sub(pair[0].timestamp);
@@ -223,27 +229,22 @@ pub(crate) fn process(tables: &Tables, record_info: &RecordInfo, res_dir: &Path)
         }
         let read = pair[1].read_bytes.saturating_sub(pair[0].read_bytes) as f64 / elapsed as f64;
         let write = pair[1].write_bytes.saturating_sub(pair[0].write_bytes) as f64 / elapsed as f64;
-        timeline.push(
-            pair[1].timestamp,
-            None,
-            None,
-            None,
-            Some(read),
-            Some(write),
-            Some("hardware_memory_controller"),
-        );
+        timeline.push(TimelinePoint {
+            timestamp: pair[1].timestamp,
+            read: Some(read),
+            write: Some(write),
+            source: Some("hardware_memory_controller"),
+            ..TimelinePoint::default()
+        });
     }
     if let Some(allocations) = &allocations {
         for point in &allocations.points {
-            timeline.push(
-                point.timestamp,
-                Some(point.live_allocated as i64),
-                Some(point.live_mapped as i64),
-                None,
-                None,
-                None,
-                None,
-            );
+            timeline.push(TimelinePoint {
+                timestamp: point.timestamp,
+                allocated: Some(point.live_allocated as i64),
+                mapped: Some(point.live_mapped as i64),
+                ..TimelinePoint::default()
+            });
         }
     }
     tables.write("memory_timeline", timeline.finish()?)?;

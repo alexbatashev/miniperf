@@ -3,8 +3,8 @@ pub(crate) mod branch;
 mod events;
 #[cfg(target_arch = "x86_64")]
 mod mem;
-mod spe;
 mod mmap;
+mod spe;
 pub(crate) mod sysfs;
 
 use hashbrown::HashMap;

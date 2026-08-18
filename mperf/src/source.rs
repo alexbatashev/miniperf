@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -26,7 +27,7 @@ pub enum Availability {
 pub struct SessionContext {
     pub directory: PathBuf,
     pub dispatcher: Arc<EventDispatcher>,
-    pub process: Option<Arc<Process>>,
+    pub process: Option<Rc<Process>>,
     pub attached_pid: Option<u32>,
 }
 
@@ -349,11 +350,11 @@ impl Source for PreciseMemorySource {
     fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
         let mut status = "available";
         let mut message = String::new();
-        if let Some(driver) = &mut self.driver {
-            if let Err(error) = driver.stop() {
-                status = "degraded";
-                message = error.to_string();
-            }
+        if let Some(driver) = &mut self.driver
+            && let Err(error) = driver.stop()
+        {
+            status = "degraded";
+            message = error.to_string();
         }
         self.driver = None;
         vec![SourceStatus {
@@ -609,10 +610,7 @@ fn collector_library_path() -> Option<PathBuf> {
     };
     let mut path = std::env::current_exe().ok()?;
     path.pop();
-    for candidate in [path.join(library), path.join("../lib").join(library)] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    [path.join(library), path.join("../lib").join(library)]
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }

@@ -1437,12 +1437,11 @@ mod tests {
             let mut statement = connection
                 .prepare("SELECT table_name FROM duckdb_tables() ORDER BY table_name")
                 .unwrap();
-            let names = statement
+            statement
                 .query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
                 .collect::<store::duckdb::Result<Vec<_>>>()
-                .unwrap();
-            names
+                .unwrap()
         };
         for table in tables {
             connection

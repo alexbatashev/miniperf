@@ -47,6 +47,7 @@ pub enum MmapRecord {
         user_regs: Option<UserRegs>,
         user_stack: Vec<u8>,
     },
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     MemSample {
         ip: u64,
         pid: u32,
@@ -129,6 +130,7 @@ impl Records {
 
     /// Parse samples using the precise-memory layout (`PERF_SAMPLE_ADDR` +
     /// `WEIGHT_STRUCT` + `DATA_SRC` instead of grouped counter reads).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub fn memory(ptr: *mut u8, sample_regs_user: u64, branch_mode: Option<BranchMode>) -> Records {
         Records {
             metadata: ptr as *mut perf_event_mmap_page,

@@ -397,12 +397,12 @@ mod tests {
     #[test]
     fn parses_cpuinfo_fields() {
         let cpuinfo = "processor\t: 0\nflags\t\t: fpu ibs sse\nisa\t\t: rv64imafdc_sscofpmf\n";
-        assert!(cpuinfo_set(&cpuinfo, "flags").contains("ibs"));
+        assert!(cpuinfo_set(cpuinfo, "flags").contains("ibs"));
         assert_eq!(
-            cpuinfo_value(&cpuinfo, "isa").as_deref(),
+            cpuinfo_value(cpuinfo, "isa").as_deref(),
             Some("rv64imafdc_sscofpmf")
         );
-        assert!(cpuinfo_set(&cpuinfo, "absent").is_empty());
+        assert!(cpuinfo_set(cpuinfo, "absent").is_empty());
     }
 
     #[test]

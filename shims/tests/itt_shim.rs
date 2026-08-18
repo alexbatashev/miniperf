@@ -1,4 +1,4 @@
-use std::ffi::{CString, c_void};
+use std::ffi::{CString, c_char, c_void};
 use std::path::PathBuf;
 
 fn collector_cdylib() -> Option<PathBuf> {
@@ -50,9 +50,9 @@ fn itt_collector_records_tasks() {
         symbol
     };
     unsafe {
-        let domain_create: extern "C" fn(*const i8) -> *mut c_void =
+        let domain_create: extern "C" fn(*const c_char) -> *mut c_void =
             std::mem::transmute(sym("__itt_domain_create"));
-        let string_create: extern "C" fn(*const i8) -> *mut c_void =
+        let string_create: extern "C" fn(*const c_char) -> *mut c_void =
             std::mem::transmute(sym("__itt_string_handle_create"));
         let task_begin: extern "C" fn(*const c_void, IttId, IttId, *mut c_void) =
             std::mem::transmute(sym("__itt_task_begin"));

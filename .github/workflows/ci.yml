@@ -68,7 +68,7 @@ jobs:
             runner: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
             task: build
-            command: CC=riscv64-linux-gnu-gcc cargo build --workspace --exclude mperf-gui --all-targets --target riscv64gc-unknown-linux-gnu
+            command: cargo build --workspace --exclude mperf-gui --all-targets --target riscv64gc-unknown-linux-gnu
           - platform: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
@@ -96,7 +96,7 @@ jobs:
         if: matrix.target == 'riscv64gc-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu
+          sudo apt-get install -y gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -142,7 +142,7 @@ jobs:
         if: matrix.target == 'riscv64gc-unknown-linux-gnu'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu
+          sudo apt-get install -y gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

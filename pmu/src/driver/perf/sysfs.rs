@@ -70,6 +70,7 @@ pub fn event_attr(pmu: &Path, event: &str) -> Option<perf_event_attr> {
 }
 
 /// Whether an event alias configures a named `format/` term.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub fn alias_has_term(pmu: &Path, event: &str, term: &str) -> bool {
     std::fs::read_to_string(pmu.join("events").join(event))
         .is_ok_and(|alias| alias.split(',').any(|part| part.trim().starts_with(term)))

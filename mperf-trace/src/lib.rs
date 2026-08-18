@@ -46,11 +46,25 @@ fn vtable() -> Option<&'static Vtable> {
             };
             unsafe {
                 Some(Vtable {
-                    register_: std::mem::transmute(resolve("mperf_trace_register")?),
-                    begin: std::mem::transmute(resolve("mperf_trace_begin")?),
-                    end: std::mem::transmute(resolve("mperf_trace_end")?),
-                    instant: std::mem::transmute(resolve("mperf_trace_instant")?),
-                    counter: std::mem::transmute(resolve("mperf_trace_counter")?),
+                    register_: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*const RawPayload) -> *mut c_void,
+                    >(resolve("mperf_trace_register")?),
+                    begin: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void, u64) -> u64,
+                    >(resolve("mperf_trace_begin")?),
+                    end: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, u64)>(
+                        resolve("mperf_trace_end")?,
+                    ),
+                    instant: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void, i64),
+                    >(resolve("mperf_trace_instant")?),
+                    counter: std::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut c_void, i64),
+                    >(resolve("mperf_trace_counter")?),
                 })
             }
         })

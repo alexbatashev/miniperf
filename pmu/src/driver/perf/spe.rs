@@ -828,10 +828,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cpumask");
         std::fs::write(&path, "0-1,6-11\n").unwrap();
-        assert_eq!(
-            read_cpumask(&path),
-            Some(vec![0, 1, 6, 7, 8, 9, 10, 11])
-        );
+        assert_eq!(read_cpumask(&path), Some(vec![0, 1, 6, 7, 8, 9, 10, 11]));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -20,7 +20,7 @@ pub struct EventDispatcher {
 }
 
 enum Msg {
-    Event(Event),
+    Event(Box<Event>),
     MemSample(MemSample),
     Module(ProcMapEntry),
 }
@@ -297,7 +297,7 @@ impl EventDispatcher {
         let worker = std::thread::spawn(move || {
             while let Ok(message) = rx.recv() {
                 match message {
-                    Msg::Event(event) => worker.consume(event),
+                    Msg::Event(event) => worker.consume(*event),
                     Msg::MemSample(sample) => worker.consume_mem_sample(sample),
                     Msg::Module(entry) => {
                         worker.modules.insert(entry);
@@ -336,7 +336,7 @@ impl EventDispatcher {
     }
 
     pub fn publish_event_sync(&self, evt: Event) {
-        if self.tx.send(Msg::Event(evt)).is_err() {
+        if self.tx.send(Msg::Event(Box::new(evt))).is_err() {
             eprintln!("lost event: writer stopped");
         }
     }

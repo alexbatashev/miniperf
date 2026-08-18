@@ -7,12 +7,9 @@ use std::path::PathBuf;
 fn next_to_current_exe(name: &str) -> Option<PathBuf> {
     let mut path = std::env::current_exe().ok()?;
     path.pop();
-    for candidate in [path.join(name), path.join("../lib").join(name)] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    [path.join(name), path.join("../lib").join(name)]
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 /// Path of the libc LD_PRELOAD shim, when built for this target.
