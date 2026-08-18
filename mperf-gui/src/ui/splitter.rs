@@ -7,13 +7,15 @@ use gpui::{
 
 use super::theme::ActiveTheme;
 
+type DragHandler = Rc<dyn Fn(Pixels, &mut Window, &mut App)>;
+
 /// Resizable-pane handle. Owns its drag state (no global root flags): while
 /// dragging, its canvas registers window-wide move/up handlers for that
 /// frame and reports the pointer position along its axis via `on_drag`.
 pub struct Splitter {
     axis: Axis,
     dragging: bool,
-    on_drag: Rc<dyn Fn(Pixels, &mut Window, &mut App)>,
+    on_drag: DragHandler,
 }
 
 impl Splitter {

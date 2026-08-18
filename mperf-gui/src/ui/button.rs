@@ -6,6 +6,8 @@ use gpui::{
 use super::icon::{Icon, icon};
 use super::theme::{ActiveTheme, Theme, mix};
 
+type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ButtonVariant {
     #[default]
@@ -91,7 +93,7 @@ pub struct Button {
     size: ButtonSize,
     disabled: bool,
     active: bool,
-    on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    on_click: Option<ClickHandler>,
 }
 
 pub fn button(id: impl Into<ElementId>) -> Button {

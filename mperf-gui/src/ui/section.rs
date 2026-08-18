@@ -6,6 +6,8 @@ use gpui::{
 use super::icon::{Icon, icon};
 use super::theme::ActiveTheme;
 
+type ToggleHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
 /// Uppercase section caption: `text-[10.5px] font-medium uppercase
 /// tracking-wide text-muted-foreground`.
 pub fn section_caption(label: impl Into<SharedString>, cx: &App) -> gpui::Div {
@@ -23,7 +25,7 @@ pub struct CollapsibleSection {
     id: ElementId,
     label: SharedString,
     open: bool,
-    on_toggle: Option<Box<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_toggle: Option<ToggleHandler>,
     children: Vec<AnyElement>,
 }
 

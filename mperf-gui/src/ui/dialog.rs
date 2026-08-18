@@ -8,6 +8,8 @@ use gpui::{
 use super::icon::{Icon, icon};
 use super::theme::ActiveTheme;
 
+type CloseHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// Modal dialog over a dimmed scrim. Render it as a child of the window
 /// root; open state lives in the parent view.
 #[derive(IntoElement)]
@@ -16,7 +18,7 @@ pub struct Dialog {
     title: SharedString,
     description: Option<SharedString>,
     width: f32,
-    on_close: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
+    on_close: Option<CloseHandler>,
     children: Vec<AnyElement>,
 }
 

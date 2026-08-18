@@ -6,6 +6,8 @@ use gpui::{
 use super::icon::{Icon, icon};
 use super::theme::ActiveTheme;
 
+type SelectHandler = Box<dyn Fn(usize, &mut Window, &mut App)>;
+
 pub struct TabItem {
     pub label: SharedString,
     pub icon: Option<Icon>,
@@ -40,15 +42,15 @@ impl TabItem {
 }
 
 /// shadcn Tabs list, dense variant: h-24px triggers, active = `bg-background`
-/// + shadow-sm (dark: input tint). Supports closable (source) tabs; overflow
+/// and shadow-sm (dark: input tint). Supports closable (source) tabs; overflow
 /// scrolls horizontally.
 #[derive(IntoElement)]
 pub struct TabBar {
     id: ElementId,
     items: Vec<TabItem>,
     active: usize,
-    on_select: Option<Box<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
-    on_close: Option<Box<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
+    on_select: Option<SelectHandler>,
+    on_close: Option<SelectHandler>,
 }
 
 pub fn tab_bar(id: impl Into<ElementId>, items: Vec<TabItem>, active: usize) -> TabBar {

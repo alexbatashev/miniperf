@@ -8,6 +8,9 @@ use gpui::{
 use super::icon::{Icon, icon};
 use super::theme::ActiveTheme;
 
+type ToggleHandler = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+type SelectHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
 pub struct DropdownItem {
     pub label: SharedString,
     pub trailing: Option<SharedString>,
@@ -59,8 +62,8 @@ pub struct DropdownMenu {
     open: bool,
     min_width: f32,
     items: Vec<DropdownItem>,
-    on_toggle: Option<Rc<dyn Fn(bool, &mut Window, &mut App)>>,
-    on_select: Option<Rc<dyn Fn(usize, &mut Window, &mut App)>>,
+    on_toggle: Option<ToggleHandler>,
+    on_select: Option<SelectHandler>,
 }
 
 pub fn dropdown_menu(
@@ -185,10 +188,10 @@ impl RenderOnce for DropdownMenu {
                                                         if let Some(on_select) = &on_select {
                                                             on_select(ix, window, cx);
                                                         }
-                                                        if !is_checkbox {
-                                                            if let Some(on_toggle) = &on_toggle {
-                                                                on_toggle(false, window, cx);
-                                                            }
+                                                        if !is_checkbox
+                                                            && let Some(on_toggle) = &on_toggle
+                                                        {
+                                                            on_toggle(false, window, cx);
                                                         }
                                                     })
                                                     .when(is_checkbox, |el| {

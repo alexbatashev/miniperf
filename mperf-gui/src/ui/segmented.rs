@@ -4,6 +4,8 @@ use gpui::{
 
 use super::theme::ActiveTheme;
 
+type SelectHandler = Box<dyn Fn(usize, &mut Window, &mut App)>;
+
 /// Single-select toggle group in segmented (spacing 0, outline) mode:
 /// collapsed inner borders, outer corners rounded, selected item = `bg-muted`.
 #[derive(IntoElement)]
@@ -14,7 +16,7 @@ pub struct SegmentedControl {
     height: f32,
     padding_x: f32,
     text_size: f32,
-    on_select: Option<Box<dyn Fn(usize, &mut Window, &mut App) + 'static>>,
+    on_select: Option<SelectHandler>,
 }
 
 pub fn segmented(

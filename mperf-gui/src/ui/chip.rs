@@ -5,6 +5,8 @@ use gpui::{
 use super::icon::{Icon, icon};
 use super::theme::ActiveTheme;
 
+type CloseHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
 /// Filter-bar chip: `h-6 rounded-md border px-2 text-[11px]`, optionally
 /// active (series-1 tint) and closable.
 #[derive(IntoElement)]
@@ -14,7 +16,7 @@ pub struct Chip {
     leading_icon: Option<Icon>,
     mono: bool,
     active: bool,
-    on_close: Option<Box<dyn Fn(&mut Window, &mut App) + 'static>>,
+    on_close: Option<CloseHandler>,
 }
 
 pub fn chip(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Chip {
