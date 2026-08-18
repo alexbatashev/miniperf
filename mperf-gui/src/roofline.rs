@@ -1,9 +1,6 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, Result, bail};
 use mperf_data::{RooflineCalibration, RooflineMethodInfo};
 
-use crate::source::SourceLocation;
 use crate::sql::{Connection, Value, as_f64, as_i64, as_text, row_values, table_columns};
 
 const LABEL_ASSET_PREFIX: &str = "roofline-label:";
@@ -33,7 +30,6 @@ pub struct RooflineData {
     pub loops: Vec<RooflineLoop>,
     pub calibration: Option<RooflineCalibration>,
     pub method: Option<RooflineMethodInfo>,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,19 +62,10 @@ impl RooflineData {
         calibration: Option<RooflineCalibration>,
         method: Option<RooflineMethodInfo>,
     ) -> RooflineData {
-        match load_loops(connection) {
-            Ok(loops) => Self {
-                loops,
-                calibration,
-                method,
-                error: None,
-            },
-            Err(error) => Self {
-                loops: Vec::new(),
-                calibration,
-                method,
-                error: Some(format!("{error:#}")),
-            },
+        Self {
+            loops: load_loops(connection).unwrap_or_default(),
+            calibration,
+            method,
         }
     }
 
@@ -107,22 +94,6 @@ impl RooflineData {
         roofs
     }
 
-    pub fn has_compatible_memory_roof(&self) -> bool {
-        !self.bandwidth_roofs().is_empty()
-    }
-
-    pub fn uses_architectural_traffic(&self) -> bool {
-        self.method
-            .as_ref()
-            .is_some_and(|method| method.traffic == "architectural")
-    }
-
-    pub fn uses_modeled_traffic(&self) -> bool {
-        self.method
-            .as_ref()
-            .is_some_and(|method| method.traffic == "dram-model")
-    }
-
     pub fn efficiency(&self, loop_data: &RooflineLoop) -> Option<f64> {
         let calibration = self.calibration.as_ref()?;
         let bandwidth = self
@@ -146,13 +117,6 @@ impl RooflineLoop {
 
     pub fn fp64_arithmetic_intensity(&self) -> Option<f64> {
         finite_positive(sum_optional(self.scalar_double_ai, self.vector_double_ai)?)
-    }
-
-    pub fn source(&self) -> Option<SourceLocation> {
-        (!self.file_name.trim().is_empty() && self.line > 0).then(|| SourceLocation {
-            path: PathBuf::from(&self.file_name),
-            line: self.line,
-        })
     }
 }
 
@@ -335,18 +299,10 @@ mod tests {
 
         let data = RooflineData::load(&connection, Some(calibration()), None);
 
-        assert_eq!(data.error, None);
         assert_eq!(data.loops.len(), 2);
         assert_eq!(data.loops[0].function_name, "mixed");
         assert_eq!(data.loops[0].fp64_gflops(), Some(8.0));
         assert_eq!(data.loops[0].fp64_arithmetic_intensity(), Some(8.0));
-        assert_eq!(
-            data.loops[0].source(),
-            Some(SourceLocation {
-                path: PathBuf::from("/src/kernel.c"),
-                line: 42,
-            })
-        );
         assert_eq!(data.loops[1].function_name, "integer-only");
         assert_eq!(data.loops[1].fp64_gflops(), None);
     }
@@ -379,13 +335,11 @@ mod tests {
             loops: Vec::new(),
             calibration: Some(calibration()),
             method: Some(method("architectural")),
-            error: None,
         };
         let dram = RooflineData {
             loops: Vec::new(),
             calibration: Some(calibration()),
             method: Some(method("dram")),
-            error: None,
         };
 
         assert_eq!(architectural.efficiency(&loop_data), Some(0.125));
@@ -398,16 +352,11 @@ mod tests {
     }
 
     #[test]
-    fn reports_a_missing_roofline_view_without_hiding_the_tab() {
+    fn keeps_an_empty_loop_list_when_the_roofline_table_is_missing() {
         let connection = Connection::open_in_memory().unwrap();
         let data = RooflineData::load(&connection, Some(calibration()), None);
 
         assert!(data.loops.is_empty());
-        assert!(
-            data.error
-                .as_deref()
-                .is_some_and(|error| error.contains("roofline"))
-        );
         assert!(data.calibration.is_some());
     }
 
@@ -420,25 +369,19 @@ mod tests {
             Some(calibration()),
             Some(method("architectural")),
         );
-        assert!(architectural.has_compatible_memory_roof());
-        assert!(architectural.uses_architectural_traffic());
         assert_eq!(
             architectural.bandwidth_roofs(),
             vec![("L1", 400.0), ("DRAM", 50.0)]
         );
 
         let dram = RooflineData::load(&connection, Some(calibration()), Some(method("dram")));
-        assert!(dram.has_compatible_memory_roof());
         assert_eq!(dram.bandwidth_roofs(), vec![("DRAM", 50.0)]);
 
         let modeled =
             RooflineData::load(&connection, Some(calibration()), Some(method("dram-model")));
-        assert!(modeled.has_compatible_memory_roof());
-        assert!(modeled.uses_modeled_traffic());
         assert_eq!(modeled.bandwidth_roofs(), vec![("DRAM", 50.0)]);
 
         let unknown = RooflineData::load(&connection, Some(calibration()), Some(method("unknown")));
-        assert!(!unknown.has_compatible_memory_roof());
         assert!(unknown.bandwidth_roofs().is_empty());
     }
 

@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use mperf_data::ScenarioInfo;
 use pmu_data::TmaMetric;
 
-use crate::sql::{Connection, SqlResult, table_columns};
+use crate::sql::{Connection, SqlResult};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TmaSummaryData {
@@ -25,8 +25,6 @@ pub struct TmaSummaryRow {
 pub struct SummaryStats {
     pub cycles: u64,
     pub instructions: u64,
-    pub branch_instructions: Option<u64>,
-    pub branch_misses: Option<u64>,
 }
 
 impl TmaSummaryData {
@@ -110,25 +108,12 @@ fn finite_tma_value(value: Option<f64>) -> Option<f64> {
 
 impl SummaryStats {
     pub fn load(connection: &Connection) -> Result<Self> {
-        let available_columns: HashSet<String> = table_columns(connection, "pmu_counters")
-            .into_iter()
-            .map(|column| column.name)
-            .collect();
-
-        let has_branch = available_columns.contains("pmu_branch_instructions")
-            && available_columns.contains("pmu_branch_misses");
-
-        let mut select_parts = vec![
-            "CAST(SUM(pmu_cycles) AS BIGINT) AS pmu_cycles".to_string(),
-            "CAST(SUM(pmu_instructions) AS BIGINT) AS pmu_instructions".to_string(),
-        ];
-
-        push_optional_sum(&mut select_parts, has_branch, "pmu_branch_instructions");
-        push_optional_sum(&mut select_parts, has_branch, "pmu_branch_misses");
-
-        let query = format!("SELECT {} FROM pmu_counters;", select_parts.join(",\n"));
         let mut statement = connection
-            .prepare(&query)
+            .prepare(
+                "SELECT CAST(SUM(pmu_cycles) AS BIGINT) AS pmu_cycles,
+                        CAST(SUM(pmu_instructions) AS BIGINT) AS pmu_instructions
+                 FROM pmu_counters;",
+            )
             .context("failed to prepare summary query")?;
         let mut rows = statement.query([]).context("failed to run summary query")?;
         let row = rows
@@ -146,21 +131,7 @@ impl SummaryStats {
         Ok(Self {
             cycles: read("pmu_cycles")?,
             instructions: read("pmu_instructions")?,
-            branch_instructions: has_branch
-                .then(|| read("pmu_branch_instructions"))
-                .transpose()?,
-            branch_misses: has_branch.then(|| read("pmu_branch_misses")).transpose()?,
         })
-    }
-}
-
-fn push_optional_sum(parts: &mut Vec<String>, present: bool, column: &str) {
-    if present {
-        parts.push(format!(
-            "CAST(SUM({column} * 1.0 / confidence) AS BIGINT) AS {column}"
-        ));
-    } else {
-        parts.push(format!("0 AS {column}"));
     }
 }
 
@@ -192,26 +163,22 @@ mod tests {
     }
 
     #[test]
-    fn loads_required_and_optional_summary_counters() {
+    fn loads_summary_counters() {
         let connection = Connection::open_in_memory().unwrap();
         connection
             .execute_batch(
                 "CREATE TABLE pmu_counters (
                     confidence DOUBLE,
                     pmu_cycles BIGINT,
-                    pmu_instructions BIGINT,
-                    pmu_branch_instructions BIGINT,
-                    pmu_branch_misses BIGINT
+                    pmu_instructions BIGINT
                 );
-                INSERT INTO pmu_counters VALUES (0.5, 100, 60, 10, 2);",
+                INSERT INTO pmu_counters VALUES (0.5, 100, 60);",
             )
             .unwrap();
 
         let summary = SummaryStats::load(&connection).unwrap();
         assert_eq!(summary.cycles, 100);
         assert_eq!(summary.instructions, 60);
-        assert_eq!(summary.branch_instructions, Some(20));
-        assert_eq!(summary.branch_misses, Some(4));
     }
 
     #[test]
@@ -310,4 +277,3 @@ mod tests {
         assert!(TmaSummaryData::for_scenario(&roofline, &connection).is_none());
     }
 }
-

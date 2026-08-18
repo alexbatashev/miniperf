@@ -9,7 +9,6 @@ pub struct SnapshotData {
     pub resources: Vec<ResourceUse>,
     pub findings: Vec<SnapshotFinding>,
     pub collectors: Vec<SnapshotCollector>,
-    pub duration_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,7 +86,6 @@ pub struct ResourceUse {
     pub resource: String,
     /// Derived one-line summary, e.g. "3.5% of 48 CPUs".
     pub headline: Option<String>,
-    pub severity: Severity,
     /// Formatted summary metrics per USE category, in category order.
     pub summaries: [Vec<SummaryMetric>; 3],
     pub charts: Vec<SnapshotChart>,
@@ -146,13 +144,7 @@ impl SnapshotData {
         let findings = load_findings(connection);
         let collectors = load_collectors(connection);
         let summary_rows = load_summary(connection);
-        let resources = build_resources(
-            samples,
-            &summary_rows,
-            &findings,
-            duration_ns,
-            logical_cpu_count,
-        );
+        let resources = build_resources(samples, &summary_rows, duration_ns, logical_cpu_count);
         if resources.is_empty() {
             return None;
         }
@@ -161,7 +153,6 @@ impl SnapshotData {
             resources,
             findings,
             collectors,
-            duration_ns,
         })
     }
 }
@@ -276,8 +267,8 @@ fn load_findings(connection: &Connection) -> Vec<SnapshotFinding> {
 }
 
 fn load_collectors(connection: &Connection) -> Vec<SnapshotCollector> {
-    let Ok(mut statement) = connection
-        .prepare("SELECT name, status, message FROM snapshot_collectors ORDER BY name;")
+    let Ok(mut statement) =
+        connection.prepare("SELECT name, status, message FROM snapshot_collectors ORDER BY name;")
     else {
         return Vec::new();
     };
@@ -298,7 +289,6 @@ const RESOURCE_ORDER: [&str; 5] = ["cpu", "memory", "disk", "io", "network"];
 fn build_resources(
     samples: Vec<SampleRow>,
     summary_rows: &[SummaryRow],
-    findings: &[SnapshotFinding],
     duration_ns: u64,
     logical_cpu_count: Option<u32>,
 ) -> Vec<ResourceUse> {
@@ -355,14 +345,6 @@ fn build_resources(
         });
     }
 
-    let mut severities = BTreeMap::<&str, Severity>::new();
-    for finding in findings {
-        let entry = severities
-            .entry(&finding.resource)
-            .or_insert(Severity::Info);
-        *entry = (*entry).max(finding.severity);
-    }
-
     let mut resources = charts_by_resource.keys().cloned().collect::<Vec<_>>();
     resources.sort_by_key(|resource| {
         RESOURCE_ORDER
@@ -384,10 +366,6 @@ fn build_resources(
                     duration_ns,
                     logical_cpu_count,
                 ),
-                severity: severities
-                    .get(resource.as_str())
-                    .copied()
-                    .unwrap_or(Severity::Info),
                 summaries,
                 charts,
                 resource,
@@ -784,7 +762,6 @@ mod tests {
         assert_eq!(cpu_chart.series[0].points, vec![(1.0, 2.0), (2.0, 2.0)]);
 
         let memory = &data.resources[1];
-        assert_eq!(memory.severity, Severity::High);
         let rss_chart = memory.charts.iter().find(|c| c.metric == "rss").unwrap();
         assert_eq!(rss_chart.unit, "bytes");
         assert_eq!(rss_chart.series[0].points.len(), 3);
@@ -796,7 +773,6 @@ mod tests {
 
         assert_eq!(data.findings.len(), 1);
         assert_eq!(data.collectors[0].status, "permission_denied");
-        assert_eq!(data.duration_ns, 2_000_000_000);
     }
 
     #[test]

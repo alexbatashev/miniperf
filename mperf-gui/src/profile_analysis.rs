@@ -1,7 +1,6 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
-    ops::Range,
 };
 
 use crate::profile::{
@@ -236,36 +235,6 @@ impl FlameScopeHeatmap {
             .and_then(|index| index.checked_add(column))
             .and_then(|index| self.bins.get(index))
     }
-
-    /// Converts a rectangular heatmap selection into its disjoint time ranges.
-    ///
-    /// A folded row is a separate second, so selecting the same sub-second
-    /// columns across several rows intentionally returns one range per row.
-    pub fn selected_ranges(&self, rows: Range<usize>, columns: Range<usize>) -> Vec<TimeRange> {
-        let row_start = rows.start.min(self.rows);
-        let row_end = rows.end.min(self.rows);
-        let column_start = columns.start.min(self.columns);
-        let column_end = columns.end.min(self.columns);
-        if row_start >= row_end || column_start >= column_end {
-            return Vec::new();
-        }
-
-        (row_start..row_end)
-            .filter_map(|row| {
-                let fold_start = self
-                    .range
-                    .start_ns
-                    .saturating_add((row as u64).saturating_mul(self.fold_ns));
-                let start_ns = fold_start
-                    .saturating_add((column_start as u64).saturating_mul(self.bin_width_ns));
-                let end_ns = fold_start
-                    .saturating_add((column_end as u64).saturating_mul(self.bin_width_ns))
-                    .min(fold_start.saturating_add(self.fold_ns))
-                    .min(self.range.end_ns);
-                (start_ns < end_ns).then_some(TimeRange { start_ns, end_ns })
-            })
-            .collect()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -314,10 +283,6 @@ impl StackWeight {
 }
 
 impl CallTree {
-    pub fn build(profile: &ProfileData, filter: &SampleFilter) -> Self {
-        Self::build_weighted(profile, filter, false, StackWeight::Samples)
-    }
-
     /// `inverted` reverses every stack, turning the tree bottom-up (leaves at
     /// the root); `weight` scales each sample's contribution.
     pub fn build_weighted(
@@ -1525,20 +1490,6 @@ mod tests {
         assert_eq!(heatmap.bin(0, 2).unwrap().samples, 1);
         assert_eq!(heatmap.bin(20, 2).unwrap().samples, 1);
         assert_eq!(heatmap.bin(39, 9).unwrap().samples, 1);
-
-        assert_eq!(
-            heatmap.selected_ranges(0..2, 2..3),
-            vec![
-                TimeRange {
-                    start_ns: 10_000_000,
-                    end_ns: 15_000_000,
-                },
-                TimeRange {
-                    start_ns: 60_000_000,
-                    end_ns: 65_000_000,
-                },
-            ]
-        );
     }
 
     #[test]
@@ -1720,7 +1671,12 @@ mod tests {
             vec![],
         );
 
-        let tree = CallTree::build(&profile, &SampleFilter::default());
+        let tree = CallTree::build_weighted(
+            &profile,
+            &SampleFilter::default(),
+            false,
+            StackWeight::Samples,
+        );
         assert_eq!(tree.total_samples, 4);
         let root_children = &tree.nodes[tree.root].children;
         assert_eq!(tree.nodes[root_children[0]].label, "A");
