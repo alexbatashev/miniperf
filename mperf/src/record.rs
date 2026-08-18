@@ -13,7 +13,7 @@ use crate::{
     event_dispatcher::EventDispatcher,
     postprocess::perform_postprocessing,
     roofline,
-    source::{Pass, PmuSamplingSource, SessionContext},
+    source::{Pass, PmuSamplingSource, SessionContext, Source},
     utils::counter_to_event_ty,
 };
 
@@ -191,22 +191,23 @@ fn snapshot(
         anyhow::bail!("record snapshot requires a command or --pid");
     }
 
-    let mut pass = Pass {
+    let optional: Vec<Box<dyn Source>> = vec![Box::new(crate::source::InternalEventsSource {
+        roofline_instrumented: false,
+    })];
+    #[cfg(target_os = "linux")]
+    let optional = {
+        let mut optional = optional;
+        optional.push(Box::new(crate::source::ProcfsSource::default()));
+        optional.push(Box::new(crate::source::BpfSource::default()));
+        optional
+    };
+    let pass = Pass {
         name: "snapshot",
         required: vec![Box::new(PmuSamplingSource::for_scenario(
             Scenario::Snapshot,
         ))],
-        optional: vec![Box::new(crate::source::InternalEventsSource {
-            roofline_instrumented: false,
-        })],
+        optional,
     };
-    #[cfg(target_os = "linux")]
-    {
-        pass.optional
-            .push(Box::new(crate::source::ProcfsSource::default()));
-        pass.optional
-            .push(Box::new(crate::source::BpfSource::default()));
-    }
     let mut pass = pass.resolve(output_directory)?;
     let child_env = pass.child_environment(output_directory);
 

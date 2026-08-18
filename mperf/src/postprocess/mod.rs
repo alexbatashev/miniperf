@@ -21,7 +21,7 @@ use tables::{Columns, Tables, quote_identifier};
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-pub(crate) use samples::{RawSample, merge_lbr_stack};
+pub(crate) use samples::RawSample;
 
 /// Turn a recording into the derived tables every consumer reads: one Parquet
 /// file per table in the session directory.

@@ -7,7 +7,7 @@ use mperf_data::{MemDataSource, MemLevel, MemSnoop};
 use store::arrow::array::{Array, BinaryArray, Int64Array, ListArray, UInt32Array, UInt64Array};
 use store::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use super::samples::{ResolvedIp, resolve_folded_stack};
+use super::samples::{RawSample, ResolvedIp, merge_lbr_stack, resolve_folded_stack};
 use super::tables::{Columns, Tables};
 use crate::utils;
 
@@ -137,7 +137,7 @@ pub(crate) fn process(tables: &Tables, res_dir: &Path) -> Result<()> {
                 let chain = list_values(callchain, index)?;
                 let lbr_chain = list_values(lbr_callchain, index)?;
                 let registers = list_values(regs, index)?;
-                let raw = super::RawSample {
+                let raw = RawSample {
                     timestamp: timestamp.value(index),
                     pid: pid.value(index),
                     tid: tid.value(index),
@@ -165,7 +165,7 @@ pub(crate) fn process(tables: &Tables, res_dir: &Path) -> Result<()> {
                 )))]
                 let frames = chain.clone();
 
-                let frames = super::merge_lbr_stack(frames.into_iter().collect(), &lbr_chain);
+                let frames = merge_lbr_stack(frames.into_iter().collect(), &lbr_chain);
                 stack_ids.push(store::stack_hash(&frames));
                 call_stacks.push(resolve_folded_stack(
                     &resolver,

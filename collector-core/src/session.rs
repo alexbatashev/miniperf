@@ -107,7 +107,7 @@ fn current_thread_id() -> u32 {
     #[cfg(target_os = "macos")]
     {
         let mut tid = 0_u64;
-        unsafe { libc::pthread_threadid_np(std::ptr::null_mut(), &mut tid) };
+        unsafe { libc::pthread_threadid_np(0, &mut tid) };
         tid as u32
     }
 }
