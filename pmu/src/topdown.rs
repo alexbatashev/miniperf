@@ -346,23 +346,9 @@ mod tests {
     use super::*;
     use crate::PmuDevice;
 
-    fn intel_host() -> Capabilities {
-        let mut cpu = PmuDevice {
-            name: "cpu".to_owned(),
-            ..PmuDevice::default()
-        };
-        for event in INTEL_EVENTS {
-            cpu.events.insert(sysfs_alias(event));
-        }
-        Capabilities {
-            pmus: vec![cpu],
-            ..Capabilities::default()
-        }
-    }
-
     #[test]
     fn intel_metrics_are_plain_fractions_of_slots() {
-        let scenario = scenario(&intel_host()).expect("fixed topdown");
+        let scenario = intel_scenario(false);
         let formulas = scenario
             .metrics
             .iter()
@@ -403,17 +389,12 @@ mod tests {
 
     #[test]
     fn level_two_metrics_appear_only_when_the_pmu_counts_them() {
-        let mut caps = intel_host();
-        assert!(scenario(&caps)
-            .expect("fixed topdown")
+        assert!(intel_scenario(false)
             .metrics
             .iter()
             .all(|metric| !metric.name.contains('.')));
 
-        for level in INTEL_LEVEL_TWO {
-            caps.pmus[0].events.insert(sysfs_alias(level.3));
-        }
-        let scenario = scenario(&caps).expect("fixed topdown");
+        let scenario = intel_scenario(true);
         assert_eq!(scenario.metrics.len(), 12);
         assert_eq!(scenario.metrics[4].name, "retiring.heavy_operations");
         assert_eq!(
@@ -442,7 +423,7 @@ mod tests {
             ..Capabilities::default()
         };
 
-        let scenario = scenario(&caps).expect("arm slots topdown");
+        let scenario = arm_scenario(&caps).expect("arm slots topdown");
         assert_eq!(scenario.metrics.len(), 8);
         assert_eq!(scenario.metrics[0].name, "retiring.armv8_pmuv3_0");
         assert_eq!(scenario.metrics[0].cpus.as_deref(), Some("0,5-11"));

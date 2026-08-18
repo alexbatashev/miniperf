@@ -246,24 +246,12 @@ mod tests {
 
     #[test]
     fn picks_the_best_satisfied_rung() {
-        let mut core = pmu("cpu");
-        for event in crate::topdown::INTEL_EVENTS {
-            core.events.insert(crate::sysfs_alias(event));
-        }
         let caps = Capabilities {
-            pmus: vec![pmu("ibs_op"), core],
+            pmus: vec![pmu("ibs_op")],
             ..Capabilities::default()
         };
-        let resolution = resolve(
-            &[
-                Rung::PebsMem,
-                Rung::FixedTopdown,
-                Rung::IbsOp,
-                Rung::Baseline,
-            ],
-            &caps,
-        );
-        assert_eq!(resolution.chosen, Rung::FixedTopdown);
+        let resolution = resolve(&[Rung::PebsMem, Rung::IbsOp, Rung::Baseline], &caps);
+        assert_eq!(resolution.chosen, Rung::IbsOp);
         assert_eq!(resolution.rejected.len(), 1);
         assert_eq!(resolution.rejected[0].0, Rung::PebsMem);
     }
