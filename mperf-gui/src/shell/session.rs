@@ -175,18 +175,18 @@ impl ShellSession {
             .with_context(|| format!("failed to parse {}", info_path.display()))?;
         record_info.ensure_supported_format()?;
 
-        let database_path = result_directory.join("perf.db");
-        let connection = sqlite::open(&database_path)
-            .with_context(|| format!("failed to open {}", database_path.display()))?;
-        let summary = SummaryStats::load(&connection)?;
-        let tma = TmaData::load(&record_info.scenario_info, &connection);
-        let mut profile = ProfileData::load(&connection);
+        let session = store::Session::open(&result_directory)
+            .with_context(|| format!("failed to open {}", result_directory.display()))?;
+        let connection = session.connection();
+        let summary = SummaryStats::load(connection)?;
+        let tma = TmaData::load(&record_info.scenario_info, connection);
+        let mut profile = ProfileData::load(connection);
         profile.logical_cpu_count = record_info.logical_cpu_count;
-        let has_assembly = super::asm::has_assembly(&connection);
-        let snapshot = SnapshotData::load(&connection, record_info.logical_cpu_count);
-        let memory = load_memory(&connection, &record_info);
-        let roofline = load_roofline(&connection, &record_info);
-        drop(connection);
+        let has_assembly = super::asm::has_assembly(connection);
+        let snapshot = SnapshotData::load(connection, record_info.logical_cpu_count);
+        let memory = load_memory(connection, &record_info);
+        let roofline = load_roofline(connection, &record_info);
+        drop(session);
 
         let name = result_directory
             .file_name()
@@ -265,7 +265,7 @@ impl ShellSession {
 
 /// Memory analysis is kept only when the recording actually produced one;
 /// availability is data-presence driven, never scenario-driven.
-fn load_memory(connection: &sqlite::Connection, record_info: &RecordInfo) -> Option<MemoryData> {
+fn load_memory(connection: &crate::sql::Connection, record_info: &RecordInfo) -> Option<MemoryData> {
     let calibration = record_info
         .cpu_info
         .memory_calibration
@@ -278,7 +278,7 @@ fn load_memory(connection: &sqlite::Connection, record_info: &RecordInfo) -> Opt
 }
 
 fn load_roofline(
-    connection: &sqlite::Connection,
+    connection: &crate::sql::Connection,
     record_info: &RecordInfo,
 ) -> Option<RooflineData> {
     let data = RooflineData::load(

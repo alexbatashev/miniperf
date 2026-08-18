@@ -1,40 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::{Path, PathBuf},
-};
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use mperf_data::{RecordInfo, ScenarioInfo, scenario_ui};
-use num_format::{Locale, ToFormattedString};
-use pmu_data::{TabSpec, TmaMetric};
-use store::Session;
+use mperf_data::ScenarioInfo;
+use pmu_data::TmaMetric;
 
-use crate::{
-    flamegraph::FlamegraphData,
-    memory::MemoryData,
-    metrics::MetricsTableData,
-    profile::ProfileData,
-    roofline::RooflineData,
-    snapshot::SnapshotData,
-    sql::{Connection, SqlResult, table_columns},
-};
-
-#[derive(Debug)]
-pub struct ResultsModel {
-    pub result_directory: PathBuf,
-    pub record_info: RecordInfo,
-    pub summary: SummaryStats,
-    pub tma_summary: Option<TmaSummaryData>,
-    pub profile: ProfileData,
-    pub snapshot: Option<SnapshotData>,
-    pub tabs: Vec<GuiTab>,
-    /// Viewer-attached visualization manifest (`manifest.yaml`/`.json` in the
-    /// session directory); presentation-only, absence never hides data.
-    /// Consumed by the redesigned track-based views.
-    #[allow(dead_code)]
-    pub manifest: Option<mperf_data::VisualizationManifest>,
-}
+use crate::sql::{Connection, SqlResult, table_columns};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TmaSummaryData {
@@ -51,89 +21,12 @@ pub struct TmaSummaryRow {
     pub dominant: bool,
 }
 
-#[derive(Debug)]
-pub enum GuiTab {
-    Summary,
-    MetricsTable {
-        title: String,
-        data: MetricsTableData,
-    },
-    Loops(Box<RooflineData>),
-    Memory(Box<MemoryData>),
-    Flamegraph(Box<FlamegraphData>),
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SummaryStats {
     pub cycles: u64,
     pub instructions: u64,
     pub branch_instructions: Option<u64>,
     pub branch_misses: Option<u64>,
-    pub cache_references: Option<u64>,
-    pub cache_misses: Option<u64>,
-    pub stalled_cycles_frontend: Option<u64>,
-    pub stalled_cycles_backend: Option<u64>,
-}
-
-#[derive(Debug)]
-pub struct CounterRow {
-    pub label: &'static str,
-    pub value: String,
-    pub detail: String,
-}
-
-impl ResultsModel {
-    pub fn load(result_directory: impl AsRef<Path>) -> Result<Self> {
-        let result_directory = fs::canonicalize(result_directory.as_ref()).with_context(|| {
-            format!("failed to resolve {}", result_directory.as_ref().display())
-        })?;
-        let info_path = result_directory.join("info.json");
-        let info_data = fs::read_to_string(&info_path)
-            .with_context(|| format!("failed to read {}", info_path.display()))?;
-        let record_info: RecordInfo = serde_json::from_str(&info_data)
-            .with_context(|| format!("failed to parse {}", info_path.display()))?;
-        record_info.ensure_supported_format()?;
-
-        let session = Session::open(&result_directory)
-            .with_context(|| format!("failed to open {}", result_directory.display()))?;
-        let connection = session.connection();
-        let summary = SummaryStats::load(connection)?;
-        let tma_summary = TmaSummaryData::for_scenario(&record_info.scenario_info, connection);
-        let mut profile = ProfileData::load(connection);
-        profile.logical_cpu_count = record_info.logical_cpu_count;
-        let snapshot = SnapshotData::load(connection, record_info.logical_cpu_count);
-
-        let tabs = scenario_ui(&record_info)
-            .tabs
-            .into_iter()
-            .map(|tab| GuiTab::load(tab, connection, &result_directory, &record_info))
-            .collect();
-
-        let manifest = ["manifest.yaml", "manifest.yml", "manifest.json"]
-            .iter()
-            .map(|name| result_directory.join(name))
-            .find(|path| path.exists())
-            .and_then(
-                |path| match mperf_data::VisualizationManifest::load(&path) {
-                    Ok(manifest) => Some(manifest),
-                    Err(error) => {
-                        eprintln!("ignoring visualization manifest: {error}");
-                        None
-                    }
-                },
-            );
-
-        Ok(Self {
-            result_directory,
-            record_info,
-            summary,
-            tma_summary,
-            profile,
-            snapshot,
-            tabs,
-            manifest,
-        })
-    }
 }
 
 impl TmaSummaryData {
@@ -215,57 +108,6 @@ fn finite_tma_value(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite())
 }
 
-impl GuiTab {
-    fn load(
-        tab: TabSpec,
-        connection: &Connection,
-        result_directory: &Path,
-        record_info: &RecordInfo,
-    ) -> Self {
-        match tab {
-            TabSpec::Summary => Self::Summary,
-            TabSpec::Resources => {
-                let spec = mperf_data::resources_table_spec();
-                Self::MetricsTable {
-                    title: spec.title.clone().unwrap_or_else(|| spec.view.clone()),
-                    data: MetricsTableData::load(connection, &spec),
-                }
-            }
-            TabSpec::MetricsTable(spec) => {
-                let title = spec.title.clone().unwrap_or_else(|| spec.view.clone());
-                Self::MetricsTable {
-                    title,
-                    data: MetricsTableData::load(connection, &spec),
-                }
-            }
-            TabSpec::Loops => Self::Loops(Box::new(RooflineData::load(
-                connection,
-                record_info
-                    .cpu_info
-                    .roofline_calibration
-                    .as_deref()
-                    .cloned(),
-                match &record_info.scenario_info {
-                    ScenarioInfo::Roofline(info) => info.method.as_deref().cloned(),
-                    _ => None,
-                },
-            ))),
-            TabSpec::Memory => Self::Memory(Box::new(MemoryData::load(
-                connection,
-                record_info
-                    .cpu_info
-                    .memory_calibration
-                    .as_deref()
-                    .map(|calibration| calibration.memory_levels.clone())
-                    .unwrap_or_default(),
-            ))),
-            TabSpec::Flamegraph => {
-                Self::Flamegraph(Box::new(FlamegraphData::load(result_directory)))
-            }
-        }
-    }
-}
-
 impl SummaryStats {
     pub fn load(connection: &Connection) -> Result<Self> {
         let available_columns: HashSet<String> = table_columns(connection, "pmu_counters")
@@ -275,10 +117,6 @@ impl SummaryStats {
 
         let has_branch = available_columns.contains("pmu_branch_instructions")
             && available_columns.contains("pmu_branch_misses");
-        let has_cache = available_columns.contains("pmu_llc_references")
-            && available_columns.contains("pmu_llc_misses");
-        let has_stalled = available_columns.contains("pmu_stalled_cycles_frontend")
-            && available_columns.contains("pmu_stalled_cycles_backend");
 
         let mut select_parts = vec![
             "CAST(SUM(pmu_cycles) AS BIGINT) AS pmu_cycles".to_string(),
@@ -287,14 +125,6 @@ impl SummaryStats {
 
         push_optional_sum(&mut select_parts, has_branch, "pmu_branch_instructions");
         push_optional_sum(&mut select_parts, has_branch, "pmu_branch_misses");
-        push_optional_sum(&mut select_parts, has_cache, "pmu_llc_references");
-        push_optional_sum(&mut select_parts, has_cache, "pmu_llc_misses");
-        push_optional_sum(
-            &mut select_parts,
-            has_stalled,
-            "pmu_stalled_cycles_frontend",
-        );
-        push_optional_sum(&mut select_parts, has_stalled, "pmu_stalled_cycles_backend");
 
         let query = format!("SELECT {} FROM pmu_counters;", select_parts.join(",\n"));
         let mut statement = connection
@@ -320,76 +150,7 @@ impl SummaryStats {
                 .then(|| read("pmu_branch_instructions"))
                 .transpose()?,
             branch_misses: has_branch.then(|| read("pmu_branch_misses")).transpose()?,
-            cache_references: has_cache.then(|| read("pmu_llc_references")).transpose()?,
-            cache_misses: has_cache.then(|| read("pmu_llc_misses")).transpose()?,
-            stalled_cycles_frontend: has_stalled
-                .then(|| read("pmu_stalled_cycles_frontend"))
-                .transpose()?,
-            stalled_cycles_backend: has_stalled
-                .then(|| read("pmu_stalled_cycles_backend"))
-                .transpose()?,
         })
-    }
-
-    pub fn rows(self) -> Vec<CounterRow> {
-        let ipc = ratio(self.instructions, self.cycles, 1.0, "");
-        let branch_per_cycle = optional_ratio(
-            self.branch_instructions,
-            Some(self.cycles),
-            1.0,
-            " per cycle",
-        );
-        let branch_miss_percent =
-            optional_ratio(self.branch_misses, self.branch_instructions, 100.0, "%");
-        let branch_mpki = optional_ratio(self.branch_misses, Some(self.instructions), 1000.0, "");
-        let cache_miss_percent = match (self.cache_misses, self.cache_references) {
-            (Some(misses), Some(references)) if misses + references > 0 => {
-                format!(
-                    "{:.2}%",
-                    misses as f64 / (misses + references) as f64 * 100.0
-                )
-            }
-            _ => "N/A".to_string(),
-        };
-        let cache_mpki = optional_ratio(self.cache_misses, Some(self.instructions), 1000.0, "");
-
-        vec![
-            row("Cycles", count(self.cycles), ""),
-            row("Instructions", count(self.instructions), ""),
-            row("IPC", ipc, ""),
-            row(
-                "Branch instructions",
-                optional_count(self.branch_instructions),
-                branch_per_cycle,
-            ),
-            row(
-                "Branch misses",
-                optional_count(self.branch_misses),
-                branch_miss_percent,
-            ),
-            row("Branch MPKI", branch_mpki, ""),
-            row(
-                "Last level cache references",
-                optional_count(self.cache_references),
-                "",
-            ),
-            row(
-                "Last level cache misses",
-                optional_count(self.cache_misses),
-                cache_miss_percent,
-            ),
-            row("Cache MPKI", cache_mpki, ""),
-            row(
-                "Stalled cycles backend",
-                optional_count(self.stalled_cycles_backend),
-                optional_ratio(self.stalled_cycles_backend, Some(self.cycles), 100.0, "%"),
-            ),
-            row(
-                "Stalled cycles frontend",
-                optional_count(self.stalled_cycles_frontend),
-                optional_ratio(self.stalled_cycles_frontend, Some(self.cycles), 100.0, "%"),
-            ),
-        ]
     }
 }
 
@@ -400,45 +161,6 @@ fn push_optional_sum(parts: &mut Vec<String>, present: bool, column: &str) {
         ));
     } else {
         parts.push(format!("0 AS {column}"));
-    }
-}
-
-fn row(label: &'static str, value: impl Into<String>, detail: impl Into<String>) -> CounterRow {
-    CounterRow {
-        label,
-        value: value.into(),
-        detail: detail.into(),
-    }
-}
-
-fn count(value: u64) -> String {
-    value.to_formatted_string(&Locale::en)
-}
-
-fn optional_count(value: Option<u64>) -> String {
-    value.map(count).unwrap_or_else(|| "N/A".to_string())
-}
-
-fn ratio(numerator: u64, denominator: u64, scale: f64, suffix: &str) -> String {
-    if denominator == 0 {
-        "N/A".to_string()
-    } else {
-        format!(
-            "{:.2}{suffix}",
-            numerator as f64 / denominator as f64 * scale
-        )
-    }
-}
-
-fn optional_ratio(
-    numerator: Option<u64>,
-    denominator: Option<u64>,
-    scale: f64,
-    suffix: &str,
-) -> String {
-    match (numerator, denominator) {
-        (Some(numerator), Some(denominator)) => ratio(numerator, denominator, scale, suffix),
-        _ => "N/A".to_string(),
     }
 }
 
@@ -490,13 +212,6 @@ mod tests {
         assert_eq!(summary.instructions, 60);
         assert_eq!(summary.branch_instructions, Some(20));
         assert_eq!(summary.branch_misses, Some(4));
-        assert_eq!(summary.cache_misses, None);
-    }
-
-    #[test]
-    fn zero_denominators_render_as_na() {
-        assert_eq!(ratio(10, 0, 1.0, ""), "N/A");
-        assert_eq!(optional_ratio(Some(10), None, 100.0, "%"), "N/A");
     }
 
     #[test]
@@ -596,82 +311,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod bench {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn bench_load_real_directory() {
-        let Ok(dir) = std::env::var("MPERF_BENCH_DIR") else {
-            return;
-        };
-        let t0 = std::time::Instant::now();
-        let model = ResultsModel::load(&dir).unwrap();
-        println!("ResultsModel::load: {:?}", t0.elapsed());
-        println!(
-            "samples={} frames={} cpu_obs={}",
-            model.profile.samples.len(),
-            model.profile.frames.len(),
-            model.profile.cpu_observations.len()
-        );
-
-        let t = std::time::Instant::now();
-        let tree = crate::profile_analysis::CallTree::build(
-            &model.profile,
-            &crate::profile_analysis::SampleFilter::default(),
-        );
-        println!(
-            "CallTree::build: {:?} ({} nodes)",
-            t.elapsed(),
-            tree.nodes.len()
-        );
-
-        let t = std::time::Instant::now();
-        let layout = tree.icicle_layout(None);
-        println!(
-            "icicle_layout: {:?} ({} frames)",
-            t.elapsed(),
-            layout.frames.len()
-        );
-
-        let t = std::time::Instant::now();
-        let chart =
-            crate::views::flame_canvas::FlameChart::from_icicle_layout(&layout, &tree, true);
-        println!(
-            "FlameChart::from_icicle_layout: {:?} ({} frames)",
-            t.elapsed(),
-            chart.frames.len()
-        );
-
-        let t = std::time::Instant::now();
-        let analysis = crate::profile_analysis::FunctionAnalysis::build(
-            &model.profile,
-            &crate::profile_analysis::SampleFilter::default(),
-        );
-        println!(
-            "FunctionAnalysis::build: {:?} ({} functions)",
-            t.elapsed(),
-            analysis.functions.len()
-        );
-
-        for tab in &model.tabs {
-            if let GuiTab::Flamegraph(data) = tab {
-                let t = std::time::Instant::now();
-                let layout = data.layout(false, flamelens::flame::ROOT_ID).unwrap();
-                println!(
-                    "flame layout: {:?} ({} frames)",
-                    t.elapsed(),
-                    layout.frames.len()
-                );
-                let t = std::time::Instant::now();
-                let chart = crate::views::flame_canvas::FlameChart::from_flame_layout(&layout);
-                println!(
-                    "FlameChart::from_flame_layout: {:?} ({} frames)",
-                    t.elapsed(),
-                    chart.frames.len()
-                );
-            }
-        }
-    }
-}

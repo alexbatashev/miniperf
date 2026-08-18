@@ -10,7 +10,6 @@ pub struct SnapshotData {
     pub findings: Vec<SnapshotFinding>,
     pub collectors: Vec<SnapshotCollector>,
     pub duration_ns: u64,
-    pub sample_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,7 +79,6 @@ pub struct SnapshotFinding {
 pub struct SnapshotCollector {
     pub name: String,
     pub status: String,
-    pub quality: String,
     pub message: String,
 }
 
@@ -110,7 +108,6 @@ pub struct SnapshotChart {
     pub category: UseCategory,
     /// Display unit after rate conversion, e.g. "MiB/s", "cores", "%".
     pub unit: String,
-    pub scope: String,
     /// One series per resource id (host, device, interface, …), sorted by id.
     pub series: Vec<ChartSeries>,
     pub max_value: f64,
@@ -121,7 +118,6 @@ pub struct ChartSeries {
     pub id: String,
     /// (seconds from recording start, value in display units)
     pub points: Vec<(f64, f64)>,
-    pub last: f64,
 }
 
 struct SampleRow {
@@ -147,12 +143,6 @@ impl SnapshotData {
             .map(|sample| sample.timestamp_ns)
             .max()
             .unwrap_or(0);
-        let sample_count = samples
-            .iter()
-            .filter(|sample| sample.resource == samples[0].resource)
-            .filter(|sample| sample.metric == samples[0].metric)
-            .count() as u64;
-
         let findings = load_findings(connection);
         let collectors = load_collectors(connection);
         let summary_rows = load_summary(connection);
@@ -172,7 +162,6 @@ impl SnapshotData {
             findings,
             collectors,
             duration_ns,
-            sample_count,
         })
     }
 }
@@ -288,7 +277,7 @@ fn load_findings(connection: &Connection) -> Vec<SnapshotFinding> {
 
 fn load_collectors(connection: &Connection) -> Vec<SnapshotCollector> {
     let Ok(mut statement) = connection
-        .prepare("SELECT name, status, quality, message FROM snapshot_collectors ORDER BY name;")
+        .prepare("SELECT name, status, message FROM snapshot_collectors ORDER BY name;")
     else {
         return Vec::new();
     };
@@ -296,8 +285,7 @@ fn load_collectors(connection: &Connection) -> Vec<SnapshotCollector> {
         Ok(SnapshotCollector {
             name: row.get(0)?,
             status: row.get(1)?,
-            quality: row.get(2)?,
-            message: row.get(3)?,
+            message: row.get(2)?,
         })
     }) else {
         return Vec::new();
@@ -332,7 +320,7 @@ fn build_resources(
 
     let mut charts_by_resource = BTreeMap::<String, Vec<SnapshotChart>>::new();
     for ((resource, category, metric), by_id) in grouped {
-        let (unit, scope) = units
+        let (unit, _) = units
             .remove(&(resource.clone(), category, metric.clone()))
             .unwrap_or_default();
         let kind = metric_kind(&metric, &unit);
@@ -355,7 +343,6 @@ fn build_resources(
                 metric,
                 category,
                 unit: kind.display_unit(&unit),
-                scope,
                 series,
                 max_value,
             });
@@ -477,11 +464,9 @@ fn build_series(
     if converted.is_empty() {
         return None;
     }
-    let last = converted.last().map(|point| point.1).unwrap_or(0.0);
     Some(ChartSeries {
         id,
         points: converted,
-        last,
     })
 }
 

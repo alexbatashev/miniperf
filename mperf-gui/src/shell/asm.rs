@@ -1,11 +1,12 @@
-//! Lazy per-function disassembly. The session drops its sqlite connection
-//! after loading, so each listing re-opens `perf.db` on the background
+//! Lazy per-function disassembly. The session drops its database connection
+//! after loading, so each listing re-opens the session on the background
 //! executor and joins `assembly_lines` against `assembly_samples`.
 
 use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result};
-use sqlite::Connection;
+
+use crate::sql::{Connection, Value, as_i64, as_text};
 
 #[derive(Clone, Debug)]
 pub struct AsmInstruction {
@@ -32,7 +33,7 @@ pub struct AsmListing {
 pub fn has_assembly(connection: &Connection) -> bool {
     connection
         .prepare("SELECT 1 FROM assembly_lines LIMIT 1;")
-        .and_then(|mut statement| statement.next().map(|state| state == sqlite::State::Row))
+        .and_then(|mut statement| Ok(statement.query([])?.next()?.is_some()))
         .unwrap_or(false)
 }
 
@@ -40,11 +41,11 @@ pub fn has_assembly(connection: &Connection) -> bool {
 /// the sampled addresses first, because the disassembler's symbol names and
 /// the profile's `func_name` do not always agree.
 pub fn load(result_directory: &Path, module: &str, function: &str) -> Result<AsmListing> {
-    let database_path = result_directory.join("perf.db");
-    let connection = sqlite::open(&database_path)
-        .with_context(|| format!("failed to open {}", database_path.display()))?;
+    let session = store::Session::open(result_directory)
+        .with_context(|| format!("failed to open {}", result_directory.display()))?;
+    let connection = session.connection();
 
-    let mut symbols = query_symbols(&connection, module, function)?;
+    let mut symbols = query_symbols(connection, module, function)?;
     if symbols.is_empty() {
         symbols.push(function.to_owned());
     }
@@ -61,22 +62,19 @@ pub fn load(result_directory: &Path, module: &str, function: &str) -> Result<Asm
              WHERE l.module_path = ? AND l.symbol = ?
              ORDER BY l.runtime_address;",
         )?;
-        statement.bind((1, module))?;
-        statement.bind((2, symbol.as_str()))?;
-        for row in statement.into_iter() {
-            let row = row?;
-            if let Some(file) = row.read::<Option<&str>, _>(2) {
+        let mut rows = statement.query(store::duckdb::params![module, symbol])?;
+        while let Some(row) = rows.next()? {
+            let source_file = row.get::<_, Value>(2)?;
+            if let Some(file) = as_text(&source_file) {
                 *source_files.entry(file.to_owned()).or_default() += 1;
             }
+            let line = row.get::<_, Value>(3)?;
             instructions.push(AsmInstruction {
-                address: row.read::<i64, _>(0).max(0) as u64,
-                text: row.read::<&str, _>(1).to_owned(),
-                line: row
-                    .read::<Option<i64>, _>(3)
-                    .filter(|line| *line > 0)
-                    .map(|line| line as usize),
-                samples: row.read::<i64, _>(4).max(0) as u64,
-                llc_misses: row.read::<i64, _>(5).max(0) as u64,
+                address: as_i64(&row.get::<_, Value>(0)?).unwrap_or_default().max(0) as u64,
+                text: as_text(&row.get::<_, Value>(1)?).unwrap_or_default().to_owned(),
+                line: as_i64(&line).filter(|line| *line > 0).map(|line| line as usize),
+                samples: as_i64(&row.get::<_, Value>(4)?).unwrap_or_default().max(0) as u64,
+                llc_misses: as_i64(&row.get::<_, Value>(5)?).unwrap_or_default().max(0) as u64,
             });
         }
     }
@@ -121,12 +119,11 @@ fn query_symbols(connection: &Connection, module: &str, function: &str) -> Resul
            ON s.module_path = l.module_path AND s.address = l.runtime_address
          WHERE l.module_path = ? AND s.func_name = ? AND l.symbol IS NOT NULL;",
     )?;
-    statement.bind((1, module))?;
-    statement.bind((2, function))?;
-    statement
-        .into_iter()
-        .map(|row| Ok(row?.read::<&str, _>(0).to_owned()))
-        .collect()
+    let rows = statement.query_map(store::duckdb::params![module, function], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<store::duckdb::Result<Vec<_>>>()
+        .context("failed to read symbols")
 }
 
 #[cfg(test)]
@@ -134,9 +131,9 @@ mod tests {
     use super::*;
 
     fn fixture() -> Connection {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
+            .execute_batch(
                 "CREATE TABLE assembly_lines (
                     module_path TEXT, symbol TEXT, rel_address INTEGER,
                     runtime_address INTEGER, instruction TEXT,

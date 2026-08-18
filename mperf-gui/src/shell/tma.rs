@@ -1,13 +1,13 @@
 //! Top-Down datasets: the metric hierarchy, the per-second interval shares and
 //! the per-function level-1 breakdown. All three are recording-wide and load
-//! once, with the session's sqlite connection.
+//! once, with the session's database connection.
 
 use std::collections::{BTreeMap, HashMap};
 
 use mperf_data::ScenarioInfo;
-use sqlite::Connection;
 
 use crate::model::{TmaSummaryData, TmaSummaryRow};
+use crate::sql::{Connection, Value, as_f64, as_i64, as_text};
 
 /// One second of pipeline-slot shares, aligned with [`TmaData::level1`].
 #[derive(Clone, Debug, PartialEq)]
@@ -96,25 +96,39 @@ pub fn is_child_of(name: &str, parent: &str) -> bool {
 }
 
 fn load_intervals(connection: &Connection, names: &[&str]) -> Vec<TmaInterval> {
-    let Ok(statement) =
+    let Ok(mut statement) =
         connection.prepare("SELECT start_ns, metric, value FROM tma_intervals ORDER BY start_ns;")
     else {
         return Vec::new();
     };
+    let Ok(mut rows) = statement.query([]) else {
+        return Vec::new();
+    };
     let mut by_start = BTreeMap::<u64, Vec<f64>>::new();
-    for row in statement.into_iter() {
-        let Ok(row) = row else { continue };
-        let metric = row.read::<&str, _>(1);
+    loop {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            _ => break,
+        };
+        let Ok(metric) = row.get::<_, Value>(1) else {
+            continue;
+        };
+        let Some(metric) = as_text(&metric) else {
+            continue;
+        };
         let Some(column) = names.iter().position(|name| *name == metric) else {
             continue;
         };
-        let Ok(value) = row.try_read::<f64, _>(2) else {
+        let Ok(value) = row.get::<_, Value>(2) else {
             continue;
         };
-        if !value.is_finite() {
+        let Some(value) = as_f64(&value).filter(|value| value.is_finite()) else {
             continue;
-        }
-        let start_ns = row.read::<i64, _>(0).max(0) as u64;
+        };
+        let Ok(start_ns) = row.get::<_, Value>(0) else {
+            continue;
+        };
+        let start_ns = as_i64(&start_ns).unwrap_or_default().max(0) as u64;
         by_start
             .entry(start_ns)
             .or_insert_with(|| vec![0.0; names.len()])[column] = value.clamp(0.0, 1.0);
@@ -128,7 +142,10 @@ fn load_intervals(connection: &Connection, names: &[&str]) -> Vec<TmaInterval> {
 /// Level-1 shares per function from `VIEW tma`, whose columns spell the metric
 /// names with underscores.
 fn load_functions(connection: &Connection, names: &[&str]) -> HashMap<String, Vec<f64>> {
-    let Ok(statement) = connection.prepare("SELECT * FROM tma;") else {
+    let Ok(mut statement) = connection.prepare("SELECT * FROM tma;") else {
+        return HashMap::new();
+    };
+    let Ok(mut rows) = statement.query([]) else {
         return HashMap::new();
     };
     let columns: Vec<String> = names
@@ -136,16 +153,24 @@ fn load_functions(connection: &Connection, names: &[&str]) -> HashMap<String, Ve
         .map(|name| name.replace('.', "_"))
         .collect::<Vec<_>>();
     let mut functions = HashMap::new();
-    for row in statement.into_iter() {
-        let Ok(row) = row else { continue };
-        let Ok(function) = row.try_read::<&str, _>("func_name") else {
+    loop {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            _ => break,
+        };
+        let Ok(function) = row.get::<_, Value>("func_name") else {
+            continue;
+        };
+        let Some(function) = as_text(&function) else {
             continue;
         };
         let values: Vec<f64> = columns
             .iter()
             .map(|column| {
-                row.try_read::<f64, _>(column.as_str())
+                row.get::<_, Value>(column.as_str())
                     .ok()
+                    .as_ref()
+                    .and_then(as_f64)
                     .filter(|value| value.is_finite())
                     .unwrap_or(0.0)
                     .clamp(0.0, 1.0)
@@ -217,10 +242,10 @@ mod tests {
 
     #[test]
     fn intervals_and_functions_come_from_the_recording_tables() {
-        let connection = sqlite::open(":memory:").unwrap();
+        let connection = Connection::open_in_memory().unwrap();
         connection
-            .execute(
-                "CREATE TABLE tma_intervals (start_ns INTEGER, metric TEXT, value REAL);
+            .execute_batch(
+                "CREATE TABLE tma_intervals (start_ns BIGINT, metric TEXT, value DOUBLE);
                  INSERT INTO tma_intervals VALUES
                     (0, 'retiring', 0.4), (0, 'backend_bound', 0.6),
                     (1000000000, 'retiring', 0.2), (1000000000, 'unknown', 0.9);
