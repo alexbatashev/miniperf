@@ -41,7 +41,9 @@ pub fn register_time_brush<V: 'static>(
     let hitbox = hitbox.clone();
     let down_entity = entity.clone();
     window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx: &mut App| {
-        if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) || !frame.in_plot(event.position.x)
+        if phase != DispatchPhase::Bubble
+            || !hitbox.is_hovered(window)
+            || !frame.in_plot(event.position.x)
         {
             return;
         }

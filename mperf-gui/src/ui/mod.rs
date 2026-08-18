@@ -44,4 +44,4 @@ pub use table::{Column, table_cell, table_header, table_header_sortable, table_r
 pub use text_input::{InputEvent, TextInput};
 pub use theme::{ActiveTheme, ModuleKind, Theme, TmaCategory};
 pub use tooltip::info_tooltip;
-pub use viz_card::viz_card;
+pub use viz_card::{viz_card, viz_panel};

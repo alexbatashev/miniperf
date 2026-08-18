@@ -185,7 +185,9 @@ impl FlameScopeHeatmap {
             .count() as u64;
         let cap = max_bins.max(1) as u64;
         let target_bins = (accepted / rows as u64 / 2).clamp(MIN_FOLD_BINS.min(cap), cap);
-        let bin_width_ns = nice_bin_width(div_ceil(fold_ns, target_bins)).min(fold_ns).max(1);
+        let bin_width_ns = nice_bin_width(div_ceil(fold_ns, target_bins))
+            .min(fold_ns)
+            .max(1);
         let columns = usize::try_from(div_ceil(fold_ns, bin_width_ns))
             .unwrap_or(usize::MAX)
             .max(1);
@@ -1161,6 +1163,190 @@ impl CpuUtilizationHeatmap {
     }
 }
 
+/// Elapsed time spent with N CPUs simultaneously busy, folded out of the same
+/// occupancy attribution the per-CPU lanes are painted from.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ConcurrencyHistogram {
+    /// Seconds spent at index-many busy CPUs; slot 0 is fully idle time.
+    pub slots: Vec<f64>,
+    pub average_busy: f64,
+    pub total_seconds: f64,
+}
+
+impl ConcurrencyHistogram {
+    pub fn build(heatmap: &CpuUtilizationHeatmap, logical_cpu_count: Option<u32>) -> Self {
+        let cpus = logical_cpu_count
+            .map(|count| count as usize)
+            .unwrap_or(0)
+            .max(heatmap.lanes.len())
+            .max(1);
+        let mut slots = vec![0.0; cpus + 1];
+        let mut weighted = 0.0;
+        let mut total_seconds = 0.0;
+        for bucket in 0..heatmap.buckets {
+            let start = heatmap
+                .range
+                .start_ns
+                .saturating_add((bucket as u64).saturating_mul(heatmap.bucket_duration_ns));
+            let end = start
+                .saturating_add(heatmap.bucket_duration_ns)
+                .min(heatmap.range.end_ns);
+            let seconds = end.saturating_sub(start) as f64 / NANOS_PER_SECOND as f64;
+            if seconds <= 0.0 {
+                continue;
+            }
+            let busy: f64 = heatmap
+                .lanes
+                .iter()
+                .filter_map(|lane| lane.buckets.get(bucket))
+                .map(|bucket| bucket.utilization)
+                .sum();
+            let slot = (busy.round().max(0.0) as usize).min(cpus);
+            slots[slot] += seconds;
+            weighted += slot as f64 * seconds;
+            total_seconds += seconds;
+        }
+        Self {
+            slots,
+            average_busy: if total_seconds > 0.0 {
+                weighted / total_seconds
+            } else {
+                0.0
+            },
+            total_seconds,
+        }
+    }
+}
+
+/// Frames that mean "this thread is waiting on someone else". Matched as
+/// substrings because libc spells them differently on every platform.
+const SYNC_FRAME_MARKERS: [&str; 12] = [
+    "futex",
+    "barrier",
+    "pthread_cond",
+    "pthread_join",
+    "lll_lock",
+    "sem_wait",
+    "psynch",
+    "ulock_wait",
+    "cond_wait",
+    "sched_yield",
+    "nanosleep",
+    "mutex_lock",
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThreadBalanceRow {
+    pub thread_id: u32,
+    /// Attributed CPU time over the analysed wall time.
+    pub busy_fraction: f64,
+    /// Share of the thread's samples parked in a synchronization frame.
+    pub sync_fraction: f64,
+    pub migrations: u64,
+    pub samples: u64,
+}
+
+/// Per-thread busy/wait/migration balance over the filtered range.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThreadBalance {
+    pub rows: Vec<ThreadBalanceRow>,
+    /// Whether any observation carried a CPU id; migrations mean nothing without.
+    pub has_cpu_ids: bool,
+}
+
+impl ThreadBalance {
+    pub fn build(profile: &ProfileData, filter: &SampleFilter) -> Option<Self> {
+        let range = analysis_range(profile, filter)?;
+        let wall = range.end_ns.saturating_sub(range.start_ns) as f64;
+        if wall <= 0.0 {
+            return None;
+        }
+        let sync_frames: BTreeSet<usize> = profile
+            .frames
+            .iter()
+            .filter(|frame| {
+                let name = frame.name.to_lowercase();
+                SYNC_FRAME_MARKERS
+                    .iter()
+                    .any(|marker| name.contains(marker))
+            })
+            .map(|frame| frame.id)
+            .collect();
+
+        let mut samples = BTreeMap::<u32, (u64, u64)>::new();
+        let mut cpu_time = BTreeMap::<u32, f64>::new();
+        let mut trails = BTreeMap::<u32, Vec<(u64, u32)>>::new();
+        let mut has_cpu_ids = false;
+
+        for sample in profile
+            .samples
+            .iter()
+            .filter(|sample| filter.matches(sample))
+        {
+            let entry = samples.entry(sample.thread_id).or_default();
+            entry.0 += 1;
+            if sample.stack.iter().any(|frame| sync_frames.contains(frame)) {
+                entry.1 += 1;
+            }
+            if let Some(cpu) = sample.cpu {
+                has_cpu_ids = true;
+                trails
+                    .entry(sample.thread_id)
+                    .or_default()
+                    .push((sample.timestamp_ns, cpu));
+            }
+        }
+
+        for observation in profile
+            .cpu_observations
+            .iter()
+            .filter(|observation| filter.matches_cpu_observation_without_time(observation))
+            .filter(|observation| {
+                observation.timestamp_ns >= range.start_ns
+                    && observation.timestamp_ns < range.end_ns
+            })
+        {
+            *cpu_time.entry(observation.thread_id).or_default() += observation.weight_ns as f64;
+            if let Some(cpu) = observation.cpu {
+                has_cpu_ids = true;
+                trails
+                    .entry(observation.thread_id)
+                    .or_default()
+                    .push((observation.timestamp_ns, cpu));
+            }
+        }
+
+        let threads: BTreeSet<u32> = samples.keys().chain(cpu_time.keys()).copied().collect();
+        let rows = threads
+            .into_iter()
+            .map(|thread_id| {
+                let (total, sync) = samples.get(&thread_id).copied().unwrap_or_default();
+                ThreadBalanceRow {
+                    thread_id,
+                    busy_fraction: (cpu_time.get(&thread_id).copied().unwrap_or(0.0) / wall)
+                        .clamp(0.0, 1.0),
+                    sync_fraction: fraction(sync, total),
+                    migrations: migrations(trails.get_mut(&thread_id)),
+                    samples: total,
+                }
+            })
+            .collect();
+        Some(Self { rows, has_cpu_ids })
+    }
+}
+
+/// Counts CPU changes along a thread's time-ordered trail of observations.
+fn migrations(trail: Option<&mut Vec<(u64, u32)>>) -> u64 {
+    let Some(trail) = trail else {
+        return 0;
+    };
+    trail.sort_unstable();
+    trail
+        .windows(2)
+        .filter(|pair| pair[0].1 != pair[1].1)
+        .count() as u64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CounterAggregation {
     Sum,
@@ -1459,6 +1645,25 @@ mod tests {
             logical_cpu_count: None,
             counter_metrics,
             error: None,
+        }
+    }
+
+    fn observation(
+        timestamp_ns: u64,
+        thread_id: u32,
+        cpu: Option<u32>,
+        interval_start_ns: u64,
+        weight_ns: u64,
+    ) -> CpuObservation {
+        CpuObservation {
+            timestamp_ns,
+            process_id: 7,
+            thread_id,
+            cpu,
+            interval_start_ns: Some(interval_start_ns),
+            stack: vec![0],
+            weight_ns,
+            source: CpuObservationSource::CounterDelta,
         }
     }
 
@@ -2221,6 +2426,67 @@ mod tests {
             vec![metric("os_cpu_clock")],
         );
         assert!(CpuUtilizationHeatmap::build(&null_metric, &SampleFilter::default(), 10).is_none());
+    }
+
+    #[test]
+    fn concurrency_histogram_books_elapsed_time_per_busy_cpu_count() {
+        let mut profile = profile(
+            vec![frame(0, "A")],
+            vec![sample(0, 1, Some(0), &[0], &[])],
+            vec![],
+        );
+        profile.logical_cpu_count = Some(2);
+        // First 10ns: both CPUs busy. Second 10ns: only CPU 0.
+        profile.cpu_observations = vec![
+            observation(10, 1, Some(0), 0, 10),
+            observation(10, 2, Some(1), 0, 10),
+            observation(19, 1, Some(0), 10, 9),
+        ];
+
+        let heatmap = CpuUtilizationHeatmap::build_with_bucket_duration(
+            &profile,
+            &SampleFilter::default(),
+            2,
+            Some(10),
+        )
+        .unwrap();
+        let histogram = ConcurrencyHistogram::build(&heatmap, profile.logical_cpu_count);
+
+        assert_eq!(histogram.slots.len(), 3);
+        assert_close(histogram.slots[0], 0.0);
+        assert_close(histogram.slots[1], 1e-8);
+        assert_close(histogram.slots[2], 1e-8);
+        assert_close(histogram.total_seconds, 2e-8);
+        assert_close(histogram.average_busy, 1.5);
+    }
+
+    #[test]
+    fn thread_balance_reports_busy_sync_and_migrations() {
+        let mut profile = profile(
+            vec![frame(0, "work"), frame(1, "pthread_cond_wait")],
+            vec![
+                sample(0, 1, Some(0), &[0], &[]),
+                sample(10, 1, Some(1), &[0, 1], &[]),
+                sample(20, 2, Some(3), &[0], &[]),
+            ],
+            vec![],
+        );
+        profile.cpu_observations = vec![
+            observation(10, 1, Some(0), 0, 10),
+            observation(20, 1, Some(1), 10, 5),
+        ];
+
+        let balance = ThreadBalance::build(&profile, &SampleFilter::default()).unwrap();
+
+        assert!(balance.has_cpu_ids);
+        assert_eq!(balance.rows.len(), 2);
+        assert_eq!(balance.rows[0].thread_id, 1);
+        assert_close(balance.rows[0].sync_fraction, 0.5);
+        // 15ns of CPU time over a 21ns range.
+        assert_close(balance.rows[0].busy_fraction, 15.0 / 21.0);
+        assert_eq!(balance.rows[0].migrations, 1);
+        assert_eq!(balance.rows[1].samples, 1);
+        assert_close(balance.rows[1].busy_fraction, 0.0);
     }
 
     #[test]

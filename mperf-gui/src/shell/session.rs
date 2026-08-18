@@ -13,11 +13,16 @@ use anyhow::{Context, Result};
 use mperf_data::{RecordInfo, Scenario};
 
 use crate::{
-    model::{SummaryStats, TmaSummaryData},
+    memory::MemoryData,
+    model::SummaryStats,
     profile::{ProfileData, TimeRange},
     profile_analysis::{CounterTracks, SampleFilter, instructions_metric},
+    roofline::RooflineData,
+    snapshot::SnapshotData,
     ui::ModuleKind,
 };
+
+use super::tma::TmaData;
 
 pub const LANE_BUCKETS: usize = 480;
 pub const TRACK_BINS: usize = 240;
@@ -55,7 +60,13 @@ pub struct ShellSession {
     pub cpu_model: String,
     pub sampling_frequency_hz: Option<u64>,
     pub summary: SummaryStats,
-    pub tma_summary: Option<TmaSummaryData>,
+    pub tma: Option<TmaData>,
+    /// USE-method resource snapshot, when the recording carries one.
+    pub snapshot: Option<SnapshotData>,
+    /// Address-trace memory analysis, when the recording carries one.
+    pub memory: Option<MemoryData>,
+    /// Calibrated roofline with per-loop throughput, when available.
+    pub roofline: Option<RooflineData>,
     pub profile: ProfileData,
     pub full_range: Option<TimeRange>,
     pub total_samples: u64,
@@ -168,10 +179,13 @@ impl ShellSession {
         let connection = sqlite::open(&database_path)
             .with_context(|| format!("failed to open {}", database_path.display()))?;
         let summary = SummaryStats::load(&connection)?;
-        let tma_summary = TmaSummaryData::for_scenario(&record_info.scenario_info, &connection);
+        let tma = TmaData::load(&record_info.scenario_info, &connection);
         let mut profile = ProfileData::load(&connection);
         profile.logical_cpu_count = record_info.logical_cpu_count;
         let has_assembly = super::asm::has_assembly(&connection);
+        let snapshot = SnapshotData::load(&connection, record_info.logical_cpu_count);
+        let memory = load_memory(&connection, &record_info);
+        let roofline = load_roofline(&connection, &record_info);
         drop(connection);
 
         let name = result_directory
@@ -190,7 +204,10 @@ impl ShellSession {
 
         let full_range = profile.full_range();
         let total_samples = profile.samples.len() as u64;
-        let has_stacks = profile.samples.iter().any(|sample| !sample.stack.is_empty());
+        let has_stacks = profile
+            .samples
+            .iter()
+            .any(|sample| !sample.stack.is_empty());
         let instructions_metric = instructions_metric(&profile.counter_metrics);
         let threads = thread_inventory(&profile, command_name.as_deref());
         let modules = module_inventory(&profile);
@@ -205,7 +222,10 @@ impl ShellSession {
             cpu_model: record_info.cpu_model,
             sampling_frequency_hz: record_info.sampling_frequency_hz,
             summary,
-            tma_summary,
+            tma,
+            snapshot,
+            memory,
+            roofline,
             profile,
             full_range,
             total_samples,
@@ -241,6 +261,39 @@ impl ShellSession {
             .find(|module| module.frame_ids.contains(&frame_id))
             .map(|module| (module.label.as_str(), module.kind))
     }
+}
+
+/// Memory analysis is kept only when the recording actually produced one;
+/// availability is data-presence driven, never scenario-driven.
+fn load_memory(connection: &sqlite::Connection, record_info: &RecordInfo) -> Option<MemoryData> {
+    let calibration = record_info
+        .cpu_info
+        .memory_calibration
+        .as_deref()
+        .map(|calibration| calibration.memory_levels.clone())
+        .unwrap_or_default();
+    let data = MemoryData::load(connection, calibration);
+    let usable = data.summary.is_some() || !data.miss_ratio.is_empty() || !data.timeline.is_empty();
+    (data.error.is_none() && usable).then_some(data)
+}
+
+fn load_roofline(
+    connection: &sqlite::Connection,
+    record_info: &RecordInfo,
+) -> Option<RooflineData> {
+    let data = RooflineData::load(
+        connection,
+        record_info
+            .cpu_info
+            .roofline_calibration
+            .as_deref()
+            .cloned(),
+        match &record_info.scenario_info {
+            mperf_data::ScenarioInfo::Roofline(info) => info.method.as_deref().cloned(),
+            _ => None,
+        },
+    );
+    (!data.loops.is_empty()).then_some(data)
 }
 
 fn thread_inventory(profile: &ProfileData, command_name: Option<&str>) -> Vec<ThreadInfo> {
@@ -499,7 +552,10 @@ mod tests {
             cpu_model: String::new(),
             sampling_frequency_hz: None,
             summary: SummaryStats::default(),
-            tma_summary: None,
+            tma: None,
+            snapshot: None,
+            memory: None,
+            roofline: None,
             total_samples: profile.samples.len() as u64,
             has_stacks: true,
             instructions_metric: None,

@@ -100,6 +100,8 @@ pub struct SummaryMetric {
     pub metric: String,
     pub value: String,
     pub scope: String,
+    /// 0..=1 position against the metric's natural ceiling, when it has one.
+    pub fraction: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,7 +388,7 @@ fn build_resources(
         .into_iter()
         .map(|resource| {
             let charts = charts_by_resource.remove(&resource).unwrap_or_default();
-            let summaries = summarize(summary_rows, &resource);
+            let summaries = summarize(summary_rows, &resource, duration_ns, logical_cpu_count);
             ResourceUse {
                 headline: headline(
                     &resource,
@@ -483,7 +485,13 @@ fn build_series(
     })
 }
 
-fn summarize(summary_rows: &[SummaryRow], resource: &str) -> [Vec<SummaryMetric>; 3] {
+fn summarize(
+    summary_rows: &[SummaryRow],
+    resource: &str,
+    duration_ns: u64,
+    logical_cpu_count: Option<u32>,
+) -> [Vec<SummaryMetric>; 3] {
+    let host_total = summary_value(summary_rows, resource, "host_total");
     let mut result: [Vec<SummaryMetric>; 3] = Default::default();
     for row in summary_rows.iter().filter(|row| row.resource == resource) {
         let index = UseCategory::ALL
@@ -497,9 +505,33 @@ fn summarize(summary_rows: &[SummaryRow], resource: &str) -> [Vec<SummaryMetric>
                 .map(|value| format_value(value, &row.unit))
                 .unwrap_or_else(|| "—".to_string()),
             scope: row.scope.clone(),
+            fraction: metric_fraction(row, duration_ns, logical_cpu_count, host_total),
         });
     }
     result
+}
+
+/// Normalizes a summary value into 0..=1 when its unit has a natural ceiling:
+/// percentages, CPU time against the machine's capacity, byte gauges against
+/// the host's total. Everything else has no meaningful meter.
+fn metric_fraction(
+    row: &SummaryRow,
+    duration_ns: u64,
+    logical_cpu_count: Option<u32>,
+    host_total: Option<f64>,
+) -> Option<f64> {
+    let value = row.value?;
+    let fraction = match row.unit.as_str() {
+        "percent" => value / 100.0,
+        "seconds" if row.resource == "cpu" => {
+            let capacity =
+                (duration_ns as f64 / 1e9) * logical_cpu_count.unwrap_or(1).max(1) as f64;
+            value / capacity
+        }
+        "bytes" => value / host_total.filter(|total| *total > 0.0)?,
+        _ => return None,
+    };
+    fraction.is_finite().then(|| fraction.clamp(0.0, 1.0))
 }
 
 fn summary_value(summary_rows: &[SummaryRow], resource: &str, metric: &str) -> Option<f64> {
@@ -780,6 +812,36 @@ mod tests {
         assert_eq!(data.findings.len(), 1);
         assert_eq!(data.collectors[0].status, "permission_denied");
         assert_eq!(data.duration_ns, 2_000_000_000);
+    }
+
+    #[test]
+    fn summary_metrics_meter_only_against_a_real_ceiling() {
+        let row = |resource: &str, metric: &str, value: f64, unit: &str| SummaryRow {
+            resource: resource.to_owned(),
+            category: UseCategory::Utilization,
+            metric: metric.to_owned(),
+            value: Some(value),
+            unit: unit.to_owned(),
+            scope: "process_tree".to_owned(),
+        };
+        let rows = [
+            row("cpu", "cgroup_cpu_time", 4.0, "seconds"),
+            row("memory", "rss", 2.0, "bytes"),
+            row("memory", "host_total", 8.0, "bytes"),
+            row("io", "psi_some_avg10", 25.0, "percent"),
+            row("disk", "read_operations", 1234.0, "operations"),
+        ];
+        let fraction = |resource: &str| {
+            summarize(&rows, resource, 2_000_000_000, Some(8))[0]
+                .first()
+                .and_then(|metric| metric.fraction)
+        };
+
+        // 4 CPU-seconds of a 2s × 8-CPU budget.
+        assert_eq!(fraction("cpu"), Some(0.25));
+        assert_eq!(fraction("memory"), Some(0.25));
+        assert_eq!(fraction("io"), Some(0.25));
+        assert_eq!(fraction("disk"), None);
     }
 
     #[test]

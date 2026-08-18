@@ -21,6 +21,15 @@ pub fn viz_card(title: impl Into<SharedString>) -> VizCard {
     }
 }
 
+/// The same panel without a caption row, for cards whose content is the title.
+pub fn viz_panel() -> VizCard {
+    VizCard {
+        title: None,
+        action: None,
+        children: Vec::new(),
+    }
+}
+
 impl VizCard {
     pub fn action(mut self, action: impl IntoElement) -> Self {
         self.action = Some(action.into_any_element());

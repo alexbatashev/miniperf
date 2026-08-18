@@ -165,9 +165,8 @@ pub fn scope_canvas(entity: Entity<ShellView>, theme: Theme, view: ScopeView) ->
             }
 
             for fraction in [0.0f32, 0.5, 1.0] {
-                let label = format_offset_ms(
-                    (fraction as f64 * heatmap.fold_ns as f64).round() as u64,
-                );
+                let label =
+                    format_offset_ms((fraction as f64 * heatmap.fold_ns as f64).round() as u64);
                 let line = shape_label(&label, 9.0, theme.viz.muted, window);
                 let y = plot_bottom - fraction * plot_height;
                 let _ = line.paint(

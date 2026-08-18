@@ -5,13 +5,14 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use gpui::{
-    Bounds, CursorStyle, Entity, HitboxBehavior, PathBuilder, Pixels, Point, Window, canvas, fill,
-    point, prelude::*, px, size,
+    Bounds, CursorStyle, Entity, HitboxBehavior, Window, canvas, fill, point, prelude::*, px, size,
 };
 
 use super::ShellView;
 use super::session::{ShellSession, format_count};
-use crate::charts::{PlotFrame, register_time_brush, shape_label, truncate_label};
+use crate::charts::{
+    PlotFrame, paint_area_series, register_time_brush, shape_label, truncate_label,
+};
 use crate::profile_analysis::CounterAggregation;
 use crate::ui::Theme;
 
@@ -19,9 +20,11 @@ use crate::ui::Theme;
 /// filter but ignore thread and symbol scoping.
 pub fn is_system_track(key: &str) -> bool {
     let key = key.to_lowercase();
-    ["uncore", "imc", "dram", "rapl", "energy", "socket", "package"]
-        .iter()
-        .any(|needle| key.contains(needle))
+    [
+        "uncore", "imc", "dram", "rapl", "energy", "socket", "package",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
 }
 
 pub const LANE_H: f32 = 15.0;
@@ -232,64 +235,22 @@ pub fn track_canvas(
                 .iter()
                 .flatten()
                 .fold(0f64, |max, value| max.max(*value));
-            if max > 0.0 {
-                let bins = track.values.len().max(1);
-                let step = pw / bins as f32;
-                let baseline = top + h - 4.0;
-                let y_for = |value: f64| top + 3.0 + (1.0 - (value / max) as f32) * (h - 8.0);
-
-                fn flush(
-                    area: &mut Option<(PathBuilder, f32)>,
-                    stroke: &mut Option<PathBuilder>,
-                    end_x: f32,
-                    baseline: f32,
-                    theme: &Theme,
-                    window: &mut Window,
-                ) {
-                    if let Some((mut path, start_x)) = area.take() {
-                        path.line_to(point(px(end_x), px(baseline)));
-                        path.line_to(point(px(start_x), px(baseline)));
-                        path.close();
-                        if let Ok(path) = path.build() {
-                            window.paint_path(path, theme.viz.series[0].opacity(0.1));
-                        }
-                    }
-                    if let Some(path) = stroke.take()
-                        && let Ok(path) = path.build()
-                    {
-                        window.paint_path(path, theme.viz.series[0]);
-                    }
-                }
-
-                let mut area: Option<(PathBuilder, f32)> = None;
-                let mut stroke: Option<PathBuilder> = None;
-                let mut last_x = 0.0f32;
-                for (bin, value) in track.values.iter().enumerate() {
-                    let x = px0 + (bin as f32 + 0.5) * step;
-                    match value {
-                        Some(value) => {
-                            let p: Point<Pixels> = point(px(x), px(y_for(*value)));
-                            match (&mut area, &mut stroke) {
-                                (Some((area, _)), Some(stroke)) => {
-                                    area.line_to(p);
-                                    stroke.line_to(p);
-                                }
-                                _ => {
-                                    let mut new_area = PathBuilder::fill();
-                                    new_area.move_to(p);
-                                    let mut new_stroke = PathBuilder::stroke(px(1.5));
-                                    new_stroke.move_to(p);
-                                    area = Some((new_area, x));
-                                    stroke = Some(new_stroke);
-                                }
-                            }
-                            last_x = x;
-                        }
-                        None => flush(&mut area, &mut stroke, last_x, baseline, &theme, window),
-                    }
-                }
-                flush(&mut area, &mut stroke, last_x, baseline, &theme, window);
-            }
+            let bins = track.values.len().max(1);
+            let step = pw / bins as f32;
+            let points: Vec<(f32, Option<f64>)> = track
+                .values
+                .iter()
+                .enumerate()
+                .map(|(bin, value)| (px0 + (bin as f32 + 0.5) * step, *value))
+                .collect();
+            paint_area_series(
+                top + 3.0,
+                (h - 7.0).max(1.0),
+                &points,
+                max,
+                theme.viz.series[0],
+                window,
+            );
 
             if let Some(range) = view.shown_range() {
                 frame.paint_selection(range, duration, top, h, &theme, window);

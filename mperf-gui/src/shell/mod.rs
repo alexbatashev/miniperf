@@ -1,9 +1,15 @@
 mod asm;
+mod cores;
 mod derived;
 mod flame;
 mod flamescope;
+mod memory;
+mod resources;
+mod roofline;
 mod session;
 mod timeline;
+mod tma;
+mod topdown;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -16,8 +22,8 @@ use gpui::{
 use crate::charts;
 use crate::profile::TimeRange;
 use crate::profile_analysis::{
-    CallTree, FlameScopeHeatmap, FunctionAnalysis, FunctionMetrics, FunctionStat, IcicleLayout,
-    StackWeight,
+    CallTree, CpuUtilizationHeatmap, FlameScopeHeatmap, FunctionAnalysis, FunctionMetrics,
+    FunctionStat, IcicleLayout, StackWeight, ThreadBalance,
 };
 use crate::recent;
 use crate::source::{SourceDocument, SourceLocation};
@@ -38,6 +44,9 @@ const KEY_CONTEXT: &str = "TracksShell";
 
 /// Upper bound on flame-scope rows per fold; the real count follows density.
 const SCOPE_MAX_BINS: usize = 50;
+
+/// Time buckets in the Cores occupancy lanes.
+const CORE_LANE_BUCKETS: usize = 360;
 
 /// Maps a Top-Down level-1 metric name onto its color category. Vendors name
 /// these differently, so match on the stem rather than the exact label.
@@ -166,15 +175,25 @@ enum ViewId {
     Flame,
     FlameScope,
     Timeline,
+    Cores,
+    TopDown,
+    Resources,
+    Memory,
+    Roofline,
 }
 
 impl ViewId {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 10] = [
         Self::Summary,
         Self::Hotspots,
         Self::Flame,
         Self::FlameScope,
         Self::Timeline,
+        Self::Cores,
+        Self::TopDown,
+        Self::Resources,
+        Self::Memory,
+        Self::Roofline,
     ];
 
     fn title(self) -> &'static str {
@@ -184,6 +203,11 @@ impl ViewId {
             Self::Flame => "Flame Graph",
             Self::FlameScope => "Flame Scope",
             Self::Timeline => "Timeline",
+            Self::Cores => "Cores",
+            Self::TopDown => "Top-Down",
+            Self::Resources => "Resources",
+            Self::Memory => "Memory",
+            Self::Roofline => "Roofline",
         }
     }
 
@@ -194,6 +218,11 @@ impl ViewId {
             Self::Flame => Icon::Flame,
             Self::FlameScope => Icon::Grid3x3,
             Self::Timeline => Icon::LineChart,
+            Self::Cores => Icon::Cpu,
+            Self::TopDown => Icon::Layers,
+            Self::Resources => Icon::Gauge,
+            Self::Memory => Icon::MemoryStick,
+            Self::Roofline => Icon::Mountain,
         }
     }
 
@@ -203,6 +232,14 @@ impl ViewId {
             Self::Hotspots | Self::Flame => session.has_stacks,
             Self::FlameScope => session.full_range.is_some() && session.total_samples > 0,
             Self::Timeline => session.lanes.is_some() || session.tracks.is_some(),
+            Self::Cores => !session.profile.cpu_observations.is_empty(),
+            Self::TopDown => session
+                .tma
+                .as_ref()
+                .is_some_and(tma::TmaData::has_hierarchy),
+            Self::Resources => session.snapshot.is_some(),
+            Self::Memory => session.memory.is_some(),
+            Self::Roofline => session.roofline.is_some(),
         }
     }
 }
@@ -275,6 +312,8 @@ pub struct ShellView {
     flame_hover: Option<FlameHover>,
     scope: Derived<FlameScopeHeatmap>,
     scope_hover: Option<ScopeHover>,
+    cpu_lanes: Derived<CpuUtilizationHeatmap>,
+    balance: Derived<ThreadBalance>,
 
     recording_menu_open: bool,
     threads_menu_open: bool,
@@ -286,6 +325,11 @@ pub struct ShellView {
     side_panel_open: bool,
     panel_width: f32,
     selected_frame: Option<usize>,
+    /// Index into the recording's roofline loops, for the Roofline view.
+    roofline_loop: Option<usize>,
+    /// Zoom/pan window of the roofline plot; `None` fits every loop.
+    roofline_view: Option<roofline::Viewport>,
+    roofline_drag: Option<roofline::Drag>,
     sort_key: SortKey,
     sort_desc: bool,
     pub brush: charts::Brush,
@@ -364,6 +408,8 @@ impl ShellView {
             flame_hover: None,
             scope: Derived::default(),
             scope_hover: None,
+            cpu_lanes: Derived::default(),
+            balance: Derived::default(),
             recording_menu_open: false,
             threads_menu_open: false,
             modules_menu_open: false,
@@ -374,6 +420,9 @@ impl ShellView {
             side_panel_open: true,
             panel_width: 300.0,
             selected_frame: None,
+            roofline_loop: None,
+            roofline_view: None,
+            roofline_drag: None,
             sort_key: SortKey::SelfPct,
             sort_desc: true,
             brush: charts::Brush::default(),
@@ -418,6 +467,9 @@ impl ShellView {
         self.filter.clear();
         self.symbol_input.update(cx, |input, cx| input.clear(cx));
         self.selected_frame = None;
+        self.roofline_loop = None;
+        self.roofline_view = None;
+        self.roofline_drag = None;
         self.source_tabs.clear();
         self.brush.clear();
         self.analysis.reset();
@@ -426,6 +478,8 @@ impl ShellView {
         self.flame_hover = None;
         self.scope.reset();
         self.scope_hover = None;
+        self.cpu_lanes.reset();
+        self.balance.reset();
         self.active_tab = self
             .views()
             .iter()
@@ -537,12 +591,73 @@ impl ShellView {
                                 .map(Arc::new)
                         })
                         .await;
-                    this.update(cx, |this, cx| {
-                        if let Some(heatmap) = heatmap
-                            && this.scope.install(key, heatmap)
-                        {
-                            cx.notify();
+                    this.update(cx, |this, cx| match heatmap {
+                        Some(heatmap) => {
+                            if this.scope.install(key, heatmap) {
+                                cx.notify();
+                            }
                         }
+                        None => this.scope.discard(key),
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+
+        if self.active_view() == Some(ViewId::Cores) {
+            let key = self.filter.spatial_key();
+            if self.cpu_lanes.needs(key) {
+                self.cpu_lanes.begin(key);
+                let filter = self.filter.spatial();
+                let session = session.clone();
+                cx.spawn(async move |this, cx| {
+                    let heatmap = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let resolved = filter.resolve(&session);
+                            CpuUtilizationHeatmap::build_with_bucket_duration(
+                                &session.profile,
+                                &resolved,
+                                CORE_LANE_BUCKETS,
+                                None,
+                            )
+                            .map(Arc::new)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| match heatmap {
+                        Some(heatmap) => {
+                            if this.cpu_lanes.install(key, heatmap) {
+                                cx.notify();
+                            }
+                        }
+                        None => this.cpu_lanes.discard(key),
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+
+            let key = self.analysis_key();
+            if self.balance.needs(key) {
+                self.balance.begin(key);
+                let filter = self.filter.clone();
+                let session = session.clone();
+                cx.spawn(async move |this, cx| {
+                    let balance = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let resolved = filter.resolve(&session);
+                            ThreadBalance::build(&session.profile, &resolved).map(Arc::new)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| match balance {
+                        Some(balance) => {
+                            if this.balance.install(key, balance) {
+                                cx.notify();
+                            }
+                        }
+                        None => this.balance.discard(key),
                     })
                     .ok();
                 })
@@ -768,7 +883,9 @@ impl ShellView {
         });
         self.active_tab = self.static_tab_count() + self.source_tabs.len() - 1;
 
-        if session.has_assembly && let Some(module) = frame.module.clone() {
+        if session.has_assembly
+            && let Some(module) = frame.module.clone()
+        {
             let directory = session.result_directory.clone();
             let function = frame.name.clone();
             cx.spawn(async move |this, cx| {
@@ -1609,13 +1726,25 @@ impl ShellView {
                 .into_any_element()
         };
         let mut blocks: Vec<gpui::AnyElement> = Vec::new();
-        if let Some(tma) = self.tma_level1(session) {
+        if let Some(tma) = topdown::level1(session) {
             blocks.push(block(
                 ui::viz_card("top-down level 1")
+                    .when_some(self.view_link(ViewId::TopDown, cx), |card, link| {
+                        card.action(link)
+                    })
                     .child(self.render_tma_bar(&tma, cx))
                     .child(tma_legend(&tma, cx))
                     .into_any_element(),
             ));
+        }
+        if let Some(card) = self.render_findings_card(session, cx) {
+            blocks.push(block(card));
+        }
+        if let Some(card) = self.render_memory_card(session, cx) {
+            blocks.push(block(card));
+        }
+        if let Some(card) = self.render_roofline_card(session, cx) {
+            blocks.push(block(card));
         }
         blocks.push(block(
             self.render_recording_card(session, cx).into_any_element(),
@@ -1671,23 +1800,6 @@ impl ShellView {
             .into_any_element()
     }
 
-    /// Level-1 Top-Down rows as (label, share, category), empty when the
-    /// recording carries no TMA summary.
-    fn tma_level1(&self, session: &ShellSession) -> Option<Vec<(String, f64, ui::TmaCategory)>> {
-        let rows: Vec<(String, f64, ui::TmaCategory)> = session
-            .tma_summary
-            .as_ref()?
-            .rows
-            .iter()
-            .filter(|row| row.level == 1)
-            .filter_map(|row| {
-                let value = row.value?;
-                Some((row.name.clone(), value, tma_category(&row.name)))
-            })
-            .collect();
-        (!rows.is_empty()).then_some(rows)
-    }
-
     fn render_tma_bar(
         &self,
         rows: &[(String, f64, ui::TmaCategory)],
@@ -1701,24 +1813,28 @@ impl ShellView {
             .w_full()
             .rounded(px(3.0))
             .overflow_hidden()
-            .children(rows.iter().enumerate().map(|(ix, (name, value, category))| {
-                let share = value.clamp(0.0, 1.0) as f32;
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .h_full()
-                    .w(gpui::relative(share))
-                    .overflow_hidden()
-                    .bg(theme.tma_color(*category))
-                    .when(ix != last, |el| el.mr(px(1.0)))
-                    .text_size(px(10.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(gpui::white())
-                    .when(share > 0.12, |el| {
-                        el.child(format!("{} {:.0}%", short_tma_label(name), share * 100.0))
-                    })
-            }))
+            .children(
+                rows.iter()
+                    .enumerate()
+                    .map(|(ix, (name, value, category))| {
+                        let share = value.clamp(0.0, 1.0) as f32;
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h_full()
+                            .w(gpui::relative(share))
+                            .overflow_hidden()
+                            .bg(theme.tma_color(*category))
+                            .when(ix != last, |el| el.mr(px(1.0)))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(gpui::white())
+                            .when(share > 0.12, |el| {
+                                el.child(format!("{} {:.0}%", short_tma_label(name), share * 100.0))
+                            })
+                    }),
+            )
     }
 
     fn render_summary_hotspot(
@@ -1773,6 +1889,190 @@ impl ShellView {
             .into_any_element()
     }
 
+    /// "open X →" link to another view, present only when this recording
+    /// actually offers that view.
+    fn view_link(&self, view: ViewId, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let tab = self
+            .views()
+            .iter()
+            .position(|candidate| *candidate == view)?;
+        Some(
+            button(("summary-open", tab))
+                .label(format!("open {} →", view.title()))
+                .variant(ButtonVariant::Link)
+                .size(ButtonSize::Sm)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_active_tab(tab, cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// Worst-first USE findings, the headline of a Snapshot recording.
+    fn render_findings_card(
+        &self,
+        session: &Arc<ShellSession>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let theme = cx.theme().clone();
+        let snapshot = session.snapshot.as_ref()?;
+        let findings = &snapshot.findings;
+        if findings.is_empty() {
+            return None;
+        }
+        Some(
+            ui::viz_card("top findings")
+                .when_some(self.view_link(ViewId::Resources, cx), |card, link| {
+                    card.action(link)
+                })
+                .children(findings.iter().take(3).map(|finding| {
+                    let color = match finding.severity {
+                        crate::snapshot::Severity::High => theme.viz.status_critical,
+                        crate::snapshot::Severity::Medium => theme.viz.status_serious,
+                        crate::snapshot::Severity::Info => theme.viz.series[0],
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(11.0))
+                        .child(badge(finding.severity.label()).tint(color))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .child(finding.finding.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.muted_foreground)
+                                .child(finding.resource.to_uppercase()),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_memory_card(
+        &self,
+        session: &Arc<ShellSession>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let theme = cx.theme().clone();
+        let summary = session.memory.as_ref()?.summary.as_ref()?;
+        let utilization = summary.bandwidth_utilization.unwrap_or(0.0);
+        let rows = [
+            (
+                "DRAM bandwidth",
+                summary
+                    .achieved_gbytes_per_second
+                    .map(|value| format!("{value:.1} GB/s avg"))
+                    .unwrap_or_else(|| "—".to_owned()),
+            ),
+            (
+                "Footprint",
+                crate::snapshot::format_bytes(summary.accessed_footprint_bytes as f64),
+            ),
+            (
+                "Peak RSS",
+                summary
+                    .peak_rss_bytes
+                    .map(|bytes| crate::snapshot::format_bytes(bytes as f64))
+                    .unwrap_or_else(|| "—".to_owned()),
+            ),
+        ];
+        Some(
+            ui::viz_card("memory")
+                .when_some(self.view_link(ViewId::Memory, cx), |card, link| {
+                    card.action(link)
+                })
+                .children(rows.map(|(label, value)| {
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .text_size(px(11.0))
+                        .child(
+                            div()
+                                .w(px(110.0))
+                                .flex_none()
+                                .text_color(theme.muted_foreground)
+                                .child(label),
+                        )
+                        .child(div().flex_1().min_w(px(0.0)).truncate().child(value))
+                }))
+                .when(utilization > 0.0, |card| {
+                    card.child(ui::meter(utilization as f32).color(if utilization > 0.75 {
+                        theme.viz.status_serious
+                    } else {
+                        theme.viz.series[0]
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "{:.0}% of the calibrated DRAM roof",
+                                utilization * 100.0
+                            )),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_roofline_card(
+        &self,
+        session: &Arc<ShellSession>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let theme = cx.theme().clone();
+        let data = session.roofline.as_ref()?;
+        let hottest = data
+            .loops
+            .iter()
+            .max_by_key(|entry| entry.timing_samples.unwrap_or(0))?;
+        Some(
+            ui::viz_card("roofline")
+                .when_some(self.view_link(ViewId::Roofline, cx), |card, link| {
+                    card.action(link)
+                })
+                .child(
+                    div()
+                        .truncate()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(hottest.function_name.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_foreground)
+                        .child(
+                            match (hottest.fp64_gflops(), hottest.fp64_arithmetic_intensity()) {
+                                (Some(gflops), Some(intensity)) => {
+                                    format!("{gflops:.2} GFLOP/s at {intensity:.3} FLOP/byte")
+                                }
+                                _ => format!("{} loops measured", data.loops.len()),
+                            },
+                        ),
+                )
+                .when_some(data.efficiency(hottest), |card, efficiency| {
+                    card.child(ui::meter(efficiency as f32).color(theme.viz.series[0]))
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.muted_foreground)
+                                .child(format!(
+                                    "{:.0}% of the roof at that intensity",
+                                    efficiency * 100.0
+                                )),
+                        )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_recording_card(
         &self,
         session: &Arc<ShellSession>,
@@ -1790,29 +2090,25 @@ impl ShellView {
             ("Scenario", session.scenario_label().to_owned()),
             ("CPU", session.cpu_model.clone()),
             ("Sampling", sampling),
-            (
-                "Recording",
-                session.result_directory.display().to_string(),
-            ),
+            ("Recording", session.result_directory.display().to_string()),
         ];
 
-        ui::viz_card("recording")
-            .child(div().flex().flex_col().gap(px(2.0)).children(rows.map(
-                |(label, value)| {
-                    div()
-                        .flex()
-                        .gap(px(8.0))
-                        .text_size(px(11.0))
-                        .child(
-                            div()
-                                .w(px(80.0))
-                                .flex_none()
-                                .text_color(theme.muted_foreground)
-                                .child(label),
-                        )
-                        .child(div().flex_1().min_w(px(0.0)).truncate().child(value))
-                },
-            )))
+        ui::viz_card("recording").child(div().flex().flex_col().gap(px(2.0)).children(rows.map(
+            |(label, value)| {
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .text_size(px(11.0))
+                    .child(
+                        div()
+                            .w(px(80.0))
+                            .flex_none()
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    )
+                    .child(div().flex_1().min_w(px(0.0)).truncate().child(value))
+            },
+        )))
     }
 
     fn render_events_card(
@@ -1926,9 +2222,9 @@ impl ShellView {
                                     .label("Reset zoom")
                                     .variant(ButtonVariant::Secondary)
                                     .size(ButtonSize::Sm)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.reset_flame_zoom(cx)
-                                    })),
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.reset_flame_zoom(cx)),
+                                    ),
                             ),
                         )
                     })
@@ -1953,8 +2249,7 @@ impl ShellView {
                                 .py(px(6.0))
                                 .text_size(px(11.0))
                                 .child(div().font_weight(FontWeight::MEDIUM).child(label))
-                                .child(
-                                    div().text_color(theme.muted_foreground).child(format!(
+                                .child(div().text_color(theme.muted_foreground).child(format!(
                                         "{}{} · {:.1}% of {}",
                                         module
                                             .map(|module| format!("{module} · "))
@@ -1965,8 +2260,7 @@ impl ShellView {
                                             StackMode::TopDown => "total",
                                             StackMode::BottomUp => "inverted total",
                                         }
-                                    )),
-                                )
+                                    )))
                                 .child(
                                     div()
                                         .text_color(theme.muted_foreground)
@@ -2222,29 +2516,29 @@ impl ShellView {
                         .mx(px(4.0))
                         .bg(theme.border),
                 )
-                    .child(ui::section_caption("weight", cx))
-                    .child(
-                        ui::segmented(
-                            "flame-weight",
-                            vec!["Cycles".into(), "Instructions".into()],
-                            usize::from(self.flame_weight == FlameWeight::Instructions),
-                        )
-                        .compact()
-                        .on_select(cx.processor(|this, ix: usize, _, cx| {
-                            let weight = if ix == 0 {
-                                FlameWeight::Cycles
-                            } else {
-                                FlameWeight::Instructions
-                            };
-                            if this.flame_weight != weight {
-                                this.flame_weight = weight;
-                                this.flame_zoom = None;
-                                this.flame_hover = None;
-                                this.ensure_derived(cx);
-                                cx.notify();
-                            }
-                        })),
+                .child(ui::section_caption("weight", cx))
+                .child(
+                    ui::segmented(
+                        "flame-weight",
+                        vec!["Cycles".into(), "Instructions".into()],
+                        usize::from(self.flame_weight == FlameWeight::Instructions),
                     )
+                    .compact()
+                    .on_select(cx.processor(|this, ix: usize, _, cx| {
+                        let weight = if ix == 0 {
+                            FlameWeight::Cycles
+                        } else {
+                            FlameWeight::Instructions
+                        };
+                        if this.flame_weight != weight {
+                            this.flame_weight = weight;
+                            this.flame_zoom = None;
+                            this.flame_hover = None;
+                            this.ensure_derived(cx);
+                            cx.notify();
+                        }
+                    })),
+                )
             })
             .child(
                 div()
@@ -2417,9 +2711,8 @@ impl ShellView {
                         })
                         .on_hover(move |hovered, _, cx| {
                             let next = hovered.then_some(line_number);
-                            hover_entity.update(cx, |this, cx| {
-                                this.hover_source_line(source_ix, next, cx)
-                            });
+                            hover_entity
+                                .update(cx, |this, cx| this.hover_source_line(source_ix, next, cx));
                         })
                         .on_click(move |_, _, cx| {
                             click_entity.update(cx, |this, cx| {
@@ -2523,9 +2816,8 @@ impl ShellView {
                         })
                         .on_hover(move |hovered, _, cx| {
                             let next = hovered.then_some(line).flatten();
-                            hover_entity.update(cx, |this, cx| {
-                                this.hover_source_line(source_ix, next, cx)
-                            });
+                            hover_entity
+                                .update(cx, |this, cx| this.hover_source_line(source_ix, next, cx));
                         })
                         .when_some(line, |el, line| {
                             el.on_click(move |_, _, cx| {
@@ -2576,12 +2868,7 @@ impl ShellView {
         .into_any_element()
     }
 
-    fn hover_source_line(
-        &mut self,
-        source_ix: usize,
-        line: Option<usize>,
-        cx: &mut Context<Self>,
-    ) {
+    fn hover_source_line(&mut self, source_ix: usize, line: Option<usize>, cx: &mut Context<Self>) {
         if let Some(tab) = self.source_tabs.get_mut(source_ix)
             && tab.hovered_line != line
         {
@@ -2612,6 +2899,11 @@ impl ShellView {
             Some(ViewId::Flame) => self.render_flame(session, cx),
             Some(ViewId::FlameScope) => self.render_flame_scope(session, cx),
             Some(ViewId::Timeline) => self.render_timeline_view(session, cx),
+            Some(ViewId::Cores) => cores::render(self, session, cx),
+            Some(ViewId::TopDown) => topdown::render(self, session, cx),
+            Some(ViewId::Resources) => resources::render(session, cx),
+            Some(ViewId::Memory) => memory::render(session, cx),
+            Some(ViewId::Roofline) => roofline::render(self, session, cx),
         }
     }
 

@@ -1,4 +1,4 @@
-use gpui::{Hsla, SharedString, ShapedLine, Window, px};
+use gpui::{Hsla, ShapedLine, SharedString, Window, px};
 
 /// Shapes one line of canvas text in the window's current text style.
 pub fn shape_label(text: &str, size_px: f32, color: Hsla, window: &mut Window) -> ShapedLine {

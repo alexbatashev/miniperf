@@ -40,6 +40,18 @@ impl<T> Derived<T> {
         true
     }
 
+    /// Marks an in-flight compute as finished with no value, so a view can
+    /// tell "still computing" from "nothing to show".
+    pub fn discard(&mut self, key: u64) {
+        if self.inflight == Some(key) {
+            self.inflight = None;
+        }
+    }
+
+    pub fn is_computing(&self) -> bool {
+        self.inflight.is_some()
+    }
+
     /// The last computed value, even when a newer key is pending.
     pub fn latest(&self) -> Option<&Arc<T>> {
         self.value.as_ref()

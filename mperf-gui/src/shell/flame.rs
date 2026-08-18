@@ -40,7 +40,11 @@ impl FlameView {
         (self.layout.max_depth + 1) as f32 * ROW_H
     }
 
-    fn hit_test(&self, bounds: &Bounds<gpui::Pixels>, position: gpui::Point<gpui::Pixels>) -> Option<usize> {
+    fn hit_test(
+        &self,
+        bounds: &Bounds<gpui::Pixels>,
+        position: gpui::Point<gpui::Pixels>,
+    ) -> Option<usize> {
         let width = f32::from(bounds.size.width).max(1.0);
         let x = (f32::from(position.x) - f32::from(bounds.left())) as f64 / width as f64;
         let depth = ((f32::from(position.y) - f32::from(bounds.top())) / ROW_H).floor();
@@ -98,11 +102,7 @@ pub fn flame_canvas(entity: Entity<ShellView>, theme: Theme, view: FlameView) ->
                 let rect = Bounds::new(point(px(x), px(y)), size(px(w), px(ROW_H - 1.0)));
                 window.paint_quad(fill(rect, color.opacity(alpha)));
                 if selected {
-                    window.paint_quad(gpui::outline(
-                        rect,
-                        theme.viz.ink,
-                        gpui::BorderStyle::Solid,
-                    ));
+                    window.paint_quad(gpui::outline(rect, theme.viz.ink, gpui::BorderStyle::Solid));
                 }
 
                 if w > 28.0 {
@@ -118,12 +118,7 @@ pub fn flame_canvas(entity: Entity<ShellView>, theme: Theme, view: FlameView) ->
                         label_color,
                         window,
                     );
-                    let _ = line.paint(
-                        point(px(x + 4.0), px(y + 2.5)),
-                        px(ROW_H),
-                        window,
-                        cx,
-                    );
+                    let _ = line.paint(point(px(x + 4.0), px(y + 2.5)), px(ROW_H), window, cx);
                 }
             }
 
