@@ -52,11 +52,6 @@ jobs:
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            task: build
-            command: cargo build --workspace --all-targets
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
             task: test
             command: cargo test --workspace --all-targets
           - platform: linux-aarch64
@@ -64,11 +59,6 @@ jobs:
             target: aarch64-unknown-linux-gnu
             task: clippy
             command: cargo clippy --workspace --all-targets -- -D warnings
-          - platform: linux-riscv64
-            runner: ubuntu-24.04
-            target: riscv64gc-unknown-linux-gnu
-            task: build
-            command: CARGO_BUILD_JOBS=2 cargo build --workspace --exclude mperf-gui --all-targets --target riscv64gc-unknown-linux-gnu
           - platform: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
