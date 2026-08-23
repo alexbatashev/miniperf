@@ -3,21 +3,33 @@
 # DynamoRIO (pinned master commit; releases lack the riscv64 port) plus the
 # miniperf dr-roofline client linked against roofline-core.
 #
-# usage: build-dynamorio-bundle.sh [output-directory]
+# linux-x86_64 and linux-aarch64 build natively. linux-riscv64 cross-compiles
+# against the sysroot that utils/deps/setup-riscv64-sysroot.sh assembles.
+#
+# usage: build-dynamorio-bundle.sh <platform> [output-directory]
 set -euo pipefail
 
-dynamorio_repository="${DYNAMORIO_REPOSITORY:-https://github.com/DynamoRIO/dynamorio.git}"
-dynamorio_revision="${DYNAMORIO_REVISION:-1fd3603b213360404f3753fadd0e8e196be1cbdf}"
-output_directory="${1:-dist}"
-build_parent="${DYNAMORIO_BUILD_PARENT:-/tmp}"
-host_arch="$(uname -m)"
-bundle_name="miniperf-dynamorio-${dynamorio_revision:0:12}-linux-${host_arch}"
-repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=utils/deps/common.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deps/common.sh"
 
-mkdir -p "${output_directory}" "${build_parent}"
-output_directory="$(realpath "${output_directory}")"
-build_parent="$(realpath "${build_parent}")"
-build_root="$(mktemp -d "${build_parent%/}/miniperf-dynamorio-build.XXXXXX")"
+platform="${1:?usage: build-dynamorio-bundle.sh <platform> [output-directory]}"
+output_directory="${2:-dist}"
+repository="${DYNAMORIO_REPOSITORY:-$(deps_manifest_get upstream.dynamorio.repository)}"
+revision="${DYNAMORIO_REVISION:-$(deps_manifest_get upstream.dynamorio.revision)}"
+repository_root="${deps_repository_root}"
+bundle_name="miniperf-dynamorio-${revision:0:12}-${platform}"
+
+case "${platform}" in
+    linux-x86_64) rust_target=x86_64-unknown-linux-gnu ;;
+    linux-aarch64) rust_target=aarch64-unknown-linux-gnu ;;
+    linux-riscv64) rust_target=riscv64gc-unknown-linux-gnu ;;
+    *)
+        printf 'DynamoRIO has no port for %s\n' "${platform}" >&2
+        exit 2
+        ;;
+esac
+
+build_root="$(mktemp -d "${DEPS_BUILD_PARENT:-/tmp}/miniperf-dynamorio.XXXXXX")"
 cleanup() {
     local status=$?
     trap - EXIT
@@ -35,27 +47,55 @@ build_directory="${build_root}/build"
 client_build_directory="${build_root}/client"
 bundle_directory="${build_root}/${bundle_name}"
 
-git clone "${dynamorio_repository}" "${source_directory}"
-git -C "${source_directory}" checkout --quiet "${dynamorio_revision}"
+git clone "${repository}" "${source_directory}"
+git -C "${source_directory}" checkout --quiet "${revision}"
 git -C "${source_directory}" submodule update --init
 
+cmake="${DYNAMORIO_CMAKE:-cmake}"
 # ZLIB_ROOT keeps non-system cmake installations (e.g. nix) finding the
 # distro zlib that drsyms requires.
-cmake="${DYNAMORIO_CMAKE:-cmake}"
-"${cmake}" -S "${source_directory}" -B "${build_directory}" \
-    -DDISABLE_WARNINGS=ON \
-    -DBUILD_TESTS=OFF \
-    -DBUILD_SAMPLES=OFF \
-    -DBUILD_DOCS=OFF \
+cmake_arguments=(
+    -DDISABLE_WARNINGS=ON
+    -DBUILD_TESTS=OFF
+    -DBUILD_SAMPLES=OFF
+    -DBUILD_DOCS=OFF
     -DZLIB_ROOT=/usr
+)
+cargo_arguments=(--release -p miniperf-roofline-core --target "${rust_target}")
+
+if [[ "${platform}" == linux-riscv64 ]]; then
+    cmake_arguments=(
+        "-DCMAKE_TOOLCHAIN_FILE=${source_directory}/make/toolchain-riscv64.cmake"
+        -DDISABLE_WARNINGS=ON
+        -DBUILD_TESTS=OFF
+        -DBUILD_SAMPLES=OFF
+        -DBUILD_DOCS=OFF
+        -DCMAKE_FIND_ROOT_PATH=/usr/riscv64-linux-gnu
+        -DZLIB_ROOT=/usr/riscv64-linux-gnu
+    )
+    export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc
+    export CC_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-gcc
+    export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=${RISCV_TARGET_FEATURE:-+v,+zba,+zbb}"
+fi
+
+"${cmake}" -S "${source_directory}" -B "${build_directory}" "${cmake_arguments[@]}"
 "${cmake}" --build "${build_directory}" -j "$(nproc)"
 
-cargo build --release -p miniperf-roofline-core \
-    --manifest-path "${repository_root}/Cargo.toml"
+cargo build --manifest-path "${repository_root}/Cargo.toml" "${cargo_arguments[@]}"
+roofline_core_library="${repository_root}/target/${rust_target}/release/libroofline_core.a"
 
+client_cmake_arguments=(
+    "-DDynamoRIO_DIR=${build_directory}/cmake"
+    "-DROOFLINE_CORE_LIB=${roofline_core_library}"
+)
+if [[ "${platform}" == linux-riscv64 ]]; then
+    client_cmake_arguments+=(
+        "-DCMAKE_TOOLCHAIN_FILE=${source_directory}/make/toolchain-riscv64.cmake"
+        -DCMAKE_FIND_ROOT_PATH=/usr/riscv64-linux-gnu
+    )
+fi
 "${cmake}" -S "${repository_root}/utils/dr-roofline" -B "${client_build_directory}" \
-    -DDynamoRIO_DIR="${build_directory}/cmake" \
-    -DROOFLINE_CORE_LIB="${repository_root}/target/release/libroofline_core.a"
+    "${client_cmake_arguments[@]}"
 "${cmake}" --build "${client_build_directory}"
 
 mkdir -p "${bundle_directory}/dynamorio"
@@ -64,17 +104,27 @@ for directory in bin64 lib64 ext; do
 done
 cp "${client_build_directory}/libdr_roofline.so" "${bundle_directory}/"
 cp "${source_directory}/License.txt" "${bundle_directory}/DYNAMORIO_LICENSE.txt"
-printf 'dynamorio_revision=%s\nhost_arch=%s\n' \
-    "${dynamorio_revision}" "${host_arch}" > "${bundle_directory}/MANIFEST"
+{
+    printf 'dynamorio_revision=%s\n' "${revision}"
+    printf 'platform=%s\n' "${platform}"
+} >"${bundle_directory}/MANIFEST.txt"
 
-# Smoke test: the bundled drrun must run the client on a trivial binary.
-smoke_output="${build_root}/smoke.counts"
-"${bundle_directory}/dynamorio/bin64/drrun" -disable_traces -max_bb_instrs 32 \
-    -c "${bundle_directory}/libdr_roofline.so" \
-    "output=${smoke_output}" memory-profile=off -- /bin/true
-grep -q '^instructions=' "${smoke_output}"
+if [[ "${platform}" == linux-riscv64 ]]; then
+    # DynamoRIO is itself a binary translator, so there is no way to exercise
+    # the cross-built bundle under qemu-user. Check the ELF shape instead.
+    machine="$(readelf -h "${bundle_directory}/libdr_roofline.so" | awk -F': +' '/Machine:/ { print $2 }')"
+    if [[ "${machine}" != *RISC-V* ]]; then
+        printf 'dr_roofline client is not a RISC-V object: %s\n' "${machine}" >&2
+        exit 1
+    fi
+    test -x "${bundle_directory}/dynamorio/bin64/drrun"
+else
+    smoke_output="${build_root}/smoke.counts"
+    "${bundle_directory}/dynamorio/bin64/drrun" -disable_traces -max_bb_instrs 32 \
+        -c "${bundle_directory}/libdr_roofline.so" \
+        "output=${smoke_output}" memory-profile=off -- /bin/true
+    grep -q '^instructions=' "${smoke_output}"
+fi
 
-tar --create --file "${output_directory}/${bundle_name}.tar.zst" \
-    --zstd --directory "${build_root}" "${bundle_name}"
-(cd "${output_directory}" && sha256sum "${bundle_name}.tar.zst" > "${bundle_name}.tar.zst.sha256")
-printf 'Bundle written to %s/%s.tar.zst\n' "${output_directory}" "${bundle_name}"
+deps_publish dynamorio "${platform}" "${revision:0:12}" \
+    "${build_root}" "${bundle_name}" "${output_directory}"

@@ -1,0 +1,32 @@
+# Pinned external binary dependencies.
+#
+# `.github/workflows/deps.yml` builds every dependency listed under [upstream]
+# for every platform that supports it, publishes the results as a dated
+# prerelease, and opens a pull request rewriting this file with the new
+# `release` tag and `[artifacts]` table. Build scripts and packaging read the
+# pins from here; nothing downloads "latest".
+#
+# DuckDB's version must match the DuckDB that the pinned `duckdb` crate
+# generated its bindings from, because miniperf-store links the prebuilt
+# library against those pregenerated bindings. Bump both together.
+
+release = ""
+
+[upstream.duckdb]
+version = "1.5.5"
+repository = "https://github.com/duckdb/duckdb.git"
+
+[upstream.dynamorio]
+# Releases lack the riscv64 port, so this tracks master.
+repository = "https://github.com/DynamoRIO/dynamorio.git"
+revision = "1fd3603b213360404f3753fadd0e8e196be1cbdf"
+
+[upstream.qemu]
+version = "11.0.2"
+source_sha256 = "3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5"
+
+# Filled in by the dependency workflow. Each entry is
+# [artifacts.<dependency>.<platform>] with the file name inside `release` and
+# its sha256. A missing platform means that dependency does not exist there:
+# DynamoRIO has no arm64 macOS port, and qemu-user targets Linux hosts only.
+[artifacts]
