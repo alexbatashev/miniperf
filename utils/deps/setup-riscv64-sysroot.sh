@@ -28,7 +28,7 @@ packages=(
 )
 
 sudo apt-get update
-sudo apt-get install -y crossbuild-essential-riscv64 rsync qemu-user qemu-user-static qemu-user-binfmt
+sudo apt-get install -y crossbuild-essential-riscv64 rsync qemu-user qemu-user-binfmt
 
 echo "deb [arch=riscv64] http://ports.ubuntu.com/ubuntu-ports ${release} main universe" \
     | sudo tee /etc/apt/sources.list.d/riscv64-ports.list >/dev/null

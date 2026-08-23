@@ -106,8 +106,11 @@ jobs:
     env:
       DUCKDB_VERSION: ${{ needs.plan.outputs.duckdb_version }}
       DYNAMORIO_REVISION: ${{ needs.plan.outputs.dynamorio_revision }}
-      QEMU_VERSION: ${{ needs.plan.outputs.qemu_version }}
-      QEMU_SHA256: ${{ needs.plan.outputs.qemu_sha256 }}
+      # Not QEMU_VERSION/QEMU_SHA256: qemu-user parses QEMU_* environment
+      # variables as its own options, and QEMU_VERSION makes every qemu
+      # invocation print its version and exit.
+      MINIPERF_QEMU_VERSION: ${{ needs.plan.outputs.qemu_version }}
+      MINIPERF_QEMU_SHA256: ${{ needs.plan.outputs.qemu_sha256 }}
     steps:
       - uses: actions/checkout@v7.0.1
 
