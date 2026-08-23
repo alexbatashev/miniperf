@@ -79,7 +79,7 @@ pub async fn do_record(
 
     let (dispatcher, join_handle) = EventDispatcher::new(output_directory);
 
-    let info = match scenario {
+    let (info, collectors) = match scenario {
         Scenario::Snapshot => snapshot(
             dispatcher.clone(),
             pid,
@@ -91,23 +91,27 @@ pub async fn do_record(
             if pid.is_some() {
                 anyhow::bail!("record mem requires a command and does not support --pid");
             }
-            roofline::record_memory(
-                &roofline_options,
-                dispatcher.clone(),
-                &command,
-                output_directory,
+            (
+                roofline::record_memory(
+                    &roofline_options,
+                    dispatcher.clone(),
+                    &command,
+                    output_directory,
+                )
+                .await?,
+                Vec::new(),
             )
-            .await?
         }
-        Scenario::Roofline => {
+        Scenario::Roofline => (
             roofline::record(
                 &roofline_options,
                 dispatcher.clone(),
                 &command,
                 output_directory,
             )
-            .await?
-        }
+            .await?,
+            Vec::new(),
+        ),
         Scenario::TMA => topdown(dispatcher.clone(), &command, output_directory)?,
     };
 
@@ -152,6 +156,7 @@ pub async fn do_record(
         cores,
         cpu_info,
         capture_fidelity: vec![fidelity],
+        collectors,
         scenario_info: info,
     };
 
@@ -186,14 +191,17 @@ fn snapshot(
     command: &[String],
     output_directory: &Path,
     duration: Option<std::time::Duration>,
-) -> Result<ScenarioInfo> {
+) -> Result<(ScenarioInfo, Vec<mperf_data::SnapshotCollectorStatus>)> {
     if pid.is_none() && command.is_empty() {
         anyhow::bail!("record snapshot requires a command or --pid");
     }
 
-    let optional: Vec<Box<dyn Source>> = vec![Box::new(crate::source::InternalEventsSource {
-        roofline_instrumented: false,
-    })];
+    let optional: Vec<Box<dyn Source>> = vec![
+        Box::new(crate::source::InternalEventsSource {
+            roofline_instrumented: false,
+        }),
+        Box::new(crate::source::HostTelemetrySource::default()),
+    ];
     #[cfg(target_os = "linux")]
     let optional = {
         let mut optional = optional;
@@ -359,24 +367,27 @@ fn snapshot(
         .map(|collector| format!("{}: {}", collector.name, collector.message))
         .collect();
 
-    Ok(ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
-        pid: recorded_pid,
-        counters: recorded_counters,
-        scope: if cfg!(target_os = "linux") {
-            if pid.is_some() {
-                "attached_tree_best_effort"
+    Ok((
+        ScenarioInfo::Snapshot(mperf_data::SnapshotInfo {
+            pid: recorded_pid,
+            counters: recorded_counters,
+            scope: if cfg!(target_os = "linux") {
+                if pid.is_some() {
+                    "attached_tree_best_effort"
+                } else {
+                    "launched_tree_inherited"
+                }
             } else {
-                "launched_tree_inherited"
+                "legacy_root_only"
             }
-        } else {
-            "legacy_root_only"
-        }
-        .to_string(),
-        interval_ms: if cfg!(target_os = "linux") { 1_000 } else { 0 },
-        stop_reason,
+            .to_string(),
+            interval_ms: if cfg!(target_os = "linux") { 1_000 } else { 0 },
+            stop_reason,
+            collectors: collectors.clone(),
+            warnings,
+        }),
         collectors,
-        warnings,
-    }))
+    ))
 }
 
 pub(crate) fn sample_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingCallback> {
@@ -562,7 +573,7 @@ fn topdown(
     dispatcher: Arc<EventDispatcher>,
     command: &[String],
     output_directory: &Path,
-) -> Result<ScenarioInfo> {
+) -> Result<(ScenarioInfo, Vec<mperf_data::SnapshotCollectorStatus>)> {
     let scenario = pmu::tma_scenario().context("TMA is not supported on this CPU")?;
     // Validate the formula groups, but do not turn each one into an independent
     // sampling leader. Multiple cycle leaders multiply the interrupt rate and
@@ -583,6 +594,7 @@ fn topdown(
                 roofline_instrumented: false,
             }),
             Box::new(crate::source::PreciseMemorySource::default()),
+            Box::new(crate::source::HostTelemetrySource::default()),
         ],
     };
     let mut pass = pass.resolve(output_directory)?;
@@ -623,15 +635,18 @@ fn topdown(
         })
         .unwrap_or_default();
 
-    Ok(ScenarioInfo::TMA(mperf_data::TMAInfo {
-        pid: recorded_pid,
-        counters: recorded_counters,
-        groups: scenario.groups,
-        precise_attribution: scenario.precise_attribution,
-        metrics: scenario.metrics,
-        constants: scenario.constants,
-        ui: scenario.ui,
-    }))
+    Ok((
+        ScenarioInfo::TMA(mperf_data::TMAInfo {
+            pid: recorded_pid,
+            counters: recorded_counters,
+            groups: scenario.groups,
+            precise_attribution: scenario.precise_attribution,
+            metrics: scenario.metrics,
+            constants: scenario.constants,
+            ui: scenario.ui,
+        }),
+        statuses,
+    ))
 }
 
 #[cfg(all(test, target_os = "macos"))]

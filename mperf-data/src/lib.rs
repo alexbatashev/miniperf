@@ -369,6 +369,10 @@ pub struct RecordInfo {
     /// before the fidelity ladder existed.
     #[serde(default)]
     pub capture_fidelity: Vec<CaptureFidelity>,
+    /// Per-collector outcome for this recording, in any scenario. Empty in
+    /// recordings made before collector status was scenario-independent.
+    #[serde(default)]
+    pub collectors: Vec<SnapshotCollectorStatus>,
     pub scenario_info: ScenarioInfo,
 }
 

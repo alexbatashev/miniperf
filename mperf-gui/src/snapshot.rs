@@ -9,6 +9,48 @@ pub struct SnapshotData {
     pub resources: Vec<ResourceUse>,
     pub findings: Vec<SnapshotFinding>,
     pub collectors: Vec<SnapshotCollector>,
+    clock_health: Option<ClockHealth>,
+}
+
+/// Clock state of the worst-off core cluster over the whole recording: every
+/// other metric is conditioned on the frequency the part actually ran at.
+#[derive(Debug, Clone)]
+pub struct ClockHealth {
+    /// The cluster these numbers describe, named only on heterogeneous hosts.
+    pub cluster: Option<String>,
+    pub mean_hz: f64,
+    pub max_hz: Option<f64>,
+    /// Throttle events accumulated during the run, not since boot.
+    pub throttle_events: f64,
+    pub severity: Severity,
+}
+
+impl ClockHealth {
+    /// One-line badge text, e.g.
+    /// `clocks: cortex_a520 at 1.10 GHz avg · 61% of 1.80 GHz max`.
+    pub fn label(&self) -> String {
+        let mut label = match &self.cluster {
+            Some(cluster) => format!(
+                "clocks: {cluster} at {} avg",
+                format_value(self.mean_hz, "hertz")
+            ),
+            None => format!("clocks: {} avg", format_value(self.mean_hz, "hertz")),
+        };
+        if let Some(max) = self.max_hz {
+            label.push_str(&format!(
+                " · {:.0}% of {} max",
+                self.mean_hz / max * 100.0,
+                format_value(max, "hertz")
+            ));
+        }
+        if self.throttle_events > 0.0 {
+            label.push_str(&format!(
+                " · {} throttle events",
+                format_count(self.throttle_events)
+            ));
+        }
+        label
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -144,6 +186,7 @@ impl SnapshotData {
         let findings = load_findings(connection);
         let collectors = load_collectors(connection);
         let summary_rows = load_summary(connection);
+        let clock_health = clock_health(&samples, &summary_rows);
         let resources = build_resources(samples, &summary_rows, duration_ns, logical_cpu_count);
         if resources.is_empty() {
             return None;
@@ -153,8 +196,117 @@ impl SnapshotData {
             resources,
             findings,
             collectors,
+            clock_health,
         })
     }
+
+    /// Mean clock, its ceiling and the throttling seen during the run, when the
+    /// recording carries frequency samples.
+    pub fn clock_health(&self) -> Option<ClockHealth> {
+        self.clock_health.clone()
+    }
+}
+
+/// Clocks are per core cluster, and a low clock is only evidence of being held
+/// back when the cluster demonstrated it could boost: a cluster whose observed
+/// `frequency_peak` reached its own `frequency_max` and whose mean sat well
+/// below it was throttled, while one that never approached its ceiling was
+/// merely idle. The worst cluster wins; hardware throttle counts outrank both.
+fn clock_health(samples: &[SampleRow], summary_rows: &[SummaryRow]) -> Option<ClockHealth> {
+    #[derive(Default)]
+    struct Cluster {
+        sum: f64,
+        count: u64,
+        peak_hz: f64,
+        max_hz: Option<f64>,
+    }
+
+    impl Cluster {
+        fn ratio(&self) -> Option<f64> {
+            let max = self.max_hz.filter(|max| *max > 0.0)?;
+            Some(self.sum / self.count as f64 / max)
+        }
+
+        /// Severity from clocks alone, `Info` without proof the cluster boosted.
+        fn severity(&self) -> Severity {
+            let Some(ratio) = self.ratio() else {
+                return Severity::Info;
+            };
+            if self.peak_hz < self.max_hz.unwrap_or(0.0) * 0.90 {
+                Severity::Info
+            } else if ratio < 0.75 {
+                Severity::High
+            } else if ratio < 0.90 {
+                Severity::Medium
+            } else {
+                Severity::Info
+            }
+        }
+    }
+
+    let mut clusters = BTreeMap::<&str, Cluster>::new();
+    let mut throttle = BTreeMap::<&str, (f64, f64)>::new();
+    for sample in samples.iter().filter(|sample| sample.resource == "cpu") {
+        match sample.metric.as_str() {
+            "frequency" => {
+                let cluster = clusters.entry(sample.resource_id.as_str()).or_default();
+                cluster.sum += sample.value;
+                cluster.count += 1;
+            }
+            "frequency_peak" => {
+                let cluster = clusters.entry(sample.resource_id.as_str()).or_default();
+                cluster.peak_hz = cluster.peak_hz.max(sample.value);
+            }
+            "frequency_max" => {
+                let cluster = clusters.entry(sample.resource_id.as_str()).or_default();
+                cluster.max_hz = Some(cluster.max_hz.unwrap_or(0.0).max(sample.value));
+            }
+            "throttle_events" => {
+                let entry = throttle
+                    .entry(sample.resource_id.as_str())
+                    .or_insert((sample.value, sample.value));
+                entry.0 = entry.0.min(sample.value);
+                entry.1 = entry.1.max(sample.value);
+            }
+            _ => {}
+        }
+    }
+    clusters.retain(|_, cluster| cluster.count > 0);
+    if clusters.is_empty() {
+        return None;
+    }
+
+    let named = clusters.len() > 1;
+    let (id, worst) = clusters.iter().max_by(|left, right| {
+        left.1.severity().cmp(&right.1.severity()).then_with(|| {
+            right
+                .1
+                .ratio()
+                .unwrap_or(f64::INFINITY)
+                .total_cmp(&left.1.ratio().unwrap_or(f64::INFINITY))
+        })
+    })?;
+
+    let mean_hz = worst.sum / worst.count as f64;
+    let max_hz = worst.max_hz.filter(|max| *max > 0.0).or_else(|| {
+        // A homogeneous host has one ceiling, so the summary's is that cluster's.
+        (!named)
+            .then(|| summary_value(summary_rows, "cpu", "frequency_max"))
+            .flatten()
+    });
+    let throttle_events = throttle.values().map(|(min, max)| max - min).sum::<f64>();
+    let severity = if throttle_events > 0.0 {
+        Severity::High
+    } else {
+        worst.severity()
+    };
+    Some(ClockHealth {
+        cluster: named.then(|| (*id).to_owned()),
+        mean_hz,
+        max_hz,
+        throttle_events,
+        severity,
+    })
 }
 
 fn load_samples(connection: &Connection) -> Option<Vec<SampleRow>> {
@@ -284,7 +436,15 @@ fn load_collectors(connection: &Connection) -> Vec<SnapshotCollector> {
     rows.filter_map(|row| row.ok()).collect()
 }
 
-const RESOURCE_ORDER: [&str; 5] = ["cpu", "memory", "disk", "io", "network"];
+const RESOURCE_ORDER: [&str; 8] = [
+    "cpu", "gpu", "npu", "memory", "disk", "io", "network", "thermal",
+];
+
+/// Constant ceilings emitted every tick: they are the denominator of a meter,
+/// never a measurement, so they get no chart and no summary row of their own.
+fn is_ceiling_metric(metric: &str) -> bool {
+    matches!(metric, "frequency_max" | "temperature_critical")
+}
 
 fn build_resources(
     samples: Vec<SampleRow>,
@@ -296,6 +456,9 @@ fn build_resources(
         BTreeMap::<(String, UseCategory, String), BTreeMap<String, Vec<(u64, f64)>>>::new();
     let mut units = BTreeMap::<(String, UseCategory, String), (String, String)>::new();
     for sample in samples {
+        if is_ceiling_metric(&sample.metric) {
+            continue;
+        }
         let key = (sample.resource, sample.category, sample.metric);
         units
             .entry(key.clone())
@@ -398,6 +561,10 @@ fn metric_kind(metric: &str, unit: &str) -> MetricKind {
     match unit {
         "seconds" | "milliseconds" => MetricKind::Occupancy,
         "faults" | "switches" | "events" | "operations" => MetricKind::Rate,
+        // Instantaneous readings, spelled out so a future unit special case
+        // cannot silently turn a clock, a temperature or an engine occupancy
+        // into a rate.
+        "hertz" | "celsius" | "level" | "percent" => MetricKind::Gauge,
         "bytes"
             if ["read", "write", "receive", "transmit", "dram"]
                 .iter()
@@ -454,9 +621,11 @@ fn summarize(
     duration_ns: u64,
     logical_cpu_count: Option<u32>,
 ) -> [Vec<SummaryMetric>; 3] {
-    let host_total = summary_value(summary_rows, resource, "host_total");
     let mut result: [Vec<SummaryMetric>; 3] = Default::default();
-    for row in summary_rows.iter().filter(|row| row.resource == resource) {
+    for row in summary_rows
+        .iter()
+        .filter(|row| row.resource == resource && !is_ceiling_metric(&row.metric))
+    {
         let index = UseCategory::ALL
             .iter()
             .position(|category| *category == row.category)
@@ -468,7 +637,7 @@ fn summarize(
                 .map(|value| format_value(value, &row.unit))
                 .unwrap_or_else(|| "—".to_string()),
             scope: row.scope.clone(),
-            fraction: metric_fraction(row, duration_ns, logical_cpu_count, host_total),
+            fraction: metric_fraction(row, summary_rows, duration_ns, logical_cpu_count),
         });
     }
     result
@@ -476,12 +645,13 @@ fn summarize(
 
 /// Normalizes a summary value into 0..=1 when its unit has a natural ceiling:
 /// percentages, CPU time against the machine's capacity, byte gauges against
-/// the host's total. Everything else has no meaningful meter.
+/// the host's total, clocks and temperatures against their recorded ceilings.
+/// Everything else has no meaningful meter.
 fn metric_fraction(
     row: &SummaryRow,
+    summary_rows: &[SummaryRow],
     duration_ns: u64,
     logical_cpu_count: Option<u32>,
-    host_total: Option<f64>,
 ) -> Option<f64> {
     let value = row.value?;
     let fraction = match row.unit.as_str() {
@@ -491,10 +661,18 @@ fn metric_fraction(
                 (duration_ns as f64 / 1e9) * logical_cpu_count.unwrap_or(1).max(1) as f64;
             value / capacity
         }
-        "bytes" => value / host_total.filter(|total| *total > 0.0)?,
+        "bytes" => value / ceiling(summary_rows, row, "host_total")?,
+        // `snapshot_summary` carries no resource_id, so these ceilings are the
+        // maximum across clusters and zones.
+        "hertz" => value / ceiling(summary_rows, row, "frequency_max")?,
+        "celsius" => value / ceiling(summary_rows, row, "temperature_critical")?,
         _ => return None,
     };
     fraction.is_finite().then(|| fraction.clamp(0.0, 1.0))
+}
+
+fn ceiling(summary_rows: &[SummaryRow], row: &SummaryRow, metric: &str) -> Option<f64> {
+    summary_value(summary_rows, &row.resource, metric).filter(|total| *total > 0.0)
 }
 
 fn summary_value(summary_rows: &[SummaryRow], resource: &str, metric: &str) -> Option<f64> {
@@ -514,21 +692,49 @@ fn headline(
     let duration_s = (duration_ns as f64 / 1e9).max(f64::EPSILON);
     match resource {
         "cpu" => {
-            let cpu_s = summary_value(summary_rows, "cpu", "cgroup_cpu_time")
+            let logical = logical_cpu_count.unwrap_or(1).max(1) as f64;
+            let load = summary_value(summary_rows, "cpu", "cgroup_cpu_time")
                 .filter(|v| *v > 0.0)
                 .or_else(|| {
                     Some(
                         summary_value(summary_rows, "cpu", "user_time").unwrap_or(0.0)
                             + summary_value(summary_rows, "cpu", "system_time").unwrap_or(0.0),
                     )
-                })?;
-            let logical = logical_cpu_count.unwrap_or(1).max(1) as f64;
-            Some(format!(
-                "{:.1}% of {} CPUs · {:.2} cores average",
-                cpu_s / duration_s / logical * 100.0,
-                logical as u64,
-                cpu_s / duration_s
-            ))
+                })
+                .map(|cpu_s| {
+                    format!(
+                        "{:.1}% of {} CPUs · {:.2} cores average",
+                        cpu_s / duration_s / logical * 100.0,
+                        logical as u64,
+                        cpu_s / duration_s
+                    )
+                });
+            joined([
+                load,
+                clock_part(charts, summary_rows),
+                peak_temperature(charts),
+            ])
+        }
+        "gpu" | "npu" => joined([
+            hottest_series(charts, "frequency")
+                .map(|(_, peak)| format!("{} peak", format_value(peak, "hertz"))),
+            hottest_series(charts, "busy").map(|(_, busy)| format!("{busy:.0}% busy")),
+            peak_temperature(charts),
+        ]),
+        "thermal" => {
+            hottest_series(charts, "temperature").map(|(zone, peak)| {
+                match summary_value(summary_rows, "thermal", "temperature_critical")
+                    .filter(|critical| *critical > 0.0)
+                {
+                    Some(critical) => format!(
+                        "peak {} on {zone} · {:.0}% of {} trip",
+                        format_value(peak, "celsius"),
+                        peak / critical * 100.0,
+                        format_value(critical, "celsius")
+                    ),
+                    None => format!("peak {} on {zone}", format_value(peak, "celsius")),
+                }
+            })
         }
         "memory" => {
             let rss = summary_value(summary_rows, "memory", "pss")
@@ -536,7 +742,7 @@ fn headline(
                 .chain(summary_value(summary_rows, "memory", "rss"))
                 .fold(0.0_f64, f64::max);
             let host_total = summary_value(summary_rows, "memory", "host_total").unwrap_or(0.0);
-            (rss > 0.0).then(|| {
+            let footprint = (rss > 0.0).then(|| {
                 if host_total > 0.0 {
                     format!(
                         "peak tree {} · {:.1}% of host {}",
@@ -547,30 +753,14 @@ fn headline(
                 } else {
                     format!("peak tree {}", format_value(rss, "bytes"))
                 }
-            })
+            });
+            joined([footprint, peak_temperature(charts)])
         }
-        "disk" => {
-            let busiest = charts
-                .iter()
-                .find(|chart| chart.metric == "busy_time")
-                .and_then(|chart| {
-                    chart
-                        .series
-                        .iter()
-                        .map(|series| {
-                            (
-                                series.id.as_str(),
-                                series
-                                    .points
-                                    .iter()
-                                    .map(|point| point.1)
-                                    .fold(0.0_f64, f64::max),
-                            )
-                        })
-                        .max_by(|left, right| left.1.total_cmp(&right.1))
-                });
-            busiest.map(|(device, busy)| format!("peak device busy {busy:.1}% ({device})"))
-        }
+        "disk" => joined([
+            hottest_series(charts, "busy_time")
+                .map(|(device, busy)| format!("peak device busy {busy:.1}% ({device})")),
+            peak_temperature(charts),
+        ]),
         "network" => {
             let received = summary_value(summary_rows, "network", "receive_bytes").unwrap_or(0.0);
             let transmitted =
@@ -595,12 +785,67 @@ fn headline(
     }
 }
 
+/// The series id and peak value of the busiest series of `metric`.
+fn hottest_series<'a>(charts: &'a [SnapshotChart], metric: &str) -> Option<(&'a str, f64)> {
+    charts
+        .iter()
+        .find(|chart| chart.metric == metric)?
+        .series
+        .iter()
+        .map(|series| {
+            (
+                series.id.as_str(),
+                series
+                    .points
+                    .iter()
+                    .map(|point| point.1)
+                    .fold(0.0_f64, f64::max),
+            )
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+/// Joins the parts a headline has into one line, `None` when it has none.
+fn joined<const N: usize>(parts: [Option<String>; N]) -> Option<String> {
+    let parts = parts.into_iter().flatten().collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The hottest temperature this resource now owns, e.g. `71.0 °C`.
+fn peak_temperature(charts: &[SnapshotChart]) -> Option<String> {
+    hottest_series(charts, "temperature").map(|(_, peak)| format_value(peak, "celsius"))
+}
+
+/// `"2.94 GHz avg, 3.80 GHz peak"`, `None` when the run has no clock samples.
+fn clock_part(charts: &[SnapshotChart], summary_rows: &[SummaryRow]) -> Option<String> {
+    let chart = charts.iter().find(|chart| chart.metric == "frequency")?;
+    let points = chart
+        .series
+        .iter()
+        .flat_map(|series| series.points.iter().map(|point| point.1));
+    let (sum, count) = points.fold((0.0, 0_u64), |(sum, count), value| (sum + value, count + 1));
+    if count == 0 {
+        return None;
+    }
+    let peak = summary_value(summary_rows, "cpu", "frequency_peak")
+        .or_else(|| summary_value(summary_rows, "cpu", "frequency"))
+        .unwrap_or_else(|| hottest_series(charts, "frequency").map_or(0.0, |(_, peak)| peak));
+    Some(format!(
+        "{} avg, {} peak",
+        format_value(sum / count as f64, "hertz"),
+        format_value(peak, "hertz")
+    ))
+}
+
 /// Formats a raw metric value using its recorded unit.
 pub fn format_value(value: f64, unit: &str) -> String {
     match unit {
         "bytes" => format_bytes(value),
         "bits_per_second" => format!("{:.1} Gbit/s", value / 1e9),
         "percent" => format!("{value:.1}%"),
+        "hertz" => format_hertz(value),
+        "celsius" => format!("{value:.1} °C"),
+        "level" => format!("{value:.0}"),
         "seconds" => format!("{value:.1} s"),
         "milliseconds" => {
             if value >= 1_000.0 {
@@ -610,6 +855,16 @@ pub fn format_value(value: f64, unit: &str) -> String {
             }
         }
         _ => format_count(value),
+    }
+}
+
+fn format_hertz(value: f64) -> String {
+    if value.abs() >= 1e9 {
+        format!("{:.2} GHz", value / 1e9)
+    } else if value.abs() >= 1e6 {
+        format!("{:.0} MHz", value / 1e6)
+    } else {
+        format!("{value:.0} Hz")
     }
 }
 
@@ -803,6 +1058,256 @@ mod tests {
         assert_eq!(fraction("memory"), Some(0.25));
         assert_eq!(fraction("io"), Some(0.25));
         assert_eq!(fraction("disk"), None);
+    }
+
+    fn summary_row(resource: &str, metric: &str, value: f64, unit: &str) -> SummaryRow {
+        SummaryRow {
+            resource: resource.to_owned(),
+            category: UseCategory::Utilization,
+            metric: metric.to_owned(),
+            value: Some(value),
+            unit: unit.to_owned(),
+            scope: "host".to_owned(),
+        }
+    }
+
+    fn sample_row(metric: &str, timestamp_s: u64, value: f64, unit: &str) -> SampleRow {
+        SampleRow {
+            timestamp_ns: timestamp_s * 1_000_000_000,
+            resource: "cpu".to_owned(),
+            resource_id: "host".to_owned(),
+            category: UseCategory::Utilization,
+            metric: metric.to_owned(),
+            value,
+            unit: unit.to_owned(),
+            scope: "host".to_owned(),
+        }
+    }
+
+    #[test]
+    fn formats_clock_and_thermal_units() {
+        assert_eq!(format_value(3.8e9, "hertz"), "3.80 GHz");
+        assert_eq!(format_value(866e6, "hertz"), "866 MHz");
+        assert_eq!(format_value(92.44, "celsius"), "92.4 °C");
+        assert_eq!(format_value(3.0, "level"), "3");
+    }
+
+    #[test]
+    fn clocks_and_temperatures_are_gauges_metered_against_their_ceiling() {
+        for unit in ["hertz", "celsius", "level", "percent"] {
+            assert!(metric_kind("frequency", unit) == MetricKind::Gauge);
+        }
+
+        let rows = [
+            summary_row("cpu", "frequency", 1.9e9, "hertz"),
+            summary_row("cpu", "frequency_max", 3.8e9, "hertz"),
+            summary_row("thermal", "temperature", 47.0, "celsius"),
+            summary_row("thermal", "temperature_critical", 94.0, "celsius"),
+        ];
+        let fractions = |resource: &str| {
+            summarize(&rows, resource, 2_000_000_000, Some(8))[0]
+                .iter()
+                .map(|metric| (metric.metric.clone(), metric.fraction))
+                .collect::<Vec<_>>()
+        };
+
+        // The ceilings are the denominator, never a row of their own.
+        assert_eq!(fractions("cpu"), [("frequency".to_owned(), Some(0.5))]);
+        assert_eq!(
+            fractions("thermal"),
+            [("temperature".to_owned(), Some(0.5))]
+        );
+    }
+
+    #[test]
+    fn clock_health_escalates_only_on_evidence_of_being_held_back() {
+        let health = |mean_hz: f64, peak_hz: f64, throttle: &[f64]| {
+            let mut samples = vec![
+                sample_row("frequency", 0, mean_hz, "hertz"),
+                sample_row("frequency_peak", 0, peak_hz, "hertz"),
+                sample_row("frequency_max", 0, 4e9, "hertz"),
+            ];
+            for (index, value) in throttle.iter().enumerate() {
+                samples.push(sample_row(
+                    "throttle_events",
+                    index as u64,
+                    *value,
+                    "events",
+                ));
+            }
+            clock_health(&samples, &[]).unwrap()
+        };
+
+        // Proved it could boost, then sat below the ceiling.
+        assert_eq!(health(3.9e9, 4e9, &[]).severity, Severity::Info);
+        assert_eq!(health(3.5e9, 4e9, &[]).severity, Severity::Medium);
+        assert_eq!(health(2.0e9, 4e9, &[]).severity, Severity::High);
+        // Never approached the ceiling: idle, not held back. No claim made.
+        assert_eq!(health(2.0e9, 2.2e9, &[]).severity, Severity::Info);
+        // Hardware throttle counts are evidence on their own.
+        let throttled = health(3.9e9, 2.2e9, &[100.0, 512.0]);
+        assert_eq!(throttled.severity, Severity::High);
+        assert_eq!(throttled.throttle_events, 412.0);
+        assert_eq!(
+            throttled.label(),
+            "clocks: 3.90 GHz avg · 98% of 4.00 GHz max · 412 throttle events"
+        );
+
+        // A homogeneous host has one ceiling, so the summary carries it.
+        let summary = [summary_row("cpu", "frequency_max", 4e9, "hertz")];
+        let single = clock_health(&[sample_row("frequency", 0, 2.0e9, "hertz")], &summary).unwrap();
+        assert_eq!(single.max_hz, Some(4e9));
+
+        assert!(clock_health(&[sample_row("throttle_events", 0, 1.0, "events")], &[]).is_none());
+    }
+
+    #[test]
+    fn clock_health_measures_each_cluster_against_its_own_ceiling() {
+        let cluster = |id: &'static str, metric: &str, value: f64| SampleRow {
+            resource_id: id.to_owned(),
+            ..sample_row(metric, 0, value, "hertz")
+        };
+        // The host-wide summary ceiling is the big cluster's and must not leak.
+        let summary = [summary_row("cpu", "frequency_max", 3.8e9, "hertz")];
+        let a520 = |mean: f64, peak: f64| {
+            [
+                cluster("cortex_a520", "frequency", mean),
+                cluster("cortex_a520", "frequency_peak", peak),
+                cluster("cortex_a520", "frequency_max", 1.8e9),
+                cluster("cortex_a720", "frequency", 3.6e9),
+                cluster("cortex_a720", "frequency_peak", 3.8e9),
+                cluster("cortex_a720", "frequency_max", 3.8e9),
+            ]
+        };
+
+        // Idle little cluster: 61% of its own ceiling, 29% of the host's, but
+        // it never got near either — no claim.
+        let idle = clock_health(&a520(1.1e9, 1.2e9), &summary).unwrap();
+        assert_eq!(idle.severity, Severity::Info);
+
+        // Same clocks, but this one demonstrated it could reach 1.8 GHz.
+        let held_back = clock_health(&a520(1.1e9, 1.75e9), &summary).unwrap();
+        assert_eq!(held_back.cluster.as_deref(), Some("cortex_a520"));
+        assert_eq!(held_back.max_hz, Some(1.8e9));
+        assert_eq!(held_back.severity, Severity::High);
+        assert_eq!(
+            held_back.label(),
+            "clocks: cortex_a520 at 1.10 GHz avg · 61% of 1.80 GHz max"
+        );
+    }
+
+    #[test]
+    fn temperature_meters_against_its_own_resource_ceiling() {
+        let rows = [
+            summary_row("gpu", "temperature", 70.0, "celsius"),
+            summary_row("gpu", "temperature_critical", 100.0, "celsius"),
+            summary_row("disk", "temperature", 70.0, "celsius"),
+            summary_row("disk", "temperature_critical", 84.0, "celsius"),
+        ];
+        let fraction = |resource: &str| {
+            summarize(&rows, resource, 2_000_000_000, Some(8))[0]
+                .first()
+                .and_then(|metric| metric.fraction)
+        };
+
+        // The same reading is comfortable on the GPU and hot on the drive.
+        assert_eq!(fraction("gpu"), Some(0.7));
+        assert_eq!(fraction("disk"), Some(70.0 / 84.0));
+    }
+
+    #[test]
+    fn device_cards_report_clock_busy_and_temperature() {
+        let connection = connection();
+        const GPU_CLOCK: Metric = Metric {
+            resource: "gpu",
+            id: "gpu0",
+            category: "utilization",
+            metric: "frequency",
+            unit: "hertz",
+        };
+        const GPU_BUSY: Metric = Metric {
+            resource: "gpu",
+            id: "gpu0",
+            category: "utilization",
+            metric: "busy",
+            unit: "percent",
+        };
+        const GPU_TEMP: Metric = Metric {
+            resource: "gpu",
+            id: "amdgpu",
+            category: "utilization",
+            metric: "temperature",
+            unit: "celsius",
+        };
+        const DISK_BUSY: Metric = Metric {
+            resource: "disk",
+            id: "nvme0n1",
+            category: "utilization",
+            metric: "busy_time",
+            unit: "milliseconds",
+        };
+        const DISK_TEMP: Metric = Metric {
+            resource: "disk",
+            id: "composite",
+            category: "utilization",
+            metric: "temperature",
+            unit: "celsius",
+        };
+        for (t, clock, busy, temperature, disk_busy_ms, disk_temperature) in [
+            (0, 350e6, 12.0, 65.0, 0.0, 44.0),
+            (1, 1.3e9, 46.0, 71.0, 1000.0, 46.0),
+        ] {
+            insert_sample(&connection, t, &GPU_CLOCK, clock);
+            insert_sample(&connection, t, &GPU_BUSY, busy);
+            insert_sample(&connection, t, &GPU_TEMP, temperature);
+            insert_sample(&connection, t, &DISK_BUSY, disk_busy_ms);
+            insert_sample(&connection, t, &DISK_TEMP, disk_temperature);
+        }
+
+        let data = SnapshotData::load(&connection, Some(8)).unwrap();
+
+        assert_eq!(
+            data.resources
+                .iter()
+                .map(|r| r.resource.as_str())
+                .collect::<Vec<_>>(),
+            ["gpu", "disk"]
+        );
+        assert_eq!(
+            data.resources[0].headline.as_deref(),
+            Some("1.30 GHz peak · 46% busy · 71.0 °C")
+        );
+        assert_eq!(
+            data.resources[1].headline.as_deref(),
+            Some("peak device busy 100.0% (nvme0n1) · 46.0 °C")
+        );
+        // Device clocks are not core clocks: no CPU clock badge from a GPU.
+        assert!(data.clock_health().is_none());
+    }
+
+    #[test]
+    fn clock_health_ignores_device_clocks() {
+        let gpu = |metric: &str, value: f64| SampleRow {
+            resource: "gpu".to_owned(),
+            resource_id: "gpu0".to_owned(),
+            ..sample_row(metric, 0, value, "hertz")
+        };
+        // A GPU idling at 350 MHz of a 1.30 GHz ceiling is not a throttled CPU.
+        let health = clock_health(
+            &[
+                sample_row("frequency", 0, 3.9e9, "hertz"),
+                sample_row("frequency_peak", 0, 4e9, "hertz"),
+                sample_row("frequency_max", 0, 4e9, "hertz"),
+                gpu("frequency", 350e6),
+                gpu("frequency_peak", 1.3e9),
+                gpu("frequency_max", 1.3e9),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(health.severity, Severity::Info);
+        assert_eq!(health.mean_hz, 3.9e9);
+        assert_eq!(health.cluster, None);
     }
 
     #[test]

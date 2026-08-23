@@ -11,6 +11,7 @@ mod criterion_measurement;
 mod driver;
 mod event_timer;
 mod fidelity;
+mod host_telemetry;
 mod platform_memory;
 mod process;
 mod quick;
@@ -20,6 +21,8 @@ pub use capabilities::{capabilities, Capabilities, PmuDevice};
 pub use cpu_family::{host_cpu_description, host_metrics};
 #[cfg(feature = "criterion")]
 pub use criterion_measurement::CriterionCounter;
+#[cfg(target_os = "linux")]
+pub use driver::perf::inherited_sample_read_supported;
 pub use driver::{
     list_supported_counters, CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver,
     CountingDriverBuilder, DriverKind, MeasurementQuality, MemSample, Record, Sample,
@@ -34,6 +37,9 @@ pub use event_timer::{
     Measurements, ReadCost, ReadMethod,
 };
 pub use fidelity::{resolve, Resolution, Rung};
+pub use host_telemetry::{
+    ClusterClocks, DeviceClocks, HostTelemetry, HostTelemetrySample, ThermalZone,
+};
 pub use platform_memory::{
     bandwidth_counters_present, MemoryControllerMonitor, MemoryControllerSample,
 };

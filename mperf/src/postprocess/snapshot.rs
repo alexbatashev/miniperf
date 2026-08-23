@@ -4,39 +4,55 @@ use std::path::Path;
 use anyhow::Result;
 use mperf_data::{RecordInfo, ScenarioInfo};
 
-use super::tables::{Columns, Tables};
+use super::tables::{Columns, Tables, quote_identifier};
 
-/// Materialize the snapshot tables from the procfs and bpftrace side files.
-pub(crate) fn process(tables: &Tables, info: &RecordInfo, res_dir: &Path) -> Result<()> {
-    write_resource_samples(tables, res_dir)?;
-    write_processes(tables, res_dir)?;
-    write_collectors(tables, info)?;
+/// Materialize the host-scoped resource tables. Clocks, temperatures and the
+/// procfs telemetry are host state, so every scenario gets them.
+pub(crate) fn write_host_telemetry(tables: &Tables, res_dir: &Path) -> Result<()> {
+    let rows = if tables.has_table("resource_samples") {
+        ResourceRows::read(
+            tables,
+            "SELECT timestamp_ns, resource, resource_id, category, metric, value, unit, \
+             scope, source, quality FROM resource_samples ORDER BY timestamp_ns",
+        )?
+    } else {
+        ResourceRows::default()
+    };
+    rows.write(tables)?;
+    write_summary(tables)?;
+    remove_intermediates(tables, res_dir, "resource_samples")
+}
+
+fn write_summary(tables: &Tables) -> Result<()> {
     tables.write_query(
         "snapshot_summary",
         "SELECT resource, category, metric, MAX(value) AS value, unit, scope, source, quality
          FROM snapshot_resource_samples
          GROUP BY resource, category, metric, unit, scope, source, quality",
-    )?;
-    write_findings(tables, info)?;
-    remove_intermediates(tables, res_dir)
+    )
+}
+
+/// Materialize the snapshot-only tables from the procfs and bpftrace side files.
+pub(crate) fn process(tables: &Tables, info: &RecordInfo, res_dir: &Path) -> Result<()> {
+    merge_bpf_metrics(tables)?;
+    write_processes(tables)?;
+    remove_intermediates(tables, res_dir, "process_samples")?;
+    write_findings(tables, info)
 }
 
 /// Delete the record-time intermediates once the final snapshot tables are
 /// materialized, mirroring `samples_raw`.
-fn remove_intermediates(tables: &Tables, res_dir: &Path) -> Result<()> {
-    tables.connection().execute_batch(
-        "DROP VIEW IF EXISTS resource_samples; DROP VIEW IF EXISTS process_samples;",
-    )?;
+fn remove_intermediates(tables: &Tables, res_dir: &Path, table: &str) -> Result<()> {
+    tables
+        .connection()
+        .execute_batch(&format!("DROP VIEW IF EXISTS {};", quote_identifier(table)))?;
     for entry in std::fs::read_dir(res_dir)? {
         let path = entry?.path();
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
         if path.extension().is_some_and(|ext| ext == "parquet")
-            && matches!(
-                store::table_base_name(stem),
-                "resource_samples" | "process_samples"
-            )
+            && store::table_base_name(stem) == table
         {
             std::fs::remove_file(path)?;
         }
@@ -44,108 +60,126 @@ fn remove_intermediates(tables: &Tables, res_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_resource_samples(tables: &Tables, _res_dir: &Path) -> Result<()> {
-    let mut timestamp_ns = Vec::new();
-    let mut resource = Vec::new();
-    let mut resource_id = Vec::new();
-    let mut category = Vec::new();
-    let mut metric = Vec::new();
-    let mut value = Vec::new();
-    let mut unit = Vec::new();
-    let mut scope = Vec::new();
-    let mut source = Vec::new();
-    let mut quality = Vec::new();
-
-    if tables.has_table("resource_samples") {
-        let mut statement = tables.connection().prepare(
-            "SELECT timestamp_ns, resource, resource_id, category, metric, value, unit, \
-             scope, source, quality FROM resource_samples ORDER BY timestamp_ns",
-        )?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            timestamp_ns.push(row.get(0)?);
-            resource.push(row.get(1)?);
-            resource_id.push(row.get(2)?);
-            category.push(row.get(3)?);
-            metric.push(row.get(4)?);
-            value.push(row.get(5)?);
-            unit.push(row.get(6)?);
-            scope.push(row.get(7)?);
-            source.push(row.get(8)?);
-            quality.push(row.get(9)?);
-        }
-    }
-
-    if tables.has_table("bpf_metrics") {
-        let mut statement = tables
-            .connection()
-            .prepare("SELECT metric, value FROM bpf_metrics")?;
-        let values = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-            })?
-            .collect::<store::duckdb::Result<HashMap<_, _>>>()?;
-        let latest = timestamp_ns.iter().copied().max().unwrap_or(0);
-        for (bpf_resource, bpf_category, bpf_metric, bpf_unit, bpf_value) in [
-            (
-                "cpu",
-                "saturation",
-                "run_queue_latency",
-                "nanoseconds",
-                values.get("runq_ns").copied().unwrap_or(0.0)
-                    / values.get("runq_count").copied().unwrap_or(0.0).max(1.0),
-            ),
-            (
-                "disk",
-                "saturation",
-                "block_latency",
-                "nanoseconds",
-                values.get("block_latency_ns").copied().unwrap_or(0.0)
-                    / values.get("block_count").copied().unwrap_or(0.0).max(1.0),
-            ),
-            (
-                "disk",
-                "utilization",
-                "block_bytes",
-                "bytes",
-                values.get("block_bytes").copied().unwrap_or(0.0),
-            ),
-            (
-                "network",
-                "errors",
-                "tcp_retransmits",
-                "events",
-                values.get("tcp_retransmits").copied().unwrap_or(0.0),
-            ),
-        ] {
-            timestamp_ns.push(latest);
-            resource.push(bpf_resource.to_owned());
-            resource_id.push("process_tree".to_owned());
-            category.push(bpf_category.to_owned());
-            metric.push(bpf_metric.to_owned());
-            value.push(bpf_value);
-            unit.push(bpf_unit.to_owned());
-            scope.push("process_tree".to_owned());
-            source.push("bpftrace".to_owned());
-            quality.push("attributed".to_owned());
-        }
-    }
-
-    let mut columns = Columns::default();
-    columns.i64("timestamp_ns", timestamp_ns);
-    columns.text("resource", resource);
-    columns.text("resource_id", resource_id);
-    columns.text("category", category);
-    columns.text("metric", metric);
-    columns.f64("value", value);
-    columns.text("unit", unit);
-    columns.text("scope", scope);
-    columns.text("source", source);
-    columns.text("quality", quality);
-    tables.write("snapshot_resource_samples", columns.finish()?)
+/// The `snapshot_resource_samples` columns, accumulated for one rewrite.
+#[derive(Default)]
+struct ResourceRows {
+    timestamp_ns: Vec<i64>,
+    resource: Vec<String>,
+    resource_id: Vec<String>,
+    category: Vec<String>,
+    metric: Vec<String>,
+    value: Vec<f64>,
+    unit: Vec<String>,
+    scope: Vec<String>,
+    source: Vec<String>,
+    quality: Vec<String>,
 }
 
-fn write_processes(tables: &Tables, _res_dir: &Path) -> Result<()> {
+impl ResourceRows {
+    fn read(tables: &Tables, select: &str) -> Result<Self> {
+        let mut rows = Self::default();
+        let mut statement = tables.connection().prepare(select)?;
+        let mut result = statement.query([])?;
+        while let Some(row) = result.next()? {
+            rows.timestamp_ns.push(row.get(0)?);
+            rows.resource.push(row.get(1)?);
+            rows.resource_id.push(row.get(2)?);
+            rows.category.push(row.get(3)?);
+            rows.metric.push(row.get(4)?);
+            rows.value.push(row.get(5)?);
+            rows.unit.push(row.get(6)?);
+            rows.scope.push(row.get(7)?);
+            rows.source.push(row.get(8)?);
+            rows.quality.push(row.get(9)?);
+        }
+        Ok(rows)
+    }
+
+    fn write(self, tables: &Tables) -> Result<()> {
+        let mut columns = Columns::default();
+        columns.i64("timestamp_ns", self.timestamp_ns);
+        columns.text("resource", self.resource);
+        columns.text("resource_id", self.resource_id);
+        columns.text("category", self.category);
+        columns.text("metric", self.metric);
+        columns.f64("value", self.value);
+        columns.text("unit", self.unit);
+        columns.text("scope", self.scope);
+        columns.text("source", self.source);
+        columns.text("quality", self.quality);
+        tables.write("snapshot_resource_samples", columns.finish()?)
+    }
+}
+
+/// Append the bpftrace-derived aggregates to the materialized resource
+/// samples. They are attributed to the profiled process tree, so unlike clocks
+/// and temperatures they belong to the snapshot scenario only.
+fn merge_bpf_metrics(tables: &Tables) -> Result<()> {
+    if !tables.has_table("bpf_metrics") {
+        return Ok(());
+    }
+    let mut rows = ResourceRows::read(
+        tables,
+        "SELECT timestamp_ns, resource, resource_id, category, metric, value, unit, \
+         scope, source, quality FROM snapshot_resource_samples ORDER BY timestamp_ns",
+    )?;
+    let mut statement = tables
+        .connection()
+        .prepare("SELECT metric, value FROM bpf_metrics")?;
+    let values = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .collect::<store::duckdb::Result<HashMap<_, _>>>()?;
+    let latest = rows.timestamp_ns.iter().copied().max().unwrap_or(0);
+    for (bpf_resource, bpf_category, bpf_metric, bpf_unit, bpf_value) in [
+        (
+            "cpu",
+            "saturation",
+            "run_queue_latency",
+            "nanoseconds",
+            values.get("runq_ns").copied().unwrap_or(0.0)
+                / values.get("runq_count").copied().unwrap_or(0.0).max(1.0),
+        ),
+        (
+            "disk",
+            "saturation",
+            "block_latency",
+            "nanoseconds",
+            values.get("block_latency_ns").copied().unwrap_or(0.0)
+                / values.get("block_count").copied().unwrap_or(0.0).max(1.0),
+        ),
+        (
+            "disk",
+            "utilization",
+            "block_bytes",
+            "bytes",
+            values.get("block_bytes").copied().unwrap_or(0.0),
+        ),
+        (
+            "network",
+            "errors",
+            "tcp_retransmits",
+            "events",
+            values.get("tcp_retransmits").copied().unwrap_or(0.0),
+        ),
+    ] {
+        rows.timestamp_ns.push(latest);
+        rows.resource.push(bpf_resource.to_owned());
+        rows.resource_id.push("process_tree".to_owned());
+        rows.category.push(bpf_category.to_owned());
+        rows.metric.push(bpf_metric.to_owned());
+        rows.value.push(bpf_value);
+        rows.unit.push(bpf_unit.to_owned());
+        rows.scope.push("process_tree".to_owned());
+        rows.source.push("bpftrace".to_owned());
+        rows.quality.push("attributed".to_owned());
+    }
+    rows.write(tables)?;
+    write_summary(tables)
+}
+
+fn write_processes(tables: &Tables) -> Result<()> {
     if tables.has_table("process_samples") {
         return tables.write_query(
             "snapshot_processes",
@@ -164,20 +198,28 @@ fn write_processes(tables: &Tables, _res_dir: &Path) -> Result<()> {
     tables.write("snapshot_processes", columns.finish()?)
 }
 
-fn write_collectors(tables: &Tables, info: &RecordInfo) -> Result<()> {
+pub(crate) fn write_collectors(tables: &Tables, info: &RecordInfo) -> Result<()> {
     let mut name = Vec::new();
     let mut status = Vec::new();
     let mut source = Vec::new();
     let mut quality = Vec::new();
     let mut message = Vec::new();
-    if let ScenarioInfo::Snapshot(snapshot) = &info.scenario_info {
-        for collector in &snapshot.collectors {
-            name.push(collector.name.clone());
-            status.push(collector.status.clone());
-            source.push(collector.source.clone());
-            quality.push(collector.quality.clone());
-            message.push(collector.message.clone());
+    // Recordings made before collector status was scenario-independent carry
+    // it inside `ScenarioInfo::Snapshot`.
+    let collectors = if info.collectors.is_empty() {
+        match &info.scenario_info {
+            ScenarioInfo::Snapshot(snapshot) => snapshot.collectors.as_slice(),
+            _ => &[],
         }
+    } else {
+        info.collectors.as_slice()
+    };
+    for collector in collectors {
+        name.push(collector.name.clone());
+        status.push(collector.status.clone());
+        source.push(collector.source.clone());
+        quality.push(collector.quality.clone());
+        message.push(collector.message.clone());
     }
 
     let mut columns = Columns::default();
@@ -268,6 +310,15 @@ fn write_findings(tables: &Tables, info: &RecordInfo) -> Result<()> {
         findings.push((4, "medium", "network", "Network utilization or reliability needs attention".into(), format!("maximum known-link utilization {network_utilization:.1}%; {network_errors:.0} host interface errors/drops; {tcp_retransmits:.0} attributed TCP retransmits"), "Inspect `ip -s link`, `ss -ti`, retransmits, and then capture packets on the affected interface if needed.".into(), "mixed", if tcp_retransmits > 0.0 { "attributed" } else { "exact_system" }));
     }
 
+    let frequency = mean_metric(tables, "frequency");
+    let frequency_max = max_metric(tables, "frequency_max");
+    let throttle_events = metric_delta_sum(tables, &["throttle_events"]);
+    if throttle_events > 0.0
+        || (frequency > 0.0 && frequency_max > 0.0 && frequency < frequency_max * 0.9)
+    {
+        findings.push((5, "high", "cpu", "The host clocked below its ceiling".into(), format!("mean core clock {:.2} GHz of a {:.2} GHz ceiling; {throttle_events:.0} throttle events during the run", frequency / 1e9, frequency_max / 1e9), "Check cooling, the power limits (`cpupower frequency-info`, RAPL/`platform_profile`) and the governor before micro-optimizing: every counter in this recording was measured at the reduced clock.".into(), "system_during_target", "exact_system"));
+    }
+
     let mut unavailable = tables.connection().prepare(
         "SELECT name, status, message FROM snapshot_collectors WHERE status <> 'available'",
     )?;
@@ -311,6 +362,15 @@ fn max_metric(tables: &Tables, metric: &str) -> f64 {
     tables
         .scalar_f64(&format!(
             "SELECT COALESCE(MAX(value), 0) FROM snapshot_resource_samples WHERE metric = '{metric}'"
+        ))
+        .unwrap_or(0.0)
+}
+
+fn mean_metric(tables: &Tables, metric: &str) -> f64 {
+    let metric = metric.replace('\'', "''");
+    tables
+        .scalar_f64(&format!(
+            "SELECT COALESCE(AVG(value), 0) FROM snapshot_resource_samples WHERE metric = '{metric}'"
         ))
         .unwrap_or(0.0)
 }

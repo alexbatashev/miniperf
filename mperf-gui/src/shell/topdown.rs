@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gpui::{CursorStyle, FontWeight, HitboxBehavior, canvas, div, fill, prelude::*, px};
 
+use super::clock_badge;
 use super::session::ShellSession;
 use super::{ShellView, tma::TmaData, tma_category, tma_legend};
 use crate::charts::{PlotFrame, paint_stacked_columns};
@@ -53,13 +54,17 @@ pub fn render(
                 .border_color(theme.border)
                 .child(
                     div()
+                        .flex()
                         .flex_none()
+                        .items_center()
+                        .gap(px(8.0))
                         .px(px(8.0))
                         .py(px(6.0))
                         .child(ui::section_caption(
                             "top-down hierarchy · % of pipeline slots",
                             cx,
-                        )),
+                        ))
+                        .children(clock_badge(session, &theme)),
                 )
                 .when_some(tma.error.clone(), |el, error| {
                     el.child(
