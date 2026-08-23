@@ -98,6 +98,10 @@ mod imp {
     const MAX_ZONES: usize = 64;
     const MAX_DEVICES: usize = 32;
 
+    /// How far above its published ceiling a clock reading may sit before it
+    /// is treated as sensor noise rather than a measurement.
+    const CEILING_TOLERANCE: f64 = 1.1;
+
     /// Substring claims on a sensor name, in precedence order: the device
     /// keywords win over the CPU ones so `gpu_cluster_thermal` is a GPU. SoC
     /// vendors name sensors `<block>_thermal`, which no prefix can catch.
@@ -198,9 +202,14 @@ mod imp {
 
     struct ClusterSensors {
         id: String,
-        /// One tier per clock source, best first; the first that yields a
-        /// reading this tick wins.
+        /// One tier per clock source, best first.
         tiers: Vec<FreqTier>,
+        /// Worst tier still allowed to answer. A tier is latched the first
+        /// time it reads, and only ever improves from there: a series that
+        /// switched sensors mid-run would not be measuring one thing, and a
+        /// single startup `EAGAIN` must not demote a cluster for the whole
+        /// recording.
+        active: usize,
         max_hz: Option<f64>,
     }
 
@@ -247,6 +256,8 @@ mod imp {
         /// be counted as many times as the package has CPUs.
         throttle: Vec<File>,
         unavailable: Vec<(&'static str, String)>,
+        /// Clock readings dropped for exceeding their cluster ceiling.
+        discarded: u64,
     }
 
     impl HostTelemetry {
@@ -273,29 +284,47 @@ mod imp {
             &self.unavailable
         }
 
+        /// How many clock readings have been dropped as impossible so far.
+        pub fn discarded_readings(&self) -> u64 {
+            self.discarded
+        }
+
         /// Read every open sensor.
         pub fn sample(&mut self) -> io::Result<HostTelemetrySample> {
+            let mut discarded = 0_u64;
             let clusters = self
                 .clusters
-                .iter()
+                .iter_mut()
                 .filter_map(|cluster| {
-                    cluster.tiers.iter().find_map(|tier| {
-                        let readings: Vec<f64> = tier
-                            .files
-                            .iter()
-                            .filter_map(|file| read_number::<f64>(file).map(khz_to_hz))
-                            .collect();
-                        let (mean_hz, peak_hz) = aggregate(&readings)?;
-                        Some(ClusterClocks {
-                            id: cluster.id.clone(),
-                            mean_hz,
-                            peak_hz,
-                            max_hz: cluster.max_hz,
-                            source: tier.source,
-                        })
+                    let (max_hz, active) = (cluster.max_hz, cluster.active);
+                    let (tier, mean_hz, peak_hz) = cluster.tiers[..=active]
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, tier)| {
+                            let readings: Vec<f64> = tier
+                                .files
+                                .iter()
+                                .filter_map(|file| read_number::<f64>(file).map(khz_to_hz))
+                                .filter(|hz| {
+                                    let keep = plausible(*hz, max_hz);
+                                    discarded += u64::from(!keep);
+                                    keep
+                                })
+                                .collect();
+                            let (mean_hz, peak_hz) = aggregate(&readings)?;
+                            Some((index, mean_hz, peak_hz))
+                        })?;
+                    cluster.active = tier;
+                    Some(ClusterClocks {
+                        id: cluster.id.clone(),
+                        mean_hz,
+                        peak_hz,
+                        max_hz,
+                        source: cluster.tiers[tier].source,
                     })
                 })
                 .collect();
+            self.discarded += discarded;
             let devices = self
                 .devices
                 .iter()
@@ -408,6 +437,7 @@ mod imp {
                 zones,
                 throttle,
                 unavailable,
+                discarded: 0,
             }))
         }
     }
@@ -467,6 +497,7 @@ mod imp {
                     .collect();
                 (!tiers.is_empty()).then(|| ClusterSensors {
                     id: unique_id(base, &mut used),
+                    active: tiers.len() - 1,
                     tiers,
                     max_hz: *max_hz,
                 })
@@ -806,6 +837,15 @@ mod imp {
         millicelsius / 1_000.0
     }
 
+    /// Whether a clock reading can be believed. `cpuinfo_max_freq` already
+    /// includes boost, so the headroom only absorbs firmware rounding — it is
+    /// not a margin for a sensor that is wrong: the Orion O6's `cppc_cpufreq`
+    /// reports 3.9GHz on a 1.8GHz part. A host that publishes no ceiling gets
+    /// the benefit of the doubt, since there is nothing to check against.
+    fn plausible(hz: f64, max_hz: Option<f64>) -> bool {
+        max_hz.is_none_or(|max_hz| hz <= max_hz * CEILING_TOLERANCE)
+    }
+
     fn aggregate(values: &[f64]) -> Option<(f64, f64)> {
         let peak = values.iter().copied().fold(f64::MIN, f64::max);
         (!values.is_empty()).then(|| (values.iter().sum::<f64>() / values.len() as f64, peak))
@@ -1067,6 +1107,72 @@ mod imp {
             assert_eq!(clusters[0].tiers[0].files.len(), 8);
         }
 
+        /// A telemetry handle over a fixture's cpufreq tree and nothing else.
+        fn cpu_telemetry(fixture: &Fixture) -> HostTelemetry {
+            let missing = Path::new("/nonexistent/miniperf/host_telemetry");
+            HostTelemetry::start_at(
+                &Roots {
+                    cpu: &fixture.0,
+                    hwmon: missing,
+                    thermal: missing,
+                    devfreq: missing,
+                    drm: missing,
+                },
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+        }
+
+        fn one_policy(fixture: &Fixture, max: &str) {
+            fixture.write("cpufreq/policy0/related_cpus", "0 1");
+            fixture.write("cpufreq/policy0/cpuinfo_max_freq", max);
+        }
+
+        #[test]
+        fn a_latched_clock_source_never_falls_back_to_a_worse_sensor() {
+            let fixture = Fixture::new("latch");
+            one_policy(&fixture, "1800000");
+            fixture.write("cpufreq/policy0/cpuinfo_avg_freq", "1798242");
+            fixture.write("cpufreq/policy0/cpuinfo_cur_freq", "1700000");
+
+            let mut telemetry = cpu_telemetry(&fixture);
+            let first = telemetry.sample().unwrap();
+            assert_eq!(first.clusters[0].source, "cpufreq_avg");
+            assert_eq!(first.clusters[0].mean_hz, 1.798242e9);
+
+            // The AMU answers EAGAIN. The tick is lost rather than filled in
+            // from a sensor measuring a different thing, which would leave one
+            // series carrying two kinds of number.
+            fixture.write("cpufreq/policy0/cpuinfo_avg_freq", "");
+            assert!(telemetry.sample().unwrap().clusters.is_empty());
+            assert_eq!(telemetry.discarded_readings(), 0);
+        }
+
+        #[test]
+        fn impossible_clocks_are_discarded_and_the_source_can_still_improve() {
+            let fixture = Fixture::new("ceiling");
+            one_policy(&fixture, "1800000");
+            fixture.write("cpufreq/policy0/cpuinfo_avg_freq", "");
+            // What the Orion O6's cppc_cpufreq reports on a 1.8GHz part.
+            fixture.write("cpufreq/policy0/cpuinfo_cur_freq", "3926612");
+            fixture.write("cpufreq/policy0/scaling_cur_freq", "1700000");
+
+            let mut telemetry = cpu_telemetry(&fixture);
+            let first = telemetry.sample().unwrap();
+            assert_eq!(first.clusters[0].source, "cpufreq_requested");
+            assert_eq!(first.clusters[0].mean_hz, 1.7e9);
+            assert_eq!(telemetry.discarded_readings(), 1);
+
+            // A tier is latched, never sealed: the AMU coming back promotes
+            // the cluster off the governor's request.
+            fixture.write("cpufreq/policy0/cpuinfo_avg_freq", "1798242");
+            let second = telemetry.sample().unwrap();
+            assert_eq!(second.clusters[0].source, "cpufreq_avg");
+            assert_eq!(second.clusters[0].mean_hz, 1.798242e9);
+            assert_eq!(telemetry.discarded_readings(), 1);
+        }
+
         #[test]
         fn attributes_hwmon_chips_by_device_class() {
             let fixture = Fixture::new("hwmon_class");
@@ -1322,6 +1428,11 @@ mod imp {
             &self.unavailable
         }
 
+        /// The clock ceiling is republished verbatim, so nothing is discarded.
+        pub fn discarded_readings(&self) -> u64 {
+            0
+        }
+
         /// Read the OS thermal pressure level and republish the clock ceiling.
         pub fn sample(&mut self) -> io::Result<HostTelemetrySample> {
             let pressure_level = self.pressure_token.and_then(|token| {
@@ -1389,6 +1500,10 @@ impl HostTelemetry {
     /// No sensor was opened, so nothing is missing.
     pub fn unavailable(&self) -> &[(&'static str, String)] {
         &[]
+    }
+    /// No sensor was opened, so nothing was discarded.
+    pub fn discarded_readings(&self) -> u64 {
+        0
     }
     /// Return an empty sample.
     pub fn sample(&mut self) -> io::Result<HostTelemetrySample> {

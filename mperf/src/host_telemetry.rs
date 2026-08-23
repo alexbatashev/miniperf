@@ -151,13 +151,27 @@ fn collect(
         thread::park_timeout(INTERVAL);
     }
     let _ = writer.finish();
-    statuses.push(status(
-        "host_telemetry",
-        "available",
-        source,
-        "exact_system",
-        "host clock and temperature sensors",
-    ));
+    let discarded = telemetry.discarded_readings();
+    statuses.push(if discarded > 0 {
+        status(
+            "host_telemetry",
+            "degraded",
+            source,
+            "best_effort",
+            &format!(
+                "{discarded} clock reading(s) exceeded their cluster ceiling and were \
+                 discarded; this host's cpufreq driver reports impossible frequencies"
+            ),
+        )
+    } else {
+        status(
+            "host_telemetry",
+            "available",
+            source,
+            "exact_system",
+            "host clock and temperature sensors",
+        )
+    });
     statuses
 }
 

@@ -23,12 +23,18 @@ pub(crate) fn write_host_telemetry(tables: &Tables, res_dir: &Path) -> Result<()
     remove_intermediates(tables, res_dir, "resource_samples")
 }
 
+/// One row per thing measured. Provenance is reported as it stood at the end
+/// of the run rather than grouped on: a sensor that improved mid-recording —
+/// a cluster's clock promoted off the governor's request onto the AMU, say —
+/// would otherwise split one series into a row per source.
 fn write_summary(tables: &Tables) -> Result<()> {
     tables.write_query(
         "snapshot_summary",
-        "SELECT resource, category, metric, MAX(value) AS value, unit, scope, source, quality
+        "SELECT resource, resource_id, category, metric, MAX(value) AS value, unit, scope,
+                arg_max(source, timestamp_ns) AS source,
+                arg_max(quality, timestamp_ns) AS quality
          FROM snapshot_resource_samples
-         GROUP BY resource, category, metric, unit, scope, source, quality",
+         GROUP BY resource, resource_id, category, metric, unit, scope",
     )
 }
 
@@ -310,13 +316,12 @@ fn write_findings(tables: &Tables, info: &RecordInfo) -> Result<()> {
         findings.push((4, "medium", "network", "Network utilization or reliability needs attention".into(), format!("maximum known-link utilization {network_utilization:.1}%; {network_errors:.0} host interface errors/drops; {tcp_retransmits:.0} attributed TCP retransmits"), "Inspect `ip -s link`, `ss -ti`, retransmits, and then capture packets on the affected interface if needed.".into(), "mixed", if tcp_retransmits > 0.0 { "attributed" } else { "exact_system" }));
     }
 
-    let frequency = mean_metric(tables, "frequency");
-    let frequency_max = max_metric(tables, "frequency_max");
     let throttle_events = metric_delta_sum(tables, &["throttle_events"]);
-    if throttle_events > 0.0
-        || (frequency > 0.0 && frequency_max > 0.0 && frequency < frequency_max * 0.9)
+    let slowest = slowest_cpu_cluster(tables);
+    if let Some((id, frequency, frequency_max)) = slowest
+        && (throttle_events > 0.0 || frequency < frequency_max * 0.9)
     {
-        findings.push((5, "high", "cpu", "The host clocked below its ceiling".into(), format!("mean core clock {:.2} GHz of a {:.2} GHz ceiling; {throttle_events:.0} throttle events during the run", frequency / 1e9, frequency_max / 1e9), "Check cooling, the power limits (`cpupower frequency-info`, RAPL/`platform_profile`) and the governor before micro-optimizing: every counter in this recording was measured at the reduced clock.".into(), "system_during_target", "exact_system"));
+        findings.push((5, "high", "cpu", "The host clocked below its ceiling".into(), format!("{id} averaged {:.2} GHz of its {:.2} GHz ceiling; {throttle_events:.0} throttle events during the run", frequency / 1e9, frequency_max / 1e9), "Check cooling, the power limits (`cpupower frequency-info`, RAPL/`platform_profile`) and the governor before micro-optimizing: every counter in this recording was measured at the reduced clock.".into(), "system_during_target", "exact_system"));
     }
 
     let mut unavailable = tables.connection().prepare(
@@ -366,13 +371,28 @@ fn max_metric(tables: &Tables, metric: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn mean_metric(tables: &Tables, metric: &str) -> f64 {
-    let metric = metric.replace('\'', "''");
-    tables
-        .scalar_f64(&format!(
-            "SELECT COALESCE(AVG(value), 0) FROM snapshot_resource_samples WHERE metric = '{metric}'"
-        ))
-        .unwrap_or(0.0)
+/// The CPU cluster that spent the run furthest below its own ceiling, as
+/// `(id, mean_hz, max_hz)`. Clocks only compare within a cluster: a machine
+/// whose little cores sit at their 1.8GHz ceiling is not throttled just
+/// because its big cores can reach 2.6GHz, and a GPU domain is not a CPU at
+/// all.
+fn slowest_cpu_cluster(tables: &Tables) -> Option<(String, f64, f64)> {
+    let mut statement = tables
+        .connection()
+        .prepare(
+            "SELECT resource_id, mean_hz, max_hz FROM (
+               SELECT resource_id,
+                      AVG(value) FILTER (WHERE metric = 'frequency') AS mean_hz,
+                      MAX(value) FILTER (WHERE metric = 'frequency_max') AS max_hz
+               FROM snapshot_resource_samples
+               WHERE resource = 'cpu' AND metric IN ('frequency', 'frequency_max')
+               GROUP BY resource_id
+             ) WHERE mean_hz > 0 AND max_hz > 0 ORDER BY mean_hz / max_hz LIMIT 1",
+        )
+        .ok()?;
+    statement
+        .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .ok()
 }
 
 fn rate_metric(tables: &Tables, metric: &str, duration_s: f64) -> f64 {

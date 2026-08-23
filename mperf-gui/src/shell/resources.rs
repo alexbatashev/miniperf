@@ -135,7 +135,12 @@ fn metric_row(metric: &SummaryMetric, category: UseCategory, theme: &Theme) -> g
                         .min_w(px(0.0))
                         .truncate()
                         .text_color(theme.muted_foreground)
-                        .child(metric.metric.replace('_', " ")),
+                        .child(match &metric.entity {
+                            Some(entity) => {
+                                format!("{} · {entity}", metric.metric.replace('_', " "))
+                            }
+                            None => metric.metric.replace('_', " "),
+                        }),
                 )
                 .child(div().flex_none().child(metric.value.clone()))
                 .when(!metric.scope.is_empty(), |el| {

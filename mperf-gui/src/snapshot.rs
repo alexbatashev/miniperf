@@ -136,6 +136,9 @@ pub struct ResourceUse {
 #[derive(Debug, Clone)]
 pub struct SummaryMetric {
     pub metric: String,
+    /// Which cluster, zone or device this row measured, on the resources that
+    /// have more than one. `None` where the name would say nothing.
+    pub entity: Option<String>,
     pub value: String,
     pub scope: String,
     /// 0..=1 position against the metric's natural ceiling, when it has one.
@@ -356,6 +359,7 @@ fn load_samples(connection: &Connection) -> Option<Vec<SampleRow>> {
 
 struct SummaryRow {
     resource: String,
+    resource_id: String,
     category: UseCategory,
     metric: String,
     value: Option<f64>,
@@ -365,8 +369,9 @@ struct SummaryRow {
 
 fn load_summary(connection: &Connection) -> Vec<SummaryRow> {
     let Ok(mut statement) = connection.prepare(
-        "SELECT resource, category, metric, value, unit, scope FROM snapshot_summary
-         ORDER BY resource, category, metric;",
+        "SELECT resource, resource_id, category, metric, value, unit, scope
+         FROM snapshot_summary
+         ORDER BY resource, category, metric, resource_id;",
     ) else {
         return Vec::new();
     };
@@ -375,17 +380,19 @@ fn load_summary(connection: &Connection) -> Vec<SummaryRow> {
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            row.get::<_, Option<f64>>(3)?,
-            row.get::<_, String>(4)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<f64>>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
         ))
     }) else {
         return Vec::new();
     };
     rows.filter_map(|row| {
-        let (resource, category, metric, value, unit, scope) = row.ok()?;
+        let (resource, resource_id, category, metric, value, unit, scope) = row.ok()?;
         Some(SummaryRow {
             resource,
+            resource_id,
             category: UseCategory::parse(&category)?,
             metric,
             value,
@@ -632,6 +639,7 @@ fn summarize(
             .unwrap_or(0);
         result[index].push(SummaryMetric {
             metric: row.metric.clone(),
+            entity: entity_label(summary_rows, row),
             value: row
                 .value
                 .map(|value| format_value(value, &row.unit))
@@ -641,6 +649,16 @@ fn summarize(
         });
     }
     result
+}
+
+/// Names the entity a row measured, but only where the resource has several:
+/// a host with one thermal zone gains nothing from labelling it.
+fn entity_label(summary_rows: &[SummaryRow], row: &SummaryRow) -> Option<String> {
+    summary_rows
+        .iter()
+        .filter(|other| other.resource == row.resource && other.metric == row.metric)
+        .nth(1)
+        .map(|_| row.resource_id.clone())
 }
 
 /// Normalizes a summary value into 0..=1 when its unit has a natural ceiling:
@@ -661,25 +679,38 @@ fn metric_fraction(
                 (duration_ns as f64 / 1e9) * logical_cpu_count.unwrap_or(1).max(1) as f64;
             value / capacity
         }
-        "bytes" => value / ceiling(summary_rows, row, "host_total")?,
-        // `snapshot_summary` carries no resource_id, so these ceilings are the
-        // maximum across clusters and zones.
-        "hertz" => value / ceiling(summary_rows, row, "frequency_max")?,
-        "celsius" => value / ceiling(summary_rows, row, "temperature_critical")?,
+        // `host_total` is published once for the machine, not per entity.
+        "bytes" => value / ceiling(summary_rows, row, "host_total", false)?,
+        "hertz" => value / ceiling(summary_rows, row, "frequency_max", true)?,
+        "celsius" => value / ceiling(summary_rows, row, "temperature_critical", true)?,
         _ => return None,
     };
     fraction.is_finite().then(|| fraction.clamp(0.0, 1.0))
 }
 
-fn ceiling(summary_rows: &[SummaryRow], row: &SummaryRow, metric: &str) -> Option<f64> {
-    summary_value(summary_rows, &row.resource, metric).filter(|total| *total > 0.0)
+/// A metric's ceiling. Clocks and temperatures are only comparable within one
+/// entity: a little core sitting at its own 1.8GHz ceiling is not throttled
+/// because some big core on the same die can reach 2.6GHz.
+fn ceiling(
+    summary_rows: &[SummaryRow],
+    row: &SummaryRow,
+    metric: &str,
+    per_entity: bool,
+) -> Option<f64> {
+    summary_rows
+        .iter()
+        .filter(|other| other.resource == row.resource && other.metric == metric)
+        .filter(|other| !per_entity || other.resource_id == row.resource_id)
+        .find_map(|other| other.value)
+        .filter(|ceiling| *ceiling > 0.0)
 }
 
 fn summary_value(summary_rows: &[SummaryRow], resource: &str, metric: &str) -> Option<f64> {
     summary_rows
         .iter()
-        .find(|row| row.resource == resource && row.metric == metric)
-        .and_then(|row| row.value)
+        .filter(|row| row.resource == resource && row.metric == metric)
+        .filter_map(|row| row.value)
+        .reduce(f64::max)
 }
 
 fn headline(
@@ -911,7 +942,7 @@ mod tests {
                     metric TEXT, value DOUBLE, unit TEXT, scope TEXT, source TEXT, quality TEXT
                 );
                 CREATE TABLE snapshot_summary (
-                    resource TEXT, category TEXT, metric TEXT, value DOUBLE,
+                    resource TEXT, resource_id TEXT, category TEXT, metric TEXT, value DOUBLE,
                     unit TEXT, scope TEXT, source TEXT, quality TEXT
                 );
                 CREATE TABLE snapshot_findings (
@@ -989,7 +1020,7 @@ mod tests {
         connection
             .execute_batch(
                 "INSERT INTO snapshot_summary VALUES
-                 ('cpu', 'utilization', 'cgroup_cpu_time', 4.0, 'seconds', 'process_tree', 'cgroup_v2', 'exact');
+                 ('cpu', 'process_tree', 'utilization', 'cgroup_cpu_time', 4.0, 'seconds', 'process_tree', 'cgroup_v2', 'exact');
                  INSERT INTO snapshot_findings VALUES
                  (1, 'high', 'memory', 'finding', 'evidence', 'recommendation', 'mixed', 'exact');
                  INSERT INTO snapshot_collectors VALUES
@@ -1034,6 +1065,7 @@ mod tests {
     fn summary_metrics_meter_only_against_a_real_ceiling() {
         let row = |resource: &str, metric: &str, value: f64, unit: &str| SummaryRow {
             resource: resource.to_owned(),
+            resource_id: "process_tree".to_owned(),
             category: UseCategory::Utilization,
             metric: metric.to_owned(),
             value: Some(value),
@@ -1061,8 +1093,19 @@ mod tests {
     }
 
     fn summary_row(resource: &str, metric: &str, value: f64, unit: &str) -> SummaryRow {
+        entity_row(resource, "host", metric, value, unit)
+    }
+
+    fn entity_row(
+        resource: &str,
+        resource_id: &str,
+        metric: &str,
+        value: f64,
+        unit: &str,
+    ) -> SummaryRow {
         SummaryRow {
             resource: resource.to_owned(),
+            resource_id: resource_id.to_owned(),
             category: UseCategory::Utilization,
             metric: metric.to_owned(),
             value: Some(value),
@@ -1116,6 +1159,40 @@ mod tests {
         assert_eq!(
             fractions("thermal"),
             [("temperature".to_owned(), Some(0.5))]
+        );
+    }
+
+    #[test]
+    fn each_cluster_meters_against_its_own_ceiling_and_is_named() {
+        // Orion O6: little cores pinned at their ceiling, big cores idling at
+        // half of theirs. A max-across-clusters denominator would report the
+        // little cores as throttled to 69%.
+        let rows = [
+            entity_row("cpu", "cortex_a520", "frequency", 1.8e9, "hertz"),
+            entity_row("cpu", "cortex_a520", "frequency_max", 1.8e9, "hertz"),
+            entity_row("cpu", "cortex_a720_0", "frequency", 1.3e9, "hertz"),
+            entity_row("cpu", "cortex_a720_0", "frequency_max", 2.6e9, "hertz"),
+        ];
+        let metered = summarize(&rows, "cpu", 2_000_000_000, Some(12))[0]
+            .iter()
+            .map(|metric| (metric.entity.clone(), metric.fraction))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            metered,
+            [
+                (Some("cortex_a520".to_owned()), Some(1.0)),
+                (Some("cortex_a720_0".to_owned()), Some(0.5)),
+            ]
+        );
+
+        // A host with one cluster gains nothing from a name.
+        let single = [
+            summary_row("cpu", "frequency", 1.9e9, "hertz"),
+            summary_row("cpu", "frequency_max", 3.8e9, "hertz"),
+        ];
+        assert_eq!(
+            summarize(&single, "cpu", 2_000_000_000, Some(8))[0][0].entity,
+            None
         );
     }
 
