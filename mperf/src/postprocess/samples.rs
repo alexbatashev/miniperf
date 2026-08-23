@@ -677,14 +677,26 @@ pub(crate) fn resolve_folded_stack(
 /// Pick the better of the unwound stack and the branch-record (LBR) stack.
 ///
 /// The unwound stack — kernel callchain or post-hoc DWARF — is authoritative
-/// once it walked past the sampled frame; LBR only sees the last ~32 taken
-/// branches and only in user space. It wins only where the other source gave
-/// up, or where hardware genuinely saw deeper.
+/// once it walked past the sampled frame; LBR only sees the last ~32 calls and
+/// only in user space, so on a deeper call tree it is always rootless. It wins
+/// only where it is deeper *and* demonstrably the same stack: the unwound
+/// stack's outermost frame must be one of its call sites, i.e. the unwinder
+/// gave up inside the window the hardware saw.
 pub(crate) fn merge_lbr_stack(frames: Frames, lbr: &[u64]) -> Frames {
-    if lbr.len() > frames.len() {
-        return Frames::from_slice(lbr);
+    if lbr.len() <= frames.len() {
+        return frames;
     }
-    frames
+    match frames.last() {
+        Some(outermost) if !lbr.iter().any(|site| is_call_site(*site, *outermost)) => frames,
+        _ => Frames::from_slice(lbr),
+    }
+}
+
+/// Whether `site` is the call whose return address is `ret`. Unwinders yield
+/// return addresses while branch records yield the call instruction itself,
+/// which sits at most one instruction (15 bytes on x86) before it.
+fn is_call_site(site: u64, ret: u64) -> bool {
+    ret.wrapping_sub(site) <= 15
 }
 
 fn flamegraph_sample_weight(counter_delta: i64) -> Option<u64> {
@@ -704,7 +716,8 @@ fn serialized_call_stack(frames: &[u64]) -> String {
 
 /// Parse a sysfs cpumask list such as `"0,5-11"` into inclusive `(start, end)`
 /// ranges.
-fn parse_cpumask(mask: &str) -> Vec<(u32, u32)> {
+/// Expand a sysfs cpumask string such as `0,5-11` into inclusive CPU ranges.
+pub(crate) fn parse_cpumask(mask: &str) -> Vec<(u32, u32)> {
     mask.trim()
         .split(',')
         .filter_map(|part| {
@@ -779,25 +792,32 @@ mod tests {
     }
 
     #[test]
-    fn lbr_stack_only_replaces_a_shallower_unwind() {
-        let unwound = Frames::from_slice(&[1, 2, 3]);
-        let lbr = [1_u64, 4, 5];
+    fn lbr_stack_only_replaces_a_shallower_unwind_it_contains() {
+        let unwound = Frames::from_slice(&[0x100, 0x200, 0x300]);
         assert_eq!(
-            merge_lbr_stack(unwound.clone(), &lbr).as_slice(),
+            merge_lbr_stack(unwound.clone(), &[0x100, 0x400, 0x500]).as_slice(),
             unwound.as_slice()
         );
         assert_eq!(
-            merge_lbr_stack(unwound, &[1, 4, 5, 6]).as_slice(),
-            &[1, 4, 5, 6]
+            merge_lbr_stack(unwound.clone(), &[0x100, 0x400, 0x500, 0x600]).as_slice(),
+            unwound.as_slice()
         );
         assert_eq!(
-            merge_lbr_stack(Frames::from_slice(&[1]), &[1, 2]).as_slice(),
-            &[1, 2]
+            merge_lbr_stack(unwound.clone(), &[0x100, 0x400, 0x2fb, 0x600]).as_slice(),
+            &[0x100, 0x400, 0x2fb, 0x600]
+        );
+        assert_eq!(
+            merge_lbr_stack(unwound.clone(), &[0x100, 0x400, 0x310, 0x600]).as_slice(),
+            unwound.as_slice()
+        );
+        assert_eq!(
+            merge_lbr_stack(Frames::from_slice(&[0x100]), &[0x100, 0x200]).as_slice(),
+            &[0x100, 0x200]
         );
         assert_eq!(merge_lbr_stack(Frames::new(), &[7]).as_slice(), &[7]);
         assert_eq!(
-            merge_lbr_stack(Frames::from_slice(&[1, 2]), &[]).as_slice(),
-            &[1, 2]
+            merge_lbr_stack(Frames::from_slice(&[0x100, 0x200]), &[]).as_slice(),
+            &[0x100, 0x200]
         );
     }
 

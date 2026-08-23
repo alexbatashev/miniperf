@@ -67,11 +67,14 @@ impl PostHocUnwinder {
         }
     }
 
-    /// Apply the milestone fallback chain: DWARF, sampled callchain, then raw IP.
+    /// Resolve the deepest stack available: the kernel callchain or the DWARF
+    /// unwind of the user stack dump, whichever walked further, then raw IP.
     pub(crate) fn resolve(&mut self, sample: &RawSample<'_>) -> Frames {
         let mut frames = Frames::from_slice(sample.callchain);
         if sample.regs_mask != 0 {
-            if let Some(stack) = self.unwind(sample) {
+            if let Some(stack) = self.unwind(sample)
+                && stack.len() > frames.len()
+            {
                 frames = stack.into_iter().collect();
             } else if frames.is_empty()
                 && let Some(ip) = instruction_pointer(sample)

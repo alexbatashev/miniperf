@@ -3,6 +3,7 @@ mod disassembly;
 mod doctor;
 mod event_dispatcher;
 mod events_export;
+mod host_telemetry;
 mod postprocess;
 mod processing;
 mod query;

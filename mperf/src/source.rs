@@ -263,23 +263,28 @@ impl Source for PmuSamplingSource {
     fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
         let mut message = String::new();
         let mut status = "available";
+        let mut quality = "exact";
         for driver in &mut self.drivers {
             if let Err(error) = driver.stop() {
                 status = "degraded";
+                quality = "lossy";
                 message = error.to_string();
             }
         }
         self.drivers.clear();
+        #[cfg(target_os = "linux")]
+        if status == "available" && !pmu::inherited_sample_read_supported() {
+            status = "degraded";
+            quality = "best_effort";
+            message = "this kernel rejects inherited sampling groups with PERF_SAMPLE_READ \
+                       (Linux < 6.12); threads created after exec are not sampled"
+                .to_string();
+        }
         vec![SourceStatus {
             name: "pmu_sampling".to_string(),
             status: status.to_string(),
             source: "perf_events".to_string(),
-            quality: if status == "available" {
-                "exact"
-            } else {
-                "lossy"
-            }
-            .to_string(),
+            quality: quality.to_string(),
             message,
         }]
     }
@@ -420,6 +425,47 @@ impl Source for InternalEventsSource {
 
     fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
         Vec::new()
+    }
+}
+
+/// Host clock and thermal sampling. Not scenario- or platform-specific: what
+/// a part clocked at conditions every number a recording reports, so this runs
+/// wherever the host exposes the sensors and reports why it could not
+/// otherwise.
+#[derive(Default)]
+pub struct HostTelemetrySource {
+    monitor: Option<crate::host_telemetry::HostTelemetryMonitor>,
+}
+
+impl Source for HostTelemetrySource {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn declare(&self) -> SourceDecl {
+        SourceDecl {
+            name: "host_telemetry",
+            provides: &["host_telemetry"],
+        }
+    }
+
+    fn probe(&self, _directory: &Path) -> Availability {
+        Availability::Available
+    }
+
+    fn start(&mut self, context: &SessionContext) -> Result<()> {
+        self.monitor = Some(crate::host_telemetry::HostTelemetryMonitor::start(
+            &context.directory,
+            context.root_pid(),
+        )?);
+        Ok(())
+    }
+
+    fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
+        self.monitor
+            .take()
+            .map(|monitor| monitor.stop())
+            .unwrap_or_default()
     }
 }
 

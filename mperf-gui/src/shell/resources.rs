@@ -135,7 +135,12 @@ fn metric_row(metric: &SummaryMetric, category: UseCategory, theme: &Theme) -> g
                         .min_w(px(0.0))
                         .truncate()
                         .text_color(theme.muted_foreground)
-                        .child(metric.metric.replace('_', " ")),
+                        .child(match &metric.entity {
+                            Some(entity) => {
+                                format!("{} · {entity}", metric.metric.replace('_', " "))
+                            }
+                            None => metric.metric.replace('_', " "),
+                        }),
                 )
                 .child(div().flex_none().child(metric.value.clone()))
                 .when(!metric.scope.is_empty(), |el| {
@@ -178,9 +183,21 @@ fn meter_color(category: UseCategory, fraction: f32, theme: &Theme) -> Hsla {
     }
 }
 
-/// The card's one sparkline: the busiest utilization series, falling back to
+/// The card's one sparkline: engine occupancy for a device that reports it,
+/// else its clock; otherwise the busiest utilization series, falling back to
 /// whatever the resource does have.
 fn spark_chart(resource: &ResourceUse) -> Option<&SnapshotChart> {
+    if matches!(resource.resource.as_str(), "gpu" | "npu") {
+        let named = |metric: &str| {
+            resource
+                .charts
+                .iter()
+                .find(|chart| chart.metric == metric && chart.max_value > 0.0)
+        };
+        if let Some(chart) = named("busy").or_else(|| named("frequency")) {
+            return Some(chart);
+        }
+    }
     resource
         .charts
         .iter()
@@ -288,7 +305,7 @@ fn finding_card(finding: &SnapshotFinding, theme: &Theme) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn severity_color(severity: Severity, theme: &Theme) -> Hsla {
+pub(super) fn severity_color(severity: Severity, theme: &Theme) -> Hsla {
     match severity {
         Severity::High => theme.viz.status_critical,
         Severity::Medium => theme.viz.status_serious,

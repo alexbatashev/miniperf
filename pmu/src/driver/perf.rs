@@ -529,8 +529,33 @@ fn apply_grouped_counting_flags(attr: &mut perf_event_attr, enable_on_exec: bool
     attr.set_exclude_kernel(1);
     attr.set_exclude_user(0);
     attr.set_exclusive(0);
-    attr.set_inherit(1);
+    attr.set_inherit(inherited_sample_read_supported().into());
     attr.set_enable_on_exec(enable_on_exec.into());
+}
+
+/// Whether this kernel accepts an inherited sampling group whose samples carry
+/// grouped counter reads. Linux rejected `inherit` together with
+/// `PERF_SAMPLE_READ` before 6.12 (EINVAL; newer kernels want `PERF_SAMPLE_TID`
+/// alongside, which every sampling group here carries). On such hosts the
+/// groups are opened without inheritance and threads created after exec go
+/// unsampled.
+pub fn inherited_sample_read_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut attr = base_counter_attr();
+        attr.type_ = sys::bindings::PERF_TYPE_SOFTWARE;
+        attr.config = sys::bindings::PERF_COUNT_SW_CPU_CLOCK as u64;
+        attr.set_exclude_kernel(1);
+        attr.set_inherit(1);
+        attr.sample_type = (PERF_SAMPLE_READ | PERF_SAMPLE_TID) as u64;
+        attr.sample_period = 1_000_000;
+        let fd = unsafe { sys::perf_event_open(&mut attr, 0, -1, -1, 0) };
+        if fd < 0 {
+            return std::io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL);
+        }
+        unsafe { close(fd) };
+        true
+    })
 }
 
 /// What each sample of a group captures, independent of the counters in it.
@@ -568,7 +593,9 @@ fn apply_sampling_flags(
     // Process profiles must include worker threads created after exec. Without
     // inheritance, OpenMP/Rayon/pthread work silently disappears and any
     // loop-level timing or counter attribution is fundamentally incomplete.
-    attr.set_inherit(1);
+    // Kernels before 6.12 refuse inheritance together with PERF_SAMPLE_READ;
+    // there the group is opened uninherited and the loss is reported.
+    attr.set_inherit(inherited_sample_read_supported().into());
     attr.set_enable_on_exec(enable_on_exec.into());
     if precise_ip {
         attr.set_precise_ip(2);

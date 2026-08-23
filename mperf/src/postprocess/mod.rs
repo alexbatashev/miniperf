@@ -22,6 +22,7 @@ use tables::{Columns, Tables, quote_identifier};
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) use samples::RawSample;
+pub(crate) use samples::parse_cpumask;
 
 /// Turn a recording into the derived tables every consumer reads: one Parquet
 /// file per table in the session directory.
@@ -35,6 +36,8 @@ pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()>
 
     let tables = Tables::open(res_dir)?;
     samples::process(&tables, &info, res_dir, &mut pb).await?;
+    snapshot::write_host_telemetry(&tables, res_dir)?;
+    snapshot::write_collectors(&tables, &info)?;
 
     match info.scenario {
         Scenario::Snapshot => {

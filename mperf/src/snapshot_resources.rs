@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::host_telemetry::{resource_sample_batch, resource_sample_schema, sample, status};
+
 const INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) struct ResourceMonitor {
@@ -731,58 +733,6 @@ fn collect(
     statuses
 }
 
-fn resource_sample_schema() -> std::sync::Arc<store::arrow::datatypes::Schema> {
-    use store::arrow::datatypes::{DataType, Field, Schema};
-    std::sync::Arc::new(Schema::new(vec![
-        Field::new("timestamp_ns", DataType::Int64, false),
-        Field::new("resource", DataType::Utf8, false),
-        Field::new("resource_id", DataType::Utf8, false),
-        Field::new("category", DataType::Utf8, false),
-        Field::new("metric", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-        Field::new("unit", DataType::Utf8, false),
-        Field::new("scope", DataType::Utf8, false),
-        Field::new("source", DataType::Utf8, false),
-        Field::new("quality", DataType::Utf8, false),
-    ]))
-}
-
-fn resource_sample_batch(
-    samples: &[SnapshotResourceSample],
-) -> anyhow::Result<store::arrow::record_batch::RecordBatch> {
-    use store::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
-    let text = |field: fn(&SnapshotResourceSample) -> &str| -> ArrayRef {
-        std::sync::Arc::new(StringArray::from(
-            samples.iter().map(field).collect::<Vec<_>>(),
-        ))
-    };
-    Ok(store::arrow::record_batch::RecordBatch::try_new(
-        resource_sample_schema(),
-        vec![
-            std::sync::Arc::new(Int64Array::from(
-                samples
-                    .iter()
-                    .map(|sample| sample.timestamp_ns as i64)
-                    .collect::<Vec<_>>(),
-            )),
-            text(|sample| &sample.resource),
-            text(|sample| &sample.resource_id),
-            text(|sample| &sample.category),
-            text(|sample| &sample.metric),
-            std::sync::Arc::new(Float64Array::from(
-                samples
-                    .iter()
-                    .map(|sample| sample.value)
-                    .collect::<Vec<_>>(),
-            )),
-            text(|sample| &sample.unit),
-            text(|sample| &sample.scope),
-            text(|sample| &sample.source),
-            text(|sample| &sample.quality),
-        ],
-    )?)
-}
-
 fn process_schema() -> std::sync::Arc<store::arrow::datatypes::Schema> {
     use store::arrow::datatypes::{DataType, Field, Schema};
     std::sync::Arc::new(Schema::new(vec![
@@ -1282,49 +1232,6 @@ fn device_sample(
         source,
         "exact_system",
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn sample(
-    timestamp_ns: u64,
-    resource: &str,
-    resource_id: &str,
-    category: &str,
-    metric: &str,
-    value: f64,
-    unit: &str,
-    scope: &str,
-    source: &str,
-    quality: &str,
-) -> SnapshotResourceSample {
-    SnapshotResourceSample {
-        timestamp_ns,
-        resource: resource.to_string(),
-        resource_id: resource_id.to_string(),
-        category: category.to_string(),
-        metric: metric.to_string(),
-        value,
-        unit: unit.to_string(),
-        scope: scope.to_string(),
-        source: source.to_string(),
-        quality: quality.to_string(),
-    }
-}
-
-fn status(
-    name: &str,
-    status_value: &str,
-    source: &str,
-    quality: &str,
-    message: &str,
-) -> SnapshotCollectorStatus {
-    SnapshotCollectorStatus {
-        name: name.to_string(),
-        status: status_value.to_string(),
-        source: source.to_string(),
-        quality: quality.to_string(),
-        message: message.to_string(),
-    }
 }
 
 #[cfg(test)]

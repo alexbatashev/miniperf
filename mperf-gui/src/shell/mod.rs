@@ -122,6 +122,13 @@ fn heat_cell(samples: u64, max: u64, theme: &Theme) -> impl IntoElement + use<> 
         )
 }
 
+/// Clock/throttle badge: a TMA or hotspot reading is not interpretable without
+/// the clock the run actually saw.
+fn clock_badge(session: &ShellSession, theme: &Theme) -> Option<impl IntoElement + use<>> {
+    let health = session.snapshot.as_ref()?.clock_health()?;
+    Some(badge(health.label()).tint(resources::severity_color(health.severity, theme)))
+}
+
 fn summary_stat(
     label: &'static str,
     value: String,
@@ -1768,6 +1775,9 @@ impl ShellView {
             .flex_col()
             .gap(px(8.0))
             .child(div().flex().flex_wrap().gap(px(8.0)).children(tiles))
+            .when_some(clock_badge(session, &theme), |el, badge| {
+                el.child(div().flex().flex_wrap().gap(px(6.0)).child(badge))
+            })
             .child(div().flex().flex_wrap().gap(px(8.0)).children(blocks))
             .when(!top.is_empty(), |el| {
                 el.child(

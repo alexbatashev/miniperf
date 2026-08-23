@@ -522,7 +522,7 @@ COMMON DATASETS
   proc_map               Symbol and source information by instruction pointer
   snapshot_processes     Observed process-tree membership and coverage quality
   snapshot_resource_samples  Normalized CPU/memory/disk/network/uncore timeline
-  snapshot_summary       Recording-wide resource peaks and totals
+  snapshot_summary       Recording-wide peaks and totals, per resource_id
   snapshot_findings      Ranked USE findings and next-measurement guidance
   snapshot_collectors    Collector availability, provenance, and remediation
   capture_fidelity       Chosen capture strategy and why better ones were rejected
