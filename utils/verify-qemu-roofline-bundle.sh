@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+symbols_only=0
+if [[ "${1:-}" == --symbols-only ]]; then
+    # Cross-built bundles cannot be executed on the build host; the exported
+    # plugin API is still checkable with readelf.
+    symbols_only=1
+    shift
+fi
 if [[ $# -ne 1 ]]; then
-    printf 'usage: %s <extracted-qemu-bundle-directory>\n' "$0" >&2
+    printf 'usage: %s [--symbols-only] <extracted-qemu-bundle-directory>\n' "$0" >&2
     exit 2
 fi
 
@@ -10,6 +17,8 @@ bundle_directory="$(realpath "$1")"
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 plugin="${repository_root}/target/release/libminiperf_qemu_roofline.so"
 riscv_compiler="${RISCV_CC:-riscv64-linux-gnu-gcc}"
+x86_compiler="${X86_CC:-cc}"
+readelf_tool="${READELF:-readelf}"
 x86_fixture="${repository_root}/utils/qemu-roofline/tests/fixtures/x86-sse2-smoke.S"
 rvv_fixture="${repository_root}/utils/qemu-roofline/tests/fixtures/rvv-smoke.S"
 temporary_directory="$(mktemp -d /tmp/miniperf-qemu-verify.XXXXXX)"
@@ -46,18 +55,20 @@ check_qemu_api() {
         printf 'missing QEMU executable: %s\n' "${qemu}" >&2
         return 1
     fi
-    local help_output
-    if ! help_output="$("${qemu}" --help 2>&1)"; then
-        printf 'failed to execute %s:\n%s\n' "${qemu}" "${help_output}" >&2
-        return 1
-    fi
-    if ! grep -Eq '^[[:space:]]*-plugin' <<<"${help_output}"; then
-        printf '%s does not advertise TCG plugin support\n' "${qemu}" >&2
-        printf '%s\n' "${help_output}" >&2
-        return 1
+    if (( ! symbols_only )); then
+        local help_output
+        if ! help_output="$("${qemu}" --help 2>&1)"; then
+            printf 'failed to execute %s:\n%s\n' "${qemu}" "${help_output}" >&2
+            return 1
+        fi
+        if ! grep -Eq '^[[:space:]]*-plugin' <<<"${help_output}"; then
+            printf '%s does not advertise TCG plugin support\n' "${qemu}" >&2
+            printf '%s\n' "${help_output}" >&2
+            return 1
+        fi
     fi
     local symbols
-    symbols="$(readelf --dyn-syms --wide "${qemu}")"
+    symbols="$("${readelf_tool}" --dyn-syms --wide "${qemu}")"
     local symbol
     for symbol in "${required_symbols[@]}"; do
         if ! grep -Eq "[[:space:]]${symbol}(@@[^[:space:]]+)?$" <<<"${symbols}"; then
@@ -108,7 +119,11 @@ validate_capture() {
     fi
 }
 
-for executable in readelf grep head cargo cc "${riscv_compiler}"; do
+required_executables=("${readelf_tool}" grep head)
+if (( ! symbols_only )); then
+    required_executables+=(cargo "${x86_compiler}" "${riscv_compiler}")
+fi
+for executable in "${required_executables[@]}"; do
     if ! command -v "${executable}" >/dev/null; then
         printf 'verification dependency is unavailable: %s\n' "${executable}" >&2
         exit 1
@@ -118,11 +133,16 @@ done
 check_qemu_api "${bundle_directory}/bin/qemu-x86_64"
 check_qemu_api "${bundle_directory}/bin/qemu-riscv64"
 
+if (( symbols_only )); then
+    printf 'QEMU Roofline bundle verification passed (symbols only): plugin API exported by qemu-x86_64 and qemu-riscv64\n'
+    exit 0
+fi
+
 cargo build --release -p miniperf-qemu-roofline --manifest-path "${repository_root}/Cargo.toml"
 
 x86_counts="${temporary_directory}/x86.counts"
 x86_workload="${temporary_directory}/x86-sse2-smoke"
-cc -nostdlib -static "${x86_fixture}" -o "${x86_workload}"
+"${x86_compiler}" -nostdlib -static "${x86_fixture}" -o "${x86_workload}"
 OMP_NUM_THREADS=1 "${bundle_directory}/bin/qemu-x86_64" \
     -plugin "${plugin},output=${x86_counts}" \
     "${x86_workload}" >/dev/null

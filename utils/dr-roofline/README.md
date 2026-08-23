@@ -16,8 +16,8 @@ falls back; `--dynamorio`, `--dynamorio-client`, `MPERF_DYNAMORIO`,
 ## Build
 
 DynamoRIO must be built from master (releases lack the riscv64 port);
-`utils/build-dynamorio-bundle.sh` does everything at a pinned revision.
-Manually:
+`utils/build-dynamorio-bundle.sh <platform>` does everything at the revision
+pinned in `deps/manifest.toml`. Manually:
 
 ```sh
 cargo build --release -p miniperf-roofline-core

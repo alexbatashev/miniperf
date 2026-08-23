@@ -1,0 +1,260 @@
+name: Dependencies
+
+# Builds the external binaries miniperf links or ships — DuckDB, DynamoRIO and
+# qemu-user — for every platform that supports them, publishes them as a dated
+# prerelease, and opens a pull request repinning deps/manifest.toml.
+#
+# Nothing in the main CI gate builds these any more: it downloads the pinned
+# release instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      refresh_upstream:
+        description: Resolve the newest DynamoRIO commit and QEMU release instead of using the pinned versions
+        type: boolean
+        default: false
+      open_pull_request:
+        description: Open a pull request repinning deps/manifest.toml
+        type: boolean
+        default: true
+  schedule:
+    # Monthly, on the 1st.
+    - cron: '0 3 1 * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: deps
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Resolve versions
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      duckdb_version: ${{ steps.resolve.outputs.duckdb_version }}
+      dynamorio_revision: ${{ steps.resolve.outputs.dynamorio_revision }}
+      qemu_version: ${{ steps.resolve.outputs.qemu_version }}
+      qemu_sha256: ${{ steps.resolve.outputs.qemu_sha256 }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REFRESH: ${{ inputs.refresh_upstream || github.event_name == 'schedule' }}
+        run: |
+          set -euo pipefail
+          get() { python3 utils/deps/manifest.py get "$1"; }
+
+          # DuckDB is deliberately not auto-bumped: miniperf-store links the
+          # prebuilt library against the `duckdb` crate's pregenerated
+          # bindings, so the two must move together in a reviewed change.
+          duckdb_version="$(get upstream.duckdb.version)"
+          dynamorio_revision="$(get upstream.dynamorio.revision)"
+          qemu_version="$(get upstream.qemu.version)"
+          qemu_sha256="$(get upstream.qemu.source_sha256)"
+
+          if [[ "${REFRESH}" == true ]]; then
+            dynamorio_revision="$(gh api repos/DynamoRIO/dynamorio/commits/master --jq .sha)"
+            qemu_version="$(
+              curl --fail --silent --show-error https://download.qemu.org/ |
+                grep -oE 'qemu-[0-9]+\.[0-9]+\.[0-9]+\.tar\.xz' |
+                sed -e 's/^qemu-//' -e 's/\.tar\.xz$//' |
+                sort --version-sort |
+                tail -n 1
+            )"
+            curl --fail --location --retry 3 --silent --show-error \
+              "https://download.qemu.org/qemu-${qemu_version}.tar.xz" --output qemu.tar.xz
+            qemu_sha256="$(sha256sum qemu.tar.xz | awk '{ print $1 }')"
+            rm -f qemu.tar.xz
+          fi
+
+          {
+            printf 'release_tag=deps-%s\n' "$(date -u +'%Y.%m.%d')"
+            printf 'duckdb_version=%s\n' "${duckdb_version}"
+            printf 'dynamorio_revision=%s\n' "${dynamorio_revision}"
+            printf 'qemu_version=%s\n' "${qemu_version}"
+            printf 'qemu_sha256=%s\n' "${qemu_sha256}"
+          } | tee -a "${GITHUB_OUTPUT}"
+
+  build:
+    name: ${{ matrix.dependency }} (${{ matrix.platform }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { dependency: duckdb, platform: linux-x86_64, runner: ubuntu-24.04 }
+          - { dependency: duckdb, platform: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { dependency: duckdb, platform: linux-riscv64, runner: ubuntu-24.04, cross: riscv64 }
+          - { dependency: duckdb, platform: macos-aarch64, runner: macos-14 }
+          - { dependency: duckdb, platform: windows-x86_64, runner: windows-2022 }
+          - { dependency: dynamorio, platform: linux-x86_64, runner: ubuntu-24.04 }
+          - { dependency: dynamorio, platform: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { dependency: dynamorio, platform: linux-riscv64, runner: ubuntu-24.04, cross: riscv64 }
+          - { dependency: qemu, platform: linux-x86_64, runner: ubuntu-24.04 }
+          - { dependency: qemu, platform: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { dependency: qemu, platform: linux-riscv64, runner: ubuntu-24.04, cross: riscv64 }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      DUCKDB_VERSION: ${{ needs.plan.outputs.duckdb_version }}
+      DYNAMORIO_REVISION: ${{ needs.plan.outputs.dynamorio_revision }}
+      QEMU_VERSION: ${{ needs.plan.outputs.qemu_version }}
+      QEMU_SHA256: ${{ needs.plan.outputs.qemu_sha256 }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build zstd
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install --quiet ninja zstd
+
+      - name: Install Windows build tools
+        if: runner.os == 'Windows'
+        run: choco install ninja -y --no-progress
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+
+      - name: Assemble the riscv64 sysroot
+        if: matrix.cross == 'riscv64'
+        run: utils/deps/setup-riscv64-sysroot.sh
+
+      - name: Install DynamoRIO build dependencies
+        if: matrix.dependency == 'dynamorio' && matrix.cross != 'riscv64'
+        run: sudo apt-get install -y zlib1g-dev
+
+      - name: Install QEMU build dependencies
+        if: matrix.dependency == 'qemu'
+        run: |
+          sudo apt-get install -y \
+            curl \
+            gcc-riscv64-linux-gnu \
+            libglib2.0-dev \
+            pkg-config \
+            python3 \
+            python3-venv \
+            xz-utils
+          if [[ "${{ matrix.cross }}" != riscv64 ]]; then
+            sudo apt-get install -y libcapstone-dev
+          fi
+          if [[ "${{ matrix.platform }}" == linux-aarch64 ]]; then
+            sudo apt-get install -y gcc-x86-64-linux-gnu
+          fi
+
+      - name: Install Rust toolchain
+        if: matrix.dependency != 'duckdb'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.cross == 'riscv64' && 'riscv64gc-unknown-linux-gnu' || '' }}
+
+      - name: Build ${{ matrix.dependency }}
+        run: |
+          case "${{ matrix.dependency }}" in
+            duckdb) utils/build-duckdb-bundle.sh "${{ matrix.platform }}" dist ;;
+            dynamorio) utils/build-dynamorio-bundle.sh "${{ matrix.platform }}" dist ;;
+            qemu) utils/build-qemu-user-bundle.sh "${{ matrix.platform }}" dist ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dep-${{ matrix.dependency }}-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ needs.plan.outputs.release_tag }}
+    needs: [plan, build]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dep-*
+          merge-multiple: true
+
+      - name: Regenerate deps/manifest.toml
+        run: |
+          set -euo pipefail
+          python3 utils/deps/manifest.py write \
+            --release "${{ needs.plan.outputs.release_tag }}" \
+            --artifacts dist \
+            --set "upstream.duckdb.version=${{ needs.plan.outputs.duckdb_version }}" \
+            --set "upstream.dynamorio.revision=${{ needs.plan.outputs.dynamorio_revision }}" \
+            --set "upstream.qemu.version=${{ needs.plan.outputs.qemu_version }}" \
+            --set "upstream.qemu.source_sha256=${{ needs.plan.outputs.qemu_sha256 }}" \
+            --output deps/manifest.toml
+
+      - name: Report coverage
+        id: coverage
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee -a "${GITHUB_STEP_SUMMARY}" > summary.md
+          import tomllib
+
+          expected = {
+              "duckdb": ["linux-x86_64", "linux-aarch64", "linux-riscv64", "macos-aarch64", "windows-x86_64"],
+              "dynamorio": ["linux-x86_64", "linux-aarch64", "linux-riscv64"],
+              "qemu": ["linux-x86_64", "linux-aarch64", "linux-riscv64"],
+          }
+          with open("deps/manifest.toml", "rb") as handle:
+              artifacts = tomllib.load(handle)["artifacts"]
+
+          print("| dependency | platform | status |")
+          print("| --- | --- | --- |")
+          missing = []
+          for dependency, platforms in expected.items():
+              for platform in platforms:
+                  if platform in artifacts.get(dependency, {}):
+                      print(f"| {dependency} | {platform} | built |")
+                  else:
+                      print(f"| {dependency} | {platform} | **MISSING** |")
+                      missing.append(f"{dependency}/{platform}")
+          if missing:
+              print()
+              print(f"Missing artifacts: {', '.join(missing)}")
+          PY
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.zst dist/*.zip dist/*.sha256)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo 'every dependency build failed; nothing to publish' >&2
+            exit 1
+          fi
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --prerelease \
+              --title "External dependencies ${RELEASE_TAG}" \
+              --notes-file summary.md
+          fi
+          gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+
+      - name: Open the repin pull request
+        if: github.event_name == 'schedule' || inputs.open_pull_request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: deps/${{ needs.plan.outputs.release_tag }}
+          title: 'ci: repin external dependencies on ${{ needs.plan.outputs.release_tag }}'
+          commit-message: 'ci: repin external dependencies on ${{ needs.plan.outputs.release_tag }}'
+          body-path: summary.md
+          add-paths: deps/manifest.toml
+          delete-branch: true

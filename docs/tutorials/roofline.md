@@ -45,7 +45,7 @@ The QEMU backend requires a user-mode QEMU executable whose `--help` output
 lists `-plugin`. You can build the pinned QEMU version used by miniperf:
 
 ```sh
-utils/build-qemu-user-bundle.sh dist
+utils/build-qemu-user-bundle.sh linux-x86_64 dist
 ```
 
 The script creates a versioned archive under `dist/`. Extract it and use the

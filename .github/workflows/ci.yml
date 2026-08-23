@@ -149,17 +149,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ inputs.release_tag }}" dist/* --clobber
-
-  dynamorio:
-    name: DynamoRIO bundle
-    needs: verify
-    uses: ./.github/workflows/dynamorio-artifact.yml
-    with:
-      release_tag: ${{ inputs.release_tag }}
-
-  qemu-user:
-    name: QEMU user-mode bundle
-    needs: verify
-    uses: ./.github/workflows/qemu-user-artifact.yml
-    with:
-      release_tag: ${{ inputs.release_tag }}

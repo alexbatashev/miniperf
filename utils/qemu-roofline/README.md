@@ -45,16 +45,18 @@ The plugin is written to
 `target/release/libminiperf_qemu_roofline.so`. Miniperf finds it next to the
 executable by default, or it can be selected with `--qemu-plugin`.
 
-To build plugin-enabled QEMU user-mode executables:
+To build plugin-enabled QEMU user-mode executables for one platform
+(`linux-x86_64`, `linux-aarch64`, or `linux-riscv64`):
 
 ```sh
-utils/build-qemu-user-bundle.sh dist
+utils/build-qemu-user-bundle.sh linux-x86_64 dist
 ```
 
-The source archive is verified by SHA-256. The resulting archive contains
-`qemu-x86_64`, `qemu-riscv32`, `qemu-riscv64`, `qemu-plugin.h`, QEMU licenses,
-a dependency manifest, and a checksum. It is dynamically linked and is built
-on Ubuntu 22.04 in the release workflow.
+The QEMU version comes from `deps/manifest.toml` and the source archive is
+verified by SHA-256. The resulting archive contains `qemu-x86_64`,
+`qemu-riscv32`, `qemu-riscv64`, `qemu-plugin.h`, QEMU licenses, a dependency
+manifest, and a checksum. `.github/workflows/deps.yml` builds it for every
+platform and publishes it as a pinned prerelease.
 
 See the [Roofline analysis tutorial](../../docs/tutorials/roofline.md) for
 complete recording examples.
