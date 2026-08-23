@@ -10,10 +10,16 @@ set -euo pipefail
 # shellcheck source=utils/deps/common.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deps/common.sh"
 
+# qemu-user reads its own options from QEMU_* environment variables, so a
+# stray QEMU_VERSION or QEMU_PLUGIN in the environment silently changes what
+# every qemu invocation below does. Our knobs are MINIPERF_QEMU_* for that
+# reason; clear QEMU's before running any of the verification binaries.
+unset QEMU_VERSION QEMU_PLUGIN QEMU_CPU QEMU_LD_PREFIX QEMU_STRACE QEMU_LOG
+
 platform="${1:?usage: build-qemu-user-bundle.sh <platform> [output-directory]}"
 output_directory="${2:-dist}"
-qemu_version="${QEMU_VERSION:-$(deps_manifest_get upstream.qemu.version)}"
-qemu_sha256="${QEMU_SHA256:-$(deps_manifest_get upstream.qemu.source_sha256)}"
+qemu_version="${MINIPERF_QEMU_VERSION:-$(deps_manifest_get upstream.qemu.version)}"
+qemu_sha256="${MINIPERF_QEMU_SHA256:-$(deps_manifest_get upstream.qemu.source_sha256)}"
 repository_root="${deps_repository_root}"
 bundle_name="miniperf-qemu-user-${qemu_version}-${platform}"
 targets=x86_64-linux-user,riscv32-linux-user,riscv64-linux-user
@@ -30,7 +36,7 @@ build_root="$(mktemp -d "${DEPS_BUILD_PARENT:-/tmp}/miniperf-qemu.XXXXXX")"
 cleanup() {
     local status=$?
     trap - EXIT
-    if [[ "${status}" -ne 0 && "${QEMU_KEEP_FAILED_BUILD:-0}" == 1 ]]; then
+    if [[ "${status}" -ne 0 && "${MINIPERF_QEMU_KEEP_FAILED_BUILD:-0}" == 1 ]]; then
         printf 'Preserving failed QEMU build at %s\n' "${build_root}" >&2
     else
         rm -rf "${build_root}"
@@ -45,8 +51,8 @@ build_directory="${build_root}/build"
 install_directory="${build_root}/install"
 bundle_directory="${build_root}/${bundle_name}"
 
-if [[ -n "${QEMU_SOURCE_ARCHIVE:-}" ]]; then
-    cp "${QEMU_SOURCE_ARCHIVE}" "${archive}"
+if [[ -n "${MINIPERF_QEMU_SOURCE_ARCHIVE:-}" ]]; then
+    cp "${MINIPERF_QEMU_SOURCE_ARCHIVE}" "${archive}"
 else
     curl --fail --location --retry 3 \
         "https://download.qemu.org/qemu-${qemu_version}.tar.xz" \
@@ -63,7 +69,7 @@ mkdir -p "${source_directory}" "${build_directory}" "${install_directory}"
 tar --extract --file "${archive}" --directory "${source_directory}" --strip-components=1
 
 configure_arguments=(
-    --python="${QEMU_PYTHON:-/usr/bin/python3}"
+    --python="${MINIPERF_QEMU_PYTHON:-/usr/bin/python3}"
     --extra-ldflags='-Wl,-rpath,$ORIGIN/../lib'
     --disable-download
     --prefix=/usr
@@ -90,13 +96,13 @@ if [[ "${platform}" == linux-riscv64 ]]; then
     strip_tool=riscv64-linux-gnu-strip
     library_directory="${sysroot}/lib"
 else
-    configure_arguments+=(--cc="${QEMU_CC:-cc}" --cxx="${QEMU_CXX:-c++}")
+    configure_arguments+=(--cc="${MINIPERF_QEMU_CC:-cc}" --cxx="${MINIPERF_QEMU_CXX:-c++}")
 fi
 
 (
     cd "${build_directory}"
     "${source_directory}/configure" "${configure_arguments[@]}"
-    ninja -j "${QEMU_JOBS:-$(nproc)}"
+    ninja -j "${MINIPERF_QEMU_JOBS:-$(nproc)}"
     DESTDIR="${install_directory}" ninja install
 )
 

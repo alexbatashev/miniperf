@@ -46,6 +46,8 @@ cmake_arguments=(
     -DSKIP_EXTENSIONS=
 )
 
+# Keep MSYS from rewriting MSVC's '-FOO:bar' arguments as Windows paths.
+export MSYS2_ARG_CONV_EXCL='*'
 archiver=ar
 warning_flag=-w
 case "${platform}" in
@@ -79,7 +81,7 @@ EOF
         )
         ;;
     windows-x86_64)
-        warning_flag=/w
+        warning_flag=-w
         ;;
     *)
         printf 'unsupported platform for DuckDB: %s\n' "${platform}" >&2
@@ -105,15 +107,20 @@ cp "${source_directory}/LICENSE" "${bundle_directory}/DUCKDB_LICENSE.txt"
 # `dummy_static_extension_loader` for builds without static extensions. Merging
 # both leaves it to the linker which one it pulls, and picking the dummy
 # silently unregisters parquet, so keep only the generated one.
+# macOS ships bash 3.2, which has no `mapfile`.
+component_libraries=()
 if [[ "${platform}" == windows-* ]]; then
-    mapfile -t component_libraries < <(
-        find "${install_directory}/lib" -name '*.lib' -not -name 'dummy_static_extension_loader.lib' | sort
-    )
+    library_glob='*.lib'
+    dummy_loader='dummy_static_extension_loader.lib'
 else
-    mapfile -t component_libraries < <(
-        find "${install_directory}/lib" -name 'lib*.a' -not -name 'libdummy_static_extension_loader.a' | sort
-    )
+    library_glob='lib*.a'
+    dummy_loader='libdummy_static_extension_loader.a'
 fi
+while IFS= read -r library; do
+    component_libraries+=("${library}")
+done < <(
+    find "${install_directory}/lib" -name "${library_glob}" -not -name "${dummy_loader}" | sort
+)
 if [[ "${#component_libraries[@]}" -eq 0 ]]; then
     printf 'DuckDB install produced no static libraries in %s\n' "${install_directory}/lib" >&2
     exit 1
@@ -123,7 +130,7 @@ printf 'Merging %d DuckDB archives\n' "${#component_libraries[@]}"
 case "${platform}" in
     windows-*)
         merged_library="${bundle_directory}/lib/duckdb_static.lib"
-        lib.exe "/OUT:${merged_library}" "${component_libraries[@]}"
+        lib.exe "-OUT:${merged_library}" "${component_libraries[@]}"
         ;;
     macos-*)
         merged_library="${bundle_directory}/lib/libduckdb_static.a"
@@ -192,8 +199,8 @@ smoke_binary="${build_root}/duckdb-smoke"
 case "${platform}" in
     windows-*)
         smoke_binary="${build_root}/duckdb-smoke.exe"
-        cl.exe /nologo "/I${bundle_directory}/include" "${smoke_source}" \
-            "/Fe:${smoke_binary}" "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
+        cl.exe -nologo "-I${bundle_directory}/include" "${smoke_source}" \
+            "-Fe:${smoke_binary}" "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
         ;;
     macos-*)
         cc -I"${bundle_directory}/include" "${smoke_source}" -o "${smoke_binary}" \
@@ -212,10 +219,12 @@ esac
 smoke_runner=()
 if [[ "${platform}" == linux-riscv64 ]]; then
     # Cross-built on x86; run the check under qemu-user when the host has it.
-    if command -v qemu-riscv64-static >/dev/null 2>&1; then
-        smoke_runner=(qemu-riscv64-static)
+    if command -v qemu-riscv64 >/dev/null 2>&1; then
+        # The bundle is compiled for rv64gcv_zba_zbb and GCC autovectorizes at
+        # -O3, so the default qemu CPU (no V) would SIGILL.
+        smoke_runner=(qemu-riscv64 -cpu "rv64,v=true,vlen=256,zba=true,zbb=true")
     else
-        printf 'qemu-riscv64-static is unavailable; DuckDB bundle verified by linking only\n' >&2
+        printf 'qemu-riscv64 is unavailable; DuckDB bundle verified by linking only\n' >&2
     fi
 fi
 if [[ "${platform}" != linux-riscv64 || "${#smoke_runner[@]}" -gt 0 ]]; then
