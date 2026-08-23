@@ -4,29 +4,43 @@
 # for every platform that supports it, publishes the results as a dated
 # prerelease, and opens a pull request rewriting this file with the new
 # `release` tag and `[artifacts]` table. Build scripts and packaging read the
-# pins from here; nothing downloads "latest".
+# pins from here; nothing downloads “latest”.
 #
 # DuckDB's version must match the DuckDB that the pinned `duckdb` crate
 # generated its bindings from, because miniperf-store links the prebuilt
 # library against those pregenerated bindings. Bump both together.
 
-release = ""
+release = "deps-2026.08.23"
 
 [upstream.duckdb]
-version = "1.5.5"
 repository = "https://github.com/duckdb/duckdb.git"
+version = "1.5.5"
 
 [upstream.dynamorio]
-# Releases lack the riscv64 port, so this tracks master.
 repository = "https://github.com/DynamoRIO/dynamorio.git"
 revision = "1fd3603b213360404f3753fadd0e8e196be1cbdf"
 
 [upstream.qemu]
-version = "11.0.2"
 source_sha256 = "3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5"
+version = "11.0.2"
 
-# Filled in by the dependency workflow. Each entry is
-# [artifacts.<dependency>.<platform>] with the file name inside `release` and
-# its sha256. A missing platform means that dependency does not exist there:
-# DynamoRIO has no arm64 macOS port, and qemu-user targets Linux hosts only.
+# Built by the dependency workflow. A missing platform means that dependency
+# does not exist there: DynamoRIO has no arm64 macOS port, and qemu-user
+# targets Linux hosts only.
 [artifacts]
+
+[artifacts.duckdb."linux-aarch64"]
+file = "miniperf-duckdb-1.5.5-linux-aarch64.tar.zst"
+sha256 = "1d3b0617ea25a9fd06974dc38b0be044db0116c10c18c56d693a7e91bb7ec0a7"
+
+[artifacts.duckdb."linux-x86_64"]
+file = "miniperf-duckdb-1.5.5-linux-x86_64.tar.zst"
+sha256 = "c631769e525d77d309296435798889827fcfb6a172daa819f84f47b73dd05546"
+
+[artifacts.dynamorio."linux-aarch64"]
+file = "miniperf-dynamorio-1fd3603b2133-linux-aarch64.tar.zst"
+sha256 = "8cf0fc1fc263cea991ae83184dbf539b79873c9da40292e79f9ef904b0cb4688"
+
+[artifacts.dynamorio."linux-x86_64"]
+file = "miniperf-dynamorio-1fd3603b2133-linux-x86_64.tar.zst"
+sha256 = "ed6631db3f12cbae36505bd52907b18e518f1d55576a1b1bde418e8307ccc86a"
