@@ -101,10 +101,18 @@ cp "${install_directory}/include/duckdb.h" "${bundle_directory}/include/duckdb.h
 cp "${install_directory}/include/duckdb.hpp" "${bundle_directory}/include/duckdb.hpp"
 cp "${source_directory}/LICENSE" "${bundle_directory}/DUCKDB_LICENSE.txt"
 
+# DuckDB installs both the generated extension loader and a do-nothing
+# `dummy_static_extension_loader` for builds without static extensions. Merging
+# both leaves it to the linker which one it pulls, and picking the dummy
+# silently unregisters parquet, so keep only the generated one.
 if [[ "${platform}" == windows-* ]]; then
-    mapfile -t component_libraries < <(find "${install_directory}/lib" -name '*.lib' | sort)
+    mapfile -t component_libraries < <(
+        find "${install_directory}/lib" -name '*.lib' -not -name 'dummy_static_extension_loader.lib' | sort
+    )
 else
-    mapfile -t component_libraries < <(find "${install_directory}/lib" -name 'lib*.a' | sort)
+    mapfile -t component_libraries < <(
+        find "${install_directory}/lib" -name 'lib*.a' -not -name 'libdummy_static_extension_loader.a' | sort
+    )
 fi
 if [[ "${#component_libraries[@]}" -eq 0 ]]; then
     printf 'DuckDB install produced no static libraries in %s\n' "${install_directory}/lib" >&2
@@ -147,11 +155,20 @@ cat >"${smoke_source}" <<'EOF'
 #include <stdio.h>
 
 int main(void) {
+    duckdb_config config;
     duckdb_database database;
     duckdb_connection connection;
     duckdb_result result;
 
-    if (duckdb_open(NULL, &database) != DuckDBSuccess) return 1;
+    // Without these, a parquet query could be satisfied by downloading the
+    // extension at runtime, which would make this test pass on a build where
+    // parquet was never linked in.
+    if (duckdb_create_config(&config) != DuckDBSuccess) return 1;
+    if (duckdb_set_config(config, "autoinstall_known_extensions", "false") != DuckDBSuccess)
+        return 1;
+    if (duckdb_set_config(config, "autoload_known_extensions", "false") != DuckDBSuccess) return 1;
+    if (duckdb_open_ext(NULL, &database, config, NULL) != DuckDBSuccess) return 1;
+    duckdb_destroy_config(&config);
     if (duckdb_connect(database, &connection) != DuckDBSuccess) return 2;
     if (duckdb_query(connection,
                      "COPY (SELECT 42::BIGINT AS answer) TO 'smoke.parquet' (FORMAT PARQUET)",
