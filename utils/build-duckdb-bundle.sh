@@ -137,6 +137,10 @@ if [[ "${#component_libraries[@]}" -eq 0 ]]; then
     exit 1
 fi
 printf 'Merging %d DuckDB archives\n' "${#component_libraries[@]}"
+for component_library in "${component_libraries[@]}"; do
+    printf '  %8s  %s\n' \
+        "$(du -k "${component_library}" | cut -f1)K" "$(basename "${component_library}")"
+done
 
 case "${platform}" in
     windows-*)
@@ -166,6 +170,9 @@ esac
 
 # Prove the merged archive is self-contained and that parquet is compiled in
 # rather than autoloaded, which is the whole reason miniperf-store links it.
+printf 'Merged library: %s (%s)\n' \
+    "${merged_library}" "$(du -k "${merged_library}" | cut -f1)K"
+
 smoke_source="${build_root}/duckdb-smoke.c"
 cat >"${smoke_source}" <<'EOF'
 #include <duckdb.h>
@@ -181,20 +188,41 @@ int main(void) {
     // Without these, a parquet query could be satisfied by downloading the
     // extension at runtime, which would make this test pass on a build where
     // parquet was never linked in.
-    if (duckdb_create_config(&config) != DuckDBSuccess) return 1;
-    if (duckdb_set_config(config, "autoinstall_known_extensions", "false") != DuckDBSuccess)
+    char *open_error = NULL;
+    if (duckdb_create_config(&config) != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_create_config failed\n");
         return 1;
-    if (duckdb_set_config(config, "autoload_known_extensions", "false") != DuckDBSuccess) return 1;
-    if (duckdb_open_ext(NULL, &database, config, NULL) != DuckDBSuccess) return 1;
+    }
+    if (duckdb_set_config(config, "autoinstall_known_extensions", "false") != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_set_config(autoinstall_known_extensions) failed\n");
+        return 7;
+    }
+    if (duckdb_set_config(config, "autoload_known_extensions", "false") != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_set_config(autoload_known_extensions) failed\n");
+        return 8;
+    }
+    if (duckdb_open_ext(NULL, &database, config, &open_error) != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_open_ext failed: %s\n",
+                open_error ? open_error : "(no error reported)");
+        return 9;
+    }
     duckdb_destroy_config(&config);
-    if (duckdb_connect(database, &connection) != DuckDBSuccess) return 2;
+    if (duckdb_connect(database, &connection) != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_connect failed\n");
+        return 2;
+    }
+    duckdb_result write_result;
     if (duckdb_query(connection,
                      "COPY (SELECT 42::BIGINT AS answer) TO 'smoke.parquet' (FORMAT PARQUET)",
-                     NULL) != DuckDBSuccess)
+                     &write_result) != DuckDBSuccess) {
+        fprintf(stderr, "parquet write failed: %s\n", duckdb_result_error(&write_result));
         return 3;
+    }
     if (duckdb_query(connection, "SELECT answer FROM read_parquet('smoke.parquet')", &result) !=
-        DuckDBSuccess)
+        DuckDBSuccess) {
+        fprintf(stderr, "parquet read failed: %s\n", duckdb_result_error(&result));
         return 4;
+    }
 
     duckdb_data_chunk chunk = duckdb_fetch_chunk(result);
     if (chunk == NULL) return 5;
