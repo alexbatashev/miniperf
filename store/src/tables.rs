@@ -349,8 +349,8 @@ impl ClockAnchorRows {
 
     pub fn push(&mut self, anchor: &str) {
         self.anchor.push(anchor.to_owned());
-        self.monotonic_ns.push(clock_ns(libc::CLOCK_MONOTONIC));
-        self.realtime_ns.push(clock_ns(libc::CLOCK_REALTIME));
+        self.monotonic_ns.push(monotonic_ns());
+        self.realtime_ns.push(realtime_ns());
     }
 
     pub fn is_empty(&self) -> bool {
@@ -367,13 +367,48 @@ impl ClockAnchorRows {
     }
 }
 
+#[cfg(unix)]
+// tv_sec and tv_nsec are already i64 on 64-bit Linux and narrower elsewhere, so
+// the conversion is a no-op on the platform clippy happens to be running on.
+#[allow(clippy::useless_conversion)]
 fn clock_ns(clock: libc::clockid_t) -> i64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     unsafe { libc::clock_gettime(clock, &mut ts) };
-    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+    i64::from(ts.tv_sec) * 1_000_000_000 + i64::from(ts.tv_nsec)
+}
+
+#[cfg(unix)]
+fn monotonic_ns() -> i64 {
+    clock_ns(libc::CLOCK_MONOTONIC)
+}
+
+#[cfg(unix)]
+fn realtime_ns() -> i64 {
+    clock_ns(libc::CLOCK_REALTIME)
+}
+
+// Windows has no clock_gettime. It only ever reads recordings — the collector
+// is Unix-only — but the table builders still have to compile there.
+#[cfg(not(unix))]
+fn monotonic_ns() -> i64 {
+    use std::{sync::OnceLock, time::Instant};
+
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    i64::try_from(ORIGIN.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(i64::MAX)
+}
+
+#[cfg(not(unix))]
+fn realtime_ns() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_nanos()).ok())
+        .unwrap_or_default()
 }
 
 /// Column builder for the record-time `samples_raw-<pid>-<seq>.parquet`
