@@ -127,11 +127,23 @@ else
     library_glob='lib*.a'
     dummy_loader='libdummy_static_extension_loader.a'
 fi
+excluded_libraries=("${dummy_loader}")
+if [[ "${platform}" == windows-* ]]; then
+    # DuckDB builds the shared library too, and duckdb.lib is its import
+    # library: stubs that define the entire C API. lib.exe keeps the first
+    # definition it sees, so leaving it in the merge replaces the static
+    # implementation with thunks into duckdb.dll. The link still succeeds and
+    # the result is a few hundred KB that fails at runtime. The Unix glob never
+    # matched the equivalent libduckdb.so, which is why only Windows broke.
+    excluded_libraries+=(duckdb.lib)
+fi
+find_arguments=("${install_directory}/lib" -name "${library_glob}")
+for excluded_library in "${excluded_libraries[@]}"; do
+    find_arguments+=(-not -name "${excluded_library}")
+done
 while IFS= read -r library; do
     component_libraries+=("${library}")
-done < <(
-    find "${install_directory}/lib" -name "${library_glob}" -not -name "${dummy_loader}" | sort
-)
+done < <(find "${find_arguments[@]}" | sort)
 if [[ "${#component_libraries[@]}" -eq 0 ]]; then
     printf 'DuckDB install produced no static libraries in %s\n' "${install_directory}/lib" >&2
     exit 1
@@ -170,8 +182,14 @@ esac
 
 # Prove the merged archive is self-contained and that parquet is compiled in
 # rather than autoloaded, which is the whole reason miniperf-store links it.
-printf 'Merged library: %s (%s)\n' \
-    "${merged_library}" "$(du -k "${merged_library}" | cut -f1)K"
+merged_kilobytes="$(du -k "${merged_library}" | cut -f1)"
+printf 'Merged library: %s (%sK)\n' "${merged_library}" "${merged_kilobytes}"
+if [[ "${merged_kilobytes}" -lt 20480 ]]; then
+    printf 'merged DuckDB library is only %sK; it holds import thunks rather than\n' \
+        "${merged_kilobytes}" >&2
+    printf 'the static implementation, which links cleanly and fails at runtime\n' >&2
+    exit 1
+fi
 
 smoke_source="${build_root}/duckdb-smoke.c"
 cat >"${smoke_source}" <<'EOF'
