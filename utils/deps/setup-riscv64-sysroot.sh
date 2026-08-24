@@ -88,6 +88,22 @@ sudo find "${sysroot}/lib" -maxdepth 1 -type l | while read -r link; do
     esac
 done
 
+# glib's .pc files carry absolute /usr paths and pkg-config prefixes
+# PKG_CONFIG_SYSROOT_DIR to them, so the compiler is handed
+# <sysroot>/usr/include/glib-2.0 and
+# <sysroot>/usr/lib/riscv64-linux-gnu/glib-2.0/include. This sysroot is flat
+# (include/, lib/), so bridge the two shapes with symlinks instead of keeping
+# a second copy of the tree.
+sudo mkdir -p "${sysroot}/usr"
+[[ -d "${sysroot}/usr/include" && ! -L "${sysroot}/usr/include" ]] ||
+    sudo ln -sfn ../include "${sysroot}/usr/include"
+[[ -d "${sysroot}/usr/lib" && ! -L "${sysroot}/usr/lib" ]] ||
+    sudo ln -sfn ../lib "${sysroot}/usr/lib"
+for triplet_directory in "${sysroot}/lib/riscv64-linux-gnu" "${sysroot}/include/riscv64-linux-gnu"; do
+    [[ -d "${triplet_directory}" && ! -L "${triplet_directory}" ]] ||
+        sudo ln -sfn . "${triplet_directory}"
+done
+
 # Meson looks up the cross ("host machine") pkg-config by prefixed name, and
 # neither pkg-config nor crossbuild-essential-riscv64 ships one, so QEMU's
 # meson setup fails to find glib. Provide the wrapper, pointed at the sysroot.

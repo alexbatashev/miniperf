@@ -75,8 +75,9 @@ EOF
         cmake_arguments+=(
             # DuckDB otherwise builds duckdb_platform_binary for the target and
             # executes it to name the platform, which binfmt cannot run without
-            # a riscv64 loader on the host.
-            -DDUCKDB_PLATFORM=linux_riscv64
+            # a riscv64 loader on the host. The build's own message suggests
+            # DUCKDB_PLATFORM, but CMakeLists.txt gates on this one.
+            -DDUCKDB_EXPLICIT_PLATFORM=linux_riscv64
             "-DCMAKE_TOOLCHAIN_FILE=${toolchain}"
             "-DCMAKE_C_FLAGS=-march=${RISCV_MARCH:-rv64gcv_zba_zbb} -mabi=lp64d"
             "-DCMAKE_CXX_FLAGS=-march=${RISCV_MARCH:-rv64gcv_zba_zbb} -mabi=lp64d"
@@ -206,16 +207,25 @@ int main(void) {
 EOF
 
 smoke_binary="${build_root}/duckdb-smoke"
+smoke_name=duckdb-smoke
 case "${platform}" in
     windows-*)
-        smoke_binary="${build_root}/duckdb-smoke.exe"
+        smoke_name=duckdb-smoke.exe
+        smoke_binary="${build_root}/${smoke_name}"
+        compile_status=0
         (
             cd "${build_root}"
             cl.exe -nologo "-I${bundle_directory}/include" "${smoke_source}" \
-                -Feduckdb-smoke.exe "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
-        )
+                "-Fe${smoke_name}" "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
+        ) || compile_status=$?
+        if [[ "${compile_status}" -ne 0 ]]; then
+            printf 'cl.exe exited %d building the DuckDB smoke test\n' "${compile_status}" >&2
+            exit 1
+        fi
         if [[ ! -f "${smoke_binary}" ]]; then
-            printf 'cl.exe did not produce %s\n' "${smoke_binary}" >&2
+            printf 'cl.exe reported success but %s is absent; build root holds:\n' \
+                "${smoke_binary}" >&2
+            ls -la "${build_root}" >&2
             exit 1
         fi
         ;;
@@ -235,7 +245,7 @@ esac
 
 # macOS ships bash 3.2, which treats "${empty[@]}" as an unbound variable under
 # `set -u`; keep the binary itself in the array so it is never empty.
-smoke_command=("${smoke_binary}")
+smoke_command=("./${smoke_name}")
 run_smoke=1
 if [[ "${platform}" == linux-riscv64 ]]; then
     # Cross-built on x86; run the check under qemu-user when the host has it.
@@ -243,7 +253,7 @@ if [[ "${platform}" == linux-riscv64 ]]; then
         # The bundle is compiled for rv64gcv_zba_zbb and GCC autovectorizes at
         # -O3, so the default qemu CPU (no V) would SIGILL.
         smoke_command=(
-            qemu-riscv64 -cpu "rv64,v=true,vlen=256,zba=true,zbb=true" "${smoke_binary}"
+            qemu-riscv64 -cpu "rv64,v=true,vlen=256,zba=true,zbb=true" "./${smoke_name}"
         )
     else
         printf 'qemu-riscv64 is unavailable; DuckDB bundle verified by linking only\n' >&2
@@ -251,7 +261,12 @@ if [[ "${platform}" == linux-riscv64 ]]; then
     fi
 fi
 if [[ "${run_smoke}" -eq 1 ]]; then
-    (cd "${build_root}" && "${smoke_command[@]}")
+    smoke_status=0
+    (cd "${build_root}" && "${smoke_command[@]}") || smoke_status=$?
+    if [[ "${smoke_status}" -ne 0 ]]; then
+        printf 'DuckDB smoke test exited %d\n' "${smoke_status}" >&2
+        exit 1
+    fi
 fi
 
 deps_publish duckdb "${platform}" "${version}" "${build_root}" "${bundle_name}" "${output_directory}"
