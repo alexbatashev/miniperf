@@ -175,6 +175,9 @@ esac
 
 {
     printf 'duckdb_version=%s\n' "${version}"
+    if [[ "${platform}" == windows-* ]]; then
+        printf 'required_define=DUCKDB_STATIC_BUILD\n'
+    fi
     printf 'platform=%s\n' "${platform}"
     printf 'extensions=parquet,core_functions\n'
     printf 'merged_archives=%s\n' "$(basename -a "${component_libraries[@]}" | paste -sd, -)"
@@ -261,8 +264,12 @@ case "${platform}" in
         compile_status=0
         (
             cd "${build_root}"
-            cl.exe -nologo "-I${bundle_directory}/include" "${smoke_source}" \
-                "-Fe${smoke_name}" "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
+            # Without DUCKDB_STATIC_BUILD, duckdb.h declares the C API
+            # __declspec(dllimport) on Windows and the link asks for __imp_*
+            # symbols that a static library does not carry.
+            cl.exe -nologo -DDUCKDB_STATIC_BUILD "-I${bundle_directory}/include" \
+                "${smoke_source}" "-Fe${smoke_name}" "${merged_library}" \
+                ws2_32.lib rstrtmgr.lib bcrypt.lib
         ) || compile_status=$?
         if [[ "${compile_status}" -ne 0 ]]; then
             printf 'cl.exe exited %d building the DuckDB smoke test\n' "${compile_status}" >&2
