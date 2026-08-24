@@ -73,6 +73,10 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 EOF
         cmake_arguments+=(
+            # DuckDB otherwise builds duckdb_platform_binary for the target and
+            # executes it to name the platform, which binfmt cannot run without
+            # a riscv64 loader on the host.
+            -DDUCKDB_PLATFORM=linux_riscv64
             "-DCMAKE_TOOLCHAIN_FILE=${toolchain}"
             "-DCMAKE_C_FLAGS=-march=${RISCV_MARCH:-rv64gcv_zba_zbb} -mabi=lp64d"
             "-DCMAKE_CXX_FLAGS=-march=${RISCV_MARCH:-rv64gcv_zba_zbb} -mabi=lp64d"
@@ -205,8 +209,15 @@ smoke_binary="${build_root}/duckdb-smoke"
 case "${platform}" in
     windows-*)
         smoke_binary="${build_root}/duckdb-smoke.exe"
-        cl.exe -nologo "-I${bundle_directory}/include" "${smoke_source}" \
-            "-Fe:${smoke_binary}" "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
+        (
+            cd "${build_root}"
+            cl.exe -nologo "-I${bundle_directory}/include" "${smoke_source}" \
+                -Feduckdb-smoke.exe "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
+        )
+        if [[ ! -f "${smoke_binary}" ]]; then
+            printf 'cl.exe did not produce %s\n' "${smoke_binary}" >&2
+            exit 1
+        fi
         ;;
     macos-*)
         cc -I"${bundle_directory}/include" "${smoke_source}" -o "${smoke_binary}" \

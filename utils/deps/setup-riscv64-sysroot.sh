@@ -88,4 +88,18 @@ sudo find "${sysroot}/lib" -maxdepth 1 -type l | while read -r link; do
     esac
 done
 
+# Meson looks up the cross ("host machine") pkg-config by prefixed name, and
+# neither pkg-config nor crossbuild-essential-riscv64 ships one, so QEMU's
+# meson setup fails to find glib. Provide the wrapper, pointed at the sysroot.
+sudo tee /usr/bin/riscv64-linux-gnu-pkg-config >/dev/null <<WRAPPER
+#!/bin/sh
+PKG_CONFIG_LIBDIR="${sysroot}/lib/pkgconfig"
+PKG_CONFIG_SYSROOT_DIR="${sysroot}"
+export PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR
+unset PKG_CONFIG_PATH
+exec pkg-config "\$@"
+WRAPPER
+sudo chmod 0755 /usr/bin/riscv64-linux-gnu-pkg-config
+
 printf 'riscv64 sysroot ready at %s\n' "${sysroot}"
+printf 'pkgconfig files: %s\n' "$(find "${sysroot}" -name '*.pc' | wc -l)"
