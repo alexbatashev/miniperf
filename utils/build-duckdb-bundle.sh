@@ -20,6 +20,12 @@ version="${DUCKDB_VERSION:-$(deps_manifest_get upstream.duckdb.version)}"
 repository="${DUCKDB_REPOSITORY:-$(deps_manifest_get upstream.duckdb.repository)}"
 bundle_name="miniperf-duckdb-${version}-${platform}"
 
+# CMake and MSVC are native binaries: handed an MSYS path like /tmp/... they
+# report the source directory as missing. Stage under the Windows temp
+# directory in mixed form (C:/...), which both bash and they understand.
+if [[ "${platform}" == windows-* && -z "${DEPS_BUILD_PARENT:-}" ]]; then
+    DEPS_BUILD_PARENT="$(deps_native_path "$(cd "${TEMP:-${TMP:-/tmp}}" && pwd)")"
+fi
 build_root="$(mktemp -d "${DEPS_BUILD_PARENT:-/tmp}/miniperf-duckdb.XXXXXX")"
 trap 'rm -rf "${build_root}"' EXIT
 source_directory="${build_root}/source"
@@ -216,19 +222,25 @@ case "${platform}" in
         ;;
 esac
 
-smoke_runner=()
+# macOS ships bash 3.2, which treats "${empty[@]}" as an unbound variable under
+# `set -u`; keep the binary itself in the array so it is never empty.
+smoke_command=("${smoke_binary}")
+run_smoke=1
 if [[ "${platform}" == linux-riscv64 ]]; then
     # Cross-built on x86; run the check under qemu-user when the host has it.
     if command -v qemu-riscv64 >/dev/null 2>&1; then
         # The bundle is compiled for rv64gcv_zba_zbb and GCC autovectorizes at
         # -O3, so the default qemu CPU (no V) would SIGILL.
-        smoke_runner=(qemu-riscv64 -cpu "rv64,v=true,vlen=256,zba=true,zbb=true")
+        smoke_command=(
+            qemu-riscv64 -cpu "rv64,v=true,vlen=256,zba=true,zbb=true" "${smoke_binary}"
+        )
     else
         printf 'qemu-riscv64 is unavailable; DuckDB bundle verified by linking only\n' >&2
+        run_smoke=0
     fi
 fi
-if [[ "${platform}" != linux-riscv64 || "${#smoke_runner[@]}" -gt 0 ]]; then
-    (cd "${build_root}" && "${smoke_runner[@]}" "${smoke_binary}")
+if [[ "${run_smoke}" -eq 1 ]]; then
+    (cd "${build_root}" && "${smoke_command[@]}")
 fi
 
 deps_publish duckdb "${platform}" "${version}" "${build_root}" "${bundle_name}" "${output_directory}"

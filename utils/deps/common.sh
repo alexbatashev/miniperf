@@ -14,6 +14,16 @@ deps_manifest_get() {
     "${deps_python}" "${deps_repository_root}/utils/deps/manifest.py" get "$1"
 }
 
+# Prints a path that native Windows tools (CMake, MSVC, Python) can open. Under
+# Git Bash the POSIX form is a fiction those binaries cannot resolve.
+deps_native_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
 deps_sha256() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{ print $1 }'
@@ -37,7 +47,9 @@ deps_publish() {
     if [[ "${platform}" == windows-* ]]; then
         archive_name="${bundle_name}.zip"
         "${deps_python}" -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2], sys.argv[3])' \
-            "${output_directory}/${bundle_name}" "${staging_parent}" "${bundle_name}"
+            "$(deps_native_path "${output_directory}/${bundle_name}")" \
+            "$(deps_native_path "${staging_parent}")" \
+            "${bundle_name}"
     else
         archive_name="${bundle_name}.tar.zst"
         tar --create --zstd --file "${output_directory}/${archive_name}" \

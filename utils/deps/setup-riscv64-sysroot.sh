@@ -30,6 +30,20 @@ packages=(
 sudo apt-get update
 sudo apt-get install -y crossbuild-essential-riscv64 rsync qemu-user qemu-user-binfmt
 
+# `dpkg --add-architecture` makes apt request a riscv64 index from every
+# configured source, and Ubuntu's own mirrors serve amd64 only — the resulting
+# 404s fail `apt-get update` outright. Pin the pre-existing sources to the host
+# architecture first; only ports.ubuntu.com carries riscv64.
+host_architecture="$(dpkg --print-architecture)"
+for source_file in /etc/apt/sources.list.d/*.sources; do
+    [[ -e "${source_file}" ]] || continue
+    grep -q '^Architectures:' "${source_file}" ||
+        sudo sed -i "/^Types:/i Architectures: ${host_architecture}" "${source_file}"
+done
+if [[ -s /etc/apt/sources.list ]]; then
+    sudo sed -i -E "s|^deb ([a-z])|deb [arch=${host_architecture}] \1|" /etc/apt/sources.list
+fi
+
 echo "deb [arch=riscv64] http://ports.ubuntu.com/ubuntu-ports ${release} main universe" \
     | sudo tee /etc/apt/sources.list.d/riscv64-ports.list >/dev/null
 sudo dpkg --add-architecture riscv64
