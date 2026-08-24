@@ -262,9 +262,19 @@ if [[ "${platform}" == linux-riscv64 ]]; then
 fi
 if [[ "${run_smoke}" -eq 1 ]]; then
     smoke_status=0
-    (cd "${build_root}" && "${smoke_command[@]}") || smoke_status=$?
+    if [[ "${platform}" == windows-* ]]; then
+        # Git Bash reports any failed image load as a bare 127 with no further
+        # detail. Run the binary through the Windows loader, which starts it if
+        # it is merely bash that cannot exec it, and names the missing DLL
+        # otherwise.
+        cmd.exe /c "cd /d \"$(cygpath -w "${build_root}")\" && ${smoke_name}" ||
+            smoke_status=$?
+    else
+        (cd "${build_root}" && "${smoke_command[@]}") || smoke_status=$?
+    fi
     if [[ "${smoke_status}" -ne 0 ]]; then
         printf 'DuckDB smoke test exited %d\n' "${smoke_status}" >&2
+        ls -la "${build_root}" >&2
         exit 1
     fi
 fi
