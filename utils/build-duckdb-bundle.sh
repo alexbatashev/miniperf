@@ -317,11 +317,10 @@ if [[ "${run_smoke}" -eq 1 ]]; then
     smoke_status=0
     if [[ "${platform}" == windows-* ]]; then
         # Git Bash reports any failed image load as a bare 127 with no further
-        # detail. Run the binary through the Windows loader, which starts it if
-        # it is merely bash that cannot exec it, and names the missing DLL
-        # otherwise.
-        cmd.exe /c "cd /d \"$(cygpath -w "${build_root}")\" && ${smoke_name}" ||
-            smoke_status=$?
+        # detail. Hand the binary to the Windows loader instead, inheriting the
+        # working directory from bash rather than quoting a path through
+        # cmd.exe, which is fussy enough to fail on its own.
+        (cd "${build_root}" && cmd.exe /c "${smoke_name}") || smoke_status=$?
     else
         (cd "${build_root}" && "${smoke_command[@]}") || smoke_status=$?
     fi
