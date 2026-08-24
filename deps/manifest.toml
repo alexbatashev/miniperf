@@ -24,9 +24,18 @@ revision = "1fd3603b213360404f3753fadd0e8e196be1cbdf"
 source_sha256 = "3745f6ea88e2e87fe0dc838b2b1d4e0a770bf48e01a1d5a186842a1fff76ccf5"
 version = "11.0.2"
 
-# Built by the dependency workflow. A missing platform means that dependency
-# does not exist there: DynamoRIO has no arm64 macOS port, and qemu-user
-# targets Linux hosts only.
+# Platforms each dependency must build for. deps.yml generates its build
+# matrix from this table and fails the run when the published release does
+# not cover it, so a partial build can never be published. Windows ships the
+# GUI only and therefore needs DuckDB alone; DynamoRIO has no arm64 macOS
+# port; qemu-user targets Linux hosts only.
+[support]
+duckdb = ["linux-x86_64", "linux-aarch64", "linux-riscv64", "macos-aarch64", "windows-x86_64"]
+dynamorio = ["linux-x86_64", "linux-aarch64", "linux-riscv64"]
+qemu = ["linux-x86_64", "linux-aarch64", "linux-riscv64"]
+
+# Built by the dependency workflow; every platform in [support] must be
+# present here or the run fails without publishing.
 [artifacts]
 
 [artifacts.duckdb."linux-aarch64"]

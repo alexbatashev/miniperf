@@ -296,8 +296,12 @@ impl QemuBackend {
         }
         let binary = qemu_binary_for_architecture(object.architecture())
             .context("unsupported guest architecture for QEMU roofline")?;
-        which::which(binary)
-            .with_context(|| format!("could not find '{binary}'; pass --qemu explicitly"))
+        if let Some(bundled) = super::package_path(&format!("qemu/bin/{binary}")) {
+            return Ok(bundled);
+        }
+        which::which(binary).with_context(|| {
+            format!("could not find '{binary}' in this miniperf package or on PATH; pass --qemu explicitly")
+        })
     }
 
     fn command(&self, qemu: &Path, guest: &[String], output: Option<&Path>) -> Result<Vec<String>> {
@@ -351,6 +355,10 @@ impl QemuBackend {
             AccountingTool::DynamoRio { drrun, client } => {
                 let mut command = vec![
                     drrun.to_string_lossy().to_string(),
+                    // The embedded bundle is 64-bit release only, so DR's
+                    // frontend warns about the lib32 and debug builds it
+                    // cannot find and then runs anyway.
+                    "-quiet".to_string(),
                     // Clean-call-heavy instrumentation exceeds DynamoRIO's
                     // block emit limits at the default 256-instruction blocks
                     // (observed on riscv64); traces add no value here.
@@ -541,15 +549,12 @@ fn dynamorio_paths(options: &Options) -> Result<(PathBuf, PathBuf)> {
     let drrun = if let Some(configured) = configured_drrun {
         resolve_dynamorio_launcher(&configured)?
     } else {
-        let bundled = super::executable_directory()
-            .unwrap_or_default()
-            .join("dynamorio/bin64/drrun");
-        if bundled.is_file() {
+        if let Some(bundled) = super::package_path("dynamorio/bin64/drrun") {
             bundled
         } else {
             which::which("drrun").map_err(|_| {
                 anyhow::anyhow!(
-                    "DynamoRIO 'drrun' was not found next to mperf or on PATH; pass --dynamorio with a drrun executable or DynamoRIO build directory"
+                    "DynamoRIO 'drrun' was not found in this miniperf package or on PATH; pass --dynamorio with a drrun executable or DynamoRIO build directory"
                 )
             })?
         }
@@ -1656,7 +1661,7 @@ fn hex(address: u64) -> String {
 
 #[cfg(target_os = "linux")]
 fn default_plugin_path() -> PathBuf {
-    super::installed_library("libminiperf_qemu_roofline.so").unwrap_or_else(|| {
+    super::package_path("libminiperf_qemu_roofline.so").unwrap_or_else(|| {
         super::executable_directory()
             .unwrap_or_default()
             .join("libminiperf_qemu_roofline.so")

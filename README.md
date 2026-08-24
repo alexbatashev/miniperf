@@ -221,6 +221,17 @@ macOS, make sure Xcode and its command-line tools are installed. If Cargo cannot
 locate the active SDK, run the command with
 `SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"`.
 
+Release packages for macOS ship the viewer as `mperf-gui.app`; drag it into
+`/Applications`, or run `bin/mperf-gui <output_directory>` from the unpacked
+archive to open a result from the command line. Windows packages ship the
+viewer alone — recording is Linux and macOS only.
+
+Linux packages are self-contained: the pinned DynamoRIO and qemu-user builds
+live under `lib/miniperf`, and `mperf` finds them relative to its own
+executable, so the instrumentation backends work straight out of the archive
+with nothing installed system-wide. `--dynamorio` and `--qemu` still override
+them.
+
 ### Querying Results
 
 Recorded performance data can also be explored non-interactively with read-only

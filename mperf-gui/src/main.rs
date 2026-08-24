@@ -206,6 +206,12 @@ fn main() -> Result<()> {
                 eprintln!("failed to register bundled Geist font: {error}");
             }
             ui::text_input::init(cx);
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
             if !gallery {
                 shell::init(cx);
             }

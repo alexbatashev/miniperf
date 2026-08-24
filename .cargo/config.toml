@@ -5,3 +5,11 @@
 [env]
 BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin = { value = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = false }
 BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_darwin = { value = "-isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = false }
+
+# miniperf-store links the DuckDB build pinned in deps/manifest.toml. Its
+# build script materialises that artifact under deps/cache/duckdb before the
+# link step; these point libduckdb-sys at it instead of letting the crate
+# compile its own copy or download an unpinned one.
+DUCKDB_LIB_DIR = { value = "deps/cache/duckdb/lib", relative = true, force = false }
+DUCKDB_INCLUDE_DIR = { value = "deps/cache/duckdb/include", relative = true, force = false }
+DUCKDB_STATIC = { value = "1", force = false }

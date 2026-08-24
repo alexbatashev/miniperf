@@ -1,5 +1,9 @@
 name: Reusable CI
 
+# Cheap checks gate expensive ones: formatting and a workspace `cargo check`
+# must pass before any platform builds or tests start, and everything must
+# pass before packaging runs.
+
 on:
   workflow_call:
     inputs:
@@ -13,8 +17,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quick:
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - task: fmt
+            command: cargo fmt --all -- --check
+          - task: check
+            command: cargo check --workspace --all-targets
+          # A hand-edited or half-published manifest would only surface at
+          # packaging time, on one platform, hours later.
+          - task: deps-manifest
+            command: python3 utils/deps/manifest.py check
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: ./.github/actions/rust
+        with:
+          target: x86_64-unknown-linux-gnu
+          components: clippy, rustfmt
+          cache-key: quick-${{ matrix.task }}
+      - run: ${{ matrix.command }}
+
   verify:
     name: ${{ matrix.task }} (${{ matrix.platform }})
+    needs: quick
     strategy:
       fail-fast: false
       matrix:
@@ -37,11 +66,6 @@ jobs:
           - platform: linux-x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            task: fmt
-            command: cargo fmt --all -- --check
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
             task: pmu-features
             command: cargo check -p miniperf-pmu --no-default-features && cargo clippy -p miniperf-pmu --all-features --all-targets -- -D warnings
           - platform: linux-x86_64
@@ -54,6 +78,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             task: clippy
             command: cargo clippy --workspace --all-targets -- -D warnings
+          - platform: linux-riscv64
+            runner: ubuntu-24.04
+            target: riscv64gc-unknown-linux-gnu
+            task: build
+            command: cargo build -p mperf -p miniperf-collector-core -p miniperf-shim-libc --target riscv64gc-unknown-linux-gnu
           - platform: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
@@ -69,27 +98,29 @@ jobs:
             target: aarch64-apple-darwin
             task: clippy
             command: cargo clippy --workspace --all-targets -- -D warnings
+          # Windows ships the GUI only, so it builds the viewer and what it
+          # needs rather than the whole workspace.
+          - platform: windows-x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            task: build
+            command: cargo build -p mperf-gui -p miniperf-store
+          - platform: windows-x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            task: clippy
+            command: cargo clippy -p mperf-gui -p miniperf-store --all-targets -- -D warnings
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install GPUI Linux dependencies
-        if: runner.os == 'Linux' && matrix.target != 'riscv64gc-unknown-linux-gnu' && (matrix.task == 'build' || matrix.task == 'test')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-      - name: Install RISC-V cross compiler
-        if: matrix.target == 'riscv64gc-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
+          target: ${{ matrix.target }}
           components: clippy, rustfmt
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: verify-${{ matrix.platform }}-${{ matrix.task }}
+          cache-key: verify-${{ matrix.platform }}-${{ matrix.task }}
       - name: Run ${{ matrix.task }}
         env:
           CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc
@@ -115,25 +146,19 @@ jobs:
           - platform: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
+          - platform: windows-x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7.0.1
-      - name: Install GPUI Linux dependencies
-        if: runner.os == 'Linux' && matrix.target != 'riscv64gc-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-      - name: Install RISC-V cross compiler
-        if: matrix.target == 'riscv64gc-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: package-${{ matrix.target }}
+          target: ${{ matrix.target }}
+          cache-key: package-${{ matrix.target }}
       - name: Build package
         env:
           CC_riscv64gc_unknown_linux_gnu: riscv64-linux-gnu-gcc

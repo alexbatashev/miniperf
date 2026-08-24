@@ -812,12 +812,16 @@ fn executable_directory() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-#[cfg(target_os = "linux")]
-fn installed_library(name: &str) -> Option<PathBuf> {
+/// Resolves `relative` inside the miniperf package that owns this executable.
+///
+/// Release packages keep the collector libraries and the embedded DynamoRIO
+/// and qemu-user bundles under `lib/miniperf`; a development build leaves them
+/// next to the binary.
+pub(super) fn package_path(relative: &str) -> Option<PathBuf> {
     let executable_directory = executable_directory().ok()?;
     [
-        executable_directory.join(name),
-        executable_directory.join("../lib/miniperf").join(name),
+        executable_directory.join(relative),
+        executable_directory.join("../lib/miniperf").join(relative),
     ]
     .into_iter()
     .find(|path| path.is_file())
@@ -825,7 +829,7 @@ fn installed_library(name: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn memory_preload_path() -> Option<PathBuf> {
-    installed_library("libmperf_libc.so")
+    package_path("libmperf_libc.so")
 }
 
 #[cfg(not(target_os = "linux"))]

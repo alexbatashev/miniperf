@@ -4,11 +4,15 @@
 `get` resolves a dotted key for shell callers. `write` rebuilds the manifest
 from the current upstream pins, optional `--set` overrides, and the `.meta`
 sidecars that the dependency build scripts drop next to each artifact.
+`matrix` renders the [support] table as a GitHub Actions build matrix and
+`check` fails when the built artifacts do not cover it, so the matrix and the
+completeness gate cannot drift apart.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import sys
 import tomllib
@@ -72,7 +76,40 @@ def quote(value: str) -> str:
     return f'"{value}"'
 
 
-def render(upstream: dict, release: str, artifacts: dict) -> str:
+RUNNERS = {
+    "linux-x86_64": "ubuntu-24.04",
+    "linux-aarch64": "ubuntu-24.04-arm",
+    "linux-riscv64": "ubuntu-24.04",
+    "macos-aarch64": "macos-14",
+    "windows-x86_64": "windows-2022",
+}
+
+
+def render_support(support: dict) -> list[str]:
+    lines = [
+        "# Platforms each dependency must build for. deps.yml generates its build",
+        "# matrix from this table and fails the run when the published release does",
+        "# not cover it, so a partial build can never be published. Windows ships the",
+        "# GUI only and therefore needs DuckDB alone; DynamoRIO has no arm64 macOS",
+        "# port; qemu-user targets Linux hosts only.",
+        "[support]",
+    ]
+    for dependency in sorted(support):
+        platforms = ", ".join(quote(platform) for platform in support[dependency])
+        lines.append(f"{dependency} = [{platforms}]")
+    return lines
+
+
+def missing_artifacts(support: dict, artifacts: dict) -> list[str]:
+    return [
+        f"{dependency}/{platform}"
+        for dependency in sorted(support)
+        for platform in support[dependency]
+        if platform not in artifacts.get(dependency, {})
+    ]
+
+
+def render(upstream: dict, release: str, artifacts: dict, support: dict) -> str:
     lines = [
         "# Pinned external binary dependencies.",
         "#",
@@ -95,9 +132,11 @@ def render(upstream: dict, release: str, artifacts: dict) -> str:
             lines.append(f"{key} = {quote(str(upstream[name][key]))}")
 
     lines.append("")
-    lines.append("# Built by the dependency workflow. A missing platform means that dependency")
-    lines.append("# does not exist there: DynamoRIO has no arm64 macOS port, and qemu-user")
-    lines.append("# targets Linux hosts only.")
+    lines.extend(render_support(support))
+
+    lines.append("")
+    lines.append("# Built by the dependency workflow; every platform in [support] must be")
+    lines.append("# present here or the run fails without publishing.")
     lines.append("[artifacts]")
     for dependency in sorted(artifacts):
         for platform in sorted(artifacts[dependency]):
@@ -129,14 +168,61 @@ def main() -> None:
     )
     write.add_argument("--output", type=pathlib.Path)
 
+    matrix = subcommands.add_parser("matrix", help="print the build matrix as JSON")
+    matrix.add_argument("--dependency", help="restrict the matrix to one dependency")
+
+    check = subcommands.add_parser("check", help="fail when [support] is not covered")
+    check.add_argument(
+        "--artifacts",
+        type=pathlib.Path,
+        help="verify freshly built .meta sidecars instead of the manifest's own table",
+    )
+
     arguments = parser.parse_args()
     manifest = load(arguments.manifest)
+
+    support = manifest.get("support", {})
 
     if arguments.command == "get":
         value = resolve(manifest, arguments.key)
         if isinstance(value, dict):
             raise SystemExit(f"'{arguments.key}' is a table, not a value")
         print(value)
+        return
+
+    if arguments.command == "matrix":
+        include = [
+            {
+                "dependency": dependency,
+                "platform": platform,
+                "runner": RUNNERS[platform],
+                "cross": "riscv64" if platform == "linux-riscv64" else "",
+            }
+            for dependency in sorted(support)
+            for platform in support[dependency]
+            if arguments.dependency in (None, dependency)
+        ]
+        unknown = {entry["platform"] for entry in include} - RUNNERS.keys()
+        if unknown:
+            raise SystemExit(f"no runner mapped for: {', '.join(sorted(unknown))}")
+        print(json.dumps({"include": include}))
+        return
+
+    if arguments.command == "check":
+        if arguments.artifacts:
+            artifacts = collect_artifacts(arguments.artifacts)
+        else:
+            artifacts = manifest.get("artifacts", {})
+        missing = missing_artifacts(support, artifacts)
+        for dependency in sorted(support):
+            for platform in support[dependency]:
+                built = platform in artifacts.get(dependency, {})
+                print(f"{'ok  ' if built else 'MISS'} {dependency}/{platform}")
+        if missing:
+            raise SystemExit(
+                f"\n{len(missing)} dependency build(s) missing: {', '.join(missing)}"
+            )
+        print(f"\nall {sum(len(p) for p in support.values())} dependency builds present")
         return
 
     upstream = manifest.get("upstream", {})
@@ -151,7 +237,14 @@ def main() -> None:
             raise SystemExit(f"unknown dependency in --set: {parts[1]}")
         upstream[parts[1]][parts[2]] = value
 
-    rendered = render(upstream, arguments.release, collect_artifacts(arguments.artifacts))
+    artifacts = collect_artifacts(arguments.artifacts)
+    missing = missing_artifacts(support, artifacts)
+    if missing:
+        raise SystemExit(
+            f"refusing to write a manifest missing {len(missing)} build(s): "
+            f"{', '.join(missing)}"
+        )
+    rendered = render(upstream, arguments.release, artifacts, support)
     if arguments.output:
         arguments.output.write_text(rendered)
     else:

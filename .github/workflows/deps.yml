@@ -35,6 +35,7 @@ jobs:
     name: Resolve versions
     runs-on: ubuntu-24.04
     outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
       release_tag: ${{ steps.resolve.outputs.release_tag }}
       duckdb_version: ${{ steps.resolve.outputs.duckdb_version }}
       dynamorio_revision: ${{ steps.resolve.outputs.dynamorio_revision }}
@@ -81,24 +82,17 @@ jobs:
             printf 'qemu_sha256=%s\n' "${qemu_sha256}"
           } | tee -a "${GITHUB_OUTPUT}"
 
+      # deps/manifest.toml's [support] table drives both the build matrix and
+      # the completeness gate in `publish`, so the two cannot disagree.
+      - id: matrix
+        run: printf 'matrix=%s\n' "$(python3 utils/deps/manifest.py matrix)" >>"${GITHUB_OUTPUT}"
+
   build:
     name: ${{ matrix.dependency }} (${{ matrix.platform }})
     needs: plan
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { dependency: duckdb, platform: linux-x86_64, runner: ubuntu-24.04 }
-          - { dependency: duckdb, platform: linux-aarch64, runner: ubuntu-24.04-arm }
-          - { dependency: duckdb, platform: linux-riscv64, runner: ubuntu-24.04, cross: riscv64 }
-          - { dependency: duckdb, platform: macos-aarch64, runner: macos-14 }
-          - { dependency: duckdb, platform: windows-x86_64, runner: windows-2022 }
-          - { dependency: dynamorio, platform: linux-x86_64, runner: ubuntu-24.04 }
-          - { dependency: dynamorio, platform: linux-aarch64, runner: ubuntu-24.04-arm }
-          - { dependency: dynamorio, platform: linux-riscv64, runner: ubuntu-24.04, cross: riscv64 }
-          - { dependency: qemu, platform: linux-x86_64, runner: ubuntu-24.04 }
-          - { dependency: qemu, platform: linux-aarch64, runner: ubuntu-24.04-arm }
-          - { dependency: qemu, platform: linux-riscv64, runner: ubuntu-24.04, cross: riscv64 }
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
@@ -179,7 +173,6 @@ jobs:
   publish:
     name: Publish ${{ needs.plan.outputs.release_tag }}
     needs: [plan, build]
-    if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
@@ -188,6 +181,13 @@ jobs:
           path: dist
           pattern: dep-*
           merge-multiple: true
+
+      # A partial dependency release is what let a 4-of-11 run publish itself
+      # and open a repin pull request. Fail before anything is written.
+      - name: Require every supported platform
+        run: |
+          set -euo pipefail
+          python3 utils/deps/manifest.py check --artifacts dist | tee -a "${GITHUB_STEP_SUMMARY}"
 
       - name: Regenerate deps/manifest.toml
         run: |
@@ -201,35 +201,16 @@ jobs:
             --set "upstream.qemu.source_sha256=${{ needs.plan.outputs.qemu_sha256 }}" \
             --output deps/manifest.toml
 
-      - name: Report coverage
-        id: coverage
+      - name: Summarise the release
         run: |
           set -euo pipefail
-          python3 - <<'PY' | tee -a "${GITHUB_STEP_SUMMARY}" > summary.md
-          import tomllib
-
-          expected = {
-              "duckdb": ["linux-x86_64", "linux-aarch64", "linux-riscv64", "macos-aarch64", "windows-x86_64"],
-              "dynamorio": ["linux-x86_64", "linux-aarch64", "linux-riscv64"],
-              "qemu": ["linux-x86_64", "linux-aarch64", "linux-riscv64"],
-          }
-          with open("deps/manifest.toml", "rb") as handle:
-              artifacts = tomllib.load(handle)["artifacts"]
-
-          print("| dependency | platform | status |")
-          print("| --- | --- | --- |")
-          missing = []
-          for dependency, platforms in expected.items():
-              for platform in platforms:
-                  if platform in artifacts.get(dependency, {}):
-                      print(f"| {dependency} | {platform} | built |")
-                  else:
-                      print(f"| {dependency} | {platform} | **MISSING** |")
-                      missing.append(f"{dependency}/{platform}")
-          if missing:
-              print()
-              print(f"Missing artifacts: {', '.join(missing)}")
-          PY
+          {
+            printf '# External dependencies %s\n\n' "${{ needs.plan.outputs.release_tag }}"
+            printf '| dependency | version |\n| --- | --- |\n'
+            printf '| DuckDB | %s |\n' "${{ needs.plan.outputs.duckdb_version }}"
+            printf '| DynamoRIO | %s |\n' "${{ needs.plan.outputs.dynamorio_revision }}"
+            printf '| qemu-user | %s |\n' "${{ needs.plan.outputs.qemu_version }}"
+          } >summary.md
 
       - name: Publish the release
         env:
@@ -239,10 +220,6 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           assets=(dist/*.tar.zst dist/*.zip dist/*.sha256)
-          if [[ "${#assets[@]}" -eq 0 ]]; then
-            echo 'every dependency build failed; nothing to publish' >&2
-            exit 1
-          fi
           if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release create "${RELEASE_TAG}" \
               --prerelease \
