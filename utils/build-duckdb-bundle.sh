@@ -20,6 +20,12 @@ version="${DUCKDB_VERSION:-$(deps_manifest_get upstream.duckdb.version)}"
 repository="${DUCKDB_REPOSITORY:-$(deps_manifest_get upstream.duckdb.repository)}"
 bundle_name="miniperf-duckdb-${version}-${platform}"
 
+# CMake and MSVC are native binaries: handed an MSYS path like /tmp/... they
+# report the source directory as missing. Stage under the Windows temp
+# directory in mixed form (C:/...), which both bash and they understand.
+if [[ "${platform}" == windows-* && -z "${DEPS_BUILD_PARENT:-}" ]]; then
+    DEPS_BUILD_PARENT="$(deps_native_path "$(cd "${TEMP:-${TMP:-/tmp}}" && pwd)")"
+fi
 build_root="$(mktemp -d "${DEPS_BUILD_PARENT:-/tmp}/miniperf-duckdb.XXXXXX")"
 trap 'rm -rf "${build_root}"' EXIT
 source_directory="${build_root}/source"
@@ -67,6 +73,11 @@ set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 EOF
         cmake_arguments+=(
+            # DuckDB otherwise builds duckdb_platform_binary for the target and
+            # executes it to name the platform, which binfmt cannot run without
+            # a riscv64 loader on the host. The build's own message suggests
+            # DUCKDB_PLATFORM, but CMakeLists.txt gates on this one.
+            -DDUCKDB_EXPLICIT_PLATFORM=linux_riscv64
             "-DCMAKE_TOOLCHAIN_FILE=${toolchain}"
             "-DCMAKE_C_FLAGS=-march=${RISCV_MARCH:-rv64gcv_zba_zbb} -mabi=lp64d"
             "-DCMAKE_CXX_FLAGS=-march=${RISCV_MARCH:-rv64gcv_zba_zbb} -mabi=lp64d"
@@ -116,16 +127,32 @@ else
     library_glob='lib*.a'
     dummy_loader='libdummy_static_extension_loader.a'
 fi
+excluded_libraries=("${dummy_loader}")
+if [[ "${platform}" == windows-* ]]; then
+    # DuckDB builds the shared library too, and duckdb.lib is its import
+    # library: stubs that define the entire C API. lib.exe keeps the first
+    # definition it sees, so leaving it in the merge replaces the static
+    # implementation with thunks into duckdb.dll. The link still succeeds and
+    # the result is a few hundred KB that fails at runtime. The Unix glob never
+    # matched the equivalent libduckdb.so, which is why only Windows broke.
+    excluded_libraries+=(duckdb.lib)
+fi
+find_arguments=("${install_directory}/lib" -name "${library_glob}")
+for excluded_library in "${excluded_libraries[@]}"; do
+    find_arguments+=(-not -name "${excluded_library}")
+done
 while IFS= read -r library; do
     component_libraries+=("${library}")
-done < <(
-    find "${install_directory}/lib" -name "${library_glob}" -not -name "${dummy_loader}" | sort
-)
+done < <(find "${find_arguments[@]}" | sort)
 if [[ "${#component_libraries[@]}" -eq 0 ]]; then
     printf 'DuckDB install produced no static libraries in %s\n' "${install_directory}/lib" >&2
     exit 1
 fi
 printf 'Merging %d DuckDB archives\n' "${#component_libraries[@]}"
+for component_library in "${component_libraries[@]}"; do
+    printf '  %8s  %s\n' \
+        "$(du -k "${component_library}" | cut -f1)K" "$(basename "${component_library}")"
+done
 
 case "${platform}" in
     windows-*)
@@ -148,6 +175,9 @@ esac
 
 {
     printf 'duckdb_version=%s\n' "${version}"
+    if [[ "${platform}" == windows-* ]]; then
+        printf 'required_define=DUCKDB_STATIC_BUILD\n'
+    fi
     printf 'platform=%s\n' "${platform}"
     printf 'extensions=parquet,core_functions\n'
     printf 'merged_archives=%s\n' "$(basename -a "${component_libraries[@]}" | paste -sd, -)"
@@ -155,6 +185,15 @@ esac
 
 # Prove the merged archive is self-contained and that parquet is compiled in
 # rather than autoloaded, which is the whole reason miniperf-store links it.
+merged_kilobytes="$(du -k "${merged_library}" | cut -f1)"
+printf 'Merged library: %s (%sK)\n' "${merged_library}" "${merged_kilobytes}"
+if [[ "${merged_kilobytes}" -lt 20480 ]]; then
+    printf 'merged DuckDB library is only %sK; it holds import thunks rather than\n' \
+        "${merged_kilobytes}" >&2
+    printf 'the static implementation, which links cleanly and fails at runtime\n' >&2
+    exit 1
+fi
+
 smoke_source="${build_root}/duckdb-smoke.c"
 cat >"${smoke_source}" <<'EOF'
 #include <duckdb.h>
@@ -170,20 +209,41 @@ int main(void) {
     // Without these, a parquet query could be satisfied by downloading the
     // extension at runtime, which would make this test pass on a build where
     // parquet was never linked in.
-    if (duckdb_create_config(&config) != DuckDBSuccess) return 1;
-    if (duckdb_set_config(config, "autoinstall_known_extensions", "false") != DuckDBSuccess)
+    char *open_error = NULL;
+    if (duckdb_create_config(&config) != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_create_config failed\n");
         return 1;
-    if (duckdb_set_config(config, "autoload_known_extensions", "false") != DuckDBSuccess) return 1;
-    if (duckdb_open_ext(NULL, &database, config, NULL) != DuckDBSuccess) return 1;
+    }
+    if (duckdb_set_config(config, "autoinstall_known_extensions", "false") != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_set_config(autoinstall_known_extensions) failed\n");
+        return 7;
+    }
+    if (duckdb_set_config(config, "autoload_known_extensions", "false") != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_set_config(autoload_known_extensions) failed\n");
+        return 8;
+    }
+    if (duckdb_open_ext(NULL, &database, config, &open_error) != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_open_ext failed: %s\n",
+                open_error ? open_error : "(no error reported)");
+        return 9;
+    }
     duckdb_destroy_config(&config);
-    if (duckdb_connect(database, &connection) != DuckDBSuccess) return 2;
+    if (duckdb_connect(database, &connection) != DuckDBSuccess) {
+        fprintf(stderr, "duckdb_connect failed\n");
+        return 2;
+    }
+    duckdb_result write_result;
     if (duckdb_query(connection,
                      "COPY (SELECT 42::BIGINT AS answer) TO 'smoke.parquet' (FORMAT PARQUET)",
-                     NULL) != DuckDBSuccess)
+                     &write_result) != DuckDBSuccess) {
+        fprintf(stderr, "parquet write failed: %s\n", duckdb_result_error(&write_result));
         return 3;
+    }
     if (duckdb_query(connection, "SELECT answer FROM read_parquet('smoke.parquet')", &result) !=
-        DuckDBSuccess)
+        DuckDBSuccess) {
+        fprintf(stderr, "parquet read failed: %s\n", duckdb_result_error(&result));
         return 4;
+    }
 
     duckdb_data_chunk chunk = duckdb_fetch_chunk(result);
     if (chunk == NULL) return 5;
@@ -196,11 +256,31 @@ int main(void) {
 EOF
 
 smoke_binary="${build_root}/duckdb-smoke"
+smoke_name=duckdb-smoke
 case "${platform}" in
     windows-*)
-        smoke_binary="${build_root}/duckdb-smoke.exe"
-        cl.exe -nologo "-I${bundle_directory}/include" "${smoke_source}" \
-            "-Fe:${smoke_binary}" "${merged_library}" ws2_32.lib rstrtmgr.lib bcrypt.lib
+        smoke_name=duckdb-smoke.exe
+        smoke_binary="${build_root}/${smoke_name}"
+        compile_status=0
+        (
+            cd "${build_root}"
+            # Without DUCKDB_STATIC_BUILD, duckdb.h declares the C API
+            # __declspec(dllimport) on Windows and the link asks for __imp_*
+            # symbols that a static library does not carry.
+            cl.exe -nologo -DDUCKDB_STATIC_BUILD "-I${bundle_directory}/include" \
+                "${smoke_source}" "-Fe${smoke_name}" "${merged_library}" \
+                ws2_32.lib rstrtmgr.lib bcrypt.lib
+        ) || compile_status=$?
+        if [[ "${compile_status}" -ne 0 ]]; then
+            printf 'cl.exe exited %d building the DuckDB smoke test\n' "${compile_status}" >&2
+            exit 1
+        fi
+        if [[ ! -f "${smoke_binary}" ]]; then
+            printf 'cl.exe reported success but %s is absent; build root holds:\n' \
+                "${smoke_binary}" >&2
+            ls -la "${build_root}" >&2
+            exit 1
+        fi
         ;;
     macos-*)
         cc -I"${bundle_directory}/include" "${smoke_source}" -o "${smoke_binary}" \
@@ -216,19 +296,39 @@ case "${platform}" in
         ;;
 esac
 
-smoke_runner=()
+# macOS ships bash 3.2, which treats "${empty[@]}" as an unbound variable under
+# `set -u`; keep the binary itself in the array so it is never empty.
+smoke_command=("./${smoke_name}")
+run_smoke=1
 if [[ "${platform}" == linux-riscv64 ]]; then
     # Cross-built on x86; run the check under qemu-user when the host has it.
     if command -v qemu-riscv64 >/dev/null 2>&1; then
         # The bundle is compiled for rv64gcv_zba_zbb and GCC autovectorizes at
         # -O3, so the default qemu CPU (no V) would SIGILL.
-        smoke_runner=(qemu-riscv64 -cpu "rv64,v=true,vlen=256,zba=true,zbb=true")
+        smoke_command=(
+            qemu-riscv64 -cpu "rv64,v=true,vlen=256,zba=true,zbb=true" "./${smoke_name}"
+        )
     else
         printf 'qemu-riscv64 is unavailable; DuckDB bundle verified by linking only\n' >&2
+        run_smoke=0
     fi
 fi
-if [[ "${platform}" != linux-riscv64 || "${#smoke_runner[@]}" -gt 0 ]]; then
-    (cd "${build_root}" && "${smoke_runner[@]}" "${smoke_binary}")
+if [[ "${run_smoke}" -eq 1 ]]; then
+    smoke_status=0
+    if [[ "${platform}" == windows-* ]]; then
+        # Git Bash reports any failed image load as a bare 127 with no further
+        # detail. Hand the binary to the Windows loader instead, inheriting the
+        # working directory from bash rather than quoting a path through
+        # cmd.exe, which is fussy enough to fail on its own.
+        (cd "${build_root}" && cmd.exe /c "${smoke_name}") || smoke_status=$?
+    else
+        (cd "${build_root}" && "${smoke_command[@]}") || smoke_status=$?
+    fi
+    if [[ "${smoke_status}" -ne 0 ]]; then
+        printf 'DuckDB smoke test exited %d\n' "${smoke_status}" >&2
+        ls -la "${build_root}" >&2
+        exit 1
+    fi
 fi
 
 deps_publish duckdb "${platform}" "${version}" "${build_root}" "${bundle_name}" "${output_directory}"

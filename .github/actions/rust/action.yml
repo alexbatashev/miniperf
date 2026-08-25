@@ -1,0 +1,40 @@
+name: Rust toolchain
+description: Installs the platform build dependencies, the Rust toolchain and the shared cargo cache.
+
+inputs:
+  target:
+    description: Rust target triple
+    required: true
+  components:
+    description: Comma-separated rustup components
+    required: false
+    default: ''
+  cache-key:
+    description: Cache key suffix
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install GPUI Linux dependencies
+      if: runner.os == 'Linux' && inputs.target != 'riscv64gc-unknown-linux-gnu'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+    - name: Install RISC-V cross compiler
+      if: inputs.target == 'riscv64gc-unknown-linux-gnu'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-riscv64-linux-gnu g++-riscv64-linux-gnu
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.target }}
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}

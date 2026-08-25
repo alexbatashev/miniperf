@@ -30,6 +30,20 @@ packages=(
 sudo apt-get update
 sudo apt-get install -y crossbuild-essential-riscv64 rsync qemu-user qemu-user-binfmt
 
+# `dpkg --add-architecture` makes apt request a riscv64 index from every
+# configured source, and Ubuntu's own mirrors serve amd64 only — the resulting
+# 404s fail `apt-get update` outright. Pin the pre-existing sources to the host
+# architecture first; only ports.ubuntu.com carries riscv64.
+host_architecture="$(dpkg --print-architecture)"
+for source_file in /etc/apt/sources.list.d/*.sources; do
+    [[ -e "${source_file}" ]] || continue
+    grep -q '^Architectures:' "${source_file}" ||
+        sudo sed -i "/^Types:/i Architectures: ${host_architecture}" "${source_file}"
+done
+if [[ -s /etc/apt/sources.list ]]; then
+    sudo sed -i -E "s|^deb ([a-z])|deb [arch=${host_architecture}] \1|" /etc/apt/sources.list
+fi
+
 echo "deb [arch=riscv64] http://ports.ubuntu.com/ubuntu-ports ${release} main universe" \
     | sudo tee /etc/apt/sources.list.d/riscv64-ports.list >/dev/null
 sudo dpkg --add-architecture riscv64
@@ -74,4 +88,34 @@ sudo find "${sysroot}/lib" -maxdepth 1 -type l | while read -r link; do
     esac
 done
 
+# glib's .pc files carry absolute /usr paths and pkg-config prefixes
+# PKG_CONFIG_SYSROOT_DIR to them, so the compiler is handed
+# <sysroot>/usr/include/glib-2.0 and
+# <sysroot>/usr/lib/riscv64-linux-gnu/glib-2.0/include. This sysroot is flat
+# (include/, lib/), so bridge the two shapes with symlinks instead of keeping
+# a second copy of the tree.
+sudo mkdir -p "${sysroot}/usr"
+[[ -d "${sysroot}/usr/include" && ! -L "${sysroot}/usr/include" ]] ||
+    sudo ln -sfn ../include "${sysroot}/usr/include"
+[[ -d "${sysroot}/usr/lib" && ! -L "${sysroot}/usr/lib" ]] ||
+    sudo ln -sfn ../lib "${sysroot}/usr/lib"
+for triplet_directory in "${sysroot}/lib/riscv64-linux-gnu" "${sysroot}/include/riscv64-linux-gnu"; do
+    [[ -d "${triplet_directory}" && ! -L "${triplet_directory}" ]] ||
+        sudo ln -sfn . "${triplet_directory}"
+done
+
+# Meson looks up the cross ("host machine") pkg-config by prefixed name, and
+# neither pkg-config nor crossbuild-essential-riscv64 ships one, so QEMU's
+# meson setup fails to find glib. Provide the wrapper, pointed at the sysroot.
+sudo tee /usr/bin/riscv64-linux-gnu-pkg-config >/dev/null <<WRAPPER
+#!/bin/sh
+PKG_CONFIG_LIBDIR="${sysroot}/lib/pkgconfig"
+PKG_CONFIG_SYSROOT_DIR="${sysroot}"
+export PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR
+unset PKG_CONFIG_PATH
+exec pkg-config "\$@"
+WRAPPER
+sudo chmod 0755 /usr/bin/riscv64-linux-gnu-pkg-config
+
 printf 'riscv64 sysroot ready at %s\n' "${sysroot}"
+printf 'pkgconfig files: %s\n' "$(find "${sysroot}" -name '*.pc' | wc -l)"
