@@ -1,0 +1,8 @@
+# Files still allowed to select code at compile time outside libprof.
+#
+# Roofline's calibration kernels are AVX-512/AVX2/RVV microkernels and its QEMU
+# driver is process plumbing; neither measures the host through libprof, so
+# both keep their compile-time dispatch until roofline grows its own platform
+# module. Every other entry is a bug: branch at runtime instead.
+mperf/src/roofline/calibrate.rs
+mperf/src/roofline/qemu.rs

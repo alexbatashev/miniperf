@@ -32,6 +32,10 @@ jobs:
           # packaging time, on one platform, hours later.
           - task: deps-manifest
             command: python3 utils/deps/manifest.py check
+          # Platform breakage is otherwise found by a different CI leg, hours
+          # later; this makes it a red build on every target in seconds.
+          - task: platform-cfg
+            command: python3 utils/platform-cfg-guard.py
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/rust
