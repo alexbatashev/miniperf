@@ -27,7 +27,8 @@ use perf_event_open_sys::bindings::{
 use perf_event_open_sys::{self as sys, bindings::PERF_SAMPLE_IDENTIFIER};
 use smallvec::SmallVec;
 
-use crate::driver::{ProcAddr, Sample, UnwindMode};
+use crate::driver::UnwindMode;
+use crate::sink::{ProcAddr, Sample};
 use crate::{Counter, Error, Record};
 
 pub use events::list_supported_counters;

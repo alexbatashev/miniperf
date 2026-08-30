@@ -12,7 +12,8 @@ use perf_event_open_sys::bindings::{
     PERF_SAMPLE_WEIGHT_STRUCT,
 };
 
-use crate::driver::{MemSample, ProcAddr, Record, SamplingDriver, Sink};
+use crate::driver::{SamplingDriver, Sink};
+use crate::sink::{MemSample, ProcAddr, Record};
 use crate::{Counter, Error};
 
 use super::branch::BranchMode;

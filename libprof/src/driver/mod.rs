@@ -14,7 +14,7 @@ use itertools::chain;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-pub(crate) use crate::sink::{MemSample, ProcAddr, Record, Sample, Sink, UserRegs};
+pub(crate) use crate::sink::Sink;
 use crate::{cpu_family, Counter, Error, Process};
 
 #[allow(dead_code)]

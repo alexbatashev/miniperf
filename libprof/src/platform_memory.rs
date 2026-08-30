@@ -546,6 +546,10 @@ impl MemoryControllerMonitor {
     pub fn start() -> io::Result<Option<Self>> {
         Ok(None)
     }
+    /// Never reached: [`Self::start`] reports no monitor.
+    pub fn source(&self) -> &'static str {
+        "unavailable"
+    }
     /// Return an empty sample.
     pub fn sample(&self) -> io::Result<MemoryControllerSample> {
         Ok(MemoryControllerSample::default())

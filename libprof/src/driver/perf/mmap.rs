@@ -6,7 +6,7 @@ use perf_event_open_sys::bindings::{
 use smallvec::{SmallVec, ToSmallVec};
 
 use super::branch::{BranchMode, BranchRecord};
-use crate::driver::UserRegs;
+use crate::sink::UserRegs;
 
 pub struct Records {
     metadata: *mut perf_event_mmap_page,

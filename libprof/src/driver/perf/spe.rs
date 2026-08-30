@@ -9,7 +9,8 @@ use perf_event_open_sys as sys;
 use perf_event_open_sys::bindings::{perf_event_attr, perf_event_header, perf_event_mmap_page};
 use smallvec::SmallVec;
 
-use crate::driver::{MemSample, Record, SamplingDriver, Sink};
+use crate::driver::{SamplingDriver, Sink};
+use crate::sink::{MemSample, Record};
 use crate::{Counter, Error};
 
 use super::sysfs;
