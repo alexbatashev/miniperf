@@ -27,12 +27,10 @@ pub use pmu::{PmuSamplingSource, PreciseMemorySource};
 pub use procfs::ProcfsSource;
 pub use telemetry::HostTelemetrySource;
 
-/// What a source provides, declared before probing.
+/// What a source is, declared before probing.
 pub struct SourceDecl {
     /// Stable identifier, also used as the status name.
     pub name: &'static str,
-    /// Logical session tables this source writes.
-    pub provides: &'static [&'static str],
 }
 
 /// Result of probing whether a source can run here.

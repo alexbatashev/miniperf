@@ -35,9 +35,12 @@ pub struct DispatcherJoinHandle {
 }
 
 const BATCH_ROWS: usize = 8192;
-/// Resource rows arrive at ~1Hz; a small batch keeps a killed recording's
-/// telemetry on disk without a segment per tick.
-const RESOURCE_BATCH_ROWS: usize = 512;
+/// Resource rows arrive in ~1Hz bursts. Writing one batch per burst is what
+/// the collectors did before they wrote through the sink, and it is what keeps
+/// a killed recording's telemetry on disk.
+const RESOURCE_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Backstop for a source that produces resource rows far faster than 1Hz.
+const RESOURCE_BATCH_ROWS: usize = 4096;
 
 struct Worker {
     interner: Arc<Mutex<StringInterner>>,
@@ -56,6 +59,7 @@ struct Worker {
     clock_writer: SegmentWriter,
     resources: Vec<libprof::ResourceSample>,
     resources_writer: SegmentWriter,
+    resources_flushed: std::time::Instant,
     processes: Vec<libprof::ProcessInfo>,
     metrics: Vec<(&'static str, String, f64)>,
     directory: std::path::PathBuf,
@@ -95,6 +99,7 @@ impl Worker {
                 resource_sample_schema(),
             )
             .with_segment_bytes(256 * 1024),
+            resources_flushed: std::time::Instant::now(),
             processes: Vec::new(),
             metrics: Vec::new(),
             directory: dir.to_owned(),
@@ -249,12 +254,15 @@ impl Worker {
 
     fn consume_resource(&mut self, sample: libprof::ResourceSample) {
         self.resources.push(sample);
-        if self.resources.len() >= RESOURCE_BATCH_ROWS {
+        if self.resources.len() >= RESOURCE_BATCH_ROWS
+            || self.resources_flushed.elapsed() >= RESOURCE_FLUSH_INTERVAL
+        {
             self.flush_resources();
         }
     }
 
     fn flush_resources(&mut self) {
+        self.resources_flushed = std::time::Instant::now();
         if self.resources.is_empty() {
             return;
         }

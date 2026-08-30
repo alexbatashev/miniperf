@@ -30,10 +30,7 @@ impl Source for BpfSource {
     }
 
     fn declare(&self) -> SourceDecl {
-        SourceDecl {
-            name: "bpf",
-            provides: &["bpf_metrics"],
-        }
+        SourceDecl { name: "bpf" }
     }
 
     fn probe(&self, _directory: &Path) -> Availability {
@@ -42,16 +39,19 @@ impl Source for BpfSource {
                 reason: "kernel BTF is unavailable".to_string(),
             };
         }
-        if unsafe { libc::geteuid() } != 0 && unprivileged_bpf_disabled() {
-            return Availability::Unavailable {
-                reason: "unprivileged BPF is disabled; run with suitable BPF/perf capabilities"
-                    .to_string(),
-            };
-        }
         Availability::Available
     }
 
     fn start(&mut self, context: &SessionContext) -> anyhow::Result<()> {
+        // Kept out of `probe`: the pass resolver records a probe failure as a
+        // plain "unavailable", and losing the difference between "this kernel
+        // forbids it" and "this host does not have it" loses the fix.
+        if unsafe { libc::geteuid() } != 0 && unprivileged_bpf_disabled() {
+            self.status = Some(unavailable(
+                "unprivileged BPF is disabled; run with suitable BPF/perf capabilities",
+            ));
+            return Ok(());
+        }
         let output = context.directory.join("snapshot-bpf.txt");
         let child = std::process::Command::new("bpftrace")
             .args(["-q", "-B", "line", "-o"])

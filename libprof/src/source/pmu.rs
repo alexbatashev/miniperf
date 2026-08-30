@@ -57,7 +57,6 @@ impl Source for PmuSamplingSource {
     fn declare(&self) -> SourceDecl {
         SourceDecl {
             name: "pmu_sampling",
-            provides: &["samples", "stacks", "modules"],
         }
     }
 
@@ -139,7 +138,7 @@ impl Source for PmuSamplingSource {
 #[derive(Default)]
 pub struct PreciseMemorySource {
     driver: Option<Box<dyn SamplingDriver>>,
-    mechanism: Option<&'static str>,
+    satisfied: Option<crate::Satisfied>,
 }
 
 impl Source for PreciseMemorySource {
@@ -150,7 +149,6 @@ impl Source for PreciseMemorySource {
     fn declare(&self) -> SourceDecl {
         SourceDecl {
             name: "precise_memory",
-            provides: &["mem_samples", "alloc_site_memory", "cacheline_contention"],
         }
     }
 
@@ -192,11 +190,23 @@ impl Source for PreciseMemorySource {
         )?;
         driver.start(context.sink.clone())?;
         self.driver = Some(driver);
-        self.mechanism = Some(satisfied.mechanism.name());
+        self.satisfied = Some(satisfied);
         Ok(())
     }
 
     fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
+        let Some(satisfied) = self.satisfied.take() else {
+            // Probed available, then opened nothing: the recording has no
+            // memory samples and must not be read as though it does.
+            self.driver = None;
+            return vec![SourceStatus::new(
+                "precise_memory",
+                "unavailable",
+                "none",
+                "unavailable",
+                "no precise memory sampling facility was opened",
+            )];
+        };
         let mut status = "available";
         let mut message = String::new();
         if let Some(Err(error)) = self.driver.as_mut().map(|driver| driver.stop()) {
@@ -207,9 +217,21 @@ impl Source for PreciseMemorySource {
         vec![SourceStatus::new(
             "precise_memory",
             status,
-            self.mechanism.take().unwrap_or("none"),
-            "precise",
+            satisfied.mechanism.name(),
+            quality_name(satisfied.quality),
             &message,
         )]
+    }
+}
+
+/// How a mechanism's provenance is written into the session.
+fn quality_name(quality: crate::MeasurementQuality) -> &'static str {
+    match quality {
+        crate::MeasurementQuality::Exact => "precise",
+        crate::MeasurementQuality::Scaled => "scaled",
+        // A mechanism that samples every op and tags the memory ones answers a
+        // different question than "sample these loads"; its rate is not a load
+        // rate, and the session has to say so.
+        crate::MeasurementQuality::Estimated => "best_effort",
     }
 }

@@ -35,7 +35,6 @@ impl Source for HostTelemetrySource {
     fn declare(&self) -> SourceDecl {
         SourceDecl {
             name: "host_telemetry",
-            provides: &["host_telemetry"],
         }
     }
 

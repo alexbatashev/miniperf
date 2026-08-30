@@ -269,7 +269,7 @@ fn wait_for_target(
 ) -> Result<String> {
     let started = std::time::Instant::now();
     let mut known_pids = HashSet::new();
-    let mut root_reaped = false;
+    let mut root_waited = false;
     if let Some(process) = process {
         process.cont();
     }
@@ -280,20 +280,20 @@ fn wait_for_target(
                 publish_process_maps(dispatcher, member.pid);
             }
         }
-        // A launched root has to be reaped once it exits, or it stays a zombie
-        // the tree never sheds. `wait` leaves it unreaped on purpose, so its
-        // final resource accounting survives until the session ends.
-        if !root_reaped && !root_alive(&tree, process, root_pid)? {
+        // Collect a launched root's exit status once it is gone. It stays a
+        // zombie on purpose, so its final resource accounting is still
+        // queryable; the session reaps it on drop.
+        if !root_waited && !root_alive(&tree, process, root_pid)? {
             if let Some(process) = process {
                 process.wait()?;
             }
-            root_reaped = true;
+            root_waited = true;
         }
         let live = match &tree {
             Some(tree) => tree.iter().any(|member| member.state != b'Z'),
-            None => !root_reaped,
+            None => !root_waited,
         };
-        if root_reaped && !live {
+        if root_waited && !live {
             return Ok(if tree.is_some() {
                 "tree_exit"
             } else {
@@ -306,8 +306,8 @@ fn wait_for_target(
                 // A launched command belongs to this recording. Terminate every
                 // member still observed so a bounded snapshot cannot leave an
                 // unexpected orphan workload behind.
-                terminate(root_pid);
-                if !root_reaped {
+                terminate(process, root_pid);
+                if !root_waited {
                     process.wait()?;
                 }
             }
@@ -337,7 +337,7 @@ fn root_alive(
 
 /// Ask the tree to exit, then insist. Members that ignore SIGTERM would
 /// otherwise outlive the recording that started them.
-fn terminate(root_pid: u32) {
+fn terminate(process: &Process, root_pid: u32) {
     let signal = |signal: i32| {
         for member in libprof::process_tree(root_pid)
             .unwrap_or_else(|| {
@@ -355,11 +355,16 @@ fn terminate(root_pid: u32) {
     signal(libc::SIGTERM);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
-        let gone = libprof::process_tree(root_pid).is_some_and(|tree| {
-            tree.iter()
+        // Without a process tree the root is the only thing to wait on, and
+        // asking it directly is what keeps a well-behaved child from costing
+        // the full grace period.
+        let gone = match libprof::process_tree(root_pid) {
+            Some(tree) => tree
+                .iter()
                 .find(|member| member.pid == root_pid)
-                .is_none_or(|member| member.state == b'Z')
-        });
+                .is_none_or(|member| member.state == b'Z'),
+            None => process.try_wait().unwrap_or(true),
+        };
         if gone {
             return;
         }

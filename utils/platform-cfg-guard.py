@@ -17,8 +17,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 GUARDED = ("mperf", "mperf-gui", "store", "mperf-data")
 ALLOWLIST = ROOT / "utils" / "platform-cfg-allowlist.txt"
-ATTRIBUTE = re.compile(r"#\[\s*cfg(_attr)?\s*\(")
-PLATFORM = re.compile(r"\btarget_(os|arch)\b")
+# `#!` too: an inner attribute gates a whole module just as effectively.
+ATTRIBUTE = re.compile(r"#!?\[\s*cfg(_attr)?\s*\(")
+# `unix` and `windows` are the same leak spelled shorter, and target_family,
+# target_env, target_vendor and target_pointer_width all pick a platform.
+PLATFORM = re.compile(
+    r"\b(unix|windows|target_(os|arch|family|env|vendor|pointer_width))\b"
+)
 
 
 def attributes(source):

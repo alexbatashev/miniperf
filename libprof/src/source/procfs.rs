@@ -41,12 +41,11 @@ impl Source for ProcfsSource {
     fn declare(&self) -> SourceDecl {
         SourceDecl {
             name: "procfs_resources",
-            provides: &["resource_samples", "process_samples"],
         }
     }
 
     fn probe(&self, _directory: &Path) -> Availability {
-        if platform::process_tree(std::process::id()).is_none() {
+        if !platform::process_tree_supported() {
             return Availability::Unavailable {
                 reason: "this host exposes no procfs process tree".to_string(),
             };

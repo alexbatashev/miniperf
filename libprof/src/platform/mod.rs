@@ -75,6 +75,11 @@ pub fn process_tree(root_pid: u32) -> Option<Vec<ProcessStat>> {
     imp::process_tree(root_pid)
 }
 
+/// Whether this host exposes a process tree at all, without walking it.
+pub fn process_tree_supported() -> bool {
+    imp::process_tree_supported()
+}
+
 /// I/O accounting for one process, all zero where the host does not report it.
 pub fn process_io(pid: u32) -> ProcessIo {
     imp::process_io(pid)
@@ -119,6 +124,10 @@ mod unsupported {
 
     pub(super) fn process_tree(_root_pid: u32) -> Option<Vec<ProcessStat>> {
         None
+    }
+
+    pub(super) fn process_tree_supported() -> bool {
+        false
     }
 
     pub(super) fn process_io(_pid: u32) -> ProcessIo {

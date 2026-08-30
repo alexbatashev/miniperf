@@ -20,7 +20,6 @@ impl Source for InternalEventsSource {
     fn declare(&self) -> SourceDecl {
         SourceDecl {
             name: "internal_events",
-            provides: &["events", "payloads", "strings", "clock"],
         }
     }
 

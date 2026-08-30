@@ -98,6 +98,24 @@ impl Mechanism {
         }
     }
 
+    /// Why libprof cannot drive this mechanism yet, whatever the hardware has.
+    ///
+    /// [`Mechanism::rejection`] answers what the host is capable of, which is
+    /// what `mperf doctor` reports; [`resolve`] additionally has to answer what
+    /// a recording will really get, and a facility with no driver behind it
+    /// delivers nothing.
+    fn driver_gap(self) -> Option<&'static str> {
+        match self {
+            // The kernel may already serve precise `mem-loads` through IBS via
+            // precise_ip, which would make a separate driver unnecessary; that
+            // needs checking on real AMD hardware before one is written.
+            Mechanism::IbsOp => {
+                Some("IBS: the ibs_op PMU is present but libprof has no driver for it yet")
+            }
+            _ => None,
+        }
+    }
+
     /// Why this mechanism cannot run on this host, or `None` when it can.
     pub fn rejection(self, caps: &Capabilities) -> Option<String> {
         match self {
@@ -280,7 +298,12 @@ impl Resolution {
 pub fn resolve(feature: Feature, caps: &Capabilities) -> Resolution {
     let mut rejected = Vec::new();
     for mechanism in feature.mechanisms() {
-        match mechanism.rejection(caps) {
+        // The hardware answer comes first: "your BIOS has IBS off" is more
+        // useful than "we have no IBS driver" on a host that has no IBS.
+        let reason = mechanism
+            .rejection(caps)
+            .or_else(|| mechanism.driver_gap().map(str::to_string));
+        match reason {
             None => {
                 return Resolution {
                     feature,
@@ -337,18 +360,40 @@ mod tests {
     #[test]
     fn picks_the_best_satisfied_mechanism_and_tags_its_quality() {
         let caps = Capabilities {
-            pmus: vec![pmu("ibs_op")],
+            pmus: vec![pmu("arm_spe_0")],
             ..Capabilities::default()
         };
         let resolution = resolve(Feature::PreciseMem, &caps);
-        assert_eq!(resolution.mechanism(), Mechanism::IbsOp);
-        // IBS samples ops, not the requested load events.
+        assert_eq!(resolution.mechanism(), Mechanism::ArmSpe);
+        // SPE samples ops, not the requested load events.
         assert_eq!(
             resolution.satisfied.unwrap().quality,
             MeasurementQuality::Estimated
         );
-        assert_eq!(resolution.rejected.len(), 1);
+        assert_eq!(resolution.rejected.len(), 2);
         assert_eq!(resolution.rejected[0].0, Mechanism::PebsMem);
+    }
+
+    /// A mechanism the hardware offers but libprof cannot open must not be
+    /// resolved: the source would probe available and then fail to start.
+    #[test]
+    fn a_mechanism_without_a_driver_is_not_satisfied() {
+        let caps = Capabilities {
+            pmus: vec![pmu("ibs_op")],
+            ..Capabilities::default()
+        };
+        assert_eq!(Mechanism::IbsOp.rejection(&caps), None);
+        let resolution = resolve(Feature::PreciseMem, &caps);
+        assert!(!resolution.is_satisfied());
+        assert!(
+            resolution
+                .rejected
+                .iter()
+                .any(|(mechanism, reason)| *mechanism == Mechanism::IbsOp
+                    && reason.contains("no driver")),
+            "{:?}",
+            resolution.rejected
+        );
     }
 
     #[test]

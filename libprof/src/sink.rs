@@ -51,8 +51,9 @@ pub enum Record {
 
 /// Receives records from a source.
 ///
-/// Implementations must not block for long: sampling drivers call this from
-/// their reader threads, and a slow sink shows up as lost samples.
+/// Sampling drivers call this from their reader threads, so the cost of an
+/// implementation is paid on the sampling path: a sink that blocks for longer
+/// than the ring takes to fill shows up as records the kernel dropped.
 pub trait Sink: Send + Sync {
     /// Handles one record.
     fn record(&self, record: Record);

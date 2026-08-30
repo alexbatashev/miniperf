@@ -13,6 +13,10 @@ pub(super) fn process_tree(_root_pid: u32) -> Option<Vec<ProcessStat>> {
     None
 }
 
+pub(super) fn process_tree_supported() -> bool {
+    false
+}
+
 pub(super) fn process_io(_pid: u32) -> ProcessIo {
     ProcessIo::default()
 }

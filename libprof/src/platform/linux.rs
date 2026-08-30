@@ -42,6 +42,10 @@ pub(super) fn process_tree(root_pid: u32) -> Option<Vec<ProcessStat>> {
     Some(result)
 }
 
+pub(super) fn process_tree_supported() -> bool {
+    std::path::Path::new("/proc/self/stat").is_file()
+}
+
 fn read_proc_stat(pid: u32) -> Option<ProcessStat> {
     let value = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let open = value.find('(')?;
