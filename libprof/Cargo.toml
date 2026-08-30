@@ -1,19 +1,19 @@
 [package]
-name = "miniperf-pmu"
+name = "libprof"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Low-overhead Linux perf event timing and in-memory sampling"
+description = "Local profiling sources: PMU counting and sampling, precise memory, host telemetry and resource monitoring"
 license = "LGPL-3.0-only"
 repository = "https://github.com/alexbatashev/miniperf"
 homepage = "https://github.com/alexbatashev/miniperf"
 readme = "README.md"
-keywords = ["performance", "profiling", "perf", "pmu", "benchmark"]
+keywords = ["performance", "profiling", "perf", "pmu", "telemetry"]
 categories = ["development-tools::profiling"]
 include = ["src/**", "events/**", "examples/**", "build.rs", "README.md", "CHANGELOG.md"]
 
 [lib]
-name = "pmu"
+name = "libprof"
 
 [features]
 default = ["events-native"]

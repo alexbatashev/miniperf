@@ -1,6 +1,6 @@
 use anyhow::Result;
 use comfy_table::{Cell, Color, ContentArrangement, Table};
-use pmu::{Capabilities, Rung};
+use libprof::{Capabilities, Rung};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Severity {
@@ -336,8 +336,8 @@ fn render(checks: &[Check]) -> Table {
 /// Diagnose this host's profiling readiness. Exits with a nonzero status when
 /// any check is a blocker.
 pub fn do_doctor() -> Result<()> {
-    let caps = pmu::capabilities();
-    let (vendor, model) = pmu::host_cpu_description();
+    let caps = libprof::capabilities();
+    let (vendor, model) = libprof::host_cpu_description();
     let cpu = if model.starts_with(&vendor) {
         model
     } else {
@@ -367,7 +367,7 @@ pub fn do_doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmu::PmuDevice;
+    use libprof::PmuDevice;
 
     fn pmu(name: &str) -> PmuDevice {
         PmuDevice {

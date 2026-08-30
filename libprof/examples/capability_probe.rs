@@ -1,10 +1,10 @@
 //! Print what this host can capture: PMUs, host facilities, and the rung each
 //! capture strategy resolves to.
 
-use pmu::Rung;
+use libprof::Rung;
 
 fn main() {
-    let caps = pmu::capabilities();
+    let caps = libprof::capabilities();
     println!(
         "kernel {}  paranoid {}  cap_perfmon {}  root {}",
         caps.kernel_version.as_deref().unwrap_or("unknown"),

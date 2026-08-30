@@ -389,7 +389,7 @@ fn collect(
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as f64;
     let mut statuses = capability_statuses();
     let mut initial_scan = true;
-    let mut memory_controller = match pmu::MemoryControllerMonitor::start() {
+    let mut memory_controller = match libprof::MemoryControllerMonitor::start() {
         Ok(Some(monitor)) => {
             statuses.push(status(
                 "uncore_memory",

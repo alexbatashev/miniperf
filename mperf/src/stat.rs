@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use comfy_table::{Cell, CellAlignment, Color, Table};
+use libprof::{Counter, CounterValue, Metric, Process};
 use num_format::{Locale, ToFormattedString};
-use pmu::{Counter, CounterValue, Metric, Process};
 
 /// PMU (hardware) counters, shown per-core on heterogeneous systems.
 fn pmu_counters() -> Vec<Counter> {
@@ -47,18 +47,18 @@ pub fn do_stat(
         None
     };
 
-    let capabilities = pmu::capabilities();
+    let capabilities = libprof::capabilities();
     if !capabilities.hardware_counters {
         eprintln!(
             "notice: no hardware PMU detected (VM/container or permissions); hardware counters may be unavailable"
         );
     }
 
-    let supported = pmu::list_supported_counters(pmu::DriverKind::Default);
-    let host_metrics = pmu::host_metrics();
+    let supported = libprof::list_supported_counters(libprof::DriverKind::Default);
+    let host_metrics = libprof::host_metrics();
     let (mut counters, metrics) = if topdown_level.is_some() {
         let scenario =
-            pmu::host_tma_scenario().expect("architectural TMA fallback is always available");
+            libprof::host_tma_scenario().expect("architectural TMA fallback is always available");
         let counters = scenario
             .events
             .iter()
@@ -81,7 +81,7 @@ pub fn do_stat(
     };
 
     let mut driver = loop {
-        match pmu::CountingDriverBuilder::new()
+        match libprof::CountingDriverBuilder::new()
             .counters(&counters)
             .process(process.as_ref())
             .pid(pid.map(|pid| pid as i32))
@@ -122,7 +122,7 @@ pub fn do_stat(
 
     if let Some(level) = topdown_level {
         let scenario =
-            pmu::host_tma_scenario().expect("architectural TMA fallback is always available");
+            libprof::host_tma_scenario().expect("architectural TMA fallback is always available");
         render_topdown(&scenario, level, &result);
         return Ok(());
     }
@@ -171,7 +171,7 @@ Performance counter stats for '{}':
     Ok(())
 }
 
-fn render_topdown(scenario: &pmu_data::TmaScenario, level: u8, result: &pmu::CounterResult) {
+fn render_topdown(scenario: &pmu_data::TmaScenario, level: u8, result: &libprof::CounterResult) {
     let mut values = scenario
         .events
         .iter()
@@ -505,7 +505,7 @@ fn info_cell(
 #[cfg(test)]
 mod metric_tests {
     use super::*;
-    use pmu::MetricExpression;
+    use libprof::MetricExpression;
 
     fn ipc() -> Metric {
         Metric {

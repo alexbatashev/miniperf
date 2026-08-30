@@ -157,7 +157,7 @@ pub async fn run() -> Result<()> {
         } => do_stat(pid, command, events, topdown.then_some(level)),
         Commands::Doctor => do_doctor(),
         Commands::List => {
-            let events = pmu::list_supported_counters(pmu::DriverKind::Default);
+            let events = libprof::list_supported_counters(libprof::DriverKind::Default);
             for event in events {
                 println!("{} - {}", event.name(), event.description());
             }

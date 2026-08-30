@@ -3,8 +3,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Result;
+use libprof::{Counter, Process};
 use mperf_data::{Scenario, SnapshotCollectorStatus};
-use pmu::{Counter, Process};
 
 use crate::event_dispatcher::EventDispatcher;
 
@@ -161,7 +161,7 @@ pub struct PmuSamplingSource {
     sample_freq: Option<u64>,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     stack_dump_size: Option<u32>,
-    drivers: Vec<Box<dyn pmu::SamplingDriver>>,
+    drivers: Vec<Box<dyn libprof::SamplingDriver>>,
     recorded: Vec<Counter>,
 }
 
@@ -234,7 +234,7 @@ impl Source for PmuSamplingSource {
         // hardware has it.
         let lbr = lbr_callstacks();
         for target_pid in target_pids {
-            let mut builder = pmu::SamplingDriverBuilder::new().counters(&self.counters);
+            let mut builder = libprof::SamplingDriverBuilder::new().counters(&self.counters);
             if let Some(freq) = self.sample_freq {
                 builder = builder.sample_freq(freq);
             }
@@ -273,7 +273,7 @@ impl Source for PmuSamplingSource {
         }
         self.drivers.clear();
         #[cfg(target_os = "linux")]
-        if status == "available" && !pmu::inherited_sample_read_supported() {
+        if status == "available" && !libprof::inherited_sample_read_supported() {
             status = "degraded";
             quality = "best_effort";
             message = "this kernel rejects inherited sampling groups with PERF_SAMPLE_READ \
@@ -296,7 +296,7 @@ impl Source for PmuSamplingSource {
 /// unavailable and nothing about the recording changes.
 #[derive(Default)]
 pub struct PreciseMemorySource {
-    driver: Option<Box<dyn pmu::SamplingDriver>>,
+    driver: Option<Box<dyn libprof::SamplingDriver>>,
     kind: Option<&'static str>,
 }
 
@@ -323,9 +323,9 @@ impl Source for PreciseMemorySource {
     }
 
     fn probe(&self, _directory: &Path) -> Availability {
-        let resolution = pmu::resolve(scenario_ladder(Scenario::Mem), &pmu::capabilities());
+        let resolution = libprof::resolve(scenario_ladder(Scenario::Mem), &libprof::capabilities());
         match resolution.chosen {
-            pmu::Rung::PebsMem | pmu::Rung::ArmSpe => Availability::Available,
+            libprof::Rung::PebsMem | libprof::Rung::ArmSpe => Availability::Available,
             _ => Availability::Unavailable {
                 reason: resolution
                     .rejected
@@ -340,9 +340,9 @@ impl Source for PreciseMemorySource {
     fn start(&mut self, context: &SessionContext) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            let mut driver = pmu::mem_sampling_driver(
+            let mut driver = libprof::mem_sampling_driver(
                 context.root_pid() as i32,
-                pmu::DEFAULT_SAMPLE_FREQUENCY_HZ,
+                libprof::DEFAULT_SAMPLE_FREQUENCY_HZ,
                 8 * 1024,
                 lbr_callstacks(),
             )?;
@@ -350,7 +350,7 @@ impl Source for PreciseMemorySource {
                 context.dispatcher.clone(),
             ))?;
             self.driver = Some(driver);
-            self.kind = Some(pmu::mem_sampling_kind());
+            self.kind = Some(libprof::mem_sampling_kind());
         }
         Ok(())
     }
@@ -574,8 +574,8 @@ mod linux_sources {
 /// The capture strategies a scenario prefers, best first. Every ladder ends at
 /// `Rung::Baseline`, the behaviour implemented today; higher rungs resolve but
 /// still run the baseline capture until their workstream fills them in.
-pub fn scenario_ladder(scenario: Scenario) -> &'static [pmu::Rung] {
-    use pmu::Rung::*;
+pub fn scenario_ladder(scenario: Scenario) -> &'static [libprof::Rung] {
+    use libprof::Rung::*;
     match scenario {
         Scenario::Snapshot => &[LbrCallstack, Baseline],
         Scenario::TMA => &[FixedTopdown, ArmSlotsTopdown, Baseline],
@@ -587,24 +587,28 @@ pub fn scenario_ladder(scenario: Scenario) -> &'static [pmu::Rung] {
 /// Whether the host can decorate sampled events with Intel LBR call stacks,
 /// the `LbrCallstack` rung.
 pub fn lbr_callstacks() -> bool {
-    pmu::resolve(
-        &[pmu::Rung::LbrCallstack, pmu::Rung::Baseline],
-        &pmu::capabilities(),
+    libprof::resolve(
+        &[libprof::Rung::LbrCallstack, libprof::Rung::Baseline],
+        &libprof::capabilities(),
     )
     .chosen
-        == pmu::Rung::LbrCallstack
+        == libprof::Rung::LbrCallstack
 }
 
 /// Whether the Roofline ladder resolves to measured memory-controller
 /// bandwidth on this host, rather than the core-side baseline.
 pub fn roofline_uncore_bandwidth() -> bool {
-    pmu::resolve(scenario_ladder(Scenario::Roofline), &pmu::capabilities()).chosen
-        == pmu::Rung::UncoreBw
+    libprof::resolve(
+        scenario_ladder(Scenario::Roofline),
+        &libprof::capabilities(),
+    )
+    .chosen
+        == libprof::Rung::UncoreBw
 }
 
 /// Resolve a scenario's ladder against the probed host.
 pub fn resolve_fidelity(scenario: Scenario) -> mperf_data::CaptureFidelity {
-    let resolution = pmu::resolve(scenario_ladder(scenario), &pmu::capabilities());
+    let resolution = libprof::resolve(scenario_ladder(scenario), &libprof::capabilities());
     mperf_data::CaptureFidelity {
         scenario: format!("{scenario:?}").to_lowercase(),
         rung: resolution.chosen.name().to_string(),
@@ -635,11 +639,11 @@ pub fn scenario_counters(scenario: Scenario) -> Vec<Counter> {
             Counter::PageFaults,
             Counter::ContextSwitches,
         ],
-        Scenario::TMA => pmu::tma_scenario()
+        Scenario::TMA => libprof::tma_scenario()
             .expect("TMA counter selection requires a supported host CPU")
             .events
             .iter()
-            .map(|event| pmu::tma_counter(event))
+            .map(|event| libprof::tma_counter(event))
             .chain([
                 Counter::CpuClock,
                 Counter::CpuMigrations,

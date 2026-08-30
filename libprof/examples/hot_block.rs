@@ -1,4 +1,4 @@
-use pmu::{Counter, EventTimer};
+use libprof::{Counter, EventTimer};
 
 fn hot_block(values: &mut [u64]) {
     for (index, value) in values.iter_mut().enumerate() {
@@ -6,7 +6,7 @@ fn hot_block(values: &mut [u64]) {
     }
 }
 
-fn main() -> Result<(), pmu::Error> {
+fn main() -> Result<(), libprof::Error> {
     let timer = EventTimer::new(&[Counter::Cycles, Counter::Instructions, Counter::LLCMisses])?;
     let mut values = vec![1_u64; 16 * 1024];
 

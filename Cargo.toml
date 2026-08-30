@@ -2,11 +2,11 @@
 resolver = "2"
 members = [
     "collector-core",
+    "libprof",
     "mperf",
     "mperf-data",
     "mperf-trace",
     "mperf-gui",
-    "pmu",
     "pmu-data",
     "shims",
     "shims/libc",

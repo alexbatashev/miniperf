@@ -5,8 +5,8 @@
 //! runs at 1Hz next to the workload and writes the same `resource_samples`
 //! intermediate the procfs collector writes, so postprocess unions the two.
 
+use libprof::{HostTelemetry, HostTelemetrySample};
 use mperf_data::{SnapshotCollectorStatus, SnapshotResourceSample};
-use pmu::{HostTelemetry, HostTelemetrySample};
 use std::{
     path::Path,
     sync::{
@@ -62,7 +62,7 @@ impl HostTelemetryMonitor {
 /// Cluster id to logical CPUs, from the host's core PMUs. Empty on a
 /// homogeneous host, which `HostTelemetry` reads as a single `host` cluster.
 fn host_clusters() -> Vec<(String, Vec<u32>)> {
-    pmu::host_core_clusters()
+    libprof::host_core_clusters()
         .into_iter()
         .map(|cluster| {
             let cpus = crate::postprocess::parse_cpumask(&cluster.cpus)
@@ -422,7 +422,7 @@ pub(crate) fn resource_sample_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmu::{ClusterClocks, DeviceClocks, ThermalZone};
+    use libprof::{ClusterClocks, DeviceClocks, ThermalZone};
 
     fn find<'a>(rows: &'a [SnapshotResourceSample], metric: &str) -> Option<&'a f64> {
         rows.iter()

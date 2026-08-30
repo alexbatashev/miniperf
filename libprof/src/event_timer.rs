@@ -226,7 +226,7 @@ impl Index<Counter> for MeasurementStatistics {
 ///
 /// ```compile_fail
 /// fn require_send<T: Send>() {}
-/// require_send::<pmu::EventTimer>();
+/// require_send::<libprof::EventTimer>();
 /// ```
 pub struct EventTimer {
     counters: Vec<Counter>,

@@ -1,6 +1,6 @@
 # miniperf-symbolize
 
-Shared native symbolization for `mperf` and the optional `miniperf-pmu`
+Shared native symbolization for `mperf` and the optional `libprof`
 `symbolize` feature.
 
 Resolution order on Linux is:

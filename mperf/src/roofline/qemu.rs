@@ -14,11 +14,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use kdam::BarExt;
+use libprof::Process;
 use mperf_data::{
     CallFrame, Event, EventType, Location, RooflineInfo, RooflineMethodInfo, ScenarioInfo,
 };
 use object::{Object, ObjectKind, ObjectSegment, ObjectSymbol, SegmentFlags};
-use pmu::Process;
 use serde::Serialize;
 use smallvec::smallvec;
 

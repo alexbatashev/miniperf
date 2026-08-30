@@ -261,7 +261,7 @@ output, SQL files, and stdin usage.
 
 - Models 0x8c and 0x8d are detected as Tiger Lake.
 - The checked-in table contains 231 core events generated from Linux perf's
-  Tiger Lake PMU data. See `pmu/events/intel/README.md` for the source,
+  Tiger Lake PMU data. See `libprof/events/intel/README.md` for the source,
   attribution, licensing, and regeneration command.
 - Unsupported architectural counters are omitted with a notice instead of
   aborting the entire `stat` or sampling run.
@@ -318,7 +318,7 @@ output, SQL files, and stdin usage.
 - Unlike X60, X100 does implement overflow interrupts for the cycle and
   instruction counters, so sampling uses `cycles` directly.
 - SpacemiT publishes no PMU event table for X100. The event names in
-  `pmu/events/spacemit/x100.json` were derived by measuring each raw event code
+  `libprof/events/spacemit/x100.json` were derived by measuring each raw event code
   against microbenchmarks with known analytic instruction, branch, and cache
   behaviour, then cross-checked against the event map in SpacemiT's K3 device
   tree. The set of valid raw codes comes from that device tree's

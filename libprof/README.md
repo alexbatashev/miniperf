@@ -1,14 +1,18 @@
-# miniperf-pmu
+# libprof
 
-The package is published as `miniperf-pmu`; its Rust library name remains
-`pmu`. It exposes Linux perf counting and sampling, including `EventTimer` for
-low-overhead measurements of a hot block:
+Every local source a profiler measures a host through: PMU counting and
+sampling, precise memory sampling, host clocks and thermals, memory-controller
+bandwidth, and procfs/BPF resource telemetry. Backends that cannot run on the
+compiling host still compile and report themselves unavailable at runtime, so
+the platform never leaks into a caller's build.
+
+It exposes `EventTimer` for low-overhead measurements of a hot block:
 
 ```rust,no_run
-use pmu::{Counter, EventTimer};
+use libprof::{Counter, EventTimer};
 
 # fn work() {}
-# fn example() -> Result<(), pmu::Error> {
+# fn example() -> Result<(), libprof::Error> {
 let timer = EventTimer::new(&[Counter::Cycles, Counter::Instructions])?;
 let span = timer.start()?;
 work();
@@ -52,10 +56,10 @@ therefore be interpreted relative to roughly twice this reported snapshot cost.
 `mperf` dispatcher, a results directory, files, or an async runtime:
 
 ```rust,no_run
-use pmu::{Counter, QuickSampler};
+use libprof::{Counter, QuickSampler};
 
 # fn work() {}
-# fn example() -> Result<(), pmu::Error> {
+# fn example() -> Result<(), libprof::Error> {
 let sampler = QuickSampler::new(&[Counter::Cycles])?;
 let samples = sampler.record(4_000, work)?;
 println!("collected {} samples", samples.len());
@@ -75,7 +79,7 @@ directory.
 Enable the `symbolize` feature for `top_symbols` and the `quick_sample` example:
 
 ```console
-cargo run -p miniperf-pmu --features symbolize --example quick_sample
+cargo run -p libprof --features symbolize --example quick_sample
 ```
 
 ## Features and compatibility
@@ -87,7 +91,7 @@ shared debug-aware in-process resolver, while `criterion` enables
 `CriterionCounter`, a `criterion::measurement::Measurement` implementation:
 
 ```console
-cargo run -p miniperf-pmu --features criterion --example criterion_counter
+cargo run -p libprof --features criterion --example criterion_counter
 ```
 
 The crate follows Semantic Versioning. Incompatible public API changes require

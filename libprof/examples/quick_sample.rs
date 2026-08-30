@@ -1,6 +1,6 @@
-use pmu::{top_symbols, Counter, QuickSampler, UnwindMode};
+use libprof::{top_symbols, Counter, QuickSampler, UnwindMode};
 
-fn main() -> Result<(), pmu::Error> {
+fn main() -> Result<(), libprof::Error> {
     let sampler =
         QuickSampler::bounded(&[Counter::Cycles], 10_000)?.unwind_mode(UnwindMode::FramePointer);
     let batch = sampler.record_batch(4_000, || {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use libprof::Counter;
 use mperf_data::{EventType, ProcMapEntry};
-use pmu::Counter;
 use store::duckdb::Connection;
 use symbolize::{ProcessMap, Resolver};
 

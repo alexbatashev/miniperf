@@ -1,7 +1,7 @@
 use criterion::{black_box, Criterion};
-use pmu::{Counter, CriterionCounter};
+use libprof::{Counter, CriterionCounter};
 
-fn main() -> Result<(), pmu::Error> {
+fn main() -> Result<(), libprof::Error> {
     let measurement = CriterionCounter::new(Counter::Instructions)?;
     let mut criterion = Criterion::default()
         .without_plots()

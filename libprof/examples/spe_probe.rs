@@ -22,7 +22,7 @@ fn main() {
         .spawn()
         .expect("spawn workload");
 
-    let mut driver = match pmu::mem_sampling_driver(child.id() as i32, 1000, 0, false) {
+    let mut driver = match libprof::mem_sampling_driver(child.id() as i32, 1000, 0, false) {
         Ok(driver) => driver,
         Err(error) => {
             let _ = child.kill();
@@ -36,7 +36,7 @@ fn main() {
     let counter = samples.clone();
     driver
         .start(Arc::new(move |record| {
-            if let pmu::Record::MemSample(sample) = record {
+            if let libprof::Record::MemSample(sample) = record {
                 counter.fetch_add(1, Ordering::Relaxed);
                 if printed.fetch_add(1, Ordering::Relaxed) < 10 {
                     println!(

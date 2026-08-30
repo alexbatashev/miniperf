@@ -5,7 +5,7 @@ use std::{fs::File, path::Path, rc::Rc, sync::Arc};
 #[cfg(target_os = "macos")]
 use std::{collections::HashMap, path::PathBuf};
 
-use pmu::{Counter, Process, Record};
+use libprof::{Counter, Process, Record};
 
 use crate::{
     Scenario,
@@ -125,9 +125,9 @@ pub async fn do_record(
         None
     };
 
-    let (cpu_vendor, cpu_model) = pmu::host_cpu_description();
+    let (cpu_vendor, cpu_model) = libprof::host_cpu_description();
 
-    let cores = pmu::host_core_clusters()
+    let cores = libprof::host_core_clusters()
         .into_iter()
         .map(|c| mperf_data::CoreCluster {
             family_id: c.family_id,
@@ -145,7 +145,7 @@ pub async fn do_record(
         sampling_frequency_hz: Some(if scenario == Scenario::Snapshot {
             99
         } else {
-            pmu::DEFAULT_SAMPLE_FREQUENCY_HZ
+            libprof::DEFAULT_SAMPLE_FREQUENCY_HZ
         }),
         cpu_clock_source: Some(if cfg!(any(target_os = "macos", target_os = "linux")) {
             CpuClockSource::SampledOccupancy
@@ -390,7 +390,9 @@ fn snapshot(
     ))
 }
 
-pub(crate) fn sample_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::SamplingCallback> {
+pub(crate) fn sample_callback(
+    dispatcher: Arc<EventDispatcher>,
+) -> Arc<dyn libprof::SamplingCallback> {
     Arc::new(move |record| match record {
         Record::Sample(sample) => {
             let unique_id = dispatcher.unique_id();
@@ -445,7 +447,7 @@ pub(crate) fn sample_callback(dispatcher: Arc<EventDispatcher>) -> Arc<dyn pmu::
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn mem_sample_callback(
     dispatcher: Arc<EventDispatcher>,
-) -> Arc<dyn pmu::SamplingCallback> {
+) -> Arc<dyn libprof::SamplingCallback> {
     Arc::new(move |record| match record {
         Record::MemSample(sample) => {
             let mut callstack = vec![sample.ip];
@@ -574,7 +576,7 @@ fn topdown(
     command: &[String],
     output_directory: &Path,
 ) -> Result<(ScenarioInfo, Vec<mperf_data::SnapshotCollectorStatus>)> {
-    let scenario = pmu::tma_scenario().context("TMA is not supported on this CPU")?;
+    let scenario = libprof::tma_scenario().context("TMA is not supported on this CPU")?;
     // Validate the formula groups, but do not turn each one into an independent
     // sampling leader. Multiple cycle leaders multiply the interrupt rate and
     // severely perturb the workload (especially while capturing DWARF stacks).

@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
+use libprof::{Counter, Process, Record};
 use mperf_data::{CallFrame, Event, ProcMapEntry, RooflineInfo, RooflineMethodInfo, ScenarioInfo};
 use object::{Object, ObjectSymbol};
-use pmu::{Counter, Process, Record};
 
 use crate::{Scenario, event_dispatcher::EventDispatcher, utils::counter_to_event_ty};
 
@@ -575,12 +575,12 @@ async fn profile_command(
         std::thread::spawn(move || sample_memory_timeline(pid, &path, stop))
     });
     let counters = crate::source::scenario_counters(Scenario::Roofline);
-    let mut instruction_counter = pmu::CountingDriverBuilder::new()
+    let mut instruction_counter = libprof::CountingDriverBuilder::new()
         .counters(&[Counter::Instructions])
         .process(Some(&process))
         .build()
         .ok();
-    let mut driver = pmu::SamplingDriverBuilder::new()
+    let mut driver = libprof::SamplingDriverBuilder::new()
         .counters(&counters)
         .process(&process)
         .build()?;
@@ -757,7 +757,7 @@ fn start_bandwidth_timeline(
     output: PathBuf,
     stop: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<Result<()>>> {
-    let monitor = match pmu::MemoryControllerMonitor::start() {
+    let monitor = match libprof::MemoryControllerMonitor::start() {
         Ok(Some(monitor)) => monitor,
         Ok(None) => return None,
         Err(error) => {

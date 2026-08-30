@@ -170,10 +170,10 @@ fn write_hotspots(tables: &Tables) -> Result<()> {
 }
 
 fn write_derived_metrics(tables: &Tables) -> Result<()> {
-    write_metric_definitions(tables, &pmu::host_metrics())
+    write_metric_definitions(tables, &libprof::host_metrics())
 }
 
-fn write_metric_definitions(tables: &Tables, metrics: &[pmu::Metric]) -> Result<()> {
+fn write_metric_definitions(tables: &Tables, metrics: &[libprof::Metric]) -> Result<()> {
     let available = tables.columns("pmu_counters");
     let mut rows = Vec::<(String, f64, Option<String>, String)>::new();
     for metric in metrics {
@@ -275,10 +275,10 @@ mod tests {
     fn persists_applicable_derived_metric() {
         let dir = tempfile::tempdir().unwrap();
         let tables = session(dir.path());
-        let metric = pmu::Metric {
+        let metric = libprof::Metric {
             name: "IPC".to_owned(),
             desc: "Instructions per cycle".to_owned(),
-            expression: pmu::MetricExpression("instructions / cycles".to_owned()),
+            expression: libprof::MetricExpression("instructions / cycles".to_owned()),
             unit: Some("insn/cycle".to_owned()),
         };
         write_metric_definitions(&tables, &[metric]).unwrap();

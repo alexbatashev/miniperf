@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `miniperf-pmu` are recorded here. This project follows
+All notable changes to `libprof` are recorded here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html): incompatible public
 API changes require a major release after 1.0; before 1.0, incompatible changes
 increment the minor version. Deprecations are preferred for at least one minor
