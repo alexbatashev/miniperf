@@ -252,15 +252,9 @@ fn perf_events_are_available() -> bool {
         eprintln!("skipped: MPERF_NO_PMU is set");
         return false;
     }
-    // perf_event_attr VER0: type=PERF_TYPE_HARDWARE, size=64,
-    // config=PERF_COUNT_HW_CPU_CYCLES, everything else zero.
-    let attr = [64_u64 << 32, 0, 0, 0, 0, 0, 0, 0];
-    let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
-    if fd >= 0 {
-        unsafe { libc::close(fd as i32) };
+    let Err(error) = open_hardware_cycles() else {
         return true;
-    }
-    let error = std::io::Error::last_os_error();
+    };
     if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) {
         eprintln!("skipped: this host has no hardware PMU ({error})");
         return false;
@@ -269,6 +263,24 @@ fn perf_events_are_available() -> bool {
         "perf_event access is unavailable ({error}); set kernel.perf_event_paranoid=-1, \
          or set MPERF_NO_PMU=1 to skip the profiler tests explicitly"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn open_hardware_cycles() -> std::io::Result<()> {
+    // perf_event_attr VER0: type=PERF_TYPE_HARDWARE, size=64,
+    // config=PERF_COUNT_HW_CPU_CYCLES, everything else zero.
+    let attr = [64_u64 << 32, 0, 0, 0, 0, 0, 0, 0];
+    let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    unsafe { libc::close(fd as i32) };
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_hardware_cycles() -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::ENOENT))
 }
 
 fn mperf_binary() -> PathBuf {
