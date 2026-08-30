@@ -424,6 +424,20 @@ fn topdown(
     }
 
     pass.start(&context)?;
+    let recorded_counters = pass.recorded_counters();
+    let missing = scenario
+        .events
+        .iter()
+        .filter(|event| !recorded_counters.iter().any(|(_, name)| name == *event))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        pass.stop(&context);
+        anyhow::bail!(
+            "TMA needs hardware counters this host cannot open ({}); run `mperf doctor`, or use `record -s snapshot`",
+            missing.join(", ")
+        );
+    }
 
     process.cont();
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -436,7 +450,6 @@ fn topdown(
     {
         eprintln!("Warning: {}: {}", status.name, status.message);
     }
-    let recorded_counters = pass.recorded_counters();
 
     Ok((
         ScenarioInfo::TMA(mperf_data::TMAInfo {
