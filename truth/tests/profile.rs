@@ -243,22 +243,32 @@ fn duty_row(row: &Row<'_>) -> (String, u64) {
     (name, value.unwrap_or(0).max(0) as u64)
 }
 
-/// Whether the profiler can be run here. Hosts without perf access must opt
-/// out with `MPERF_NO_PMU=1`; a missing PMU is never a silent pass.
+/// Whether the profiler can be run here with a hardware PMU, which every
+/// truth assertion needs. Hosts without perf access must opt out with
+/// `MPERF_NO_PMU=1`; a permission problem is never a silent pass. A kernel
+/// that reports no hardware counters at all (a VM) is skipped by probe.
 fn perf_events_are_available() -> bool {
     if env::var_os("MPERF_NO_PMU").is_some() {
         eprintln!("skipped: MPERF_NO_PMU is set");
         return false;
     }
-    let level = fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
-        .ok()
-        .and_then(|value| value.trim().parse::<i32>().ok());
-    assert!(
-        level.is_some_and(|level| level <= -1),
-        "perf_event access is unavailable (kernel.perf_event_paranoid={level:?}); \
-         set kernel.perf_event_paranoid=-1, or set MPERF_NO_PMU=1 to skip the profiler tests explicitly"
+    // perf_event_attr VER0: type=PERF_TYPE_HARDWARE, size=64,
+    // config=PERF_COUNT_HW_CPU_CYCLES, everything else zero.
+    let attr = [64_u64 << 32, 0, 0, 0, 0, 0, 0, 0];
+    let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0) };
+    if fd >= 0 {
+        unsafe { libc::close(fd as i32) };
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) {
+        eprintln!("skipped: this host has no hardware PMU ({error})");
+        return false;
+    }
+    panic!(
+        "perf_event access is unavailable ({error}); set kernel.perf_event_paranoid=-1, \
+         or set MPERF_NO_PMU=1 to skip the profiler tests explicitly"
     );
-    true
 }
 
 fn mperf_binary() -> PathBuf {

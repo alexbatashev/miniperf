@@ -7552,6 +7552,7 @@ dependencies = [
 name = "truth"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "miniperf-store",
 ]
 
