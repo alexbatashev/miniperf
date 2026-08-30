@@ -14,18 +14,18 @@ The pure assertions, including mutation evidence, run normally:
 cargo test -p truth
 ```
 
-The profiler integration test is ignored because hardware perf access is a
-host policy decision. On Linux, build `mperf`, allow perf events, and run:
+The profiler integration tests run under plain `cargo test` and fail on a host
+without perf access. A kernel that exposes no hardware PMU at all (a VM) skips
+them by probe; hosts that cannot profile for policy reasons must say so
+explicitly:
 
 ```sh
-sudo sysctl -w kernel.perf_event_paranoid=-1
-cargo build -p mperf
-cargo test -p truth --test profile -- --ignored
+sudo sysctl -w kernel.perf_event_paranoid=-1   # to run them
+MPERF_NO_PMU=1 cargo test -p truth             # to skip them, visibly
 ```
 
-The ignored test checks privileges before recording and reports a skip when
-they are unavailable. CI is responsible for setting the sysctl; tests never
-change host policy themselves. `MPERF_BIN` may override the binary path.
+GitHub-hosted CI sets `MPERF_NO_PMU=1`; tests never change host policy
+themselves. `MPERF_BIN` may override the binary path.
 
 ## Fixture policy
 
