@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use mperf_data::{CallFrame, Event, ProcMapEntry, RooflineInfo, RooflineMethodInfo, ScenarioInfo};
+use libprof::{Counter, Process};
+use mperf_data::{RooflineInfo, RooflineMethodInfo, ScenarioInfo};
 use object::{Object, ObjectSymbol};
-use pmu::{Counter, Process, Record};
 
 use crate::{Scenario, event_dispatcher::EventDispatcher, utils::counter_to_event_ty};
 
@@ -441,16 +441,17 @@ fn inspect_guest(path: &Path) -> Result<GuestInfo> {
 }
 
 fn host_architecture() -> object::Architecture {
-    #[cfg(target_arch = "x86_64")]
-    return object::Architecture::X86_64;
-    #[cfg(target_arch = "riscv64")]
-    return object::Architecture::Riscv64;
-    #[cfg(target_arch = "riscv32")]
-    return object::Architecture::Riscv32;
-    #[cfg(target_arch = "aarch64")]
-    return object::Architecture::Aarch64;
-    #[allow(unreachable_code)]
-    object::Architecture::Unknown
+    if cfg!(target_arch = "x86_64") {
+        object::Architecture::X86_64
+    } else if cfg!(target_arch = "aarch64") {
+        object::Architecture::Aarch64
+    } else if cfg!(target_arch = "riscv64") {
+        object::Architecture::Riscv64
+    } else if cfg!(target_arch = "riscv32") {
+        object::Architecture::Riscv32
+    } else {
+        object::Architecture::Unknown
+    }
 }
 
 pub(crate) fn calibrate_host() -> Result<mperf_data::RooflineCalibration> {
@@ -481,8 +482,8 @@ impl RooflineBackend for CompilerBackend {
                 Ok(path) => format!("{path}:{exe_path}:{exe_path}/../lib"),
                 Err(_) => format!("{exe_path}:{exe_path}/../lib"),
             };
-            let collector_env = crate::source::Source::child_environment(
-                &crate::source::InternalEventsSource {
+            let collector_env = libprof::Source::child_environment(
+                &libprof::InternalEventsSource {
                     roofline_instrumented: false,
                 },
                 output_directory,
@@ -507,8 +508,8 @@ impl RooflineBackend for CompilerBackend {
                 "Run 2: collecting compiler-instrumented loop statistics for '{}'",
                 command.join(" ")
             );
-            let mut instrumented_env = crate::source::Source::child_environment(
-                &crate::source::InternalEventsSource {
+            let mut instrumented_env = libprof::Source::child_environment(
+                &libprof::InternalEventsSource {
                     roofline_instrumented: true,
                 },
                 output_directory,
@@ -519,18 +520,22 @@ impl RooflineBackend for CompilerBackend {
             process.wait()?;
             ensure_process_success(&process, "compiler Roofline accounting run")?;
 
+            let mut method = self.method.clone();
+            method.warnings.extend(baseline.warnings);
+
             Ok(ScenarioInfo::Roofline(RooflineInfo {
                 backend: "compiler".to_string(),
                 perf_pid: baseline.pid,
                 counters: baseline.counters,
                 inst_pid: process.pid(),
-                method: Some(Box::new(self.method.clone())),
+                method: Some(Box::new(method)),
             }))
         })
     }
 }
 
 struct ProfiledRun {
+    warnings: Vec<String>,
     pid: i32,
     start_ns: u64,
     end_ns: u64,
@@ -575,68 +580,21 @@ async fn profile_command(
         std::thread::spawn(move || sample_memory_timeline(pid, &path, stop))
     });
     let counters = crate::source::scenario_counters(Scenario::Roofline);
-    let mut instruction_counter = pmu::CountingDriverBuilder::new()
+    // Opened before the sampling groups so they can size themselves around the
+    // hardware counter it takes.
+    let mut instruction_counter = libprof::CountingDriverBuilder::new()
         .counters(&[Counter::Instructions])
         .process(Some(&process))
         .build()
         .ok();
-    let mut driver = pmu::SamplingDriverBuilder::new()
+    let mut driver = libprof::SamplingDriverBuilder::new()
         .counters(&counters)
         .process(&process)
         .build()?;
     let mut precise_memory = precise_memory_source.map(|(source, directory)| {
         start_precise_memory(source, dispatcher.clone(), &directory, &process)
     });
-    let sample_dispatcher = dispatcher;
-    driver.start(Arc::new(move |record| match record {
-        Record::Sample(sample) => {
-            let name = if let Counter::Custom(name) = &sample.counter {
-                sample_dispatcher.string_id(name)
-            } else {
-                0
-            };
-            let mut callstack = smallvec::smallvec![CallFrame::IP(sample.ip)];
-            callstack.extend(
-                sample
-                    .callstack
-                    .into_iter()
-                    .filter(|address| *address != sample.ip)
-                    .map(CallFrame::IP),
-            );
-            sample_dispatcher.publish_event_sync(Event {
-                unique_id: 0,
-                correlation_id: sample.event_id as u64,
-                parent_id: 0,
-                ty: counter_to_event_ty(&sample.counter),
-                thread_id: sample.tid,
-                process_id: sample.pid,
-                cpu: sample.cpu,
-                time_enabled: sample.time_enabled,
-                time_running: sample.time_running,
-                value: sample.value,
-                timestamp: sample.time,
-                name,
-                callstack,
-                lbr_callstack: Vec::new(),
-                user_regs: sample.user_regs.map(|regs| mperf_data::UserRegs {
-                    abi: regs.abi,
-                    mask: regs.mask,
-                    values: regs.values,
-                }),
-                user_stack: sample.user_stack,
-            });
-        }
-        Record::ProcAddr(addr) => {
-            sample_dispatcher.publish_proc_map_sync(ProcMapEntry {
-                filename: addr.filename,
-                address: addr.addr as usize,
-                size: addr.len as usize,
-                offset: addr.pgoff as usize,
-                pid: addr.pid,
-            });
-        }
-        Record::MemSample(_) => {}
-    }))?;
+    driver.start(dispatcher)?;
     if let Some(counter) = instruction_counter.as_mut()
         && counter.start().is_err()
     {
@@ -667,11 +625,22 @@ async fn profile_command(
             .map_err(|_| anyhow::anyhow!("bandwidth sampler panicked"))??;
     }
     let end_ns = monotonic_timestamp()?;
-    driver.stop()?;
+    let mut warnings = Vec::new();
+    // A sampler that lost records still measured the run, and a second pass
+    // depends on this one; a sampler that never scheduled measured nothing, so
+    // there is no timing for the second pass to pair with.
+    if let Err(error) = driver.stop() {
+        if matches!(error, libprof::Error::SamplingGroupNeverScheduled) {
+            anyhow::bail!("{error}");
+        }
+        eprintln!("Warning: pmu_sampling: {error}");
+        warnings.push(format!("pmu_sampling: {error}"));
+    }
+
     if let Some((source, context)) = precise_memory.as_mut() {
-        for status in crate::source::Source::stop(source.as_mut(), context)
+        for status in libprof::Source::stop(source.as_mut(), context)
             .iter()
-            .filter(|status| status.status != "available")
+            .filter(|status| !status.is_available())
         {
             eprintln!("Warning: {}: {}", status.name, status.message);
         }
@@ -679,6 +648,7 @@ async fn profile_command(
     ensure_process_success(&process, "Roofline performance run")?;
 
     Ok(ProfiledRun {
+        warnings,
         pid: process.pid(),
         start_ns,
         end_ns,
@@ -690,15 +660,14 @@ async fn profile_command(
     })
 }
 
-/// The `PebsMem` rung of the memory scenario's ladder, when the host supports
-/// it. Below that rung nothing is created and the recording — including the
-/// profiled child's environment — is exactly what it was before.
-fn precise_memory_source(directory: &Path) -> Option<(Box<dyn crate::source::Source>, PathBuf)> {
-    let source: Box<dyn crate::source::Source> =
-        Box::new(crate::source::PreciseMemorySource::default());
+/// Precise memory sampling for the timed run, where the host provides it.
+/// Otherwise nothing is created and the recording — including the profiled
+/// child's environment — is exactly what it was before.
+fn precise_memory_source(directory: &Path) -> Option<(Box<dyn libprof::Source>, PathBuf)> {
+    let source: Box<dyn libprof::Source> = Box::new(libprof::PreciseMemorySource::default());
     match source.probe(directory) {
-        crate::source::Availability::Available => Some((source, directory.to_owned())),
-        crate::source::Availability::Unavailable { reason } => {
+        libprof::Availability::Available => Some((source, directory.to_owned())),
+        libprof::Availability::Unavailable { reason } => {
             println!("Precise memory sampling unavailable: {reason}");
             None
         }
@@ -706,17 +675,14 @@ fn precise_memory_source(directory: &Path) -> Option<(Box<dyn crate::source::Sou
 }
 
 fn start_precise_memory(
-    mut source: Box<dyn crate::source::Source>,
+    mut source: Box<dyn libprof::Source>,
     dispatcher: Arc<EventDispatcher>,
     directory: &Path,
     process: &Process,
-) -> (
-    Box<dyn crate::source::Source>,
-    crate::source::SessionContext,
-) {
-    let context = crate::source::SessionContext {
+) -> (Box<dyn libprof::Source>, libprof::SessionContext) {
+    let context = libprof::SessionContext {
         directory: directory.to_owned(),
-        dispatcher,
+        sink: dispatcher,
         process: None,
         attached_pid: Some(process.pid() as u32),
     };
@@ -757,7 +723,7 @@ fn start_bandwidth_timeline(
     output: PathBuf,
     stop: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<Result<()>>> {
-    let monitor = match pmu::MemoryControllerMonitor::start() {
+    let monitor = match libprof::MemoryControllerMonitor::start() {
         Ok(Some(monitor)) => monitor,
         Ok(None) => return None,
         Err(error) => {
@@ -827,14 +793,13 @@ pub(super) fn package_path(relative: &str) -> Option<PathBuf> {
     .find(|path| path.is_file())
 }
 
-#[cfg(target_os = "linux")]
+/// The `LD_PRELOAD` shim that reports allocations. It is an ELF shared object
+/// loaded through a Linux-only mechanism; elsewhere there is nothing to
+/// preload.
 fn memory_preload_path() -> Option<PathBuf> {
-    package_path("libmperf_libc.so")
-}
-
-#[cfg(not(target_os = "linux"))]
-fn memory_preload_path() -> Option<PathBuf> {
-    None
+    cfg!(target_os = "linux")
+        .then(|| package_path("libmperf_libc.so"))
+        .flatten()
 }
 
 fn monotonic_timestamp() -> Result<u64> {

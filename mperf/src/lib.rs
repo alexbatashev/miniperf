@@ -3,22 +3,13 @@ mod disassembly;
 mod doctor;
 mod event_dispatcher;
 mod events_export;
-mod host_telemetry;
 mod postprocess;
-mod processing;
 mod query;
 mod record;
 mod roofline;
-#[cfg(target_os = "linux")]
-mod snapshot_resources;
 mod source;
 mod stat;
 mod tui;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-mod unwind;
 mod utils;
 
 use std::{
@@ -157,7 +148,7 @@ pub async fn run() -> Result<()> {
         } => do_stat(pid, command, events, topdown.then_some(level)),
         Commands::Doctor => do_doctor(),
         Commands::List => {
-            let events = pmu::list_supported_counters(pmu::DriverKind::Default);
+            let events = libprof::list_supported_counters(libprof::DriverKind::Default);
             for event in events {
                 println!("{} - {}", event.name(), event.description());
             }

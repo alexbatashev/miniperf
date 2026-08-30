@@ -54,20 +54,15 @@ fn state_file() -> Option<PathBuf> {
         return Some(PathBuf::from(path).join("recent-results.json"));
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        env::var_os("HOME").map(|home| {
-            PathBuf::from(home).join("Library/Application Support/mperf-gui/recent-results.json")
-        })
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let state_directory = env::var_os("XDG_STATE_HOME")
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let state_directory = if cfg!(target_os = "macos") {
+        home?.join("Library/Application Support")
+    } else {
+        env::var_os("XDG_STATE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
-        Some(state_directory.join("mperf-gui/recent-results.json"))
-    }
+            .or_else(|| home.map(|home| home.join(".local/state")))?
+    };
+    Some(state_directory.join("mperf-gui/recent-results.json"))
 }
 
 #[cfg(test)]

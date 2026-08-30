@@ -255,13 +255,48 @@ Run `mperf query help` for the complete guide, including available tables and
 views, schema discovery, formula inspection, Roofline and TMA examples, JSON
 output, SQL files, and stdin usage.
 
+## Architecture
+
+The workspace has two tiers, and the boundary between them is what keeps a
+change green on every target.
+
+- **`libprof`** knows *how to measure*: PMU counting and sampling, precise
+  memory sampling (PEBS/IBS/SPE), host clocks and thermals, memory-controller
+  bandwidth, procfs/cgroup and BPF resource telemetry, and the post-hoc DWARF
+  unwinder for captured stack dumps. Everything it exposes compiles on every
+  target; a host that cannot provide a source says so at runtime.
+- **`mperf`** knows *when and what to measure*: scenarios, passes, counter
+  selection, storage, postprocessing and presentation. It contains no
+  `#[cfg(target_os)]` or `#[cfg(target_arch)]` outside Roofline's calibration
+  kernels, and CI fails if any appears.
+
+The rest of the workspace — `store`, `mperf-data`, `mperf-gui`, `symbolize`,
+`shims/*`, `utils/roofline-core` — is platform-agnostic already.
+
+Two rules follow from that split:
+
+- **A new data source is one `Source` impl in `libprof`** writing through
+  `Sink`, plus one registration line in the scenario that wants it. It must
+  compile on hosts that cannot run it and return
+  `Availability::Unavailable { reason }` there.
+- **A new hardware facility is a new `Mechanism` behind an existing
+  `Feature`**, never a new user-facing knob. Callers ask for `PreciseMem` or
+  `Topdown`; `libprof::resolve` decides whether PEBS, IBS or SPE answers, and
+  records which one along with its `MeasurementQuality`.
+
+`Sink` is the contract that makes `libprof` embeddable: a `Record` carries
+samples, memory samples, module maps, resource observations, process-tree
+entries and scalar metrics, and the consumer decides where they go. `mperf`
+implements it over the Parquet session writer; an application embedding
+`libprof` can implement it over anything.
+
 ## Platform-Specific Notes
 
 ### Intel Tiger Lake
 
 - Models 0x8c and 0x8d are detected as Tiger Lake.
 - The checked-in table contains 231 core events generated from Linux perf's
-  Tiger Lake PMU data. See `pmu/events/intel/README.md` for the source,
+  Tiger Lake PMU data. See `libprof/events/intel/README.md` for the source,
   attribution, licensing, and regeneration command.
 - Unsupported architectural counters are omitted with a notice instead of
   aborting the entire `stat` or sampling run.
@@ -318,7 +353,7 @@ output, SQL files, and stdin usage.
 - Unlike X60, X100 does implement overflow interrupts for the cycle and
   instruction counters, so sampling uses `cycles` directly.
 - SpacemiT publishes no PMU event table for X100. The event names in
-  `pmu/events/spacemit/x100.json` were derived by measuring each raw event code
+  `libprof/events/spacemit/x100.json` were derived by measuring each raw event code
   against microbenchmarks with known analytic instruction, branch, and cache
   behaviour, then cross-checked against the event map in SpacemiT's K3 device
   tree. The set of valid raw codes comes from that device tree's

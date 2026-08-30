@@ -4199,6 +4199,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "libprof"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cfg-if",
+ "criterion",
+ "dlopen2",
+ "framehop",
+ "framehop-object",
+ "glob",
+ "hashbrown 0.15.5",
+ "insta",
+ "itertools 0.14.0",
+ "lazy_static",
+ "libc",
+ "miniperf-pmu-data",
+ "miniperf-symbolize",
+ "object 0.39.1",
+ "perf-event-open-sys2",
+ "prettyplease",
+ "proc-macro2",
+ "proc-maps",
+ "proc_getter",
+ "quote",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "syn 2.0.118",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4457,34 +4490,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "miniperf-pmu"
-version = "0.1.0"
-dependencies = [
- "cfg-if",
- "criterion",
- "dlopen2",
- "glob",
- "hashbrown 0.15.5",
- "insta",
- "itertools 0.14.0",
- "lazy_static",
- "libc",
- "miniperf-pmu-data",
- "miniperf-symbolize",
- "perf-event-open-sys2",
- "prettyplease",
- "proc-macro2",
- "proc_getter",
- "quote",
- "serde",
- "serde_json",
- "smallvec",
- "syn 2.0.118",
- "thiserror 2.0.18",
- "uuid",
-]
-
-[[package]]
 name = "miniperf-pmu-data"
 version = "0.1.0"
 dependencies = [
@@ -4644,7 +4649,7 @@ dependencies = [
  "inferno",
  "kdam",
  "libc",
- "miniperf-pmu",
+ "libprof",
  "miniperf-pmu-data",
  "miniperf-store",
  "miniperf-symbolize",

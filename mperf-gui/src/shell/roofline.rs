@@ -301,7 +301,7 @@ impl Plot {
                     time_share: entry.timing_samples.unwrap_or(0) as f64
                         / total_samples.max(1) as f64,
                     vectorized: entry.vector_double_ops.is_some_and(|ops| ops > 0.0),
-                    confident: entry.timing_quality.as_deref() == Some("advisor-grade"),
+                    confident: entry.timing_quality.as_deref() == Some("high-confidence"),
                 })
             })
             .collect();
@@ -796,7 +796,7 @@ fn format_tick(value: f64) -> String {
 /// they mean for the reader instead.
 fn quality_label(quality: &str) -> &str {
     match quality {
-        "advisor-grade" => "high confidence",
+        "high-confidence" => "high confidence",
         "low-confidence" => "low confidence",
         "insufficient-samples" => "insufficient data",
         "unclassified-instructions" => "unclassified instructions",
@@ -807,7 +807,7 @@ fn quality_label(quality: &str) -> &str {
 fn quality_badge(entry: &RooflineLoop, theme: &Theme) -> Option<impl IntoElement + use<>> {
     let quality = entry.timing_quality.as_deref()?;
     let color = match quality {
-        "advisor-grade" => theme.viz.status_good,
+        "high-confidence" => theme.viz.status_good,
         "low-confidence" => theme.viz.status_warn,
         _ => theme.viz.status_serious,
     };

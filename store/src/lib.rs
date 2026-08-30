@@ -2,6 +2,7 @@
 //! into the session directory, and all consumers query them through an
 //! in-memory DuckDB with one view per table.
 
+mod clock;
 mod hash;
 mod interner;
 mod recover;

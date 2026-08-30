@@ -14,11 +14,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use kdam::BarExt;
+use libprof::Process;
 use mperf_data::{
     CallFrame, Event, EventType, Location, RooflineInfo, RooflineMethodInfo, ScenarioInfo,
 };
 use object::{Object, ObjectKind, ObjectSegment, ObjectSymbol, SegmentFlags};
-use pmu::Process;
 use serde::Serialize;
 use smallvec::smallvec;
 
@@ -901,19 +901,34 @@ impl RooflineBackend for QemuBackend {
                 );
             }
             let mut method = self.method.clone();
+            method.warnings.extend(baseline.warnings.iter().cloned());
+            // The replay reproduces the program's work; the timed run executes
+            // that work plus whatever its threads retire while waiting for each
+            // other. How much waiting that is depends on how fast the run went,
+            // so the two totals are not comparable in that direction: an OpenMP
+            // barrier at the default active wait policy retires three orders of
+            // magnitude more than the loops it waits for. Only a native total
+            // below the replay's means the runs executed different programs.
             if baseline.instructions != 0 && counts.instructions != 0 {
-                let difference = baseline.instructions.abs_diff(counts.instructions) as f64
-                    / counts.instructions as f64;
-                if difference > 0.05 {
+                let native = baseline.instructions as f64;
+                let replayed = counts.instructions as f64;
+                if native < replayed * 0.95 {
                     let warning = format!(
-                        "native and {} instruction totals differ by {:.1}% (native {}, instrumented {}); replay-dependent memory rates are degraded",
+                        "the timed run retired fewer instructions than {} replayed ({} against {}); the two runs did not execute the same work and replay-dependent memory rates are degraded",
                         self.tool.name(),
-                        difference * 100.0,
                         baseline.instructions,
                         counts.instructions
                     );
                     eprintln!("Warning: {warning}");
                     method.quality = "replay-diverged".to_string();
+                    method.warnings.push(warning);
+                } else if native > replayed * 2.0 {
+                    let warning = format!(
+                        "the timed run retired {:.0}x the instructions {} accounted for; two things look like this and the totals cannot tell them apart — threads retiring instructions while waiting rather than computing (an OpenMP barrier at the default active wait policy is the usual source, and its wait loop then dominates the hotspots), or a replay that did not execute all of the work the timed run did",
+                        native / replayed,
+                        self.tool.name()
+                    );
+                    eprintln!("Warning: {warning}");
                     method.warnings.push(warning);
                 }
             }

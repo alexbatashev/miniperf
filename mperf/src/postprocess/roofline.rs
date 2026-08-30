@@ -586,7 +586,7 @@ fn collect_binary_loops(
             relative_error,
         ) {
             (false, _) => "unclassified-instructions",
-            (true, Some(error)) if error <= 0.10 => "advisor-grade",
+            (true, Some(error)) if error <= 0.10 => "high-confidence",
             (true, Some(error)) if error <= 0.20 => "low-confidence",
             _ => "insufficient-samples",
         };
@@ -602,7 +602,7 @@ fn collect_binary_loops(
         rows.line.push(loop_info.line.unwrap_or_default() as i64);
         rows.trip_count.push(loop_info.trip_count as i64);
         rows.duration
-            .push((quality == "advisor-grade").then(|| active_duration(&intervals) as i64));
+            .push((quality == "high-confidence").then(|| active_duration(&intervals) as i64));
         rows.timing_samples.push(sample_count as i64);
         rows.relative_errors.push(relative_error);
         rows.timing_qualities.push(quality.to_owned());
@@ -867,7 +867,7 @@ mod tests {
         rows.duration.push(Some(1_000_000_000));
         rows.timing_samples.push(400);
         rows.relative_errors.push(Some(0.098));
-        rows.timing_qualities.push("advisor-grade".to_owned());
+        rows.timing_qualities.push("high-confidence".to_owned());
         rows.measured_dram_bytes.push(measured);
         // bytes_load, bytes_store, arch_bytes_load, arch_bytes_store, then ops.
         for (index, value) in [
@@ -921,7 +921,7 @@ mod tests {
         // bytes, not the 1000 bytes the model says reached DRAM.
         assert_eq!(scalar_ai, 400_000.0);
         assert_eq!(vector_ai, 1_200_000.0);
-        assert_eq!(quality, "advisor-grade");
+        assert_eq!(quality, "high-confidence");
         assert_eq!(measured, None);
         assert_eq!(source, "architectural");
     }

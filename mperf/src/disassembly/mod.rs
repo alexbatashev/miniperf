@@ -1,16 +1,9 @@
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
 use std::process::Command;
 
-#[cfg(target_os = "linux")]
-use anyhow::Context;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(dead_code, reason = "the objdump backend is Linux-only")
-)]
 pub struct DisassembleRequest {
     pub module_path: PathBuf,
     pub load_bias: i64,
@@ -24,7 +17,6 @@ pub struct DisassembleTarget {
     /// Stable, demangled owner stored for every emitted instruction.
     pub owner_symbol: String,
     pub start_address: u64,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub end_address: u64,
 }
 
@@ -39,36 +31,33 @@ pub trait Disassembler: Send + Sync {
     fn disassemble(&self, request: &DisassembleRequest) -> Result<Vec<AssemblyLine>>;
 }
 
+/// The host's `objdump`, when it has one. Nothing about the backend is
+/// platform-specific: a host without the binary says so at runtime.
 pub fn default_disassembler() -> Result<Box<dyn Disassembler>> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(Box::new(ObjdumpDisassembler::new(None)?))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(anyhow!(
-            "no default disassembler is available for this platform"
-        ))
-    }
+    Ok(Box::new(ObjdumpDisassembler::new(None)?))
 }
 
-#[cfg(target_os = "linux")]
 struct ObjdumpDisassembler {
     program: PathBuf,
+    /// LLVM's objdump (also Apple's `objdump`) spells symbol selection
+    /// `--disassemble-symbols=`; GNU binutils spells it `--disassemble=`.
+    llvm: bool,
 }
 
-#[cfg(target_os = "linux")]
 impl ObjdumpDisassembler {
     fn new(program: Option<PathBuf>) -> Result<Self> {
         let program = program.unwrap_or_else(|| PathBuf::from("objdump"));
-        if which::which(&program).is_err() {
-            return Err(anyhow!(
-                "failed to locate '{}' required for disassembly",
-                program.display()
-            ));
-        }
-        Ok(ObjdumpDisassembler { program })
+        let version = Command::new(&program)
+            .arg("--version")
+            .output()
+            .map_err(|error| {
+                anyhow!(
+                    "failed to locate '{}' required for disassembly: {error}",
+                    program.display()
+                )
+            })?;
+        let llvm = String::from_utf8_lossy(&version.stdout).contains("LLVM");
+        Ok(ObjdumpDisassembler { program, llvm })
     }
 
     fn run_objdump(
@@ -84,7 +73,12 @@ impl ObjdumpDisassembler {
             command.arg("--demangle");
         }
         if let Some(symbol) = selected_symbol {
-            command.arg(format!("--disassemble={symbol}"));
+            let flag = if self.llvm {
+                "--disassemble-symbols"
+            } else {
+                "--disassemble"
+            };
+            command.arg(format!("{flag}={symbol}"));
         } else {
             command
                 .arg(format!("--start-address={}", target.start_address))
@@ -103,8 +97,11 @@ impl ObjdumpDisassembler {
 
         if !output.status.success() {
             return Err(anyhow!(
-                "disassembler returned non-zero exit status for {}",
-                request.module_path.display()
+                "{} exited with {} for {}: {}",
+                self.program.display(),
+                output.status,
+                request.module_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
@@ -149,7 +146,6 @@ impl ObjdumpDisassembler {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl Disassembler for ObjdumpDisassembler {
     fn disassemble(&self, request: &DisassembleRequest) -> Result<Vec<AssemblyLine>> {
         if request.targets.is_empty() {
@@ -189,7 +185,6 @@ impl Disassembler for ObjdumpDisassembler {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn parse_objdump(output: &str, _load_bias: i64, owner: Option<&str>) -> Result<Vec<AssemblyLine>> {
     let mut lines = Vec::new();
     let mut current_symbol: Option<String> = None;
@@ -243,7 +238,7 @@ fn parse_objdump(output: &str, _load_bias: i64, owner: Option<&str>) -> Result<V
     Ok(lines)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use object::{Object, ObjectSymbol, SymbolKind};
@@ -256,6 +251,19 @@ mod tests {
 
     #[test]
     fn targeted_rust_symbol_produces_instructions() {
+        // The backend shells out to objdump; a host without it has nothing to
+        // assert about, which is exactly what `default_disassembler` reports.
+        // Where both dialects are installed, both must work.
+        let disassemblers = ["objdump", "llvm-objdump"]
+            .into_iter()
+            .filter_map(|program| ObjdumpDisassembler::new(Some(program.into())).ok())
+            .collect::<Vec<_>>();
+        for disassembler in disassemblers {
+            targeted_rust_symbol_produces_instructions_with(&disassembler);
+        }
+    }
+
+    fn targeted_rust_symbol_produces_instructions_with(disassembler: &ObjdumpDisassembler) {
         assert_eq!(targeted_disassembly_fixture(2), 37);
         let module_path = std::env::current_exe().unwrap();
         let bytes = std::fs::read(&module_path).unwrap();
@@ -284,10 +292,7 @@ mod tests {
             }],
         };
 
-        let lines = ObjdumpDisassembler::new(None)
-            .unwrap()
-            .disassemble(&request)
-            .unwrap();
+        let lines = disassembler.disassemble(&request).unwrap();
 
         assert!(!lines.is_empty());
         assert!(

@@ -1,4 +1,4 @@
-use pmu::Counter;
+use libprof::Counter;
 use pmu_data::{TmaScenario, arith_parser::Expr};
 use std::collections::BTreeSet;
 
@@ -13,7 +13,7 @@ pub fn get_tma_counter_groups(scenario: &TmaScenario) -> anyhow::Result<Vec<Vec<
         &scenario.groups
     };
     let available = scenario.events.iter().collect::<BTreeSet<_>>();
-    let capacity = pmu::host_max_counters();
+    let capacity = libprof::host_max_counters();
     let mut resolved = Vec::with_capacity(groups.len());
     for group in groups {
         if group.events.is_empty() {
@@ -24,7 +24,7 @@ pub fn get_tma_counter_groups(scenario: &TmaScenario) -> anyhow::Result<Vec<Vec<
         let programmable = group
             .events
             .iter()
-            .filter(|event| !pmu::is_topdown_event(event))
+            .filter(|event| !libprof::is_topdown_event(event))
             .count();
         if let Some(limit) = capacity
             && programmable > limit
@@ -46,7 +46,7 @@ pub fn get_tma_counter_groups(scenario: &TmaScenario) -> anyhow::Result<Vec<Vec<
             group
                 .events
                 .iter()
-                .map(|event| pmu::tma_counter(event))
+                .map(|event| libprof::tma_counter(event))
                 .collect(),
         );
     }

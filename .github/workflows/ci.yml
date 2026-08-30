@@ -32,6 +32,10 @@ jobs:
           # packaging time, on one platform, hours later.
           - task: deps-manifest
             command: python3 utils/deps/manifest.py check
+          # Platform breakage is otherwise found by a different CI leg, hours
+          # later; this makes it a red build on every target in seconds.
+          - task: platform-cfg
+            command: python3 utils/platform-cfg-guard.py
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: ./.github/actions/rust
@@ -66,13 +70,13 @@ jobs:
           - platform: linux-x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            task: pmu-features
-            command: cargo check -p miniperf-pmu --no-default-features && cargo clippy -p miniperf-pmu --all-features --all-targets -- -D warnings
+            task: libprof-features
+            command: cargo check -p libprof --no-default-features && cargo clippy -p libprof --all-features --all-targets -- -D warnings
           - platform: linux-x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            task: pmu-docs
-            command: RUSTDOCFLAGS="-D warnings" cargo doc -p miniperf-pmu -p miniperf-pmu-data --all-features --no-deps
+            task: libprof-docs
+            command: RUSTDOCFLAGS="-D warnings" cargo doc -p libprof -p miniperf-pmu-data --all-features --no-deps
           - platform: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu

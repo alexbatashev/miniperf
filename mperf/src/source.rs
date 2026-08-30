@@ -1,74 +1,19 @@
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::sync::Arc;
+//! Assembling libprof sources into the passes a scenario runs.
+//!
+//! Everything here is about *when and what* to measure: which counters a
+//! scenario wants, which sources it needs versus merely likes, and what to
+//! record about the ones that could not run. How to measure is libprof's.
+
+use std::path::Path;
 
 use anyhow::Result;
+use libprof::{Availability, Counter, Feature, PmuSamplingSource, SessionContext, Source};
 use mperf_data::{Scenario, SnapshotCollectorStatus};
-use pmu::{Counter, Process};
 
-use crate::event_dispatcher::EventDispatcher;
-
-/// What a source provides, declared before probing.
-pub struct SourceDecl {
-    pub name: &'static str,
-    /// Logical session tables this source writes.
-    #[allow(dead_code)]
-    pub provides: &'static [&'static str],
-}
-
-/// Result of probing whether a source can run here.
-pub enum Availability {
-    Available,
-    Unavailable { reason: String },
-}
-
-/// Everything a source needs to know about the pass it runs in. The target
-/// process is the launched (still suspended) root, or an attach PID.
-pub struct SessionContext {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub directory: PathBuf,
-    pub dispatcher: Arc<EventDispatcher>,
-    pub process: Option<Rc<Process>>,
-    pub attached_pid: Option<u32>,
-}
-
-impl SessionContext {
-    pub fn root_pid(&self) -> u32 {
-        self.attached_pid
-            .unwrap_or_else(|| self.process.as_ref().expect("no target process").pid() as u32)
-    }
-
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn launched(&self) -> bool {
-        self.process.is_some()
-    }
-}
-
-/// Per-source outcome recorded into the session; generalizes the snapshot
-/// collector status and feeds `ScenarioInfo` warnings.
-pub type SourceStatus = SnapshotCollectorStatus;
-
-/// A data producer contributing tables to the session directory. Scenarios
-/// declare required and optional sources per pass; the orchestrator resolves
-/// the declarations against probed availability, injects child environment
-/// before launch, and records per-source status.
-pub trait Source {
-    fn declare(&self) -> SourceDecl;
-
-    fn as_any(&self) -> &dyn std::any::Any;
-
-    fn probe(&self, directory: &Path) -> Availability;
-
-    /// Environment the profiled child needs for this source, injected before
-    /// the process is created.
-    fn child_environment(&self, _directory: &Path) -> Vec<(String, String)> {
-        Vec::new()
-    }
-
-    fn start(&mut self, context: &SessionContext) -> Result<()>;
-
-    fn stop(&mut self, context: &SessionContext) -> Vec<SourceStatus>;
-}
+/// Interrupt rate for the snapshot scenario, in hertz. A snapshot watches a
+/// whole process tree for as long as the user leaves it running, so it trades
+/// resolution for an overhead the user does not notice.
+pub const SNAPSHOT_SAMPLE_FREQUENCY_HZ: u64 = 99;
 
 /// One app execution with its own source set. A scenario is an ordered list
 /// of passes; single-pass scenarios are the one-element case. Passes share
@@ -85,7 +30,7 @@ pub struct Pass {
 pub struct ResolvedPass {
     pub name: &'static str,
     pub sources: Vec<Box<dyn Source>>,
-    pub statuses: Vec<SourceStatus>,
+    pub statuses: Vec<SnapshotCollectorStatus>,
 }
 
 impl Pass {
@@ -106,7 +51,7 @@ impl Pass {
         for source in self.optional {
             match source.probe(directory) {
                 Availability::Available => sources.push(source),
-                Availability::Unavailable { reason } => statuses.push(SourceStatus {
+                Availability::Unavailable { reason } => statuses.push(SnapshotCollectorStatus {
                     name: source.declare().name.to_string(),
                     status: "unavailable".to_string(),
                     source: "probe".to_string(),
@@ -144,478 +89,87 @@ impl ResolvedPass {
         Ok(())
     }
 
-    pub fn stop(&mut self, context: &SessionContext) -> Vec<SourceStatus> {
+    pub fn stop(&mut self, context: &SessionContext) -> Vec<SnapshotCollectorStatus> {
         let mut statuses = std::mem::take(&mut self.statuses);
         for source in &mut self.sources {
-            statuses.extend(source.stop(context));
+            statuses.extend(source.stop(context).into_iter().map(collector_status));
         }
         statuses
     }
-}
 
-/// PMU sampling as a source. The counter list is part of the declaration,
-/// parameterized by scenario — this is where the old `counter_selection`
-/// hardcoding lives now.
-pub struct PmuSamplingSource {
-    counters: Vec<Counter>,
-    sample_freq: Option<u64>,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    stack_dump_size: Option<u32>,
-    drivers: Vec<Box<dyn pmu::SamplingDriver>>,
-    recorded: Vec<Counter>,
-}
-
-impl PmuSamplingSource {
-    pub fn for_scenario(scenario: Scenario) -> PmuSamplingSource {
-        let counters = scenario_counters(scenario);
-        let (sample_freq, stack_dump_size) = match scenario {
-            Scenario::Snapshot if cfg!(target_os = "linux") => (Some(99), Some(2 * 1024)),
-            _ => (None, None),
-        };
-        PmuSamplingSource {
-            counters,
-            sample_freq,
-            stack_dump_size,
-            drivers: Vec::new(),
-            recorded: Vec::new(),
-        }
-    }
-
-    /// Counters the drivers actually opened, for `ScenarioInfo`.
+    /// Counters the pass's PMU sampling source actually opened.
     pub fn recorded_counters(&self) -> Vec<(mperf_data::EventType, String)> {
-        self.recorded
+        self.sources
             .iter()
-            .map(|counter| {
-                (
-                    crate::utils::counter_to_event_ty(counter),
-                    counter.name().to_string(),
-                )
+            .find_map(|source| source.as_any().downcast_ref::<PmuSamplingSource>())
+            .map(|source| {
+                source
+                    .recorded_counters()
+                    .iter()
+                    .map(|counter| {
+                        (
+                            crate::utils::counter_to_event_ty(counter),
+                            counter.name().to_string(),
+                        )
+                    })
+                    .collect()
             })
-            .collect()
-    }
-}
-
-impl Source for PmuSamplingSource {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn declare(&self) -> SourceDecl {
-        SourceDecl {
-            name: "pmu_sampling",
-            provides: &["samples", "stacks", "modules"],
-        }
-    }
-
-    fn probe(&self, _directory: &Path) -> Availability {
-        Availability::Available
-    }
-
-    fn start(&mut self, context: &SessionContext) -> Result<()> {
-        let target_pids = if let Some(pid) = context.attached_pid {
-            #[cfg(target_os = "linux")]
-            {
-                let tree = crate::snapshot_resources::process_tree(pid);
-                if tree.is_empty() {
-                    vec![pid]
-                } else {
-                    tree.into_iter().map(|member| member.pid).collect()
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                vec![pid]
-            }
-        } else {
-            vec![context.root_pid()]
-        };
-        // Call-stack LBR is a per-task feature; every group opened here is
-        // attached to a target PID, so the rung is always valid when the
-        // hardware has it.
-        let lbr = lbr_callstacks();
-        for target_pid in target_pids {
-            let mut builder = pmu::SamplingDriverBuilder::new().counters(&self.counters);
-            if let Some(freq) = self.sample_freq {
-                builder = builder.sample_freq(freq);
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(size) = self.stack_dump_size {
-                builder = builder.stack_dump_size(size);
-            }
-            builder = builder.lbr_callstack(lbr);
-            if let Some(process) = &context.process {
-                builder = builder.process(process);
-            } else {
-                builder = builder.pid(target_pid as i32);
-            }
-            self.drivers.push(builder.build()?);
-        }
-        if let Some(driver) = self.drivers.first() {
-            self.recorded = driver.counters();
-        }
-        let callback = crate::record::sample_callback(context.dispatcher.clone());
-        for driver in &mut self.drivers {
-            driver.start(callback.clone())?;
-        }
-        Ok(())
-    }
-
-    fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
-        let mut message = String::new();
-        let mut status = "available";
-        let mut quality = "exact";
-        for driver in &mut self.drivers {
-            if let Err(error) = driver.stop() {
-                status = "degraded";
-                quality = "lossy";
-                message = error.to_string();
-            }
-        }
-        self.drivers.clear();
-        #[cfg(target_os = "linux")]
-        if status == "available" && !pmu::inherited_sample_read_supported() {
-            status = "degraded";
-            quality = "best_effort";
-            message = "this kernel rejects inherited sampling groups with PERF_SAMPLE_READ \
-                       (Linux < 6.12); threads created after exec are not sampled"
-                .to_string();
-        }
-        vec![SourceStatus {
-            name: "pmu_sampling".to_string(),
-            status: status.to_string(),
-            source: "perf_events".to_string(),
-            quality: quality.to_string(),
-            message,
-        }]
-    }
-}
-
-/// Precise memory sampling: the `PebsMem` and `ArmSpe` rungs of the memory
-/// scenario's ladder. Runs alongside the counter-based sampling group and
-/// contributes the `mem_samples` family; at `counter_only` it probes
-/// unavailable and nothing about the recording changes.
-#[derive(Default)]
-pub struct PreciseMemorySource {
-    driver: Option<Box<dyn pmu::SamplingDriver>>,
-    kind: Option<&'static str>,
-}
-
-impl Source for PreciseMemorySource {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn declare(&self) -> SourceDecl {
-        SourceDecl {
-            name: "precise_memory",
-            provides: &["mem_samples", "alloc_site_memory", "cacheline_contention"],
-        }
-    }
-
-    /// Allocation-site attribution needs the in-process collector's stack
-    /// capture around `malloc`/`free`; the unthrottled allocation stream alone
-    /// carries no call stacks.
-    fn child_environment(&self, directory: &Path) -> Vec<(String, String)> {
-        InternalEventsSource {
-            roofline_instrumented: false,
-        }
-        .child_environment(directory)
-    }
-
-    fn probe(&self, _directory: &Path) -> Availability {
-        let resolution = pmu::resolve(scenario_ladder(Scenario::Mem), &pmu::capabilities());
-        match resolution.chosen {
-            pmu::Rung::PebsMem | pmu::Rung::ArmSpe => Availability::Available,
-            _ => Availability::Unavailable {
-                reason: resolution
-                    .rejected
-                    .first()
-                    .map(|(_, reason)| reason.clone())
-                    .unwrap_or_else(|| "no precise memory sampling on this host".to_string()),
-            },
-        }
-    }
-
-    #[cfg_attr(not(target_os = "linux"), allow(unused))]
-    fn start(&mut self, context: &SessionContext) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut driver = pmu::mem_sampling_driver(
-                context.root_pid() as i32,
-                pmu::DEFAULT_SAMPLE_FREQUENCY_HZ,
-                8 * 1024,
-                lbr_callstacks(),
-            )?;
-            driver.start(crate::record::mem_sample_callback(
-                context.dispatcher.clone(),
-            ))?;
-            self.driver = Some(driver);
-            self.kind = Some(pmu::mem_sampling_kind());
-        }
-        Ok(())
-    }
-
-    fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
-        let mut status = "available";
-        let mut message = String::new();
-        if let Some(driver) = &mut self.driver
-            && let Err(error) = driver.stop()
-        {
-            status = "degraded";
-            message = error.to_string();
-        }
-        self.driver = None;
-        vec![SourceStatus {
-            name: "precise_memory".to_string(),
-            status: status.to_string(),
-            source: self.kind.take().unwrap_or("pebs").to_string(),
-            quality: "precise".to_string(),
-            message,
-        }]
-    }
-}
-
-/// The self-contained internal-event collector inside the profiled process:
-/// activated purely through the child environment; contributes event tables
-/// written by the child itself.
-pub struct InternalEventsSource {
-    pub roofline_instrumented: bool,
-}
-
-impl Source for InternalEventsSource {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn declare(&self) -> SourceDecl {
-        SourceDecl {
-            name: "internal_events",
-            provides: &["events", "payloads", "strings", "clock"],
-        }
-    }
-
-    fn probe(&self, _directory: &Path) -> Availability {
-        Availability::Available
-    }
-
-    fn child_environment(&self, directory: &Path) -> Vec<(String, String)> {
-        let directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_owned());
-        let mut env = vec![(
-            "MPERF_SESSION_DIR".to_string(),
-            directory.to_string_lossy().into_owned(),
-        )];
-        if let Some(library) = collector_library_path() {
-            env.push((
-                "MPERF_COLLECTOR_LIBRARY".to_string(),
-                library.to_string_lossy().into_owned(),
-            ));
-        }
-        if self.roofline_instrumented {
-            env.push((
-                "MPERF_COLLECTOR_ROOFLINE_INSTRUMENTED".to_string(),
-                "1".to_string(),
-            ));
-        }
-        env
-    }
-
-    fn start(&mut self, _context: &SessionContext) -> Result<()> {
-        Ok(())
-    }
-
-    fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
-        Vec::new()
-    }
-}
-
-/// Host clock and thermal sampling. Not scenario- or platform-specific: what
-/// a part clocked at conditions every number a recording reports, so this runs
-/// wherever the host exposes the sensors and reports why it could not
-/// otherwise.
-#[derive(Default)]
-pub struct HostTelemetrySource {
-    monitor: Option<crate::host_telemetry::HostTelemetryMonitor>,
-}
-
-impl Source for HostTelemetrySource {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn declare(&self) -> SourceDecl {
-        SourceDecl {
-            name: "host_telemetry",
-            provides: &["host_telemetry"],
-        }
-    }
-
-    fn probe(&self, _directory: &Path) -> Availability {
-        Availability::Available
-    }
-
-    fn start(&mut self, context: &SessionContext) -> Result<()> {
-        self.monitor = Some(crate::host_telemetry::HostTelemetryMonitor::start(
-            &context.directory,
-            context.root_pid(),
-        )?);
-        Ok(())
-    }
-
-    fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
-        self.monitor
-            .take()
-            .map(|monitor| monitor.stop())
             .unwrap_or_default()
     }
 }
 
-#[cfg(target_os = "linux")]
-pub use linux_sources::{BpfSource, ProcfsSource};
-
-#[cfg(target_os = "linux")]
-mod linux_sources {
-    use super::*;
-    use crate::snapshot_resources::{BpfMonitor, CgroupScope, ResourceMonitor};
-
-    /// procfs/cgroup resource pollers as one source (they share the private
-    /// cgroup scope and the once-per-second collection loop).
-    #[derive(Default)]
-    pub struct ProcfsSource {
-        cgroup: Option<CgroupScope>,
-        monitor: Option<ResourceMonitor>,
-    }
-
-    impl Source for ProcfsSource {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn declare(&self) -> SourceDecl {
-            SourceDecl {
-                name: "procfs_resources",
-                provides: &[
-                    "snapshot_resource_samples",
-                    "snapshot_processes",
-                    "snapshot_collectors",
-                ],
-            }
-        }
-
-        fn probe(&self, _directory: &Path) -> Availability {
-            Availability::Available
-        }
-
-        fn start(&mut self, context: &SessionContext) -> Result<()> {
-            let cgroup = CgroupScope::create(context.root_pid(), context.launched());
-            self.monitor = Some(ResourceMonitor::start(
-                context.root_pid(),
-                context.launched(),
-                cgroup.path(),
-                &context.directory,
-            )?);
-            self.cgroup = Some(cgroup);
-            Ok(())
-        }
-
-        fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
-            let mut statuses = self
-                .monitor
-                .take()
-                .map(|monitor| monitor.stop())
-                .unwrap_or_default();
-            if let Some(cgroup) = self.cgroup.take() {
-                statuses.push(cgroup.status());
-            }
-            statuses
-        }
-    }
-
-    /// bpftrace scheduling/block-IO/network probes.
-    #[derive(Default)]
-    pub struct BpfSource {
-        monitor: Option<BpfMonitor>,
-    }
-
-    impl Source for BpfSource {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
-        fn declare(&self) -> SourceDecl {
-            SourceDecl {
-                name: "bpf",
-                provides: &["snapshot_bpf"],
-            }
-        }
-
-        fn probe(&self, _directory: &Path) -> Availability {
-            if !Path::new("/sys/kernel/btf/vmlinux").is_file() {
-                return Availability::Unavailable {
-                    reason: "kernel BTF is unavailable".to_string(),
-                };
-            }
-            Availability::Available
-        }
-
-        fn start(&mut self, context: &SessionContext) -> Result<()> {
-            self.monitor = Some(BpfMonitor::start(context.root_pid(), &context.directory));
-            Ok(())
-        }
-
-        fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
-            self.monitor
-                .take()
-                .map(|monitor| vec![monitor.stop()])
-                .unwrap_or_default()
-        }
+fn collector_status(status: libprof::SourceStatus) -> SnapshotCollectorStatus {
+    SnapshotCollectorStatus {
+        name: status.name,
+        status: status.status,
+        source: status.source,
+        quality: status.quality,
+        message: status.message,
     }
 }
 
-/// The capture strategies a scenario prefers, best first. Every ladder ends at
-/// `Rung::Baseline`, the behaviour implemented today; higher rungs resolve but
-/// still run the baseline capture until their workstream fills them in.
-pub fn scenario_ladder(scenario: Scenario) -> &'static [pmu::Rung] {
-    use pmu::Rung::*;
+/// The hardware capability each scenario's headline analysis needs. Which
+/// mechanism provides it is libprof's business, not the scenario's.
+pub fn scenario_feature(scenario: Scenario) -> Feature {
     match scenario {
-        Scenario::Snapshot => &[LbrCallstack, Baseline],
-        Scenario::TMA => &[FixedTopdown, ArmSlotsTopdown, Baseline],
-        Scenario::Mem => &[PebsMem, IbsOp, ArmSpe, Baseline],
-        Scenario::Roofline => &[UncoreBw, Baseline],
+        Scenario::Snapshot => Feature::HwCallstack,
+        Scenario::TMA => Feature::Topdown,
+        Scenario::Mem => Feature::PreciseMem,
+        Scenario::Roofline => Feature::DramBw,
     }
 }
 
-/// Whether the host can decorate sampled events with Intel LBR call stacks,
-/// the `LbrCallstack` rung.
-pub fn lbr_callstacks() -> bool {
-    pmu::resolve(
-        &[pmu::Rung::LbrCallstack, pmu::Rung::Baseline],
-        &pmu::capabilities(),
-    )
-    .chosen
-        == pmu::Rung::LbrCallstack
-}
-
-/// Whether the Roofline ladder resolves to measured memory-controller
-/// bandwidth on this host, rather than the core-side baseline.
+/// Whether the Roofline scenario gets measured memory-controller bandwidth on
+/// this host, rather than the core-side baseline.
 pub fn roofline_uncore_bandwidth() -> bool {
-    pmu::resolve(scenario_ladder(Scenario::Roofline), &pmu::capabilities()).chosen
-        == pmu::Rung::UncoreBw
+    libprof::resolve(Feature::DramBw, &libprof::capabilities()).is_satisfied()
 }
 
-/// Resolve a scenario's ladder against the probed host.
+/// Resolve a scenario's headline feature against the probed host.
 pub fn resolve_fidelity(scenario: Scenario) -> mperf_data::CaptureFidelity {
-    let resolution = pmu::resolve(scenario_ladder(scenario), &pmu::capabilities());
+    let resolution = libprof::resolve(scenario_feature(scenario), &libprof::capabilities());
     mperf_data::CaptureFidelity {
         scenario: format!("{scenario:?}").to_lowercase(),
-        rung: resolution.chosen.name().to_string(),
+        rung: resolution.mechanism().name().to_string(),
         rejected: resolution
             .rejected
             .into_iter()
-            .map(|(rung, reason)| mperf_data::RejectedRung {
-                rung: rung.name().to_string(),
+            .map(|(mechanism, reason)| mperf_data::RejectedRung {
+                rung: mechanism.name().to_string(),
                 reason,
             })
             .collect(),
+    }
+}
+
+/// The PMU sampling source a scenario records with.
+pub fn pmu_sampling_source(scenario: Scenario) -> PmuSamplingSource {
+    let source = PmuSamplingSource::new(scenario_counters(scenario));
+    match scenario {
+        Scenario::Snapshot => source
+            .sample_freq(SNAPSHOT_SAMPLE_FREQUENCY_HZ)
+            .stack_dump_size(2 * 1024),
+        _ => source,
     }
 }
 
@@ -635,11 +189,11 @@ pub fn scenario_counters(scenario: Scenario) -> Vec<Counter> {
             Counter::PageFaults,
             Counter::ContextSwitches,
         ],
-        Scenario::TMA => pmu::tma_scenario()
+        Scenario::TMA => libprof::tma_scenario()
             .expect("TMA counter selection requires a supported host CPU")
             .events
             .iter()
-            .map(|event| pmu::tma_counter(event))
+            .map(|event| libprof::tma_counter(event))
             .chain([
                 Counter::CpuClock,
                 Counter::CpuMigrations,
@@ -648,18 +202,4 @@ pub fn scenario_counters(scenario: Scenario) -> Vec<Counter> {
             ])
             .collect(),
     }
-}
-
-/// The collector core shipped next to this binary, when present.
-fn collector_library_path() -> Option<PathBuf> {
-    let library = if cfg!(target_os = "macos") {
-        "libmperf_collector.dylib"
-    } else {
-        "libmperf_collector.so"
-    };
-    let mut path = std::env::current_exe().ok()?;
-    path.pop();
-    [path.join(library), path.join("../lib").join(library)]
-        .into_iter()
-        .find(|candidate| candidate.exists())
 }

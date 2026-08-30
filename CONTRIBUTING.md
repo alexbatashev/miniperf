@@ -6,7 +6,38 @@ Run the workspace quality gates before submitting a change:
 cargo fmt --all -- --check
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
+python3 utils/platform-cfg-guard.py
 ```
+
+## Where platform code lives
+
+`libprof` is the only crate allowed to select code at compile time, and inside
+it only `src/platform/` and the leaf syscall bindings should need to. The guard
+above fails the build when a `#[cfg(target_os = ...)]` or
+`#[cfg_attr(..., target_arch = ...)]` appears in `mperf/`, `mperf-gui/`,
+`store/` or `mperf-data/` outside `utils/platform-cfg-allowlist.txt`. It runs in
+seconds on every pull request, because the alternative is finding out from an
+aarch64 or macOS job hours later that the two targets were compiling different
+programs.
+
+`cfg!(target_os = ...)` is deliberately allowed: both of its branches compile
+everywhere, so it cannot break a target you did not build. Prefer branching on
+a libprof capability over branching on the platform at all.
+
+When you add to the profiler:
+
+- **A new data source is one `Source` impl in `libprof`** writing through
+  `Sink`, plus one registration line in the scenario that wants it. It must
+  compile on hosts that cannot run it and report
+  `Availability::Unavailable { reason }` there, so the recording degrades with
+  an explanation instead of the build failing.
+- **A new hardware facility is a new `Mechanism` behind an existing
+  `Feature`** in `libprof::features`, never a new scenario, CLI flag or knob.
+  Give it an honest `MeasurementQuality`: a mechanism that answers a different
+  question than the one asked is `Estimated`, however precise its hardware is.
+- **Anything a source produces goes through `Record`.** Sources do not write
+  files; adding a new shape of output means a new `Record` variant and one arm
+  in the consumer, not a second writer.
 
 ## Profiler truth policy
 
