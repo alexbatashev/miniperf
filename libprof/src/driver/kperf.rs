@@ -13,9 +13,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::driver::{
-    CounterEntry, CounterResult, CounterValue, CountingDriver, MeasurementQuality, Record, Sample,
-    SamplingDriver, Sink,
+    CounterEntry, CounterResult, CounterValue, CountingDriver, MeasurementQuality, SamplingDriver,
+    Sink,
 };
+use crate::sink::{Record, Sample};
 use crate::{Counter, Error};
 
 /// Upper bound on counters the kernel can write per CPU (arm64 is 11, x86_64 is
