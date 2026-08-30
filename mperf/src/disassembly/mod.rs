@@ -39,18 +39,25 @@ pub fn default_disassembler() -> Result<Box<dyn Disassembler>> {
 
 struct ObjdumpDisassembler {
     program: PathBuf,
+    /// LLVM's objdump (also Apple's `objdump`) spells symbol selection
+    /// `--disassemble-symbols=`; GNU binutils spells it `--disassemble=`.
+    llvm: bool,
 }
 
 impl ObjdumpDisassembler {
     fn new(program: Option<PathBuf>) -> Result<Self> {
         let program = program.unwrap_or_else(|| PathBuf::from("objdump"));
-        if which::which(&program).is_err() {
-            return Err(anyhow!(
-                "failed to locate '{}' required for disassembly",
-                program.display()
-            ));
-        }
-        Ok(ObjdumpDisassembler { program })
+        let version = Command::new(&program)
+            .arg("--version")
+            .output()
+            .map_err(|error| {
+                anyhow!(
+                    "failed to locate '{}' required for disassembly: {error}",
+                    program.display()
+                )
+            })?;
+        let llvm = String::from_utf8_lossy(&version.stdout).contains("LLVM");
+        Ok(ObjdumpDisassembler { program, llvm })
     }
 
     fn run_objdump(
@@ -66,7 +73,12 @@ impl ObjdumpDisassembler {
             command.arg("--demangle");
         }
         if let Some(symbol) = selected_symbol {
-            command.arg(format!("--disassemble={symbol}"));
+            let flag = if self.llvm {
+                "--disassemble-symbols"
+            } else {
+                "--disassemble"
+            };
+            command.arg(format!("{flag}={symbol}"));
         } else {
             command
                 .arg(format!("--start-address={}", target.start_address))
@@ -85,8 +97,11 @@ impl ObjdumpDisassembler {
 
         if !output.status.success() {
             return Err(anyhow!(
-                "disassembler returned non-zero exit status for {}",
-                request.module_path.display()
+                "{} exited with {} for {}: {}",
+                self.program.display(),
+                output.status,
+                request.module_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
@@ -238,9 +253,17 @@ mod tests {
     fn targeted_rust_symbol_produces_instructions() {
         // The backend shells out to objdump; a host without it has nothing to
         // assert about, which is exactly what `default_disassembler` reports.
-        let Ok(disassembler) = ObjdumpDisassembler::new(None) else {
-            return;
-        };
+        // Where both dialects are installed, both must work.
+        let disassemblers = ["objdump", "llvm-objdump"]
+            .into_iter()
+            .filter_map(|program| ObjdumpDisassembler::new(Some(program.into())).ok())
+            .collect::<Vec<_>>();
+        for disassembler in disassemblers {
+            targeted_rust_symbol_produces_instructions_with(&disassembler);
+        }
+    }
+
+    fn targeted_rust_symbol_produces_instructions_with(disassembler: &ObjdumpDisassembler) {
         assert_eq!(targeted_disassembly_fixture(2), 37);
         let module_path = std::env::current_exe().unwrap();
         let bytes = std::fs::read(&module_path).unwrap();
