@@ -2798,7 +2798,7 @@ mod tests {
             .iter()
             .map(|record| match record {
                 Record::Sample(sample) => sample.value,
-                Record::ProcAddr(_) | Record::MemSample(_) => panic!("expected sample"),
+                _ => panic!("expected sample"),
             })
             .collect();
         assert_eq!(values, [50]);
