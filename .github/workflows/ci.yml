@@ -61,7 +61,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             task: test
-            command: cargo test --workspace --all-targets
+            command: sudo sysctl -w kernel.perf_event_paranoid=-1 && cargo test --workspace --all-targets
           - platform: linux-x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
@@ -96,7 +96,7 @@ jobs:
             runner: macos-14
             target: aarch64-apple-darwin
             task: test
-            command: cargo test --workspace --all-targets
+            command: MPERF_NO_PMU=1 cargo test --workspace --all-targets
           - platform: macos-aarch64
             runner: macos-14
             target: aarch64-apple-darwin
