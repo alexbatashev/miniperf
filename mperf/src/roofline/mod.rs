@@ -520,18 +520,22 @@ impl RooflineBackend for CompilerBackend {
             process.wait()?;
             ensure_process_success(&process, "compiler Roofline accounting run")?;
 
+            let mut method = self.method.clone();
+            method.warnings.extend(baseline.warnings);
+
             Ok(ScenarioInfo::Roofline(RooflineInfo {
                 backend: "compiler".to_string(),
                 perf_pid: baseline.pid,
                 counters: baseline.counters,
                 inst_pid: process.pid(),
-                method: Some(Box::new(self.method.clone())),
+                method: Some(Box::new(method)),
             }))
         })
     }
 }
 
 struct ProfiledRun {
+    warnings: Vec<String>,
     pid: i32,
     start_ns: u64,
     end_ns: u64,
@@ -576,6 +580,8 @@ async fn profile_command(
         std::thread::spawn(move || sample_memory_timeline(pid, &path, stop))
     });
     let counters = crate::source::scenario_counters(Scenario::Roofline);
+    // Opened before the sampling groups so they can size themselves around the
+    // hardware counter it takes.
     let mut instruction_counter = libprof::CountingDriverBuilder::new()
         .counters(&[Counter::Instructions])
         .process(Some(&process))
@@ -619,7 +625,18 @@ async fn profile_command(
             .map_err(|_| anyhow::anyhow!("bandwidth sampler panicked"))??;
     }
     let end_ns = monotonic_timestamp()?;
-    driver.stop()?;
+    let mut warnings = Vec::new();
+    // A sampler that lost records still measured the run, and a second pass
+    // depends on this one; a sampler that never scheduled measured nothing, so
+    // there is no timing for the second pass to pair with.
+    if let Err(error) = driver.stop() {
+        if matches!(error, libprof::Error::SamplingGroupNeverScheduled) {
+            anyhow::bail!("{error}");
+        }
+        eprintln!("Warning: pmu_sampling: {error}");
+        warnings.push(format!("pmu_sampling: {error}"));
+    }
+
     if let Some((source, context)) = precise_memory.as_mut() {
         for status in libprof::Source::stop(source.as_mut(), context)
             .iter()
@@ -631,6 +648,7 @@ async fn profile_command(
     ensure_process_success(&process, "Roofline performance run")?;
 
     Ok(ProfiledRun {
+        warnings,
         pid: process.pid(),
         start_ns,
         end_ns,

@@ -44,6 +44,42 @@ use super::{
 /// counter multiplexing is supported.
 pub struct PerfCountingDriver {
     native_handles: Vec<NativeCounterHandle>,
+    /// Physical PMU counters this driver holds, published through
+    /// [`hardware_counters_held_for_counting`] while it lives.
+    reserved: usize,
+}
+
+/// Physical PMU counters held by counting drivers in this process.
+///
+/// A counting event occupies a hardware counter for its whole lifetime, and a
+/// sampling group sized to the rest of the PMU is still accepted by
+/// `perf_event_open` and then never scheduled. Sizing sampling groups around
+/// the counting drivers already open keeps that from happening, but it only
+/// holds when the counting driver is opened first; the guarantee that it never
+/// happens silently is [`PerfSamplingDriver::groups_scheduled`].
+static COUNTING_DRIVER_COUNTERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(super) fn hardware_counters_held_for_counting() -> usize {
+    COUNTING_DRIVER_COUNTERS.load(Ordering::Relaxed)
+}
+
+fn reserve_counting_counters(counters: &[Counter]) -> usize {
+    let reserved = counters
+        .iter()
+        .filter(|counter| !counter.is_software())
+        .count();
+    COUNTING_DRIVER_COUNTERS.fetch_add(reserved, Ordering::Relaxed);
+    reserved
+}
+
+impl Drop for PerfCountingDriver {
+    fn drop(&mut self) {
+        COUNTING_DRIVER_COUNTERS.fetch_sub(self.reserved, Ordering::Relaxed);
+        for handle in &self.native_handles {
+            unsafe { close(handle.fd) };
+        }
+    }
 }
 
 /// Sampling driver performs PMU event sampling. That is, every N cycles, the process is
@@ -111,7 +147,10 @@ impl PerfCountingDriver {
 
         let native_handles = binding::direct(&counters, &mut attrs, pid)?;
 
-        Ok(PerfCountingDriver { native_handles })
+        Ok(PerfCountingDriver {
+            native_handles,
+            reserved: reserve_counting_counters(&counters),
+        })
     }
 
     /// Open each PMU counter once per core cluster (faithful per-core counting).
@@ -196,7 +235,12 @@ impl PerfCountingDriver {
             ));
         }
 
-        Ok(PerfCountingDriver { native_handles })
+        Ok(PerfCountingDriver {
+            native_handles,
+            // A task runs on one cluster at a time, so the per-cluster copies
+            // of a counter occupy one physical counter between them.
+            reserved: reserve_counting_counters(&counters),
+        })
     }
 }
 
@@ -499,12 +543,57 @@ impl SamplingDriver for PerfSamplingDriver {
             handle.join().map_err(|_| Error::WorkerPanicked)?;
         }
 
+        if self.groups_scheduled() == Some(false) {
+            return Err(Error::SamplingGroupNeverScheduled);
+        }
+
         let lost = self.lost_samples.load(Ordering::Relaxed);
         if lost != 0 {
             return Err(Error::SamplesLost { count: lost });
         }
 
         Ok(())
+    }
+}
+
+/// How long a group leader reports its group was enabled and running.
+///
+/// `None` when the kernel returned less than the fixed header, which leaves
+/// the caller no basis to say anything about the group.
+fn read_group_times(fd: i32) -> Option<(u64, u64)> {
+    const MEMBERS: usize = 64;
+    const HEADER: usize = 3;
+
+    let mut buffer = [0_u64; HEADER + MEMBERS * 2];
+    let size = std::mem::size_of_val(&buffer);
+    let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), size) };
+    if read < (HEADER * std::mem::size_of::<u64>()) as isize {
+        return None;
+    }
+    Some((buffer[1], buffer[2]))
+}
+
+impl PerfSamplingDriver {
+    /// Whether any group the target actually reached ran on the PMU.
+    ///
+    /// `perf_event_open` accepts a group too large for the hardware and the
+    /// kernel then silently declines to schedule it: enabled time accrues,
+    /// running time stays at zero and not one sample is written. `None` when
+    /// no group was ever enabled, which is a target that never ran rather than
+    /// a group that never fit.
+    fn groups_scheduled(&self) -> Option<bool> {
+        let mut enabled_anywhere = false;
+        for handle in self.native_handles.iter().filter(|handle| handle.leader) {
+            let (enabled, running) = read_group_times(handle.fd)?;
+            if enabled == 0 {
+                continue;
+            }
+            if running > 0 {
+                return Some(true);
+            }
+            enabled_anywhere = true;
+        }
+        enabled_anywhere.then_some(false)
     }
 }
 

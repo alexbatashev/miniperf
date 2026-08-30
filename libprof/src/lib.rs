@@ -226,6 +226,12 @@ pub enum Error {
         /// Number of records reported lost by the kernel.
         count: u64,
     },
+    /// Every sampling group the target reached reported enabled time and no
+    /// running time: the kernel accepted groups the hardware cannot schedule.
+    #[error(
+        "the sampling groups asked for more hardware counters than this host has free, so the kernel never scheduled them and the recording has no samples"
+    )]
+    SamplingGroupNeverScheduled,
     /// A grouped counter read failed.
     #[error("failed to read perf counter group: {source}")]
     PerfRead {

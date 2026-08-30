@@ -155,6 +155,21 @@ pub fn grouped_on_cpu(
 
     let mut handles: Vec<NativeCounterHandle> = vec![];
 
+    // The ring owner carries the sampling configuration for its whole group.
+    // Every other member is read through it, so nothing else is left able to
+    // overflow.
+    if leader.is_some() {
+        make_counting_member(&mut cycles_attrs);
+    }
+    make_counting_member(&mut instr_attrs);
+    for index in group_plan
+        .iter()
+        .flat_map(|group| &group.hardware_indices)
+        .chain(&software_indices)
+    {
+        make_counting_member(&mut attrs[*index]);
+    }
+
     for group in group_plan {
         let cycles_leader_fd = if leader.is_some() {
             let mut leader_attr = leader_attrs.ok_or_else(|| {
@@ -212,6 +227,25 @@ pub fn grouped_on_cpu(
     Ok(handles)
 }
 
+/// Strip the sampling configuration from a group member.
+///
+/// Only the handle that owns the ring buffer needs to overflow: every other
+/// counter in the group is reported through the leader's `PERF_SAMPLE_READ`.
+/// Leaving a member configured to sample costs one PMU interrupt per member
+/// per period whose record has nowhere to be written, so a group of N events
+/// perturbs the workload N times harder than the caller asked for and records
+/// nothing extra for it.
+fn make_counting_member(attr: &mut perf_event_attr) {
+    attr.sample_freq = 0;
+    attr.set_freq(0);
+    attr.set_precise_ip(0);
+    attr.sample_type = 0;
+    attr.sample_regs_user = 0;
+    attr.sample_stack_user = 0;
+    attr.branch_sample_type = 0;
+    attr.set_mmap(0);
+}
+
 fn is_topdown(counter: &Counter) -> bool {
     matches!(counter, Counter::Custom(name) if crate::is_topdown_event(name))
 }
@@ -240,6 +274,12 @@ fn grouped_topdown_on_cpu(
         .iter()
         .position(|counter| matches!(counter, Counter::Custom(name) if name == crate::GROUP_LEADER))
         .unwrap_or(sampled);
+
+    for (index, attr) in attrs.iter_mut().enumerate() {
+        if index != sampled {
+            make_counting_member(attr);
+        }
+    }
 
     let mut handles = Vec::with_capacity(counters.len());
     let leader_fd = unsafe { sys::perf_event_open(&mut attrs[leader], pid, cpu, -1, 0) };
@@ -331,6 +371,12 @@ pub fn grouped_software_on_cpu(
         ));
     };
 
+    for (index, attr) in attrs.iter_mut().enumerate() {
+        if index != leader_index {
+            make_counting_member(attr);
+        }
+    }
+
     let mut handles = Vec::with_capacity(counters.len());
     let leader_fd = unsafe { sys::perf_event_open(&mut attrs[leader_index], pid, cpu, -1, 0) };
     push_handle(&mut handles, leader_fd, Counter::CpuClock, true, cpu)?;
@@ -366,6 +412,10 @@ fn grouped_all_on_cpu(
         return Err(Error::InvalidConfiguration(
             "a sampling group requires matching non-empty counters and attributes".to_owned(),
         ));
+    }
+
+    for attr in &mut attrs[1..] {
+        make_counting_member(attr);
     }
 
     let mut handles = Vec::with_capacity(counters.len());
@@ -445,12 +495,14 @@ fn close_handles(handles: &[NativeCounterHandle]) {
     }
 }
 
-/// Hardware counters the kernel itself occupies: currently one when the NMI
-/// watchdog is active (it pins a cycles event on every CPU).
+/// Hardware counters no sampling group can use: one for an active NMI
+/// watchdog, plus whatever counting drivers this process already holds on the
+/// target.
 fn reserved_hardware_counters() -> usize {
-    std::fs::read_to_string("/proc/sys/kernel/nmi_watchdog")
+    let nmi_watchdog = std::fs::read_to_string("/proc/sys/kernel/nmi_watchdog")
         .map(|value| value.trim() == "1")
-        .unwrap_or(false) as usize
+        .unwrap_or(false) as usize;
+    nmi_watchdog + super::hardware_counters_held_for_counting()
 }
 
 #[cfg(test)]

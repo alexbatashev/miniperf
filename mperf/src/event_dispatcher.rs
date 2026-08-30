@@ -35,6 +35,16 @@ pub struct DispatcherJoinHandle {
 }
 
 const BATCH_ROWS: usize = 8192;
+/// Cap on the raw sample bytes held before a Parquet write.
+///
+/// A row's captured user stack dwarfs its scalar columns, so a row count alone
+/// says nothing about the size of the write it will produce. 8192 rows of
+/// stack dumps encode for tens of milliseconds, and because the sampling
+/// driver publishes through a bounded channel, that stall reaches back into the
+/// kernel's perf ring, which is far smaller and drops what it cannot hold.
+/// Bounding the batch by bytes keeps each write short enough for the ring to
+/// ride out.
+const BATCH_STACK_BYTES: usize = 1024 * 1024;
 /// Resource rows arrive in ~1Hz bursts. Writing one batch per burst is what
 /// the collectors did before they wrote through the sink, and it is what keeps
 /// a killed recording's telemetry on disk.
@@ -60,6 +70,9 @@ struct Worker {
     resources: Vec<libprof::ResourceSample>,
     resources_writer: SegmentWriter,
     resources_flushed: std::time::Instant,
+    /// Captured stack bytes buffered in `samples` and `mem_samples`.
+    sample_bytes: usize,
+    mem_sample_bytes: usize,
     processes: Vec<libprof::ProcessInfo>,
     metrics: Vec<(&'static str, String, f64)>,
     directory: std::path::PathBuf,
@@ -100,6 +113,8 @@ impl Worker {
             )
             .with_segment_bytes(256 * 1024),
             resources_flushed: std::time::Instant::now(),
+            sample_bytes: 0,
+            mem_sample_bytes: 0,
             processes: Vec::new(),
             metrics: Vec::new(),
             directory: dir.to_owned(),
@@ -151,8 +166,9 @@ impl Worker {
         rows.regs_abi.push(abi);
         rows.regs_mask.push(mask);
         rows.regs.push(regs);
+        self.sample_bytes += event.user_stack.len();
         rows.user_stack.push(event.user_stack);
-        if rows.len() >= BATCH_ROWS {
+        if rows.len() >= BATCH_ROWS || self.sample_bytes >= BATCH_STACK_BYTES {
             self.flush_samples();
         }
     }
@@ -176,8 +192,9 @@ impl Worker {
         rows.regs_abi.push(abi);
         rows.regs_mask.push(mask);
         rows.regs.push(regs);
+        self.mem_sample_bytes += sample.user_stack.len();
         rows.user_stack.push(sample.user_stack);
-        if rows.len() >= BATCH_ROWS {
+        if rows.len() >= BATCH_ROWS || self.mem_sample_bytes >= BATCH_STACK_BYTES {
             self.flush_mem_samples();
         }
     }
@@ -227,6 +244,7 @@ impl Worker {
     }
 
     fn flush_samples(&mut self) {
+        self.sample_bytes = 0;
         if self.samples.is_empty() {
             return;
         }
@@ -240,6 +258,7 @@ impl Worker {
     }
 
     fn flush_mem_samples(&mut self) {
+        self.mem_sample_bytes = 0;
         if self.mem_samples.is_empty() {
             return;
         }
