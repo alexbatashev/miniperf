@@ -15,7 +15,9 @@ cargo test -p truth
 ```
 
 The profiler integration tests run under plain `cargo test` and fail on a host
-without perf access. Hosts that cannot profile must say so explicitly:
+without perf access. A kernel that exposes no hardware PMU at all (a VM) skips
+them by probe; hosts that cannot profile for policy reasons must say so
+explicitly:
 
 ```sh
 sudo sysctl -w kernel.perf_event_paranoid=-1   # to run them

@@ -6,3 +6,6 @@ publish = false
 build = "build.rs"
 [dependencies]
 miniperf-store = { path = "../store" }
+
+[dev-dependencies]
+libc = "0.2.169"
