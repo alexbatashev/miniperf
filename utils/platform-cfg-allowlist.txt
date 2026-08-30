@@ -3,6 +3,10 @@
 # Roofline's calibration kernels are AVX-512/AVX2/RVV microkernels and its QEMU
 # driver is process plumbing; neither measures the host through libprof, so
 # both keep their compile-time dispatch until roofline grows its own platform
-# module. Every other entry is a bug: branch at runtime instead.
+# module. The kernels cannot move into utils/roofline-core, which is linked as
+# a static library into the DynamoRIO client and the QEMU plugin: that would
+# put rayon and mperf-data inside every instrumented process.
+#
+# Every other entry is a bug: branch at runtime instead.
 mperf/src/roofline/calibrate.rs
 mperf/src/roofline/qemu.rs

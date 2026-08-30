@@ -255,6 +255,41 @@ Run `mperf query help` for the complete guide, including available tables and
 views, schema discovery, formula inspection, Roofline and TMA examples, JSON
 output, SQL files, and stdin usage.
 
+## Architecture
+
+The workspace has two tiers, and the boundary between them is what keeps a
+change green on every target.
+
+- **`libprof`** knows *how to measure*: PMU counting and sampling, precise
+  memory sampling (PEBS/IBS/SPE), host clocks and thermals, memory-controller
+  bandwidth, procfs/cgroup and BPF resource telemetry, and the post-hoc DWARF
+  unwinder for captured stack dumps. Everything it exposes compiles on every
+  target; a host that cannot provide a source says so at runtime.
+- **`mperf`** knows *when and what to measure*: scenarios, passes, counter
+  selection, storage, postprocessing and presentation. It contains no
+  `#[cfg(target_os)]` or `#[cfg(target_arch)]` outside Roofline's calibration
+  kernels, and CI fails if any appears.
+
+The rest of the workspace — `store`, `mperf-data`, `mperf-gui`, `symbolize`,
+`shims/*`, `utils/roofline-core` — is platform-agnostic already.
+
+Two rules follow from that split:
+
+- **A new data source is one `Source` impl in `libprof`** writing through
+  `Sink`, plus one registration line in the scenario that wants it. It must
+  compile on hosts that cannot run it and return
+  `Availability::Unavailable { reason }` there.
+- **A new hardware facility is a new `Mechanism` behind an existing
+  `Feature`**, never a new user-facing knob. Callers ask for `PreciseMem` or
+  `Topdown`; `libprof::resolve` decides whether PEBS, IBS or SPE answers, and
+  records which one along with its `MeasurementQuality`.
+
+`Sink` is the contract that makes `libprof` embeddable: a `Record` carries
+samples, memory samples, module maps, resource observations, process-tree
+entries and scalar metrics, and the consumer decides where they go. `mperf`
+implements it over the Parquet session writer; an application embedding
+`libprof` can implement it over anything.
+
 ## Platform-Specific Notes
 
 ### Intel Tiger Lake
