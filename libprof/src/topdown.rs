@@ -1,6 +1,6 @@
 use pmu_data::{TmaConstant, TmaGroup, TmaMetric, TmaScenario};
 
-use crate::{Capabilities, Rung};
+use crate::{Capabilities, Mechanism};
 
 /// Intel PERF_METRICS events. The names are the sysfs aliases with `-` turned
 /// into `_` so they are valid formula variables and SQL column names;
@@ -146,7 +146,7 @@ pub(crate) fn group_events(pmu: &crate::PmuDevice) -> Vec<String> {
 /// The fixed-topdown scenario this host supports, if any. Returns `None` when
 /// the level-one breakdown has to be estimated from event arithmetic instead.
 pub fn scenario(caps: &Capabilities) -> Option<TmaScenario> {
-    if Rung::FixedTopdown.rejection(caps).is_none() {
+    if Mechanism::FixedTopdown.rejection(caps).is_none() {
         let level_two = caps.core_pmus().any(|pmu| {
             INTEL_LEVEL_TWO
                 .iter()
@@ -154,7 +154,7 @@ pub fn scenario(caps: &Capabilities) -> Option<TmaScenario> {
         });
         return Some(intel_scenario(level_two));
     }
-    if Rung::ArmSlotsTopdown.rejection(caps).is_none() {
+    if Mechanism::ArmSlotsTopdown.rejection(caps).is_none() {
         return arm_scenario(caps);
     }
     None

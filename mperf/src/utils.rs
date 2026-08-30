@@ -100,3 +100,18 @@ pub fn resolve_proc_maps(proc_maps: &[ProcMapEntry]) -> Resolver {
         offset: map.offset as u64,
     }))
 }
+
+/// The module maps libprof's unwinder needs, from a recording's `modules`
+/// table.
+pub fn proc_addrs(modules: &[mperf_data::ProcMapEntry]) -> Vec<libprof::ProcAddr> {
+    modules
+        .iter()
+        .map(|module| libprof::ProcAddr {
+            pid: module.pid,
+            addr: module.address as u64,
+            len: module.size as u64,
+            pgoff: module.offset as u64,
+            filename: module.filename.clone(),
+        })
+        .collect()
+}

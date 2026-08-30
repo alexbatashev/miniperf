@@ -14,6 +14,7 @@ use itertools::chain;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
+pub(crate) use crate::sink::{MemSample, ProcAddr, Record, Sample, Sink, UserRegs};
 use crate::{cpu_family, Counter, Error, Process};
 
 #[allow(dead_code)]
@@ -36,17 +37,6 @@ pub enum UnwindMode {
     #[default]
     /// Capture registers and stack bytes for post-hoc DWARF unwinding.
     Dwarf,
-}
-
-/// Register state captured by `PERF_SAMPLE_REGS_USER`.
-#[derive(Debug, Clone)]
-pub struct UserRegs {
-    /// Perf register ABI tag.
-    pub abi: u64,
-    /// Bit mask identifying captured architecture registers.
-    pub mask: u64,
-    /// Values are ordered by increasing set-bit index in `mask`.
-    pub values: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,19 +74,13 @@ pub trait CountingDriver {
     fn counters(&mut self) -> Result<CounterResult, std::io::Error>;
 }
 
-/// Receives records from a sampling driver.
-pub trait SamplingCallback: Send + Sync {
-    /// Handles one sample or process mapping record.
-    fn call(&self, record: Record);
-}
-
 /// Common interface for streaming PMU samples.
 pub trait SamplingDriver {
     /// Counters that were successfully activated after capability fallbacks.
     fn counters(&self) -> Vec<Counter>;
 
     /// Starts sampling and forwards records to `callback`.
-    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error>;
+    fn start(&mut self, sink: Arc<dyn Sink>) -> Result<(), Error>;
 
     /// Stops sampling, drains pending records, and joins the reader thread.
     fn stop(&mut self) -> Result<(), Error>;
@@ -132,100 +116,6 @@ pub struct CounterResult {
     entries: SmallVec<[CounterEntry; 16]>,
 }
 
-/// Sampling driver produces records that describe events
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)] // Keep samples inline on the sampling hot path.
-pub enum Record {
-    /// A performance-counter sample.
-    Sample(Sample),
-    /// A precise memory-access sample (PEBS/IBS/SPE).
-    MemSample(MemSample),
-    /// A process address-space mapping.
-    ProcAddr(ProcAddr),
-}
-
-/// One precise memory access: skid-free IP plus the data address, vendor data
-/// source encoding and access latency the hardware reported for it.
-#[derive(Debug)]
-pub struct MemSample {
-    /// Instruction pointer of the accessing instruction.
-    pub ip: u64,
-    /// Process ID.
-    pub pid: u32,
-    /// Thread ID.
-    pub tid: u32,
-    /// CPU the access executed on.
-    pub cpu: u32,
-    /// Timestamp on `CLOCK_MONOTONIC`.
-    pub time: u64,
-    /// Virtual address the access targeted.
-    pub data_addr: u64,
-    /// Access latency in core cycles, zero when unreported.
-    pub latency: u64,
-    /// Raw vendor data-source encoding, normalized downstream.
-    pub data_src: u64,
-    /// Kernel-provided instruction-pointer callchain.
-    pub callstack: SmallVec<[u64; 8]>,
-    /// Call stack reconstructed from the hardware branch records.
-    pub lbr_callstack: SmallVec<[u64; 8]>,
-    /// Raw user register state for post-hoc unwinding.
-    pub user_regs: Option<UserRegs>,
-    /// User stack bytes beginning at the sampled stack pointer.
-    pub user_stack: Vec<u8>,
-}
-
-/// A structure that represents a single sample
-#[derive(Debug)]
-pub struct Sample {
-    /// Unique ID shared by all samples of the event
-    pub event_id: u128,
-    /// Instruction pointer
-    pub ip: u64,
-    /// Process ID
-    pub pid: u32,
-    /// Thread ID
-    pub tid: u32,
-    /// CPU ID that the event occured on
-    pub cpu: u32,
-    /// Family id of the core cluster this sample came from (e.g.
-    /// `"cortex_a720"`), on a heterogeneous system. `None` on homogeneous hosts.
-    pub core: Option<String>,
-    /// Timestamp
-    pub time: u64,
-    /// Time for which the event was enabled.
-    pub time_enabled: u64,
-    /// Time for which the event was scheduled on hardware.
-    pub time_running: u64,
-    /// Counter represented by this sample.
-    pub counter: Counter,
-    /// Counter delta since the preceding sample.
-    pub value: u64,
-    /// Kernel-provided instruction-pointer callchain.
-    pub callstack: SmallVec<[u64; 8]>,
-    /// Call stack reconstructed from the hardware branch stack (Intel LBR
-    /// call-stack mode). Empty when branch records were not requested.
-    pub lbr_callstack: SmallVec<[u64; 8]>,
-    /// Raw user register state for post-hoc unwinding.
-    pub user_regs: Option<UserRegs>,
-    /// User stack bytes beginning at the sampled stack pointer.
-    pub user_stack: Vec<u8>,
-}
-
-#[derive(Debug)]
-/// One process memory mapping observed by perf.
-pub struct ProcAddr {
-    /// Process identifier.
-    pub pid: u32,
-    /// Mapping start address.
-    pub addr: u64,
-    /// Mapping length in bytes.
-    pub len: u64,
-    /// File offset backing the mapping.
-    pub pgoff: u64,
-    /// Path of the mapped file.
-    pub filename: String,
-}
-
 /// Builder for a counting driver.
 pub struct CountingDriverBuilder {
     counters: Vec<Counter>,
@@ -246,51 +136,51 @@ pub struct SamplingDriverBuilder {
     lbr_callstack: bool,
 }
 
-impl<F: Fn(Record) + Send + Sync> SamplingCallback for F {
-    fn call(&self, record: Record) {
-        self(record)
-    }
-}
-
 /// Open precise memory sampling (data address, data source and latency per
 /// access) for a target process, alongside whatever counter-based sampling is
 /// already running: Arm SPE where an `arm_spe_*` PMU exists, Intel PEBS
 /// `mem-loads`/`mem-stores` otherwise.
-#[cfg(target_os = "linux")]
+///
+/// Fails with [`Error::UnsupportedDriver`] on a host with no such facility;
+/// callers resolve [`crate::Feature::PreciseMem`] first to find out.
 pub fn mem_sampling_driver(
     pid: i32,
     sample_freq: u64,
     stack_dump_size: u32,
     lbr_callstack: bool,
 ) -> Result<Box<dyn SamplingDriver>, Error> {
-    if perf::spe_pmu_path().is_some() {
-        return Ok(Box::new(perf::PerfSpeSamplingDriver::new(pid)?));
-    }
-    #[cfg(target_arch = "x86_64")]
-    return Ok(Box::new(perf::PerfMemSamplingDriver::new(
-        pid,
-        sample_freq,
-        stack_dump_size,
-        perf::dwarf_register_mask(),
-        lbr_callstack,
-    )?));
-    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (pid, sample_freq, stack_dump_size, lbr_callstack);
+    #[cfg(target_os = "linux")]
     {
-        let _ = (sample_freq, stack_dump_size, lbr_callstack);
-        Err(Error::InvalidConfiguration(
-            "no precise memory sampling facility on this host".to_owned(),
-        ))
+        if perf::spe_pmu_path().is_some() {
+            return Ok(Box::new(perf::PerfSpeSamplingDriver::new(pid)?));
+        }
+        #[cfg(target_arch = "x86_64")]
+        return Ok(Box::new(perf::PerfMemSamplingDriver::new(
+            pid,
+            sample_freq,
+            stack_dump_size,
+            perf::dwarf_register_mask(),
+            lbr_callstack,
+        )?));
     }
+    #[allow(unreachable_code)]
+    Err(Error::UnsupportedDriver {
+        driver: "precise memory sampling".to_owned(),
+    })
 }
 
-/// The precise-memory facility `mem_sampling_driver` would use, for status
-/// reporting: `"spe"` or `"pebs"`.
-#[cfg(target_os = "linux")]
-pub fn mem_sampling_kind() -> &'static str {
-    if perf::spe_pmu_path().is_some() {
-        "spe"
-    } else {
-        "pebs"
+/// Whether this kernel accepts an inherited sampling group whose samples carry
+/// grouped counter reads. `None` where the host has no such concept, `false`
+/// where threads created after exec will go unsampled.
+pub fn inherited_sampling_supported() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(perf::inherited_sample_read_supported())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 

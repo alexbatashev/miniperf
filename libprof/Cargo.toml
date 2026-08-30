@@ -25,11 +25,14 @@ symbolize = ["dep:symbolize"]
 criterion = ["dep:criterion"]
 
 [dependencies]
+anyhow = "1.0"
 cfg-if = "1.0.0"
 libc = "0.2.144"
 thiserror = "2.0.9"
 pmu-data = { package = "miniperf-pmu-data", path = "../pmu-data/", version = "0.1.0" }
 lazy_static = "1.5.0"
+proc-maps = "0.4.0"
+object = "0.39.1"
 smallvec = "1.13.2"
 itertools = "0.14.0"
 uuid = { version = "1.16.0", features = ["v7"] }
@@ -48,6 +51,13 @@ dlopen2 = "0.7.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 perf-event-open-sys2 = "5.0.6"
+
+# Post-hoc DWARF unwinding of captured stack dumps. framehop has a native
+# unwinder for these architectures only; elsewhere the kernel callchain stands
+# and `PostHocUnwinder` compiles without it.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+framehop = { version = "0.16.0", default-features = false, features = ["std"] }
+framehop-object = "0.2.0"
 
 [build-dependencies]
 serde = "1.0.217"

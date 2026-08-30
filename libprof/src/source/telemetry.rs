@@ -1,90 +1,122 @@
 //! Host clock and thermal sampling, in any scenario.
 //!
-//! Frequencies and temperatures are host state, not a snapshot feature: every
-//! recording is conditioned on the clock the part actually ran at. The monitor
-//! runs at 1Hz next to the workload and writes the same `resource_samples`
-//! intermediate the procfs collector writes, so postprocess unions the two.
+//! Frequencies and temperatures are host state, not a feature of one analysis:
+//! every recording is conditioned on the clock the part actually ran at. The
+//! monitor runs at 1Hz next to the workload and emits the same resource
+//! samples the procfs collector does, so a consumer unions the two.
 
-use libprof::{HostTelemetry, HostTelemetrySample};
-use mperf_data::{SnapshotCollectorStatus, SnapshotResourceSample};
 use std::{
     path::Path,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     thread,
     time::{Duration, Instant},
 };
 
+use super::{Availability, SessionContext, Source, SourceDecl};
+use crate::{HostTelemetry, HostTelemetrySample, Record, ResourceSample, Sink, SourceStatus};
+
 const INTERVAL: Duration = Duration::from_secs(1);
 
-pub(crate) struct HostTelemetryMonitor {
-    stop: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<Vec<SnapshotCollectorStatus>>>,
+/// Samples the host's clock and temperature sensors while a workload runs.
+#[derive(Default)]
+pub struct HostTelemetrySource {
+    stop: Option<Arc<AtomicBool>>,
+    worker: Option<thread::JoinHandle<Vec<SourceStatus>>>,
 }
 
-impl HostTelemetryMonitor {
-    pub(crate) fn start(output: &Path, root_pid: u32) -> std::io::Result<Self> {
-        let output = output.to_owned();
+impl Source for HostTelemetrySource {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn declare(&self) -> SourceDecl {
+        SourceDecl {
+            name: "host_telemetry",
+            provides: &["host_telemetry"],
+        }
+    }
+
+    fn probe(&self, _directory: &Path) -> Availability {
+        Availability::Available
+    }
+
+    fn start(&mut self, context: &SessionContext) -> anyhow::Result<()> {
         let clusters = host_clusters();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
-        let worker = thread::Builder::new()
-            .name("mperf-host-telemetry".to_string())
-            .spawn(move || collect(&output, root_pid, &clusters, worker_stop))?;
-        Ok(Self {
-            stop,
-            worker: Some(worker),
-        })
+        let sink = context.sink.clone();
+        self.worker = Some(
+            thread::Builder::new()
+                .name("libprof-host-telemetry".to_string())
+                .spawn(move || collect(sink.as_ref(), &clusters, worker_stop))?,
+        );
+        self.stop = Some(stop);
+        Ok(())
     }
 
-    pub(crate) fn stop(mut self) -> Vec<SnapshotCollectorStatus> {
-        self.stop.store(true, Ordering::Release);
+    fn stop(&mut self, _context: &SessionContext) -> Vec<SourceStatus> {
+        if let Some(stop) = self.stop.take() {
+            stop.store(true, Ordering::Release);
+        }
         let worker = self.worker.take();
         if let Some(worker) = &worker {
             worker.thread().unpark();
         }
         worker
-            .and_then(|worker| worker.join().ok())
-            .unwrap_or_else(|| {
-                vec![status(
-                    "host_telemetry",
-                    "error",
-                    "internal",
-                    "unavailable",
-                    "host telemetry thread did not shut down cleanly",
-                )]
+            .map(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    vec![SourceStatus::new(
+                        "host_telemetry",
+                        "error",
+                        "internal",
+                        "unavailable",
+                        "host telemetry thread did not shut down cleanly",
+                    )]
+                })
             })
+            .unwrap_or_default()
     }
 }
 
 /// Cluster id to logical CPUs, from the host's core PMUs. Empty on a
 /// homogeneous host, which `HostTelemetry` reads as a single `host` cluster.
 fn host_clusters() -> Vec<(String, Vec<u32>)> {
-    libprof::host_core_clusters()
+    crate::host_core_clusters()
         .into_iter()
-        .map(|cluster| {
-            let cpus = crate::postprocess::parse_cpumask(&cluster.cpus)
-                .into_iter()
-                .flat_map(|(first, last)| first..=last)
-                .collect();
-            (cluster.family_id, cpus)
+        .map(|cluster| (cluster.family_id, parse_cpumask(&cluster.cpus)))
+        .collect()
+}
+
+/// Expand a sysfs cpumask such as `"0,5-11"` into its logical CPU numbers.
+fn parse_cpumask(mask: &str) -> Vec<u32> {
+    mask.split(',')
+        .filter_map(|range| {
+            let range = range.trim();
+            match range.split_once('-') {
+                Some((first, last)) => Some(first.parse().ok()?..=last.parse().ok()?),
+                None => {
+                    let cpu = range.parse().ok()?;
+                    Some(cpu..=cpu)
+                }
+            }
         })
+        .flatten()
         .collect()
 }
 
 fn collect(
-    output: &Path,
-    root_pid: u32,
+    sink: &dyn Sink,
     clusters: &[(String, Vec<u32>)],
     stop: Arc<AtomicBool>,
-) -> Vec<SnapshotCollectorStatus> {
+) -> Vec<SourceStatus> {
     let mut statuses = Vec::new();
     let mut telemetry = match HostTelemetry::start(clusters) {
         Ok(Some(telemetry)) => telemetry,
         Ok(None) => {
-            statuses.push(status(
+            statuses.push(SourceStatus::new(
                 "host_telemetry",
                 "unavailable",
                 "sysfs",
@@ -94,7 +126,7 @@ fn collect(
             return statuses;
         }
         Err(error) => {
-            statuses.push(status(
+            statuses.push(SourceStatus::new(
                 "host_telemetry",
                 "unavailable",
                 "sysfs",
@@ -105,7 +137,7 @@ fn collect(
         }
     };
     for (signal, reason) in telemetry.unavailable() {
-        statuses.push(status(
+        statuses.push(SourceStatus::new(
             signal,
             "unavailable",
             "sysfs",
@@ -114,14 +146,6 @@ fn collect(
         ));
     }
 
-    // A second writer for the same logical table: the per-process file name
-    // keeps its segments from overwriting the procfs collector's.
-    let mut writer = store::SegmentWriter::new(
-        output,
-        "resource_samples",
-        Some(root_pid),
-        resource_sample_schema(),
-    );
     let start = Instant::now();
     let mut source = "sysfs";
     loop {
@@ -131,11 +155,12 @@ fn collect(
                 if let Some(cluster) = sample.clusters.first() {
                     source = cluster.source;
                 }
-                let rows = telemetry_rows(timestamp_ns, &sample);
-                let _ = resource_sample_batch(&rows).and_then(|batch| writer.write(&batch));
+                for row in telemetry_rows(timestamp_ns, &sample) {
+                    sink.record(Record::Resource(row));
+                }
             }
             Err(error) => {
-                statuses.push(status(
+                statuses.push(SourceStatus::new(
                     "host_telemetry",
                     "degraded",
                     source,
@@ -150,10 +175,9 @@ fn collect(
         }
         thread::park_timeout(INTERVAL);
     }
-    let _ = writer.finish();
     let discarded = telemetry.discarded_readings();
     statuses.push(if discarded > 0 {
-        status(
+        SourceStatus::new(
             "host_telemetry",
             "degraded",
             source,
@@ -164,7 +188,7 @@ fn collect(
             ),
         )
     } else {
-        status(
+        SourceStatus::new(
             "host_telemetry",
             "available",
             source,
@@ -178,7 +202,7 @@ fn collect(
 /// The rows one tick contributes. Measurements that read as zero carry no
 /// information and would drag a mean down, so only ceilings and counters are
 /// emitted at zero.
-fn telemetry_rows(timestamp_ns: u64, sample: &HostTelemetrySample) -> Vec<SnapshotResourceSample> {
+fn telemetry_rows(timestamp_ns: u64, sample: &HostTelemetrySample) -> Vec<ResourceSample> {
     let mut rows = Vec::new();
     let mut measurement = |resource: &str, id: &str, metric: &str, value: f64, unit, source| {
         if value.is_finite() && value > 0.0 {
@@ -309,8 +333,8 @@ fn host_sample(
     value: f64,
     unit: &str,
     source: &str,
-) -> SnapshotResourceSample {
-    sample(
+) -> ResourceSample {
+    super::resource_sample(
         timestamp_ns,
         resource,
         id,
@@ -324,107 +348,12 @@ fn host_sample(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn sample(
-    timestamp_ns: u64,
-    resource: &str,
-    resource_id: &str,
-    category: &str,
-    metric: &str,
-    value: f64,
-    unit: &str,
-    scope: &str,
-    source: &str,
-    quality: &str,
-) -> SnapshotResourceSample {
-    SnapshotResourceSample {
-        timestamp_ns,
-        resource: resource.to_string(),
-        resource_id: resource_id.to_string(),
-        category: category.to_string(),
-        metric: metric.to_string(),
-        value,
-        unit: unit.to_string(),
-        scope: scope.to_string(),
-        source: source.to_string(),
-        quality: quality.to_string(),
-    }
-}
-
-pub(crate) fn status(
-    name: &str,
-    status_value: &str,
-    source: &str,
-    quality: &str,
-    message: &str,
-) -> SnapshotCollectorStatus {
-    SnapshotCollectorStatus {
-        name: name.to_string(),
-        status: status_value.to_string(),
-        source: source.to_string(),
-        quality: quality.to_string(),
-        message: message.to_string(),
-    }
-}
-
-pub(crate) fn resource_sample_schema() -> Arc<store::arrow::datatypes::Schema> {
-    use store::arrow::datatypes::{DataType, Field, Schema};
-    Arc::new(Schema::new(vec![
-        Field::new("timestamp_ns", DataType::Int64, false),
-        Field::new("resource", DataType::Utf8, false),
-        Field::new("resource_id", DataType::Utf8, false),
-        Field::new("category", DataType::Utf8, false),
-        Field::new("metric", DataType::Utf8, false),
-        Field::new("value", DataType::Float64, false),
-        Field::new("unit", DataType::Utf8, false),
-        Field::new("scope", DataType::Utf8, false),
-        Field::new("source", DataType::Utf8, false),
-        Field::new("quality", DataType::Utf8, false),
-    ]))
-}
-
-pub(crate) fn resource_sample_batch(
-    samples: &[SnapshotResourceSample],
-) -> anyhow::Result<store::arrow::record_batch::RecordBatch> {
-    use store::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
-    let text = |field: fn(&SnapshotResourceSample) -> &str| -> ArrayRef {
-        Arc::new(StringArray::from(
-            samples.iter().map(field).collect::<Vec<_>>(),
-        ))
-    };
-    Ok(store::arrow::record_batch::RecordBatch::try_new(
-        resource_sample_schema(),
-        vec![
-            Arc::new(Int64Array::from(
-                samples
-                    .iter()
-                    .map(|sample| sample.timestamp_ns as i64)
-                    .collect::<Vec<_>>(),
-            )),
-            text(|sample| &sample.resource),
-            text(|sample| &sample.resource_id),
-            text(|sample| &sample.category),
-            text(|sample| &sample.metric),
-            Arc::new(Float64Array::from(
-                samples
-                    .iter()
-                    .map(|sample| sample.value)
-                    .collect::<Vec<_>>(),
-            )),
-            text(|sample| &sample.unit),
-            text(|sample| &sample.scope),
-            text(|sample| &sample.source),
-            text(|sample| &sample.quality),
-        ],
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libprof::{ClusterClocks, DeviceClocks, ThermalZone};
+    use crate::{ClusterClocks, DeviceClocks, ThermalZone};
 
-    fn find<'a>(rows: &'a [SnapshotResourceSample], metric: &str) -> Option<&'a f64> {
+    fn find<'a>(rows: &'a [ResourceSample], metric: &str) -> Option<&'a f64> {
         rows.iter()
             .find(|row| row.metric == metric)
             .map(|row| &row.value)
@@ -475,10 +404,9 @@ mod tests {
         assert_eq!(gpu("frequency"), Some(4.09e8));
         assert_eq!(gpu("frequency_max"), Some(1.228e9));
         assert_eq!(gpu("busy"), Some(37.0));
-        assert!(
-            rows.iter()
-                .any(|row| row.resource == "cpu" && row.metric == "temperature")
-        );
+        assert!(rows
+            .iter()
+            .any(|row| row.resource == "cpu" && row.metric == "temperature"));
         assert_eq!(find(&rows, "temperature_critical"), Some(&94.0));
         assert_eq!(find(&rows, "throttle_events"), Some(&0.0));
         assert_eq!(find(&rows, "thermal_pressure_level"), Some(&2.0));
@@ -516,5 +444,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["frequency_max"]
         );
+    }
+
+    #[test]
+    fn expands_sysfs_cpumasks() {
+        assert_eq!(parse_cpumask("0,5-8"), vec![0, 5, 6, 7, 8]);
+        assert_eq!(parse_cpumask("3"), vec![3]);
+        assert!(parse_cpumask("").is_empty());
     }
 }

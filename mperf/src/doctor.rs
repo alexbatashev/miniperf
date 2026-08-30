@@ -1,6 +1,6 @@
 use anyhow::Result;
 use comfy_table::{Cell, Color, ContentArrangement, Table};
-use libprof::{Capabilities, Rung};
+use libprof::{Capabilities, Mechanism};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Severity {
@@ -225,47 +225,47 @@ fn tooling_checks(tooling: &Tooling) -> Vec<Check> {
     checks
 }
 
-fn rung_feature(rung: Rung) -> &'static str {
-    match rung {
-        Rung::PebsMem => "precise sampling (Intel PEBS)",
-        Rung::IbsOp => "precise sampling (AMD IBS)",
-        Rung::ArmSpe => "precise sampling (Arm SPE)",
-        Rung::FixedTopdown => "fixed topdown (PERF_METRICS)",
-        Rung::ArmSlotsTopdown => "topdown (Arm pmuv3 slots)",
-        Rung::LbrCallstack => "branch records (LBR call stacks)",
-        Rung::UncoreBw => "uncore memory bandwidth",
-        Rung::Baseline => "baseline counters",
+fn mechanism_feature(mechanism: Mechanism) -> &'static str {
+    match mechanism {
+        Mechanism::PebsMem => "precise sampling (Intel PEBS)",
+        Mechanism::IbsOp => "precise sampling (AMD IBS)",
+        Mechanism::ArmSpe => "precise sampling (Arm SPE)",
+        Mechanism::FixedTopdown => "fixed topdown (PERF_METRICS)",
+        Mechanism::ArmSlotsTopdown => "topdown (Arm pmuv3 slots)",
+        Mechanism::LbrCallstack => "branch records (LBR call stacks)",
+        Mechanism::UncoreBw => "uncore memory bandwidth",
+        Mechanism::Baseline => "baseline counters",
     }
 }
 
-/// Rungs worth reporting on this host: no Arm SPE row on x86, no PEBS row on
-/// AMD, nothing vendor-specific on architectures that cannot have it.
-fn applicable_rungs(caps: &Capabilities) -> Vec<Rung> {
-    let mut rungs = Vec::new();
+/// Mechanisms worth reporting on this host: no Arm SPE row on x86, no PEBS row
+/// on AMD, nothing vendor-specific on architectures that cannot have it.
+fn applicable_mechanisms(caps: &Capabilities) -> Vec<Mechanism> {
+    let mut mechanisms = Vec::new();
     match caps.arch.as_str() {
         "x86_64" | "x86" => {
             if !caps.is_amd() {
-                rungs.push(Rung::PebsMem);
-                rungs.push(Rung::FixedTopdown);
+                mechanisms.push(Mechanism::PebsMem);
+                mechanisms.push(Mechanism::FixedTopdown);
             }
             if !caps.is_intel() {
-                rungs.push(Rung::IbsOp);
+                mechanisms.push(Mechanism::IbsOp);
             }
-            rungs.push(Rung::LbrCallstack);
+            mechanisms.push(Mechanism::LbrCallstack);
         }
         "aarch64" => {
-            rungs.push(Rung::ArmSpe);
-            rungs.push(Rung::ArmSlotsTopdown);
+            mechanisms.push(Mechanism::ArmSpe);
+            mechanisms.push(Mechanism::ArmSlotsTopdown);
         }
         _ => {}
     }
-    rungs.push(Rung::UncoreBw);
-    rungs
+    mechanisms.push(Mechanism::UncoreBw);
+    mechanisms
 }
 
-fn rung_check(rung: Rung, caps: &Capabilities) -> Check {
-    let feature = rung_feature(rung);
-    let Some(reason) = rung.rejection(caps) else {
+fn mechanism_check(mechanism: Mechanism, caps: &Capabilities) -> Check {
+    let feature = mechanism_feature(mechanism);
+    let Some(reason) = mechanism.rejection(caps) else {
         return check(feature, "available", Severity::Ok, "-");
     };
     let status = reason
@@ -273,20 +273,20 @@ fn rung_check(rung: Rung, caps: &Capabilities) -> Check {
         .map_or(reason.as_str(), |(_, rest)| rest)
         .to_owned();
 
-    let (severity, action) = match rung {
-        Rung::IbsOp if !caps.has_cpu_flag("ibs") => (
+    let (severity, action) = match mechanism {
+        Mechanism::IbsOp if !caps.has_cpu_flag("ibs") => (
             Severity::Degraded,
             "check BIOS for an IBS / 'Instruction Based Sampling' toggle",
         ),
-        Rung::IbsOp => (
+        Mechanism::IbsOp => (
             Severity::Degraded,
             "kernel needs CONFIG_PERF_EVENTS_AMD_IBS to expose the ibs_op PMU",
         ),
-        Rung::ArmSpe => (
+        Mechanism::ArmSpe => (
             Severity::Degraded,
             "kernel needs CONFIG_ARM_SPE_PMU and firmware must expose SPE",
         ),
-        Rung::UncoreBw if !caps.system_wide_allowed() => {
+        Mechanism::UncoreBw if !caps.system_wide_allowed() => {
             return check(
                 feature,
                 status,
@@ -294,7 +294,7 @@ fn rung_check(rung: Rung, caps: &Capabilities) -> Check {
                 sysctl("kernel.perf_event_paranoid", "0"),
             );
         }
-        Rung::UncoreBw => (Severity::Info, "no memory-controller PMU on this platform"),
+        Mechanism::UncoreBw => (Severity::Info, "no memory-controller PMU on this platform"),
         _ => (Severity::Info, "not available on this CPU"),
     };
 
@@ -310,9 +310,9 @@ fn checks(caps: &Capabilities, tooling: &Tooling) -> Vec<Check> {
     ];
     checks.extend(bpf_checks(caps, tooling));
     checks.extend(
-        applicable_rungs(caps)
+        applicable_mechanisms(caps)
             .into_iter()
-            .map(|rung| rung_check(rung, caps)),
+            .map(|mechanism| mechanism_check(mechanism, caps)),
     );
     checks.extend(tooling_checks(tooling));
     checks
@@ -425,42 +425,46 @@ mod tests {
 
     #[test]
     fn rows_are_vendor_aware() {
-        let intel = applicable_rungs(&intel_host());
-        assert!(intel.contains(&Rung::PebsMem));
-        assert!(!intel.contains(&Rung::IbsOp));
-        assert!(!intel.contains(&Rung::ArmSpe));
+        let intel = applicable_mechanisms(&intel_host());
+        assert!(intel.contains(&Mechanism::PebsMem));
+        assert!(!intel.contains(&Mechanism::IbsOp));
+        assert!(!intel.contains(&Mechanism::ArmSpe));
 
-        let amd = applicable_rungs(&Capabilities {
+        let amd = applicable_mechanisms(&Capabilities {
             cpu_vendor: Some("AuthenticAMD".to_owned()),
             ..intel_host()
         });
-        assert!(amd.contains(&Rung::IbsOp));
-        assert!(!amd.contains(&Rung::PebsMem));
-        assert!(!amd.contains(&Rung::FixedTopdown));
+        assert!(amd.contains(&Mechanism::IbsOp));
+        assert!(!amd.contains(&Mechanism::PebsMem));
+        assert!(!amd.contains(&Mechanism::FixedTopdown));
 
-        let arm = applicable_rungs(&Capabilities {
+        let arm = applicable_mechanisms(&Capabilities {
             arch: "aarch64".to_owned(),
             cpu_vendor: None,
             ..intel_host()
         });
         assert_eq!(
             arm,
-            vec![Rung::ArmSpe, Rung::ArmSlotsTopdown, Rung::UncoreBw]
+            vec![
+                Mechanism::ArmSpe,
+                Mechanism::ArmSlotsTopdown,
+                Mechanism::UncoreBw
+            ]
         );
 
-        let riscv = applicable_rungs(&Capabilities {
+        let riscv = applicable_mechanisms(&Capabilities {
             arch: "riscv64".to_owned(),
             cpu_vendor: None,
             ..intel_host()
         });
-        assert_eq!(riscv, vec![Rung::UncoreBw]);
+        assert_eq!(riscv, vec![Mechanism::UncoreBw]);
     }
 
     #[test]
     fn missing_hardware_features_never_block() {
         let checks = checks(&intel_host(), &full_tooling());
-        for rung in applicable_rungs(&intel_host()) {
-            let check = find(&checks, rung_feature(rung));
+        for mechanism in applicable_mechanisms(&intel_host()) {
+            let check = find(&checks, mechanism_feature(mechanism));
             assert_ne!(check.severity, Severity::Blocker, "{}", check.feature);
         }
         assert_eq!(
@@ -476,7 +480,7 @@ mod tests {
             cpu_vendor: Some("AuthenticAMD".to_owned()),
             ..intel_host()
         };
-        let check = rung_check(Rung::IbsOp, &caps);
+        let check = mechanism_check(Mechanism::IbsOp, &caps);
         assert_eq!(check.severity, Severity::Degraded);
         assert!(check.action.contains("BIOS"), "{}", check.action);
     }

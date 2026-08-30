@@ -37,7 +37,7 @@ pub use spe::{spe_pmu_path, PerfSpeSamplingDriver};
 
 use super::{
     CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver, MeasurementQuality,
-    SamplingCallback, SamplingDriver,
+    SamplingDriver, Sink,
 };
 
 /// Counting driver is used for simple collection of system's performance counters values. On Linux,
@@ -341,7 +341,7 @@ impl SamplingDriver for PerfSamplingDriver {
         counters
     }
 
-    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
+    fn start(&mut self, callback: Arc<dyn Sink>) -> Result<(), Error> {
         if self.enable_on_start {
             for handle in self.native_handles.iter().filter(|handle| handle.leader) {
                 let result =
@@ -441,7 +441,7 @@ impl SamplingDriver for PerfSamplingDriver {
                                         },
                                     );
 
-                                    callback.call(sample);
+                                    callback.record(sample);
                                 }
                             }
                             mmap::MmapRecord::Address {
@@ -451,7 +451,7 @@ impl SamplingDriver for PerfSamplingDriver {
                                 offset,
                                 filename,
                             } => {
-                                callback.call(Record::ProcAddr(ProcAddr {
+                                callback.record(Record::ProcAddr(ProcAddr {
                                     pid,
                                     addr: start,
                                     len,

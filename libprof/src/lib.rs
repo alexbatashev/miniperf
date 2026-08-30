@@ -10,36 +10,38 @@ mod cpu_family;
 mod criterion_measurement;
 mod driver;
 mod event_timer;
-mod fidelity;
+mod features;
 mod host_telemetry;
+mod platform;
 mod platform_memory;
 mod process;
 mod quick;
+mod sink;
+mod source;
 mod topdown;
+mod unwind;
 
 pub use capabilities::{capabilities, Capabilities, PmuDevice};
 pub use cpu_family::{host_cpu_description, host_metrics};
 #[cfg(feature = "criterion")]
 pub use criterion_measurement::CriterionCounter;
-#[cfg(target_os = "linux")]
-pub use driver::perf::inherited_sample_read_supported;
+pub use driver::{inherited_sampling_supported, mem_sampling_driver};
 pub use driver::{
     list_supported_counters, CoreId, CounterEntry, CounterResult, CounterValue, CountingDriver,
-    CountingDriverBuilder, DriverKind, MeasurementQuality, MemSample, Record, Sample,
-    SamplingCallback, SamplingDriver, SamplingDriverBuilder, UnwindMode, UserRegs,
+    CountingDriverBuilder, DriverKind, MeasurementQuality, SamplingDriver, SamplingDriverBuilder,
+    UnwindMode,
 };
-#[cfg(target_os = "linux")]
-pub use driver::{mem_sampling_driver, mem_sampling_kind};
 #[cfg(feature = "criterion")]
 pub use event_timer::CounterCheckpoint;
 pub use event_timer::{
     CounterStatistics, EventTimer, Measurement, MeasurementSpan, MeasurementStatistics,
     Measurements, ReadCost, ReadMethod,
 };
-pub use fidelity::{resolve, Resolution, Rung};
+pub use features::{resolve, Feature, Mechanism, Resolution, Satisfied};
 pub use host_telemetry::{
     ClusterClocks, DeviceClocks, HostTelemetry, HostTelemetrySample, ThermalZone,
 };
+pub use platform::{current_thread_id, process_alive, process_modules, process_tree, ProcessStat};
 pub use platform_memory::{
     bandwidth_counters_present, MemoryControllerMonitor, MemoryControllerSample,
 };
@@ -48,7 +50,15 @@ pub use process::Process;
 #[cfg(feature = "symbolize")]
 pub use quick::{top_symbols, SymbolCount};
 pub use quick::{QuickSampler, SampleBatch};
+pub use sink::{
+    MemSample, ProcAddr, ProcessInfo, Record, ResourceSample, Sample, Sink, SourceStatus, UserRegs,
+};
+pub use source::{
+    Availability, BpfSource, HostTelemetrySource, InternalEventsSource, PmuSamplingSource,
+    PreciseMemorySource, ProcfsSource, SessionContext, Source, SourceDecl,
+};
 pub use topdown::{is_topdown_event, sysfs_alias, GROUP_LEADER};
+pub use unwind::{Frames, PostHocUnwinder, StackSample};
 
 /// Default sampling frequency used by [`SamplingDriverBuilder`].
 pub const DEFAULT_SAMPLE_FREQUENCY_HZ: u64 = 1_000;

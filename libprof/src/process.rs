@@ -208,6 +208,41 @@ impl Process {
         Ok(())
     }
 
+    /// Whether the child has already exited, without blocking. Like
+    /// [`Process::wait`], it leaves the zombie in place so the child's final
+    /// resource accounting stays queryable.
+    pub fn try_wait(&self) -> Result<bool, std::io::Error> {
+        if self.exited.get() {
+            return Ok(true);
+        }
+        unsafe {
+            // waitid leaves the struct untouched when nothing has exited, so
+            // a zeroed si_pid is what "still running" looks like.
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                self.pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if info.si_pid() == 0 {
+                return Ok(false);
+            }
+            let status = info.si_status();
+            self.exit_code
+                .set(Some(if info.si_code == libc::CLD_EXITED {
+                    status
+                } else {
+                    128_i32.saturating_add(status)
+                }));
+        }
+        self.exited.set(true);
+        Ok(true)
+    }
+
     /// Returns the conventional process exit code after [`Process::wait`].
     /// Signal termination is represented as `128 + signal`.
     pub fn exit_code(&self) -> Option<i32> {

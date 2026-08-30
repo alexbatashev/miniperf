@@ -23,7 +23,6 @@ type Frames = SmallVec<[u64; 32]>;
 const BATCH_ROWS: usize = 8192;
 
 /// One row of `samples_raw`, borrowed from the Arrow batch it was read from.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct RawSample<'a> {
     pub timestamp: i64,
     pub pid: u32,
@@ -40,6 +39,20 @@ pub(crate) struct RawSample<'a> {
     pub regs_mask: u64,
     pub regs: &'a [u64],
     pub user_stack: &'a [u8],
+}
+
+impl<'a> RawSample<'a> {
+    /// The stack capture libprof needs to walk this sample.
+    pub(crate) fn stack(&self) -> libprof::StackSample<'a> {
+        libprof::StackSample {
+            pid: self.pid,
+            group_id: self.group_id,
+            regs_mask: self.regs_mask,
+            regs: self.regs,
+            user_stack: self.user_stack,
+            callchain: self.callchain,
+        }
+    }
 }
 
 struct RawColumns<'a> {
@@ -384,11 +397,7 @@ pub(crate) async fn process(
         HashMap::new()
     };
     let resolver = utils::resolve_proc_maps(&modules);
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let mut unwinder = crate::unwind::PostHocUnwinder::new(&modules);
+    let mut unwinder = libprof::PostHocUnwinder::new(&utils::proc_addrs(&modules));
 
     let clusters: Vec<ClusterRanges> = record_info
         .cores
@@ -466,17 +475,7 @@ pub(crate) async fn process(
                     user_stack: raw.user_stack.value(index),
                 };
 
-                #[cfg(all(
-                    target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ))]
-                let frames = unwinder.resolve(&sample);
-                #[cfg(not(all(
-                    target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                )))]
-                let frames = Frames::from_slice(sample.callchain);
-
+                let frames = unwinder.resolve(&sample.stack());
                 let frames = merge_lbr_stack(frames, sample.lbr_callchain);
                 let stack_id = stacks.intern(&frames);
                 samples.timestamp.push(sample.timestamp);

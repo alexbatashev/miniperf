@@ -4202,9 +4202,12 @@ dependencies = [
 name = "libprof"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "cfg-if",
  "criterion",
  "dlopen2",
+ "framehop",
+ "framehop-object",
  "glob",
  "hashbrown 0.15.5",
  "insta",
@@ -4213,9 +4216,11 @@ dependencies = [
  "libc",
  "miniperf-pmu-data",
  "miniperf-symbolize",
+ "object 0.39.1",
  "perf-event-open-sys2",
  "prettyplease",
  "proc-macro2",
+ "proc-maps",
  "proc_getter",
  "quote",
  "serde",

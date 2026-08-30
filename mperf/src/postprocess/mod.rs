@@ -17,13 +17,6 @@ use tokio::fs;
 
 use tables::{Columns, Tables, quote_identifier};
 
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-))]
-pub(crate) use samples::RawSample;
-pub(crate) use samples::parse_cpumask;
-
 /// Turn a recording into the derived tables every consumer reads: one Parquet
 /// file per table in the session directory.
 pub async fn perform_postprocessing(res_dir: &Path, pb: kdam::Bar) -> Result<()> {

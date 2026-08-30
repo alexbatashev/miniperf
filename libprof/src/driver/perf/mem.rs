@@ -12,7 +12,7 @@ use perf_event_open_sys::bindings::{
     PERF_SAMPLE_WEIGHT_STRUCT,
 };
 
-use crate::driver::{MemSample, ProcAddr, Record, SamplingCallback, SamplingDriver};
+use crate::driver::{MemSample, ProcAddr, Record, SamplingDriver, Sink};
 use crate::{Counter, Error};
 
 use super::branch::BranchMode;
@@ -181,7 +181,7 @@ impl SamplingDriver for PerfMemSamplingDriver {
             .collect()
     }
 
-    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
+    fn start(&mut self, callback: Arc<dyn Sink>) -> Result<(), Error> {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let lost_samples = self.lost_samples.clone();
@@ -206,7 +206,7 @@ impl SamplingDriver for PerfMemSamplingDriver {
                             lbr_callstack,
                             user_regs,
                             user_stack,
-                        } => callback.call(Record::MemSample(MemSample {
+                        } => callback.record(Record::MemSample(MemSample {
                             ip,
                             pid,
                             tid,
@@ -226,7 +226,7 @@ impl SamplingDriver for PerfMemSamplingDriver {
                             len,
                             offset,
                             filename,
-                        } => callback.call(Record::ProcAddr(ProcAddr {
+                        } => callback.record(Record::ProcAddr(ProcAddr {
                             pid,
                             addr: start,
                             len,

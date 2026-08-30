@@ -100,11 +100,7 @@ pub(crate) fn process(tables: &Tables, res_dir: &Path) -> Result<()> {
         Vec::new()
     };
     let resolver = utils::resolve_proc_maps(&modules);
-    #[cfg(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
-    let mut unwinder = crate::unwind::PostHocUnwinder::new(&modules);
+    let mut unwinder = libprof::PostHocUnwinder::new(&utils::proc_addrs(&modules));
     let mut resolved_ips = HashMap::<(u32, u64), ResolvedIp>::new();
 
     let mut samples = Vec::new();
@@ -154,17 +150,7 @@ pub(crate) fn process(tables: &Tables, res_dir: &Path) -> Result<()> {
                     regs: &registers,
                     user_stack: user_stack.value(index),
                 };
-                #[cfg(all(
-                    target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                ))]
-                let frames = unwinder.resolve(&raw);
-                #[cfg(not(all(
-                    target_os = "linux",
-                    any(target_arch = "x86_64", target_arch = "aarch64")
-                )))]
-                let frames = chain.clone();
-
+                let frames = unwinder.resolve(&raw.stack());
                 let frames = merge_lbr_stack(frames.into_iter().collect(), &lbr_chain);
                 stack_ids.push(store::stack_hash(&frames));
                 call_stacks.push(resolve_folded_stack(

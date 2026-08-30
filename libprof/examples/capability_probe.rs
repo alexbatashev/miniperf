@@ -1,7 +1,7 @@
-//! Print what this host can capture: PMUs, host facilities, and the rung each
-//! capture strategy resolves to.
+//! Print what this host can capture: PMUs, host facilities, and the mechanism
+//! each requestable feature resolves to.
 
-use libprof::Rung;
+use libprof::Feature;
 
 fn main() {
     let caps = libprof::capabilities();
@@ -27,19 +27,24 @@ fn main() {
             pmu.caps
         );
     }
-    for rung in [
-        Rung::PebsMem,
-        Rung::IbsOp,
-        Rung::ArmSpe,
-        Rung::FixedTopdown,
-        Rung::ArmSlotsTopdown,
-        Rung::LbrCallstack,
-        Rung::UncoreBw,
-        Rung::Baseline,
+    for feature in [
+        Feature::PreciseMem,
+        Feature::Topdown,
+        Feature::HwCallstack,
+        Feature::DramBw,
     ] {
-        match rung.rejection(&caps) {
-            None => println!("  {:<18} available", rung.name()),
-            Some(reason) => println!("  {:<18} {reason}", rung.name()),
+        let resolution = libprof::resolve(feature, &caps);
+        match resolution.satisfied {
+            Some(satisfied) => println!(
+                "  {:<14} {} ({:?})",
+                feature.name(),
+                satisfied.mechanism.name(),
+                satisfied.quality
+            ),
+            None => println!("  {:<14} unavailable", feature.name()),
+        }
+        for (mechanism, reason) in &resolution.rejected {
+            println!("    {:<16} {reason}", mechanism.name());
         }
     }
 }

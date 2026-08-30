@@ -3,12 +3,14 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 
-use mperf_data::{Event, EventType, MemSample, ProcMapEntry};
+use mperf_data::{CallFrame, Event, EventType, MemSample, ProcMapEntry};
 use store::{
     ClockAnchorRows, EventKind, EventRows, MemSampleRawRows, ModuleRows, PayloadRows,
     SampleRawRows, SegmentWriter, StringInterner, xxh3,
 };
 use thread_local::ThreadLocal;
+
+use crate::utils::counter_to_event_ty;
 
 /// Routes recorded events into the Parquet session directory: PMU/OS samples
 /// into `samples_raw`, instrumentation events into `events`/`payloads`, and
@@ -21,9 +23,11 @@ pub struct EventDispatcher {
 
 enum Msg {
     Event(Box<Event>),
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     MemSample(MemSample),
     Module(ProcMapEntry),
+    Resource(libprof::ResourceSample),
+    Process(libprof::ProcessInfo),
+    Metric(&'static str, String, f64),
 }
 
 pub struct DispatcherJoinHandle {
@@ -31,6 +35,9 @@ pub struct DispatcherJoinHandle {
 }
 
 const BATCH_ROWS: usize = 8192;
+/// Resource rows arrive at ~1Hz; a small batch keeps a killed recording's
+/// telemetry on disk without a segment per tick.
+const RESOURCE_BATCH_ROWS: usize = 512;
 
 struct Worker {
     interner: Arc<Mutex<StringInterner>>,
@@ -47,6 +54,11 @@ struct Worker {
     modules_writer: SegmentWriter,
     clock: ClockAnchorRows,
     clock_writer: SegmentWriter,
+    resources: Vec<libprof::ResourceSample>,
+    resources_writer: SegmentWriter,
+    processes: Vec<libprof::ProcessInfo>,
+    metrics: Vec<(&'static str, String, f64)>,
+    directory: std::path::PathBuf,
 }
 
 impl Worker {
@@ -73,6 +85,19 @@ impl Worker {
             modules_writer: SegmentWriter::new(dir, "modules", None, ModuleRows::schema()),
             clock,
             clock_writer: SegmentWriter::new(dir, "clock", None, ClockAnchorRows::schema()),
+            resources: Vec::new(),
+            // Roll small segments so a crash loses at most the open one: a
+            // recording that dies still explains what the machine was doing.
+            resources_writer: SegmentWriter::new(
+                dir,
+                "resource_samples",
+                None,
+                resource_sample_schema(),
+            )
+            .with_segment_bytes(256 * 1024),
+            processes: Vec::new(),
+            metrics: Vec::new(),
+            directory: dir.to_owned(),
         }
     }
 
@@ -222,6 +247,25 @@ impl Worker {
         }
     }
 
+    fn consume_resource(&mut self, sample: libprof::ResourceSample) {
+        self.resources.push(sample);
+        if self.resources.len() >= RESOURCE_BATCH_ROWS {
+            self.flush_resources();
+        }
+    }
+
+    fn flush_resources(&mut self) {
+        if self.resources.is_empty() {
+            return;
+        }
+        let rows = std::mem::take(&mut self.resources);
+        let result =
+            resource_sample_batch(&rows).and_then(|batch| self.resources_writer.write(&batch));
+        if let Err(err) = result {
+            eprintln!("failed to write resource samples: {err:#}");
+        }
+    }
+
     fn flush_events(&mut self) {
         if self.events.is_empty() {
             return;
@@ -239,6 +283,9 @@ impl Worker {
         self.flush_samples();
         self.flush_mem_samples();
         self.flush_events();
+        self.flush_resources();
+        let processes = process_batch(&self.processes);
+        let metrics = metric_batches(&self.metrics);
         let mut modules = ModuleRows::default();
         for entry in std::mem::take(&mut self.modules) {
             modules.pid.push(entry.pid);
@@ -268,6 +315,14 @@ impl Worker {
                 self.mem_samples_writer.finish().map(|_| ()),
             ),
             ("events", self.events_writer.finish().map(|_| ())),
+            (
+                "resource_samples",
+                self.resources_writer.finish().map(|_| ()),
+            ),
+            (
+                "process_samples",
+                write_table(&self.directory, "process_samples", processes),
+            ),
             ("strings", self.interner.lock().unwrap().finish()),
         ];
         for (name, result) in steps {
@@ -275,7 +330,30 @@ impl Worker {
                 eprintln!("failed to write {name}: {err:#}");
             }
         }
+        for (group, batch) in metrics {
+            let table = format!("{group}_metrics");
+            if let Err(err) = write_table(&self.directory, &table, batch) {
+                eprintln!("failed to write {table}: {err:#}");
+            }
+        }
     }
+}
+
+/// Write one complete table and close it. An empty batch writes nothing, so a
+/// table only exists when the source that fills it actually ran.
+fn write_table(
+    directory: &Path,
+    table: &str,
+    batch: anyhow::Result<store::arrow::record_batch::RecordBatch>,
+) -> anyhow::Result<()> {
+    let batch = batch?;
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    let mut writer = SegmentWriter::new(directory, table, None, batch.schema());
+    writer.write(&batch)?;
+    writer.finish()?;
+    Ok(())
 }
 
 fn write_all(
@@ -303,6 +381,9 @@ impl EventDispatcher {
                     Msg::Module(entry) => {
                         worker.modules.insert(entry);
                     }
+                    Msg::Resource(sample) => worker.consume_resource(sample),
+                    Msg::Process(info) => worker.processes.push(info),
+                    Msg::Metric(group, name, value) => worker.metrics.push((group, name, value)),
                 }
             }
             worker.finish();
@@ -323,7 +404,7 @@ impl EventDispatcher {
         *counter += 1;
         let mut bytes = [0u8; 20];
         bytes[..4].copy_from_slice(&std::process::id().to_le_bytes());
-        bytes[4..12].copy_from_slice(&current_thread_id().to_le_bytes());
+        bytes[4..12].copy_from_slice(&libprof::current_thread_id().to_le_bytes());
         bytes[12..20].copy_from_slice(&counter.to_le_bytes());
         xxh3(&bytes)
     }
@@ -342,7 +423,6 @@ impl EventDispatcher {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn publish_mem_sample_sync(&self, sample: MemSample) {
         if self.tx.send(Msg::MemSample(sample)).is_err() {
             eprintln!("lost memory sample: writer stopped");
@@ -360,25 +440,227 @@ impl EventDispatcher {
     }
 }
 
-fn current_thread_id() -> u64 {
-    #[cfg(target_os = "linux")]
-    {
-        unsafe { libc::gettid() as u64 }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut tid = 0_u64;
-        unsafe {
-            libc::pthread_threadid_np(0, &mut tid);
-        }
-        tid
-    }
-}
-
 impl DispatcherJoinHandle {
     pub async fn join(self) {
         let worker = self.worker;
         let _ = tokio::task::spawn_blocking(move || worker.join()).await;
     }
+}
+
+/// The dispatcher is the CLI's adapter for libprof's [`libprof::Sink`]: every
+/// source writes through it, and the session's tables are the only place the
+/// records land.
+impl libprof::Sink for EventDispatcher {
+    fn record(&self, record: libprof::Record) {
+        match record {
+            libprof::Record::Sample(sample) => {
+                let unique_id = self.unique_id();
+                let mut callstack = smallvec::smallvec![CallFrame::IP(sample.ip)];
+                callstack.extend(
+                    sample
+                        .callstack
+                        .into_iter()
+                        .filter(|address| *address != sample.ip)
+                        .map(CallFrame::IP),
+                );
+                let name = match &sample.counter {
+                    libprof::Counter::Custom(name) => self.string_id(name),
+                    _ => 0,
+                };
+                self.publish_event_sync(Event {
+                    unique_id,
+                    correlation_id: sample.event_id as u64,
+                    parent_id: 0,
+                    ty: counter_to_event_ty(&sample.counter),
+                    thread_id: sample.tid,
+                    process_id: sample.pid,
+                    cpu: sample.cpu,
+                    time_enabled: sample.time_enabled,
+                    time_running: sample.time_running,
+                    value: sample.value,
+                    timestamp: sample.time,
+                    name,
+                    callstack,
+                    lbr_callstack: sample.lbr_callstack.into_vec(),
+                    user_regs: sample.user_regs.map(user_regs),
+                    user_stack: sample.user_stack,
+                });
+            }
+            libprof::Record::MemSample(sample) => {
+                let mut callstack = vec![sample.ip];
+                callstack.extend(
+                    sample
+                        .callstack
+                        .into_iter()
+                        .filter(|address| *address != sample.ip),
+                );
+                self.publish_mem_sample_sync(MemSample {
+                    timestamp: sample.time,
+                    process_id: sample.pid,
+                    thread_id: sample.tid,
+                    cpu: sample.cpu,
+                    data_addr: sample.data_addr,
+                    latency: sample.latency,
+                    data_src: sample.data_src,
+                    callstack,
+                    lbr_callstack: sample.lbr_callstack.into_vec(),
+                    user_regs: sample.user_regs.map(user_regs),
+                    user_stack: sample.user_stack,
+                });
+            }
+            libprof::Record::ProcAddr(map) => self.publish_proc_map_sync(ProcMapEntry {
+                filename: map.filename,
+                address: map.addr as usize,
+                size: map.len as usize,
+                offset: map.pgoff as usize,
+                pid: map.pid,
+            }),
+            libprof::Record::Resource(sample) => {
+                if self.tx.send(Msg::Resource(sample)).is_err() {
+                    eprintln!("lost resource sample: writer stopped");
+                }
+            }
+            libprof::Record::Process(info) => {
+                if self.tx.send(Msg::Process(info)).is_err() {
+                    eprintln!("lost process record: writer stopped");
+                }
+            }
+            libprof::Record::Metric { group, name, value } => {
+                if self.tx.send(Msg::Metric(group, name, value)).is_err() {
+                    eprintln!("lost metric: writer stopped");
+                }
+            }
+        }
+    }
+}
+
+fn user_regs(regs: libprof::UserRegs) -> mperf_data::UserRegs {
+    mperf_data::UserRegs {
+        abi: regs.abi,
+        mask: regs.mask,
+        values: regs.values,
+    }
+}
+
+fn resource_sample_schema() -> Arc<store::arrow::datatypes::Schema> {
+    use store::arrow::datatypes::{DataType, Field, Schema};
+    Arc::new(Schema::new(vec![
+        Field::new("timestamp_ns", DataType::Int64, false),
+        Field::new("resource", DataType::Utf8, false),
+        Field::new("resource_id", DataType::Utf8, false),
+        Field::new("category", DataType::Utf8, false),
+        Field::new("metric", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new("unit", DataType::Utf8, false),
+        Field::new("scope", DataType::Utf8, false),
+        Field::new("source", DataType::Utf8, false),
+        Field::new("quality", DataType::Utf8, false),
+    ]))
+}
+
+fn resource_sample_batch(
+    samples: &[libprof::ResourceSample],
+) -> anyhow::Result<store::arrow::record_batch::RecordBatch> {
+    use store::arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
+    let text = |field: fn(&libprof::ResourceSample) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from(
+            samples.iter().map(field).collect::<Vec<_>>(),
+        ))
+    };
+    Ok(store::arrow::record_batch::RecordBatch::try_new(
+        resource_sample_schema(),
+        vec![
+            Arc::new(Int64Array::from(
+                samples
+                    .iter()
+                    .map(|sample| sample.timestamp_ns as i64)
+                    .collect::<Vec<_>>(),
+            )),
+            text(|sample| &sample.resource),
+            text(|sample| &sample.resource_id),
+            text(|sample| &sample.category),
+            text(|sample| &sample.metric),
+            Arc::new(Float64Array::from(
+                samples
+                    .iter()
+                    .map(|sample| sample.value)
+                    .collect::<Vec<_>>(),
+            )),
+            text(|sample| &sample.unit),
+            text(|sample| &sample.scope),
+            text(|sample| &sample.source),
+            text(|sample| &sample.quality),
+        ],
+    )?)
+}
+
+fn process_batch(
+    rows: &[libprof::ProcessInfo],
+) -> anyhow::Result<store::arrow::record_batch::RecordBatch> {
+    use store::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use store::arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pid", DataType::Int64, false),
+        Field::new("ppid", DataType::Int64, false),
+        Field::new("start_ticks", DataType::Int64, false),
+        Field::new("first_seen_ns", DataType::Int64, false),
+        Field::new("last_seen_ns", DataType::Int64, false),
+        Field::new("command", DataType::Utf8, false),
+        Field::new("quality", DataType::Utf8, false),
+    ]));
+    let int = |field: fn(&libprof::ProcessInfo) -> i64| -> ArrayRef {
+        Arc::new(Int64Array::from(rows.iter().map(field).collect::<Vec<_>>()))
+    };
+    let text = |field: fn(&libprof::ProcessInfo) -> &str| -> ArrayRef {
+        Arc::new(StringArray::from(
+            rows.iter().map(field).collect::<Vec<_>>(),
+        ))
+    };
+    Ok(store::arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![
+            int(|row| row.pid as i64),
+            int(|row| row.ppid as i64),
+            int(|row| row.start_ticks as i64),
+            int(|row| row.first_seen_ns as i64),
+            int(|row| row.last_seen_ns as i64),
+            text(|row| &row.command),
+            text(|row| &row.quality),
+        ],
+    )?)
+}
+
+/// Scalar summary metrics, one `<group>_metrics` table per group.
+fn metric_batches(
+    metrics: &[(&'static str, String, f64)],
+) -> Vec<(
+    &'static str,
+    anyhow::Result<store::arrow::record_batch::RecordBatch>,
+)> {
+    use store::arrow::array::{ArrayRef, Float64Array, StringArray};
+    use store::arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("metric", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, false),
+    ]));
+    let mut groups: Vec<&'static str> = metrics.iter().map(|(group, _, _)| *group).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+        .into_iter()
+        .map(|group| {
+            let rows = metrics.iter().filter(|(name, _, _)| *name == group);
+            let names: Vec<&str> = rows.clone().map(|(_, name, _)| name.as_str()).collect();
+            let values: Vec<f64> = rows.map(|(_, _, value)| *value).collect();
+            let batch = store::arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(names)) as ArrayRef,
+                    Arc::new(Float64Array::from(values)),
+                ],
+            )
+            .map_err(anyhow::Error::from);
+            (group, batch)
+        })
+        .collect()
 }

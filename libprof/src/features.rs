@@ -1,10 +1,51 @@
-use crate::Capabilities;
+//! What a caller asks for, and what this host can actually do about it.
+//!
+//! Callers request a [`Feature`] — an intent, like "precise memory samples".
+//! libprof answers with the best [`Mechanism`] the host supports for it, or
+//! with the reason every mechanism was rejected. PEBS, IBS and SPE are three
+//! mechanisms for one feature, not three things a scenario has to know about;
+//! adding a fourth is one variant and one resolver arm, invisible above.
 
-/// A capture strategy a scenario can run at. Scenarios declare an ordered
-/// ladder of these, best first; [`resolve`] picks the best rung the host
-/// supports and explains every rung it had to reject.
+use crate::{Capabilities, MeasurementQuality};
+
+/// A capability a caller needs, independent of the hardware that provides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Feature {
+    /// Instruction-level memory access samples: address, data source, latency.
+    PreciseMem,
+    /// Hardware top-down pipeline slot breakdown.
+    Topdown,
+    /// Call stacks from hardware branch records, without frame pointers.
+    HwCallstack,
+    /// Measured memory-controller bandwidth, rather than a core-side estimate.
+    DramBw,
+}
+
+impl Feature {
+    /// Stable identifier written to the session and shown to the user.
+    pub fn name(self) -> &'static str {
+        match self {
+            Feature::PreciseMem => "precise_mem",
+            Feature::Topdown => "topdown",
+            Feature::HwCallstack => "hw_callstack",
+            Feature::DramBw => "dram_bw",
+        }
+    }
+
+    /// The mechanisms that can provide this feature, best first.
+    pub fn mechanisms(self) -> &'static [Mechanism] {
+        match self {
+            Feature::PreciseMem => &[Mechanism::PebsMem, Mechanism::IbsOp, Mechanism::ArmSpe],
+            Feature::Topdown => &[Mechanism::FixedTopdown, Mechanism::ArmSlotsTopdown],
+            Feature::HwCallstack => &[Mechanism::LbrCallstack],
+            Feature::DramBw => &[Mechanism::UncoreBw],
+        }
+    }
+}
+
+/// A hardware facility that provides a [`Feature`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rung {
+pub enum Mechanism {
     /// Intel PEBS precise memory sampling (address, data source, latency).
     PebsMem,
     /// AMD IBS op sampling through the `ibs_op` PMU.
@@ -19,29 +60,48 @@ pub enum Rung {
     LbrCallstack,
     /// Memory-controller counters for measured DRAM bandwidth.
     UncoreBw,
-    /// Plain counters and frame-pointer/DWARF stacks: always available.
+    /// Plain counters and frame-pointer/DWARF stacks: what a host that
+    /// provides none of the above still measures.
     Baseline,
 }
 
-impl Rung {
+impl Mechanism {
     /// Stable identifier written to the session and shown to the user.
     pub fn name(self) -> &'static str {
         match self {
-            Rung::PebsMem => "pebs_mem",
-            Rung::IbsOp => "ibs_op",
-            Rung::ArmSpe => "arm_spe",
-            Rung::FixedTopdown => "fixed_topdown",
-            Rung::ArmSlotsTopdown => "arm_slots_topdown",
-            Rung::LbrCallstack => "lbr_callstack",
-            Rung::UncoreBw => "uncore_bw",
-            Rung::Baseline => "counter_only",
+            Mechanism::PebsMem => "pebs_mem",
+            Mechanism::IbsOp => "ibs_op",
+            Mechanism::ArmSpe => "arm_spe",
+            Mechanism::FixedTopdown => "fixed_topdown",
+            Mechanism::ArmSlotsTopdown => "arm_slots_topdown",
+            Mechanism::LbrCallstack => "lbr_callstack",
+            Mechanism::UncoreBw => "uncore_bw",
+            Mechanism::Baseline => "counter_only",
         }
     }
 
-    /// Why this rung cannot run on this host, or `None` when it can.
+    /// How faithfully this mechanism delivers its feature.
+    ///
+    /// PEBS periods count the load events that were asked for; IBS and SPE
+    /// sample every op and tag the memory ones, so their periods mean ops and
+    /// their rate cannot be read as a load rate.
+    pub fn quality(self) -> MeasurementQuality {
+        match self {
+            Mechanism::PebsMem
+            | Mechanism::FixedTopdown
+            | Mechanism::ArmSlotsTopdown
+            | Mechanism::LbrCallstack
+            | Mechanism::UncoreBw => MeasurementQuality::Exact,
+            Mechanism::IbsOp | Mechanism::ArmSpe | Mechanism::Baseline => {
+                MeasurementQuality::Estimated
+            }
+        }
+    }
+
+    /// Why this mechanism cannot run on this host, or `None` when it can.
     pub fn rejection(self, caps: &Capabilities) -> Option<String> {
         match self {
-            Rung::PebsMem => {
+            Mechanism::PebsMem => {
                 if caps.core_pmus().next().is_none() {
                     return Some("PEBS: no core PMU exposed in sysfs".to_string());
                 }
@@ -71,7 +131,7 @@ impl Rung {
                 }
                 None
             }
-            Rung::IbsOp => {
+            Mechanism::IbsOp => {
                 if caps.pmu("ibs_op").is_some() {
                     return None;
                 }
@@ -82,18 +142,18 @@ impl Rung {
                 }
                 Some("IBS: no `ibs_op` PMU exposed by the kernel".to_string())
             }
-            Rung::ArmSpe => (caps.pmus_with_prefix("arm_spe").next().is_none()).then(|| {
+            Mechanism::ArmSpe => (caps.pmus_with_prefix("arm_spe").next().is_none()).then(|| {
                 "Arm SPE: no `arm_spe_*` PMU exposed — needs CONFIG_ARM_SPE_PMU and firmware support"
                     .to_string()
             }),
             // A hybrid host needs one topdown group per core type, opened only
             // on that type's CPUs; until that exists, degrade rather than open
             // a P-core group on an E-core and fail the recording.
-            Rung::FixedTopdown if caps.pmu("cpu_atom").is_some() => Some(
+            Mechanism::FixedTopdown if caps.pmu("cpu_atom").is_some() => Some(
                 "fixed topdown: hybrid Intel cores (cpu_core/cpu_atom) are not supported yet"
                     .to_string(),
             ),
-            Rung::FixedTopdown => {
+            Mechanism::FixedTopdown => {
                 let Some(pmu) = caps.core_pmus().find(|pmu| {
                     crate::topdown::INTEL_EVENTS
                         .iter()
@@ -106,7 +166,7 @@ impl Rung {
                 };
                 group_is_schedulable(pmu)
             }
-            Rung::ArmSlotsTopdown => {
+            Mechanism::ArmSlotsTopdown => {
                 let pmuv3: Vec<_> = caps.pmus_with_prefix("armv8_pmuv3").collect();
                 if pmuv3.is_empty() {
                     return Some("Arm topdown: no `armv8_pmuv3*` PMU exposed".to_string());
@@ -130,7 +190,7 @@ impl Rung {
                 }
                 pmuv3.iter().find_map(|pmu| group_is_schedulable(pmu))
             }
-            Rung::LbrCallstack => {
+            Mechanism::LbrCallstack => {
                 let depth = caps
                     .core_pmus()
                     .filter_map(|pmu| pmu.cap_number("branches"))
@@ -139,7 +199,7 @@ impl Rung {
                     "LBR: core PMU advertises no branch-record depth in `caps/branches`".to_string()
                 })
             }
-            Rung::UncoreBw => {
+            Mechanism::UncoreBw => {
                 if !caps.system_wide_allowed() {
                     return Some(format!(
                         "uncore bandwidth: system-wide events need CAP_PERFMON or perf_event_paranoid <= 0 (currently {})",
@@ -152,14 +212,14 @@ impl Rung {
                         .to_string()
                 })
             }
-            Rung::Baseline => None,
+            Mechanism::Baseline => None,
         }
     }
 }
 
-/// Reject a topdown rung whose group the PMU is too narrow to schedule. The
-/// event set is fixed by the methodology, so a PMU that cannot hold it has to
-/// degrade to the arithmetic baseline rather than fail the recording.
+/// Reject a topdown mechanism whose group the PMU is too narrow to schedule.
+/// The event set is fixed by the methodology, so a PMU that cannot hold it has
+/// to degrade to the arithmetic baseline rather than fail the recording.
 fn group_is_schedulable(pmu: &crate::PmuDevice) -> Option<String> {
     let events = crate::topdown::group_events(pmu);
     let events = events.iter().map(String::as_str).collect::<Vec<_>>();
@@ -173,7 +233,7 @@ fn group_is_schedulable(pmu: &crate::PmuDevice) -> Option<String> {
 }
 
 /// Whether a `uname -r` release is at least `major.minor`. `None` when the
-/// string cannot be parsed, so an unreadable version never blocks a rung.
+/// string cannot be parsed, so an unreadable version never blocks a mechanism.
 fn kernel_at_least(release: &str, major: u32, minor: u32) -> Option<bool> {
     let mut parts = release.split(|c: char| !c.is_ascii_digit());
     let found_major = parts.next()?.parse::<u32>().ok()?;
@@ -181,32 +241,62 @@ fn kernel_at_least(release: &str, major: u32, minor: u32) -> Option<bool> {
     Some((found_major, found_minor) >= (major, minor))
 }
 
-/// The rung a scenario runs at, plus every better rung that was rejected.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Resolution {
-    /// The best rung this host supports.
-    pub chosen: Rung,
-    /// Rejected rungs, best first, each with a human-readable reason.
-    pub rejected: Vec<(Rung, String)>,
+/// The mechanism a feature runs on, with its provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Satisfied {
+    /// Hardware facility that provides the feature here.
+    pub mechanism: Mechanism,
+    /// How faithful that facility's data is.
+    pub quality: MeasurementQuality,
 }
 
-/// Pick the best rung in `ladder` that `caps` supports. Ladders always end at
-/// [`Rung::Baseline`], which every host satisfies.
-pub fn resolve(ladder: &[Rung], caps: &Capabilities) -> Resolution {
+/// What libprof can do for one requested feature on this host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resolution {
+    /// The feature that was requested.
+    pub feature: Feature,
+    /// The mechanism chosen, or `None` when every mechanism was rejected.
+    pub satisfied: Option<Satisfied>,
+    /// Mechanisms rejected before the chosen one, best first.
+    pub rejected: Vec<(Mechanism, String)>,
+}
+
+impl Resolution {
+    /// Whether the host can provide the feature at all.
+    pub fn is_satisfied(&self) -> bool {
+        self.satisfied.is_some()
+    }
+
+    /// The mechanism in use, or [`Mechanism::Baseline`] when the feature was
+    /// rejected and the caller falls back to plain counters.
+    pub fn mechanism(&self) -> Mechanism {
+        self.satisfied
+            .map_or(Mechanism::Baseline, |satisfied| satisfied.mechanism)
+    }
+}
+
+/// Resolve one feature against a probed host: the best mechanism it supports,
+/// plus why every better one was rejected.
+pub fn resolve(feature: Feature, caps: &Capabilities) -> Resolution {
     let mut rejected = Vec::new();
-    for rung in ladder {
-        match rung.rejection(caps) {
+    for mechanism in feature.mechanisms() {
+        match mechanism.rejection(caps) {
             None => {
                 return Resolution {
-                    chosen: *rung,
+                    feature,
+                    satisfied: Some(Satisfied {
+                        mechanism: *mechanism,
+                        quality: mechanism.quality(),
+                    }),
                     rejected,
                 };
             }
-            Some(reason) => rejected.push((*rung, reason)),
+            Some(reason) => rejected.push((*mechanism, reason)),
         }
     }
     Resolution {
-        chosen: Rung::Baseline,
+        feature,
+        satisfied: None,
         rejected,
     }
 }
@@ -224,11 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_host_falls_back_to_baseline_with_reasons() {
-        let caps = Capabilities::default();
-        let resolution = resolve(&[Rung::PebsMem, Rung::IbsOp, Rung::Baseline], &caps);
-        assert_eq!(resolution.chosen, Rung::Baseline);
-        assert_eq!(resolution.rejected.len(), 2);
+    fn empty_host_rejects_every_mechanism_with_reasons() {
+        let resolution = resolve(Feature::PreciseMem, &Capabilities::default());
+        assert!(!resolution.is_satisfied());
+        assert_eq!(resolution.mechanism(), Mechanism::Baseline);
+        assert_eq!(resolution.rejected.len(), 3);
         assert!(resolution.rejected[0].1.contains("no core PMU"));
     }
 
@@ -238,22 +328,27 @@ mod tests {
             pmus: vec![pmu("cpu")],
             ..Capabilities::default()
         };
-        let reason = Rung::IbsOp.rejection(&caps).unwrap();
+        let reason = Mechanism::IbsOp.rejection(&caps).unwrap();
         if cfg!(target_arch = "x86_64") {
             assert!(reason.contains("CPUID flag absent"), "{reason}");
         }
     }
 
     #[test]
-    fn picks_the_best_satisfied_rung() {
+    fn picks_the_best_satisfied_mechanism_and_tags_its_quality() {
         let caps = Capabilities {
             pmus: vec![pmu("ibs_op")],
             ..Capabilities::default()
         };
-        let resolution = resolve(&[Rung::PebsMem, Rung::IbsOp, Rung::Baseline], &caps);
-        assert_eq!(resolution.chosen, Rung::IbsOp);
+        let resolution = resolve(Feature::PreciseMem, &caps);
+        assert_eq!(resolution.mechanism(), Mechanism::IbsOp);
+        // IBS samples ops, not the requested load events.
+        assert_eq!(
+            resolution.satisfied.unwrap().quality,
+            MeasurementQuality::Estimated
+        );
         assert_eq!(resolution.rejected.len(), 1);
-        assert_eq!(resolution.rejected[0].0, Rung::PebsMem);
+        assert_eq!(resolution.rejected[0].0, Mechanism::PebsMem);
     }
 
     #[test]
@@ -271,7 +366,7 @@ mod tests {
             perf_event_paranoid: Some(2),
             ..Capabilities::default()
         };
-        assert!(Rung::UncoreBw
+        assert!(Mechanism::UncoreBw
             .rejection(&caps)
             .unwrap()
             .contains("CAP_PERFMON"));
@@ -280,6 +375,6 @@ mod tests {
             perf_event_paranoid: Some(-1),
             ..caps
         };
-        assert_eq!(Rung::UncoreBw.rejection(&allowed), None);
+        assert!(resolve(Feature::DramBw, &allowed).is_satisfied());
     }
 }

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::driver::{
     CounterEntry, CounterResult, CounterValue, CountingDriver, MeasurementQuality, Record, Sample,
-    SamplingCallback, SamplingDriver,
+    SamplingDriver, Sink,
 };
 use crate::{Counter, Error};
 
@@ -967,7 +967,7 @@ impl KPerfCountingDriver {
         };
 
         let counts = self.estimated_counts.clone();
-        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+        let callback: Arc<dyn Sink> = Arc::new(move |record| {
             let Record::Sample(sample) = record else {
                 return;
             };
@@ -1114,7 +1114,7 @@ impl SamplingDriver for KPerfSamplingDriver {
             .collect()
     }
 
-    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
+    fn start(&mut self, callback: Arc<dyn Sink>) -> Result<(), Error> {
         setup_kdebug_buffer().map_err(|_| Error::EnableFailed)?;
 
         let period_ns = (1_000_000_000_u64 / self.sample_freq.max(1)).max(1);
@@ -1551,7 +1551,7 @@ fn rotate_sampling_program(
     kpc_count: &mut usize,
     pid_filter: Option<u32>,
     state: &mut KdebugDecodeState,
-    callback: &Arc<dyn SamplingCallback>,
+    callback: &Arc<dyn Sink>,
 ) {
     // Stop generation first, then decode all buffered KPC records with the old
     // epoch/slot mapping. A deferred AST stack may arrive later, but its sample
@@ -1959,7 +1959,7 @@ fn handle_kdebug_record(
     rec: KdBuf,
     config: KdebugDecodeConfig<'_>,
     state: &mut KdebugDecodeState,
-    callback: &Arc<dyn SamplingCallback>,
+    callback: &Arc<dyn Sink>,
 ) {
     let event = rec.debugid & KDBG_EVENTID_MASK;
     match event {
@@ -2102,7 +2102,7 @@ fn finish_pending_sample(
     program_epoch: u64,
     time_enabled_multiplier: u64,
     state: &mut KdebugDecodeState,
-    callback: &Arc<dyn SamplingCallback>,
+    callback: &Arc<dyn Sink>,
 ) {
     if sample.pid == 0 {
         if let Some(pid) = sample.forced_pid {
@@ -2165,10 +2165,7 @@ fn finish_pending_sample(
     );
 }
 
-fn flush_incomplete_deferred_samples(
-    state: &mut KdebugDecodeState,
-    callback: &Arc<dyn SamplingCallback>,
-) {
+fn flush_incomplete_deferred_samples(state: &mut KdebugDecodeState, callback: &Arc<dyn Sink>) {
     // PMU values need the deferred stack to produce a useful attributed delta.
     // CPU-clock is sampled occupancy, though, so the timer hit itself is enough
     // evidence to keep one period even when shutdown wins the AST race.
@@ -2190,7 +2187,7 @@ fn emit_pending_sample(
     program_epoch: u64,
     time_enabled_multiplier: u64,
     state: &mut KdebugDecodeState,
-    callback: &Arc<dyn SamplingCallback>,
+    callback: &Arc<dyn Sink>,
 ) {
     let ip = sample.callstack.first().copied().unwrap_or_default();
     let event_id = uuid::Uuid::now_v7().as_u128();
@@ -2222,7 +2219,7 @@ fn emit_pending_sample(
         let time_delta = sample.time.saturating_sub(last.time).max(1);
         let value_delta = value.saturating_sub(last.value);
 
-        callback.call(Record::Sample(Sample {
+        callback.record(Record::Sample(Sample {
             event_id,
             ip,
             pid: sample.pid,
@@ -2249,7 +2246,7 @@ fn emit_cpu_clock_observation(
     handles: &[NativeCounterHandle],
     sample_period_ns: u64,
     event_id: u128,
-    callback: &Arc<dyn SamplingCallback>,
+    callback: &Arc<dyn Sink>,
 ) {
     if sample_period_ns == 0
         || !handles
@@ -2264,7 +2261,7 @@ fn emit_cpu_clock_observation(
     // period to the CPU that delivered it. Interarrival time is deliberately
     // irrelevant: back-projecting it would smear occupancy across migration or
     // scheduled-out gaps and would also lose the first hit.
-    callback.call(Record::Sample(Sample {
+    callback.record(Record::Sample(Sample {
         event_id,
         ip: sample.callstack.first().copied().unwrap_or_default(),
         pid: sample.pid,
@@ -2375,10 +2372,10 @@ mod tests {
         }
     }
 
-    fn recording_callback() -> (Arc<Mutex<Vec<Record>>>, Arc<dyn SamplingCallback>) {
+    fn recording_callback() -> (Arc<Mutex<Vec<Record>>>, Arc<dyn Sink>) {
         let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
         let emitted_for_callback = emitted.clone();
-        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+        let callback: Arc<dyn Sink> = Arc::new(move |record| {
             emitted_for_callback.lock().unwrap().push(record);
         });
         (emitted, callback)
@@ -2763,7 +2760,7 @@ mod tests {
         let handles = one_counter_handles();
         let emitted = Arc::new(Mutex::new(Vec::<Record>::new()));
         let emitted_for_callback = emitted.clone();
-        let callback: Arc<dyn SamplingCallback> = Arc::new(move |record| {
+        let callback: Arc<dyn Sink> = Arc::new(move |record| {
             emitted_for_callback.lock().unwrap().push(record);
         });
         let mut state = KdebugDecodeState::default();

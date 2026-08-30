@@ -9,7 +9,7 @@ use perf_event_open_sys as sys;
 use perf_event_open_sys::bindings::{perf_event_attr, perf_event_header, perf_event_mmap_page};
 use smallvec::SmallVec;
 
-use crate::driver::{MemSample, Record, SamplingCallback, SamplingDriver};
+use crate::driver::{MemSample, Record, SamplingDriver, Sink};
 use crate::{Counter, Error};
 
 use super::sysfs;
@@ -210,7 +210,7 @@ impl SamplingDriver for PerfSpeSamplingDriver {
         vec![Counter::Custom("arm_spe".to_owned())]
     }
 
-    fn start(&mut self, callback: Arc<dyn SamplingCallback>) -> Result<(), Error> {
+    fn start(&mut self, callback: Arc<dyn Sink>) -> Result<(), Error> {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let lost_samples = self.lost_samples.clone();
@@ -387,7 +387,7 @@ impl SpeStream {
         tail_atomic.store(tail, Ordering::Release);
     }
 
-    fn decode(&mut self, pid: u32, clock: &TimerCalibration, callback: &dyn SamplingCallback) {
+    fn decode(&mut self, pid: u32, clock: &TimerCalibration, callback: &dyn Sink) {
         let mut cursor = 0usize;
         loop {
             let buf = &self.carry[cursor..];
@@ -411,7 +411,7 @@ impl SpeStream {
                 } else {
                     monotonic_now()
                 };
-                callback.call(Record::MemSample(MemSample {
+                callback.record(Record::MemSample(MemSample {
                     ip: sample.pc,
                     pid,
                     tid: pid,
