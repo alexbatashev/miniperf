@@ -15,7 +15,6 @@ const POINTER_CHASE_FP: &str = env!("TRUTH_POINTER_CHASE_FP");
 const BRANCH_HEAVY_FP: &str = env!("TRUTH_BRANCH_HEAVY_FP");
 
 #[test]
-#[ignore = "requires Linux perf_event access; run `cargo build -p mperf && cargo test -p truth --test profile -- --ignored`"]
 fn f6_1_mperf_reports_analytic_duty_split() {
     let Some((results, log_path)) = record_fixture(DUTY_SPLIT_FP, "3", "01-F6.1") else {
         return;
@@ -26,7 +25,6 @@ fn f6_1_mperf_reports_analytic_duty_split() {
 }
 
 #[test]
-#[ignore = "requires Linux perf_event access; run `cargo build -p mperf && cargo test -p truth --test profile -- --ignored`"]
 fn f3_1_dwarf_resolves_optimized_no_frame_pointer_fixture() {
     let Some((results, log_path)) = record_fixture(DUTY_SPLIT_NO_FP, "1", "01-F3.1") else {
         return;
@@ -51,7 +49,6 @@ fn f3_1_dwarf_resolves_optimized_no_frame_pointer_fixture() {
 }
 
 #[test]
-#[ignore = "requires Linux perf_event access; run `cargo build -p mperf && cargo test -p truth --test profile -- --ignored`"]
 fn tma_acceptance_fixtures_have_expected_dominant_paths() {
     for (fixture, expected) in [
         (POINTER_CHASE_FP, "be_bound"),
@@ -124,9 +121,6 @@ fn assert_fixed_topdown_fractions_are_exhaustive(session: &Session) {
 
 fn record_fixture(fixture: &str, duration: &str, milestone: &str) -> Option<(PathBuf, PathBuf)> {
     if !perf_events_are_available() {
-        eprintln!(
-            "{milestone} skipped: perf_event access is unavailable (set kernel.perf_event_paranoid=-1 or grant equivalent capabilities)"
-        );
         return None;
     }
 
@@ -249,14 +243,22 @@ fn duty_row(row: &Row<'_>) -> (String, u64) {
     (name, value.unwrap_or(0).max(0) as u64)
 }
 
+/// Whether the profiler can be run here. Hosts without perf access must opt
+/// out with `MPERF_NO_PMU=1`; a missing PMU is never a silent pass.
 fn perf_events_are_available() -> bool {
-    if !cfg!(target_os = "linux") {
+    if env::var_os("MPERF_NO_PMU").is_some() {
+        eprintln!("skipped: MPERF_NO_PMU is set");
         return false;
     }
-    let Ok(value) = fs::read_to_string("/proc/sys/kernel/perf_event_paranoid") else {
-        return false;
-    };
-    value.trim().parse::<i32>().is_ok_and(|level| level <= -1)
+    let level = fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok());
+    assert!(
+        level.is_some_and(|level| level <= -1),
+        "perf_event access is unavailable (kernel.perf_event_paranoid={level:?}); \
+         set kernel.perf_event_paranoid=-1, or set MPERF_NO_PMU=1 to skip the profiler tests explicitly"
+    );
+    true
 }
 
 fn mperf_binary() -> PathBuf {
@@ -269,6 +271,14 @@ fn mperf_binary() -> PathBuf {
         path.pop();
     }
     path.push(if cfg!(windows) { "mperf.exe" } else { "mperf" });
+    if !path.is_file() {
+        let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = Command::new(cargo)
+            .args(["build", "-p", "mperf"])
+            .status()
+            .expect("failed to run cargo build -p mperf");
+        assert!(status.success(), "cargo build -p mperf failed");
+    }
     path
 }
 
